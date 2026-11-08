@@ -50,14 +50,28 @@ impl ArtifactStore {
     pub fn new(session_id: impl Into<String>, root: Option<PathBuf>) -> io::Result<Self> {
         use std::os::unix::fs::PermissionsExt;
         let session_id = session_id.into();
+        let mut next = 0u64;
         if let Some(root) = &root {
             std::fs::create_dir_all(root)?;
             let _ = std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700));
+            if let Ok(entries) = std::fs::read_dir(root) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    if let Some(number) = name
+                        .strip_prefix("out-")
+                        .and_then(|rest| rest.strip_suffix(".txt"))
+                        .and_then(|digits| digits.parse::<u64>().ok())
+                    {
+                        next = next.max(number);
+                    }
+                }
+            }
         }
         Ok(Self {
             session_id,
             root,
-            counter: AtomicU64::new(0),
+            counter: AtomicU64::new(next),
             memory: Mutex::new(HashMap::new()),
         })
     }
@@ -262,22 +276,18 @@ pub fn cleanup_root(root: &Path, days: u32) -> io::Result<usize> {
         return Ok(0);
     };
     for session in sessions.flatten() {
-        let artifacts = session.path().join("artifacts");
-        let Ok(files) = std::fs::read_dir(&artifacts) else {
+        // `root` is the per-project artifacts directory; its children are
+        // per-session directories containing out-N.txt files.
+        let Ok(entries) = std::fs::read_dir(session.path()) else {
             continue;
         };
-        for dir in files.flatten() {
-            let Ok(entries) = std::fs::read_dir(dir.path()) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                if let Ok(meta) = entry.metadata()
-                    && meta.is_file()
-                    && meta.modified().is_ok_and(|modified| modified < cutoff)
-                    && std::fs::remove_file(entry.path()).is_ok()
-                {
-                    removed += 1;
-                }
+        for entry in entries.flatten() {
+            if let Ok(meta) = entry.metadata()
+                && meta.is_file()
+                && meta.modified().is_ok_and(|modified| modified < cutoff)
+                && std::fs::remove_file(entry.path()).is_ok()
+            {
+                removed += 1;
             }
         }
     }
@@ -318,6 +328,19 @@ mod tests {
         let store = ArtifactStore::ephemeral();
         assert!(store.read_all("../etc/passwd").is_err());
         assert!(store.read_all("nope").is_err());
+    }
+
+    #[test]
+    fn resumed_store_does_not_reuse_artifact_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("s1");
+        {
+            let store = ArtifactStore::new("s1", Some(root.clone())).unwrap();
+            assert_eq!(store.write("one").unwrap().id, "out-1");
+            assert_eq!(store.write("two").unwrap().id, "out-2");
+        }
+        let reopened = ArtifactStore::new("s1", Some(root)).unwrap();
+        assert_eq!(reopened.write("three").unwrap().id, "out-3");
     }
 
     #[test]

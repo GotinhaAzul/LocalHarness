@@ -245,6 +245,7 @@ async fn run_loop(
             window: budget.context_window,
         });
 
+        let mut partial = None;
         let result = stream_assistant(
             core,
             request,
@@ -253,12 +254,18 @@ async fn run_loop(
             &mut budget,
             assembled.estimated_tokens,
             assembled.char_count,
+            &mut partial,
         )
         .await;
 
         let assistant = match result {
             Ok(assistant) => assistant,
             Err(err) if err.class == ErrorClass::Cancelled => {
+                if let Some(partial) = partial.take()
+                    && let Err(error) = append_assistant(&core.session, partial)
+                {
+                    tracing::warn!(%error, "cannot persist partial assistant output");
+                }
                 append_error(&core.session, "cancelled", "generation cancelled", true);
                 let _ = tx.send(AgentEvent::Guard {
                     code: "cancelled".into(),
@@ -269,6 +276,11 @@ async fn run_loop(
             Err(err)
                 if err.class == ErrorClass::ContextTooSmall && !progress.context_retry_used =>
             {
+                if let Some(partial) = partial.take()
+                    && let Err(error) = append_assistant(&core.session, partial)
+                {
+                    tracing::warn!(%error, "cannot persist partial assistant output");
+                }
                 progress.context_retry_used = true;
                 pending_compaction = true;
                 let _ = tx.send(AgentEvent::Notice(
@@ -277,6 +289,11 @@ async fn run_loop(
                 continue;
             }
             Err(err) => {
+                if let Some(partial) = partial.take()
+                    && let Err(error) = append_assistant(&core.session, partial)
+                {
+                    tracing::warn!(%error, "cannot persist partial assistant output");
+                }
                 let code = err.class.code().to_string();
                 append_error(&core.session, &code, &err.message, true);
                 let _ = tx.send(AgentEvent::Error {
@@ -473,6 +490,29 @@ struct PartialCall {
 }
 
 impl StreamAccum {
+    /// Content streamed so far, without tool calls, for a cancelled or failed
+    /// generation. Keeps the branch useful after an interruption.
+    fn partial(&self) -> Option<AssistantData> {
+        if self.content.trim().is_empty() && self.reasoning.trim().is_empty() {
+            return None;
+        }
+        Some(AssistantData {
+            content: if self.content.is_empty() {
+                None
+            } else {
+                Some(self.content.clone())
+            },
+            reasoning: if self.reasoning.is_empty() {
+                None
+            } else {
+                Some(self.reasoning.clone())
+            },
+            tool_calls: None,
+            usage: self.usage.clone(),
+            stop_reason: Some("cancelled".into()),
+        })
+    }
+
     fn new() -> Self {
         Self {
             content: String::new(),
@@ -522,6 +562,7 @@ impl StreamAccum {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn stream_assistant(
     core: &Core,
     request: ChatRequest,
@@ -530,6 +571,7 @@ async fn stream_assistant(
     budget: &mut TokenBudget,
     estimated_tokens: u32,
     char_count: usize,
+    partial: &mut Option<AssistantData>,
 ) -> Result<AssistantData, ProviderError> {
     if cancel.is_cancelled() {
         return Err(ProviderError::new(
@@ -562,9 +604,11 @@ async fn stream_assistant(
     task.abort();
     let _ = task.await;
     if let Some(err) = failure {
+        *partial = accum.partial();
         return Err(err);
     }
     if cancel.is_cancelled() {
+        *partial = accum.partial();
         return Err(ProviderError::new(
             ErrorClass::Cancelled,
             "generation cancelled",

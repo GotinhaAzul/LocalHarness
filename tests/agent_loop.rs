@@ -21,6 +21,7 @@ use tokio_util::sync::CancellationToken;
 
 enum Script {
     Events(Vec<StreamEvent>),
+    EventsThenWait(Vec<StreamEvent>),
     Error(ProviderError),
 }
 
@@ -44,6 +45,12 @@ impl Provider for ScriptedProvider {
                 for event in events {
                     let _ = tx.send(Ok(event));
                 }
+            }
+            Some(Script::EventsThenWait(events)) => {
+                for event in events {
+                    let _ = tx.send(Ok(event));
+                }
+                _cancel.cancelled().await;
             }
             Some(Script::Error(err)) => {
                 let _ = tx.send(Err(err));
@@ -512,5 +519,50 @@ async fn verify_gate_runs_configured_steps_and_review_settles() {
     assert_eq!(
         verify.payload.get("passed").and_then(|v| v.as_bool()),
         Some(true)
+    );
+}
+
+#[tokio::test]
+async fn cancellation_mid_stream_keeps_partial_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness(
+        dir.path(),
+        vec![Script::EventsThenWait(vec![StreamEvent::Delta(
+            "half an answer".into(),
+        )])],
+        &["read"],
+    );
+    let cancel = CancellationToken::new();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let core = harness.core.clone();
+    let task = tokio::spawn(run_turn(core, "start".into(), tx, cancel.clone()));
+    let mut saw_text = false;
+    while let Some(event) = rx.recv().await {
+        if matches!(event, AgentEvent::TextDelta(_)) {
+            saw_text = true;
+            break;
+        }
+        if matches!(event, AgentEvent::TurnDone(_)) {
+            break;
+        }
+    }
+    assert!(saw_text);
+    cancel.cancel();
+    let outcome = task.await.unwrap();
+    assert_eq!(outcome.status, TurnStatus::Cancelled);
+    let session = harness.session.lock().unwrap();
+    let assistant = session
+        .branch_entries()
+        .iter()
+        .find_map(|entry| match &entry.kind {
+            EntryKind::Assistant(assistant) => assistant.content.clone(),
+            _ => None,
+        });
+    assert_eq!(assistant.as_deref(), Some("half an answer"));
+    assert!(
+        session
+            .branch_entries()
+            .iter()
+            .any(|entry| matches!(&entry.kind, EntryKind::Error(data) if data.code == "cancelled"))
     );
 }
