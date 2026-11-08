@@ -154,7 +154,9 @@ pub async fn run(cli: Cli) -> Result<i32> {
             if direct.is_file() {
                 Some(direct)
             } else {
-                let candidate = paths.project_sessions_dir().join(format!("{id_or_path}.jsonl"));
+                let candidate = paths
+                    .project_sessions_dir()
+                    .join(format!("{id_or_path}.jsonl"));
                 if candidate.is_file() {
                     Some(candidate)
                 } else {
@@ -204,11 +206,7 @@ pub async fn run(cli: Cli) -> Result<i32> {
     }
 }
 
-async fn run_headless(
-    runtime: crate::app::Runtime,
-    prompt: String,
-    json: bool,
-) -> Result<i32> {
+async fn run_headless(runtime: crate::app::Runtime, prompt: String, json: bool) -> Result<i32> {
     let cancel = CancellationToken::new();
     let (tx, mut rx) = mpsc::unbounded_channel();
     let core = runtime.core.clone();
@@ -275,14 +273,31 @@ fn render_event(event: AgentEvent, json: bool) -> Result<Option<TurnStatus>> {
                 duration_ms,
                 preview,
                 artifact,
-            } => json!({"type":"tool_finished","call_id":call_id,"name":name,"is_error":is_error,"duration_ms":duration_ms,"preview":preview,"artifact":artifact}),
-            AgentEvent::Usage(usage) => json!({"type":"usage","prompt_tokens":usage.prompt_tokens,"completion_tokens":usage.completion_tokens}),
-            AgentEvent::Context { used, window } => json!({"type":"context","used":used,"window":window}),
-            AgentEvent::Compacted { summary, tokens_before } => json!({"type":"compacted","summary":summary,"tokens_before":tokens_before}),
+            } => {
+                json!({"type":"tool_finished","call_id":call_id,"name":name,"is_error":is_error,"duration_ms":duration_ms,"preview":preview,"artifact":artifact})
+            }
+            AgentEvent::Usage(usage) => {
+                json!({"type":"usage","prompt_tokens":usage.prompt_tokens,"completion_tokens":usage.completion_tokens})
+            }
+            AgentEvent::Context { used, window } => {
+                json!({"type":"context","used":used,"window":window})
+            }
+            AgentEvent::Compacted {
+                summary,
+                tokens_before,
+            } => json!({"type":"compacted","summary":summary,"tokens_before":tokens_before}),
             AgentEvent::Notice(message) => json!({"type":"notice","message":message}),
-            AgentEvent::Guard { code, message } => json!({"type":"guard","code":code,"message":message}),
-            AgentEvent::Error { code, message, recoverable } => json!({"type":"error","code":code,"message":message,"recoverable":recoverable}),
-            AgentEvent::TurnDone(outcome) => json!({"type":"done","status":format!("{:?}", outcome.status)}),
+            AgentEvent::Guard { code, message } => {
+                json!({"type":"guard","code":code,"message":message})
+            }
+            AgentEvent::Error {
+                code,
+                message,
+                recoverable,
+            } => json!({"type":"error","code":code,"message":message,"recoverable":recoverable}),
+            AgentEvent::TurnDone(outcome) => {
+                json!({"type":"done","status":format!("{:?}", outcome.status)})
+            }
         };
         println!("{}", serde_json::to_string(&value)?);
         if let AgentEvent::TurnDone(outcome) = event {
@@ -300,7 +315,12 @@ fn render_event(event: AgentEvent, json: bool) -> Result<Option<TurnStatus>> {
         AgentEvent::ToolStarted { name, summary, .. } => {
             eprintln!("[tool] {name} {summary}");
         }
-        AgentEvent::ToolFinished { name, is_error, preview, .. } => {
+        AgentEvent::ToolFinished {
+            name,
+            is_error,
+            preview,
+            ..
+        } => {
             if is_error {
                 eprintln!("[error] {name}: {preview}");
             } else {

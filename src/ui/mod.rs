@@ -1,5 +1,9 @@
 //! TUI application.
 
+pub mod highlight;
+pub mod markdown;
+pub mod theme;
+
 use anyhow::Result;
 
 use crate::app::Runtime;

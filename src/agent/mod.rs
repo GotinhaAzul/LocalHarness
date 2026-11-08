@@ -77,11 +77,18 @@ impl Core {
 /// UI-facing events for one turn.
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
-    TurnStarted { model: String, profile: String },
+    TurnStarted {
+        model: String,
+        profile: String,
+    },
     State(AgentState),
     TextDelta(String),
     ReasoningDelta(String),
-    ToolStarted { call_id: String, name: String, summary: String },
+    ToolStarted {
+        call_id: String,
+        name: String,
+        summary: String,
+    },
     ToolFinished {
         call_id: String,
         name: String,
@@ -91,11 +98,24 @@ pub enum AgentEvent {
         artifact: Option<String>,
     },
     Usage(Usage),
-    Context { used: u32, window: u32 },
-    Compacted { summary: String, tokens_before: u64 },
+    Context {
+        used: u32,
+        window: u32,
+    },
+    Compacted {
+        summary: String,
+        tokens_before: u64,
+    },
     Notice(String),
-    Guard { code: String, message: String },
-    Error { code: String, message: String, recoverable: bool },
+    Guard {
+        code: String,
+        message: String,
+    },
+    Error {
+        code: String,
+        message: String,
+        recoverable: bool,
+    },
     TurnDone(TurnOutcome),
 }
 

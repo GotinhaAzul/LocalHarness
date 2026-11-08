@@ -4,8 +4,8 @@ use std::time::Duration;
 
 use serde_json::json;
 
-use super::types::{ErrorClass, ProviderError};
 use super::Provider;
+use super::types::{ErrorClass, ProviderError};
 
 #[derive(Debug, Clone, Default)]
 pub struct Capabilities {
@@ -36,12 +36,18 @@ fn client_and_base<'a>(
     provider: &'a dyn Provider,
 ) -> Result<(&'a reqwest::Client, &'a str), ProviderError> {
     let client = provider.client().ok_or_else(|| {
-        ProviderError::new(ErrorClass::BadRequest, "this provider does not expose HTTP probes")
+        ProviderError::new(
+            ErrorClass::BadRequest,
+            "this provider does not expose HTTP probes",
+        )
     })?;
     Ok((client, provider.endpoint().trim_end_matches('/')))
 }
 
-fn request<'a>(provider: &'a dyn Provider, url: &str) -> Result<reqwest::RequestBuilder, ProviderError> {
+fn request<'a>(
+    provider: &'a dyn Provider,
+    url: &str,
+) -> Result<reqwest::RequestBuilder, ProviderError> {
     let (client, _) = client_and_base(provider)?;
     let mut req = client.get(url).timeout(Duration::from_secs(10));
     if !provider.api_key().is_empty() {
@@ -54,20 +60,18 @@ fn request<'a>(provider: &'a dyn Provider, url: &str) -> Result<reqwest::Request
 pub async fn list_models(provider: &dyn Provider) -> Result<Vec<String>, ProviderError> {
     let (_, base) = client_and_base(provider)?;
     let url = format!("{base}/v1/models");
-    let response = request(provider, &url)?
-        .send()
-        .await
-        .map_err(|err| ProviderError::new(ErrorClass::Connection, format!("/v1/models failed: {err}")))?;
+    let response = request(provider, &url)?.send().await.map_err(|err| {
+        ProviderError::new(ErrorClass::Connection, format!("/v1/models failed: {err}"))
+    })?;
     if !response.status().is_success() {
         return Err(ProviderError::new(
             ErrorClass::BadRequest,
             format!("/v1/models returned {}", response.status()),
         ));
     }
-    let value: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|err| ProviderError::new(ErrorClass::Parse, format!("/v1/models is not JSON: {err}")))?;
+    let value: serde_json::Value = response.json().await.map_err(|err| {
+        ProviderError::new(ErrorClass::Parse, format!("/v1/models is not JSON: {err}"))
+    })?;
     let models = value["data"]
         .as_array()
         .map(|items| {
@@ -84,20 +88,18 @@ pub async fn list_models(provider: &dyn Provider) -> Result<Vec<String>, Provide
 pub async fn llama_props(provider: &dyn Provider) -> Result<LlamaProps, ProviderError> {
     let (_, base) = client_and_base(provider)?;
     let url = format!("{base}/props");
-    let response = request(provider, &url)?
-        .send()
-        .await
-        .map_err(|err| ProviderError::new(ErrorClass::Connection, format!("/props failed: {err}")))?;
+    let response = request(provider, &url)?.send().await.map_err(|err| {
+        ProviderError::new(ErrorClass::Connection, format!("/props failed: {err}"))
+    })?;
     if !response.status().is_success() {
         return Err(ProviderError::new(
             ErrorClass::BadRequest,
             format!("/props returned {}", response.status()),
         ));
     }
-    let value: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|err| ProviderError::new(ErrorClass::Parse, format!("/props is not JSON: {err}")))?;
+    let value: serde_json::Value = response.json().await.map_err(|err| {
+        ProviderError::new(ErrorClass::Parse, format!("/props is not JSON: {err}"))
+    })?;
     let n_ctx = value["default_generation_settings"]["n_ctx"]
         .as_u64()
         .or_else(|| value["n_ctx"].as_u64())
@@ -125,20 +127,18 @@ pub async fn tokenize(provider: &dyn Provider, text: &str) -> Result<Vec<u32>, P
     if !provider.api_key().is_empty() {
         req = req.bearer_auth(provider.api_key());
     }
-    let response = req
-        .send()
-        .await
-        .map_err(|err| ProviderError::new(ErrorClass::Connection, format!("/tokenize failed: {err}")))?;
+    let response = req.send().await.map_err(|err| {
+        ProviderError::new(ErrorClass::Connection, format!("/tokenize failed: {err}"))
+    })?;
     if !response.status().is_success() {
         return Err(ProviderError::new(
             ErrorClass::BadRequest,
             format!("/tokenize returned {}", response.status()),
         ));
     }
-    let value: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|err| ProviderError::new(ErrorClass::Parse, format!("/tokenize is not JSON: {err}")))?;
+    let value: serde_json::Value = response.json().await.map_err(|err| {
+        ProviderError::new(ErrorClass::Parse, format!("/tokenize is not JSON: {err}"))
+    })?;
     if let Some(tokens) = value["tokens"].as_array() {
         return Ok(tokens
             .iter()
@@ -163,7 +163,10 @@ pub async fn token_count(provider: &dyn Provider, text: &str) -> Option<usize> {
 }
 
 /// `GET /api/show` on Ollama.
-pub async fn ollama_show(provider: &dyn Provider, model: &str) -> Result<OllamaModel, ProviderError> {
+pub async fn ollama_show(
+    provider: &dyn Provider,
+    model: &str,
+) -> Result<OllamaModel, ProviderError> {
     let (client, base) = client_and_base(provider)?;
     let url = format!("{base}/api/show");
     let mut req = client
@@ -173,20 +176,18 @@ pub async fn ollama_show(provider: &dyn Provider, model: &str) -> Result<OllamaM
     if !provider.api_key().is_empty() {
         req = req.bearer_auth(provider.api_key());
     }
-    let response = req
-        .send()
-        .await
-        .map_err(|err| ProviderError::new(ErrorClass::Connection, format!("/api/show failed: {err}")))?;
+    let response = req.send().await.map_err(|err| {
+        ProviderError::new(ErrorClass::Connection, format!("/api/show failed: {err}"))
+    })?;
     if !response.status().is_success() {
         return Err(ProviderError::new(
             ErrorClass::BadRequest,
             format!("/api/show returned {}", response.status()),
         ));
     }
-    let value: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|err| ProviderError::new(ErrorClass::Parse, format!("/api/show is not JSON: {err}")))?;
+    let value: serde_json::Value = response.json().await.map_err(|err| {
+        ProviderError::new(ErrorClass::Parse, format!("/api/show is not JSON: {err}"))
+    })?;
     let context_length = value["model_info"]
         .as_object()
         .and_then(|info| {

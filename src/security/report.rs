@@ -36,9 +36,7 @@ pub fn render(engagement: &Engagement) -> String {
         for finding in group {
             out.push_str(&format!(
                 "### {} — {} ({})\n\n",
-                finding.id,
-                finding.title,
-                finding.status
+                finding.id, finding.title, finding.status
             ));
             out.push_str(&format!("- Target: `{}`\n", finding.target));
             if let Some(evidence) = &finding.evidence {

@@ -1,13 +1,384 @@
-//! `finding` tool.
+//! `finding` tool: the engagement findings ledger.
+
+use std::io::Write as _;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::Path;
+use std::sync::MutexGuard;
 
 use async_trait::async_trait;
-use serde_json::Value;
+use chrono::Utc;
+use serde_json::{Value, json};
 
-use crate::tools::{Tool, ToolContext, ToolPack, ToolResult};
+use crate::security::findings::{MAX_EVIDENCE_CHARS, clip};
+use crate::security::{
+    EvidenceRef, FindingPatch, NewFinding, SecurityState, Severity, Status, render_report,
+};
+use crate::tools::{Tool, ToolContext, ToolPack, ToolResult, display_path, optional_str};
+
+/// Cap on the report Markdown echoed back in the tool result.
+const REPORT_CHARS: usize = 18_000;
 
 pub struct FindingTool;
 
 impl FindingTool {
+    fn add(ctx: &ToolContext, args: &Value) -> Result<ToolResult, ToolResult> {
+        let title = required(args, "title")?;
+        let severity = required(args, "severity")?
+            .parse::<Severity>()
+            .map_err(arg_err)?;
+        let target = required(args, "target")?;
+
+        let session_id = ctx.session.lock().ok().map(|session| session.id.clone());
+        let explicit_artifact = optional_str(args, "artifact");
+
+        let mut evidence = non_empty(args, "evidence");
+        let mut evidence_ref = explicit_ref(args);
+        let mut entry_id = optional_str(args, "entry");
+
+        if evidence.is_none() {
+            let Some((content, entry, artifact)) = last_tool_result(ctx) else {
+                return Err(arg_err(
+                    "evidence is required when the branch has no tool result; pass {\"evidence\":\"...\"} or run a tool first",
+                ));
+            };
+            evidence = Some(clip(&content, MAX_EVIDENCE_CHARS));
+            evidence_ref = Some(EvidenceRef {
+                session: session_id.clone(),
+                entry: Some(entry.clone()),
+                artifact: explicit_artifact.or(artifact),
+            });
+            entry_id = Some(entry);
+        }
+
+        let new = NewFinding {
+            title,
+            severity,
+            target,
+            evidence,
+            evidence_ref,
+            impact: non_empty(args, "impact"),
+            remediation: non_empty(args, "remediation"),
+            session_id,
+            entry_id,
+        };
+
+        let mut state = lock_security(ctx)?;
+        let engagement = state
+            .ensure_engagement(&ctx.paths)
+            .map_err(|err| security_io(&ctx.paths, err))?;
+        let finding = engagement
+            .add(new)
+            .map_err(|msg| ToolResult::err("FINDING_ARGS", msg))?;
+
+        let from_entry = finding
+            .evidence_ref
+            .as_ref()
+            .and_then(|reference| reference.entry.as_deref());
+        let mut content = format!(
+            "added {} ({}, {}): {}\ntarget: {}",
+            finding.id, finding.severity, finding.status, finding.title, finding.target
+        );
+        if let Some(entry) = from_entry {
+            content.push_str(&format!("\nevidence: attached from entry {entry}"));
+        }
+        content.push_str(
+            "\nnext: `finding list` shows the ledger; `finding report` renders the engagement report.",
+        );
+
+        Ok(ToolResult::ok(content)
+            .with_details(json!({"finding": to_json(&finding), "id": finding.id})))
+    }
+
+    fn update(ctx: &ToolContext, args: &Value) -> Result<ToolResult, ToolResult> {
+        let id = required(args, "id")?;
+        let mut patch = FindingPatch::default();
+        let mut changed: Vec<&str> = Vec::new();
+
+        if let Some(title) = non_empty(args, "title") {
+            patch.title = Some(title);
+            changed.push("title");
+        }
+        if let Some(severity) = non_empty(args, "severity") {
+            patch.severity = Some(severity.parse::<Severity>().map_err(arg_err)?);
+            changed.push("severity");
+        }
+        if let Some(status) = non_empty(args, "status") {
+            patch.status = Some(status.parse::<Status>().map_err(arg_err)?);
+            changed.push("status");
+        }
+        if let Some(target) = non_empty(args, "target") {
+            patch.target = Some(target);
+            changed.push("target");
+        }
+        if let Some(evidence) = non_empty(args, "evidence") {
+            patch.evidence = Some(evidence);
+            changed.push("evidence");
+        }
+        if let Some(impact) = non_empty(args, "impact") {
+            patch.impact = Some(impact);
+            changed.push("impact");
+        }
+        if let Some(remediation) = non_empty(args, "remediation") {
+            patch.remediation = Some(remediation);
+            changed.push("remediation");
+        }
+
+        if changed.is_empty() {
+            return Err(arg_err(
+                "nothing to update; pass at least one of title, severity, status, target, evidence, impact, or remediation",
+            ));
+        }
+
+        let mut state = lock_security(ctx)?;
+        let engagement_name = state.engagement_name.clone();
+        let Some(engagement) = state.engagement.as_mut() else {
+            return Err(not_found(&id, &engagement_name));
+        };
+        if engagement.get(&id).is_none() {
+            return Err(not_found(&id, &engagement_name));
+        }
+        let finding = engagement
+            .update(&id, patch)
+            .map_err(|msg| ToolResult::err("FINDING_ARGS", msg))?;
+
+        Ok(ToolResult::ok(format!(
+            "updated {}: {}\n{} · {} · {} · {}",
+            finding.id,
+            changed.join(", "),
+            finding.id,
+            finding.severity,
+            finding.status,
+            finding.title
+        ))
+        .with_details(json!({"finding": to_json(&finding), "changed": changed})))
+    }
+
+    fn list(ctx: &ToolContext) -> Result<ToolResult, ToolResult> {
+        let state = lock_security(ctx)?;
+        let name = state.engagement_name.clone();
+        let Some(engagement) = state.engagement.as_ref() else {
+            return Ok(no_findings(&name));
+        };
+        if engagement.findings.is_empty() {
+            return Ok(no_findings(&name));
+        }
+
+        let header = ("id", "severity", "status", "title", "target");
+        let rows: Vec<[String; 5]> = engagement
+            .findings
+            .iter()
+            .map(|finding| {
+                [
+                    finding.id.clone(),
+                    finding.severity.to_string(),
+                    finding.status.to_string(),
+                    finding.title.clone(),
+                    finding.target.clone(),
+                ]
+            })
+            .collect();
+        let mut widths = [0usize; 5];
+        for (index, cell) in [header.0, header.1, header.2, header.3, header.4]
+            .iter()
+            .enumerate()
+        {
+            widths[index] = cell.chars().count();
+        }
+        for row in &rows {
+            for (index, cell) in row.iter().enumerate() {
+                widths[index] = widths[index].max(cell.chars().count());
+            }
+        }
+
+        let mut content = format!(
+            "engagement {name}: {} findings\n\n",
+            engagement.findings.len()
+        );
+        content.push_str(&format_row(
+            &[
+                header.0.to_string(),
+                header.1.to_string(),
+                header.2.to_string(),
+                header.3.to_string(),
+                header.4.to_string(),
+            ],
+            &widths,
+        ));
+        content.push('\n');
+        for row in &rows {
+            content.push_str(&format_row(row, &widths));
+            content.push('\n');
+        }
+        let (open, high, medium) = engagement.counts();
+        content.push_str(&format!(
+            "\n{open} open ({} high/critical, {medium} medium/low)\nnext: `finding update` changes status; `finding report` renders Markdown.",
+            high
+        ));
+
+        Ok(ToolResult::ok(content).with_details(json!({
+            "counts": {"total": engagement.findings.len(), "open": open, "high_critical": high, "medium_low": medium},
+            "findings": engagement.findings.iter().map(to_json).collect::<Vec<_>>(),
+        })))
+    }
+
+    fn report(ctx: &ToolContext) -> Result<ToolResult, ToolResult> {
+        let state = lock_security(ctx)?;
+        let name = state.engagement_name.clone();
+        let Some(engagement) = state.engagement.as_ref() else {
+            return Ok(no_findings(&name));
+        };
+        if engagement.findings.is_empty() {
+            return Ok(no_findings(&name));
+        }
+
+        let markdown = render_report(engagement);
+        let stamp = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+        let path = engagement.dir.join(format!("report-{stamp}.md"));
+        write_0600(&path, &markdown).map_err(|err| {
+            ToolResult::err(
+                "SECURITY_IO",
+                format!("cannot write report {}: {err}", path.display()),
+            )
+        })?;
+
+        let mut content = format!(
+            "wrote {} ({} findings)\n\n",
+            display_path(&ctx.cwd, &path),
+            engagement.findings.len()
+        );
+        if markdown.chars().count() > REPORT_CHARS {
+            content.push_str(&clip(&markdown, REPORT_CHARS));
+            content.push_str("\n\n(truncated; full report in the file)");
+        } else {
+            content.push_str(&markdown);
+        }
+
+        Ok(ToolResult::ok(content).with_details(json!({
+            "path": path.to_string_lossy(),
+            "findings": engagement.findings.len(),
+        })))
+    }
+}
+
+fn format_row(cells: &[String; 5], widths: &[usize; 5]) -> String {
+    let mut out = String::new();
+    for (index, cell) in cells.iter().enumerate() {
+        if index > 0 {
+            out.push_str("  ");
+        }
+        if index == 4 {
+            out.push_str(cell);
+        } else {
+            let pad = widths[index].saturating_sub(cell.chars().count());
+            out.push_str(cell);
+            out.extend(std::iter::repeat_n(' ', pad));
+        }
+    }
+    out
+}
+
+fn write_0600(path: &Path, body: &str) -> std::io::Result<()> {
+    let tmp = path.with_extension("md.tmp");
+    {
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        file.write_all(body.as_bytes())?;
+        file.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)
+}
+
+fn required(args: &Value, key: &str) -> Result<String, ToolResult> {
+    match args.get(key).and_then(|value| value.as_str()) {
+        Some(value) if !value.trim().is_empty() => Ok(value.trim().to_string()),
+        _ => Err(arg_err(format!(
+            "missing or empty \"{key}\"; finding needs {key}"
+        ))),
+    }
+}
+
+fn non_empty(args: &Value, key: &str) -> Option<String> {
+    args.get(key)
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn explicit_ref(args: &Value) -> Option<EvidenceRef> {
+    let session = optional_str(args, "session");
+    let entry = optional_str(args, "entry");
+    let artifact = optional_str(args, "artifact");
+    if session.is_none() && entry.is_none() && artifact.is_none() {
+        return None;
+    }
+    Some(EvidenceRef {
+        session,
+        entry,
+        artifact,
+    })
+}
+
+/// Last tool result on the active branch, as `(content, entry id, artifact)`.
+fn last_tool_result(ctx: &ToolContext) -> Option<(String, String, Option<String>)> {
+    let session = ctx.session.lock().ok()?;
+    session
+        .branch_entries()
+        .into_iter()
+        .rev()
+        .find_map(|entry| {
+            entry.tool_result().map(|result| {
+                (
+                    result.content.clone(),
+                    entry.id.clone(),
+                    result.artifact.clone(),
+                )
+            })
+        })
+}
+
+fn lock_security(ctx: &ToolContext) -> Result<MutexGuard<'_, SecurityState>, ToolResult> {
+    ctx.security.lock().map_err(|_| {
+        ToolResult::err(
+            "SECURITY_IO",
+            "security state is poisoned; restart lh so the findings ledger is reloaded",
+        )
+    })
+}
+
+fn security_io(paths: &crate::paths::Paths, err: anyhow::Error) -> ToolResult {
+    ToolResult::err(
+        "SECURITY_IO",
+        format!(
+            "cannot open the findings ledger under {}: {err}",
+            paths.engagements_dir().display()
+        ),
+    )
+}
+
+fn arg_err(message: impl Into<String>) -> ToolResult {
+    ToolResult::err("FINDING_ARGS", message)
+}
+
+fn not_found(id: &str, engagement: &str) -> ToolResult {
+    ToolResult::err(
+        "FINDING_NOT_FOUND",
+        format!("no finding {id:?} in engagement {engagement}; `finding list` shows ids"),
+    )
+}
+
+fn no_findings(engagement: &str) -> ToolResult {
+    ToolResult::ok(format!(
+        "engagement {engagement}: no findings recorded; `finding add` records one"
+    ))
+}
+
+fn to_json(finding: &crate::security::Finding) -> Value {
+    serde_json::to_value(finding).unwrap_or(Value::Null)
 }
 
 #[async_trait]
@@ -21,7 +392,25 @@ impl Tool for FindingTool {
     }
 
     fn schema(&self) -> Value {
-        serde_json::from_str(r#"{"type":"object","properties":{"action":{"type":"string","enum":["add","update","list","report"]},"id":{"type":"string"},"title":{"type":"string"},"severity":{"type":"string","enum":["critical","high","medium","low","info"]},"status":{"type":"string","enum":["open","fixed","accepted","false-positive"]},"target":{"type":"string"},"evidence":{"type":"string"},"impact":{"type":"string"},"remediation":{"type":"string"}},"required":["action"],"additionalProperties":false}"#).expect("valid schema")
+        json!({
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["add", "update", "list", "report"]},
+                "id": {"type": "string", "description": "finding id from `list`, e.g. f1"},
+                "title": {"type": "string"},
+                "severity": {"type": "string", "enum": ["critical", "high", "medium", "low", "info"]},
+                "status": {"type": "string", "enum": ["open", "fixed", "accepted", "false-positive"]},
+                "target": {"type": "string", "description": "affected asset, host, or URL"},
+                "evidence": {"type": "string", "description": "request/response or observation proving the finding"},
+                "impact": {"type": "string"},
+                "remediation": {"type": "string"},
+                "session": {"type": "string", "description": "session id for the evidence ref"},
+                "entry": {"type": "string", "description": "session entry id for the evidence ref"},
+                "artifact": {"type": "string", "description": "artifact id holding the evidence"}
+            },
+            "required": ["action"],
+            "additionalProperties": false
+        })
     }
 
     fn pack(&self) -> ToolPack {
@@ -32,7 +421,215 @@ impl Tool for FindingTool {
         false
     }
 
-    async fn call(&self, _ctx: &ToolContext, _args: Value) -> ToolResult {
-        ToolResult::err("not_implemented", "finding is not implemented yet")
+    async fn call(&self, ctx: &ToolContext, args: Value) -> ToolResult {
+        let action = match args.get("action").and_then(|value| value.as_str()) {
+            Some(action) => action,
+            None => {
+                return arg_err(
+                    "missing \"action\"; pass {\"action\":\"add\"|\"update\"|\"list\"|\"report\"}",
+                );
+            }
+        };
+        let outcome = match action {
+            "add" => Self::add(ctx, &args),
+            "update" => Self::update(ctx, &args),
+            "list" => Self::list(ctx),
+            "report" => Self::report(ctx),
+            other => Err(arg_err(format!(
+                "unknown action {other:?}; use add, update, list, or report"
+            ))),
+        };
+        match outcome {
+            Ok(result) => result,
+            Err(error) => error,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path as FsPath;
+    use std::sync::{Arc, Mutex};
+
+    use crate::config::VerifyConfig;
+    use crate::paths::Paths;
+    use crate::session::{EntryKind, Session, SessionData, ToolResultData};
+    use crate::tools::{BgRegistry, ReadTracker};
+    use serde_json::json;
+    use tokio_util::sync::CancellationToken;
+
+    fn context(dir: &FsPath) -> ToolContext {
+        let mut paths = Paths::discover(dir).unwrap();
+        paths.data_dir = dir.join("data");
+        paths.config_dir = dir.join("config");
+        paths.ensure_dirs().unwrap();
+        let header = SessionData {
+            cwd: paths.cwd.display().to_string(),
+            endpoint: "test".into(),
+            model: "test".into(),
+            profile: "test".into(),
+            app: "test".into(),
+        };
+        let session = Session::create(&paths, header, true).unwrap();
+        let artifacts = session.artifacts.clone();
+        let security = SecurityState::load(&paths, Some("eng".into())).unwrap();
+        ToolContext {
+            cwd: paths.cwd.clone(),
+            path_jail: false,
+            session: Arc::new(Mutex::new(session)),
+            artifacts,
+            cancel: CancellationToken::new(),
+            trust: false,
+            verify: VerifyConfig::default(),
+            profile: "test".into(),
+            reads: Arc::new(Mutex::new(ReadTracker::default())),
+            bg: Arc::new(Mutex::new(BgRegistry::new())),
+            security: Arc::new(Mutex::new(security)),
+            paths,
+        }
+    }
+
+    #[tokio::test]
+    async fn add_list_update_report() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(dir.path());
+        let tool = FindingTool;
+
+        let added = tool
+            .call(
+                &ctx,
+                json!({
+                    "action": "add",
+                    "title": "Reflected XSS",
+                    "severity": "high",
+                    "target": "https://app.test/search",
+                    "evidence": "<script>alert(1)</script>",
+                    "impact": "session theft",
+                    "remediation": "encode output"
+                }),
+            )
+            .await;
+        assert!(!added.is_error, "{}", added.content);
+        assert!(added.content.contains("added f1"), "{}", added.content);
+
+        let listed = tool.call(&ctx, json!({"action": "list"})).await;
+        assert!(!listed.is_error, "{}", listed.content);
+        assert!(listed.content.contains("Reflected XSS"));
+        assert!(listed.content.contains("1 open"));
+
+        let updated = tool
+            .call(
+                &ctx,
+                json!({"action": "update", "id": "f1", "status": "fixed"}),
+            )
+            .await;
+        assert!(!updated.is_error, "{}", updated.content);
+        assert!(updated.content.contains("status"));
+
+        let missing = tool
+            .call(
+                &ctx,
+                json!({"action": "update", "id": "f99", "status": "fixed"}),
+            )
+            .await;
+        assert!(missing.is_error);
+        assert!(missing.content.contains("FINDING_NOT_FOUND"));
+
+        let report = tool.call(&ctx, json!({"action": "report"})).await;
+        assert!(!report.is_error, "{}", report.content);
+        let path = report
+            .details
+            .as_ref()
+            .and_then(|details| details.get("path"))
+            .and_then(|value| value.as_str())
+            .expect("report path");
+        let written = std::fs::read_to_string(path).unwrap();
+        assert!(written.contains("# Findings — eng"));
+        assert!(written.contains("Reflected XSS"));
+        let mode = std::os::unix::fs::PermissionsExt::mode(
+            &std::fs::metadata(path).unwrap().permissions(),
+        );
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[tokio::test]
+    async fn add_auto_attaches_last_tool_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(dir.path());
+        {
+            let mut session = ctx.session.lock().unwrap();
+            session
+                .append(EntryKind::ToolResult(ToolResultData {
+                    call_id: "call-1".into(),
+                    content: "HTTP/1.1 200 OK\n<script>alert(1)</script>".into(),
+                    is_error: false,
+                    details: None,
+                    artifact: Some("art-7".into()),
+                }))
+                .unwrap();
+        }
+
+        let added = FindingTool
+            .call(
+                &ctx,
+                json!({
+                    "action": "add",
+                    "title": "Stored XSS",
+                    "severity": "critical",
+                    "target": "https://app.test/profile",
+                }),
+            )
+            .await;
+        assert!(!added.is_error, "{}", added.content);
+        assert!(
+            added.content.contains("attached from entry e1"),
+            "{}",
+            added.content
+        );
+
+        let state = ctx.security.lock().unwrap();
+        let finding = &state.engagement.as_ref().unwrap().findings[0];
+        assert!(finding.evidence.as_deref().unwrap().contains("alert(1)"));
+        let reference = finding.evidence_ref.as_ref().unwrap();
+        assert_eq!(reference.session.as_deref(), Some("ephemeral"));
+        assert_eq!(reference.entry.as_deref(), Some("e1"));
+        assert_eq!(reference.artifact.as_deref(), Some("art-7"));
+    }
+
+    #[tokio::test]
+    async fn add_without_evidence_or_tool_result_is_prescriptive() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(dir.path());
+        let result = FindingTool
+            .call(
+                &ctx,
+                json!({"action": "add", "title": "t", "severity": "low", "target": "h"}),
+            )
+            .await;
+        assert!(result.is_error);
+        assert!(result.content.contains("FINDING_ARGS"));
+        assert!(result.content.contains("evidence"));
+
+        let bad_severity = FindingTool
+            .call(
+                &ctx,
+                json!({"action": "add", "title": "t", "severity": "urgent", "target": "h", "evidence": "e"}),
+            )
+            .await;
+        assert!(bad_severity.is_error);
+        assert!(bad_severity.content.contains("unknown severity"));
+    }
+
+    #[tokio::test]
+    async fn list_and_report_without_findings_succeed() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(dir.path());
+        let listed = FindingTool.call(&ctx, json!({"action": "list"})).await;
+        assert!(!listed.is_error);
+        assert!(listed.content.contains("no findings recorded"));
+        let reported = FindingTool.call(&ctx, json!({"action": "report"})).await;
+        assert!(!reported.is_error);
+        assert!(reported.content.contains("no findings recorded"));
     }
 }

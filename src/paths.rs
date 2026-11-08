@@ -77,7 +77,8 @@ impl Paths {
     }
 
     pub fn session_file(&self, session_id: &str) -> PathBuf {
-        self.project_sessions_dir().join(format!("{session_id}.jsonl"))
+        self.project_sessions_dir()
+            .join(format!("{session_id}.jsonl"))
     }
 
     pub fn artifacts_root(&self) -> PathBuf {
@@ -153,6 +154,9 @@ mod tests {
     #[test]
     fn session_id_shape() {
         let id = new_session_id();
-        assert_eq!(id.len(), 8 + 1 + 6 + 1 + std::process::id().to_string().len());
+        assert_eq!(
+            id.len(),
+            8 + 1 + 6 + 1 + std::process::id().to_string().len()
+        );
     }
 }

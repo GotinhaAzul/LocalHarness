@@ -179,19 +179,16 @@ impl Config {
     }
 
     pub fn profile(&self) -> &ProfileConfig {
-        static FALLBACK: std::sync::LazyLock<ProfileConfig> = std::sync::LazyLock::new(|| {
-            ProfileConfig {
+        static FALLBACK: std::sync::LazyLock<ProfileConfig> =
+            std::sync::LazyLock::new(|| ProfileConfig {
                 packs: vec!["core".into(), "coding".into(), "security".into()],
                 tools: vec![],
                 model_profile: Some("auto".into()),
                 prompt: None,
                 description: None,
                 theme: None,
-            }
-        });
-        self.profiles
-            .get(self.profile_name())
-            .unwrap_or(&FALLBACK)
+            });
+        self.profiles.get(self.profile_name()).unwrap_or(&FALLBACK)
     }
 
     /// Resolve the model profile for `model`. `auto` matches by prefix declared
@@ -491,8 +488,8 @@ impl VerifyConfig {
 fn read_toml(path: &Path) -> Result<toml::Value> {
     let raw =
         std::fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
-    let value: toml::Value = toml::from_str(&raw)
-        .with_context(|| format!("invalid TOML in {}", path.display()))?;
+    let value: toml::Value =
+        toml::from_str(&raw).with_context(|| format!("invalid TOML in {}", path.display()))?;
     Ok(value)
 }
 

@@ -66,73 +66,83 @@ pub fn build_summary(
         last_instruction = clip(&last_instruction, LAST_INSTRUCTION_CHARS);
     }
 
-    let compose = |actions_kept: bool,
-                   facts_kept: bool,
-                   list_limit: usize,
-                   instruction_chars: usize| {
-        let mut out = String::new();
-        out.push_str("[localharness] deterministic compaction\n\n");
-        out.push_str(&format!("## Active thread T1 - {title}\n"));
-        if !objective.is_empty() {
-            out.push_str(&format!("objective: {objective}\n"));
-        }
-        if !thread.constraints.is_empty() {
-            out.push_str(&format!("constraints: {}\n", thread.constraints.join("; ")));
-        }
-        let files: Vec<&str> = changed
-            .iter()
-            .map(|s| s.as_str())
-            .chain(thread.files.iter().map(|s| s.as_str()))
-            .collect::<Vec<_>>();
-        if !files.is_empty() {
-            out.push_str(&format!("files: {}\n", join_limited(&files, list_limit.max(6))));
-        }
-        if !thread.done.is_empty() {
-            out.push_str(&format!("done: {}\n", join_limited_str(&thread.done, list_limit)));
-        }
-        if !thread.open.is_empty() {
-            out.push_str(&format!("open: {}\n", join_limited_str(&thread.open, list_limit)));
-        }
-        if facts_kept && !thread.facts.is_empty() {
-            out.push_str(&format!("facts: {}\n", join_limited_str(&thread.facts, list_limit)));
-        }
-        if !changed.is_empty() {
-            out.push_str("\n## Repo\n");
-            out.push_str(&format!("changed: {}\n", join_limited_str(&changed, 12)));
-            if let Some((passed, ago)) = &verify {
+    let compose =
+        |actions_kept: bool, facts_kept: bool, list_limit: usize, instruction_chars: usize| {
+            let mut out = String::new();
+            out.push_str("[localharness] deterministic compaction\n\n");
+            out.push_str(&format!("## Active thread T1 - {title}\n"));
+            if !objective.is_empty() {
+                out.push_str(&format!("objective: {objective}\n"));
+            }
+            if !thread.constraints.is_empty() {
+                out.push_str(&format!("constraints: {}\n", thread.constraints.join("; ")));
+            }
+            let files: Vec<&str> = changed
+                .iter()
+                .map(|s| s.as_str())
+                .chain(thread.files.iter().map(|s| s.as_str()))
+                .collect::<Vec<_>>();
+            if !files.is_empty() {
                 out.push_str(&format!(
-                    "verify: {} ({} entries ago)\n",
-                    if *passed { "passed" } else { "failed" },
-                    ago
+                    "files: {}\n",
+                    join_limited(&files, list_limit.max(6))
                 ));
             }
-        }
-        if let Some(findings) = findings
-            && findings.open > 0
-        {
-            out.push_str("\n## Findings\n");
-            out.push_str(&format!(
-                "{} open ({} high, {} medium)",
-                findings.open, findings.high, findings.other
-            ));
-            out.push('\n');
-        }
-        if !last_instruction.is_empty() {
-            out.push_str("\n## Last instruction (verbatim)\n");
-            let text = clip(&last_instruction, instruction_chars);
-            out.push_str(&text);
-            out.push('\n');
-        }
-        if actions_kept && !actions.is_empty() {
-            out.push_str("\n## Last actions\n");
-            for action in actions.iter().take(5) {
-                out.push_str(action);
+            if !thread.done.is_empty() {
+                out.push_str(&format!(
+                    "done: {}\n",
+                    join_limited_str(&thread.done, list_limit)
+                ));
+            }
+            if !thread.open.is_empty() {
+                out.push_str(&format!(
+                    "open: {}\n",
+                    join_limited_str(&thread.open, list_limit)
+                ));
+            }
+            if facts_kept && !thread.facts.is_empty() {
+                out.push_str(&format!(
+                    "facts: {}\n",
+                    join_limited_str(&thread.facts, list_limit)
+                ));
+            }
+            if !changed.is_empty() {
+                out.push_str("\n## Repo\n");
+                out.push_str(&format!("changed: {}\n", join_limited_str(&changed, 12)));
+                if let Some((passed, ago)) = &verify {
+                    out.push_str(&format!(
+                        "verify: {} ({} entries ago)\n",
+                        if *passed { "passed" } else { "failed" },
+                        ago
+                    ));
+                }
+            }
+            if let Some(findings) = findings
+                && findings.open > 0
+            {
+                out.push_str("\n## Findings\n");
+                out.push_str(&format!(
+                    "{} open ({} high, {} medium)",
+                    findings.open, findings.high, findings.other
+                ));
                 out.push('\n');
             }
-        }
-        out.truncate(out.trim_end().len());
-        out
-    };
+            if !last_instruction.is_empty() {
+                out.push_str("\n## Last instruction (verbatim)\n");
+                let text = clip(&last_instruction, instruction_chars);
+                out.push_str(&text);
+                out.push('\n');
+            }
+            if actions_kept && !actions.is_empty() {
+                out.push_str("\n## Last actions\n");
+                for action in actions.iter().take(5) {
+                    out.push_str(action);
+                    out.push('\n');
+                }
+            }
+            out.truncate(out.trim_end().len());
+            out
+        };
 
     let mut summary = compose(true, true, usize::MAX, LAST_INSTRUCTION_CHARS);
     if summary.chars().count() > budget_chars {
@@ -191,7 +201,10 @@ fn thread_info(session: &Session, _branch: &[&Entry]) -> ThreadInfo {
         && let Some(tasks) = custom.payload.get("tasks").and_then(|v| v.as_array())
     {
         for task in tasks {
-            let status = task.get("status").and_then(|v| v.as_str()).unwrap_or("pending");
+            let status = task
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("pending");
             let content = task.get("content").and_then(|v| v.as_str()).unwrap_or("");
             if content.is_empty() {
                 continue;
@@ -294,7 +307,12 @@ fn entry_char_len(entry: &Entry) -> usize {
                 + a.reasoning.as_ref().map(|r| r.len()).unwrap_or(0)
                 + a.tool_calls
                     .as_ref()
-                    .map(|calls| calls.iter().map(|c| c.arguments.to_string().len() + 16).sum())
+                    .map(|calls| {
+                        calls
+                            .iter()
+                            .map(|c| c.arguments.to_string().len() + 16)
+                            .sum()
+                    })
                     .unwrap_or(0)
         }
         EntryKind::ToolResult(t) => t.content.len(),
@@ -309,7 +327,10 @@ fn clip(text: &str, max_chars: usize) -> String {
     if flat.chars().count() <= max_chars {
         return flat;
     }
-    flat.chars().take(max_chars.saturating_sub(1)).collect::<String>() + "…"
+    flat.chars()
+        .take(max_chars.saturating_sub(1))
+        .collect::<String>()
+        + "…"
 }
 
 fn join_limited(items: &[&str], limit: usize) -> String {

@@ -108,14 +108,28 @@ impl TurnFacts {
     }
 }
 
-/// Everything after the last user entry is the current turn.
+/// Facts for the current turn, using the last user entry as the boundary.
+/// Synthetic gate continuations are user entries too, so the agent loop must
+/// pass the real turn start id with [`analyze_turn_since`].
 pub fn analyze_turn(session: &Session, verify_configured: bool) -> TurnFacts {
+    analyze_turn_since(session, verify_configured, None)
+}
+
+/// Facts after the entry `since` (the user message that began the turn).
+pub fn analyze_turn_since(
+    session: &Session,
+    verify_configured: bool,
+    since: Option<&str>,
+) -> TurnFacts {
     let branch = session.branch_entries();
-    let turn_start = branch
-        .iter()
-        .rposition(|entry| matches!(entry.kind, EntryKind::User(_)))
-        .map(|index| index + 1)
-        .unwrap_or(0);
+    let turn_start = match since.and_then(|id| branch.iter().position(|entry| entry.id == id)) {
+        Some(index) => index + 1,
+        None => branch
+            .iter()
+            .rposition(|entry| matches!(entry.kind, EntryKind::User(_)))
+            .map(|index| index + 1)
+            .unwrap_or(0),
+    };
     let turn = &branch[turn_start..];
     let mut facts = TurnFacts {
         verify_configured,
@@ -142,7 +156,8 @@ pub fn analyze_turn(session: &Session, verify_configured: bool) -> TurnFacts {
                     if let Some(tasks) = custom.payload.get("tasks").and_then(|v| v.as_array()) {
                         let mut all_done = !tasks.is_empty();
                         for task in tasks {
-                            let done = task.get("status").and_then(|s| s.as_str()) == Some("completed");
+                            let done =
+                                task.get("status").and_then(|s| s.as_str()) == Some("completed");
                             all_done &= done;
                         }
                         facts.todo_all_done = all_done;
@@ -151,10 +166,8 @@ pub fn analyze_turn(session: &Session, verify_configured: bool) -> TurnFacts {
                 }
                 "verify-result" => {
                     facts.verify_called = true;
-                    facts.last_verify_passed = custom
-                        .payload
-                        .get("passed")
-                        .and_then(|v| v.as_bool());
+                    facts.last_verify_passed =
+                        custom.payload.get("passed").and_then(|v| v.as_bool());
                 }
                 _ => {}
             },
@@ -201,6 +214,26 @@ pub fn analyze_turn(session: &Session, verify_configured: bool) -> TurnFacts {
     facts
 }
 
+/// Which guard tools are present in the active profile. Guards whose tool is
+/// absent are inert.
+#[derive(Debug, Clone, Copy)]
+pub struct GateTools {
+    pub todo: bool,
+    pub verify: bool,
+    pub review: bool,
+}
+
+impl GateTools {
+    pub fn from_names<'a>(names: impl Iterator<Item = &'a str>) -> Self {
+        let names: Vec<&str> = names.collect();
+        Self {
+            todo: names.contains(&"todo"),
+            verify: names.contains(&"verify"),
+            review: names.contains(&"review"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SettleKind {
     Todo,
@@ -216,8 +249,8 @@ pub enum SettleDecision {
 }
 
 /// Decide whether the turn settles or continues with a gate instruction.
-pub fn settle(facts: &TurnFacts, progress: &mut RunProgress) -> SettleDecision {
-    if facts.multi_step() && !facts.todo_plan_present {
+pub fn settle(facts: &TurnFacts, progress: &mut RunProgress, tools: GateTools) -> SettleDecision {
+    if tools.todo && facts.multi_step() && !facts.todo_plan_present {
         if progress.can_continue_settle() {
             progress.settle_continuations += 1;
             return SettleDecision::Continue {
@@ -234,8 +267,10 @@ pub fn settle(facts: &TurnFacts, progress: &mut RunProgress) -> SettleDecision {
         };
     }
 
-    let verify_needed = facts.verify_configured
-        && (facts.unverified_mutations || (facts.todo_final_done && !facts.last_verify_passed.unwrap_or(false)));
+    let verify_needed = tools.verify
+        && facts.verify_configured
+        && (facts.unverified_mutations
+            || (facts.todo_final_done && !facts.last_verify_passed.unwrap_or(false)));
     if verify_needed {
         if progress.verify_attempts < progress.limits.verify_attempts
             && progress.can_continue_settle()
@@ -247,10 +282,12 @@ pub fn settle(facts: &TurnFacts, progress: &mut RunProgress) -> SettleDecision {
                 message: "[localharness] verify gate: files changed after the last passing verification. Run the verify tool now and fix any failure before settling.".into(),
             };
         }
-        tracing::warn!("verify still failing with attempts exhausted; allowing settle with unverified state");
+        tracing::warn!(
+            "verify still failing with attempts exhausted; allowing settle with unverified state"
+        );
     }
 
-    if facts.mutations > 0 && !facts.review_called && !progress.review_nudged {
+    if tools.review && facts.mutations > 0 && !facts.review_called && !progress.review_nudged {
         progress.review_nudged = true;
         return SettleDecision::Continue {
             kind: SettleKind::Review,
@@ -292,8 +329,14 @@ mod tests {
     #[test]
     fn loop_guard_trips_on_third_repeat() {
         let mut guard = LoopGuard::new();
-        assert_eq!(guard.check_and_record("read:{\"path\":\"a\"}"), LoopDecision::Ok);
-        assert_eq!(guard.check_and_record("read:{\"path\":\"a\"}"), LoopDecision::Ok);
+        assert_eq!(
+            guard.check_and_record("read:{\"path\":\"a\"}"),
+            LoopDecision::Ok
+        );
+        assert_eq!(
+            guard.check_and_record("read:{\"path\":\"a\"}"),
+            LoopDecision::Ok
+        );
         assert!(matches!(
             guard.check_and_record("read:{\"path\":\"a\"}"),
             LoopDecision::Tripped { .. }
@@ -327,15 +370,45 @@ mod tests {
             ..TurnFacts::default()
         };
         assert!(matches!(
-            settle(&facts, &mut progress),
-            SettleDecision::Continue { kind: SettleKind::Todo, .. }
+            settle(
+                &facts,
+                &mut progress,
+                GateTools {
+                    todo: true,
+                    verify: true,
+                    review: true
+                }
+            ),
+            SettleDecision::Continue {
+                kind: SettleKind::Todo,
+                ..
+            }
         ));
         assert!(matches!(
-            settle(&facts, &mut progress),
-            SettleDecision::Continue { kind: SettleKind::Todo, .. }
+            settle(
+                &facts,
+                &mut progress,
+                GateTools {
+                    todo: true,
+                    verify: true,
+                    review: true
+                }
+            ),
+            SettleDecision::Continue {
+                kind: SettleKind::Todo,
+                ..
+            }
         ));
         assert!(matches!(
-            settle(&facts, &mut progress),
+            settle(
+                &facts,
+                &mut progress,
+                GateTools {
+                    todo: true,
+                    verify: true,
+                    review: true
+                }
+            ),
             SettleDecision::Block { .. }
         ));
     }
@@ -355,15 +428,48 @@ mod tests {
         };
         for _ in 0..2 {
             assert!(matches!(
-                settle(&facts, &mut progress),
-                SettleDecision::Continue { kind: SettleKind::Verify, .. }
+                settle(
+                    &facts,
+                    &mut progress,
+                    GateTools {
+                        todo: true,
+                        verify: true,
+                        review: true
+                    }
+                ),
+                SettleDecision::Continue {
+                    kind: SettleKind::Verify,
+                    ..
+                }
             ));
         }
         assert!(matches!(
-            settle(&facts, &mut progress),
-            SettleDecision::Continue { kind: SettleKind::Review, .. }
+            settle(
+                &facts,
+                &mut progress,
+                GateTools {
+                    todo: true,
+                    verify: true,
+                    review: true
+                }
+            ),
+            SettleDecision::Continue {
+                kind: SettleKind::Review,
+                ..
+            }
         ));
-        assert!(matches!(settle(&facts, &mut progress), SettleDecision::Done));
+        assert!(matches!(
+            settle(
+                &facts,
+                &mut progress,
+                GateTools {
+                    todo: true,
+                    verify: true,
+                    review: true
+                }
+            ),
+            SettleDecision::Done
+        ));
     }
 
     #[test]

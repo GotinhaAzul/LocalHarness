@@ -12,9 +12,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 use crate::paths::Paths;
-pub use findings::{
-    Engagement, EvidenceRef, Finding, FindingPatch, NewFinding, Severity, Status,
-};
+pub use findings::{Engagement, EvidenceRef, Finding, FindingPatch, NewFinding, Severity, Status};
 pub use report::render as render_report;
 pub use scope::{Scope, ScopeViolation, extract_targets, gate_command, is_security_command};
 
@@ -121,10 +119,7 @@ impl SecurityState {
             }
             None => "findings: none recorded".to_string(),
         };
-        format!(
-            "engagement: {}\n{scope}\n{findings}",
-            self.engagement_name
-        )
+        format!("engagement: {}\n{scope}\n{findings}", self.engagement_name)
     }
 }
 
@@ -176,6 +171,9 @@ mod tests {
 
     #[test]
     fn default_name_is_clean() {
-        assert_eq!(default_engagement_name(Path::new("/tmp/My Project")), "my-project");
+        assert_eq!(
+            default_engagement_name(Path::new("/tmp/My Project")),
+            "my-project"
+        );
     }
 }

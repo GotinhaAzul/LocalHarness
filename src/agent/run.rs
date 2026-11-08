@@ -8,14 +8,11 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 
-use crate::context::{self, TokenBudget, cap_result};
 use crate::context::compact::{COMPACTION_BUDGET_CHARS, FindingSummary, build_summary};
-use crate::provider::{
-    ChatMessage, ChatRequest, ErrorClass, ProviderError, StreamEvent, Usage,
-};
+use crate::context::{self, TokenBudget, cap_result};
+use crate::provider::{ChatMessage, ChatRequest, ErrorClass, ProviderError, StreamEvent, Usage};
 use crate::session::{
-    AssistantData, CompactionData, CustomData, EntryKind, ToolCall, ToolResultData,
-    UserData,
+    AssistantData, CompactionData, CustomData, EntryKind, ToolCall, ToolResultData, UserData,
 };
 use crate::tools::{ToolResult, display_path};
 
@@ -78,7 +75,8 @@ pub async fn run_turn(
         return TurnOutcome::error("session_write", message);
     }
 
-    let outcome = run_loop(&core, &tx, &cancel).await;
+    let turn_start = core.session.lock().expect("session lock").active_leaf_id();
+    let outcome = run_loop(&core, &tx, &cancel, turn_start).await;
     if let Ok(mut session) = core.session.lock() {
         if let Err(err) = session.fsync() {
             let _ = tx.send(AgentEvent::Notice(format!("session fsync failed: {err}")));
@@ -98,11 +96,14 @@ async fn run_loop(
     core: &std::sync::Arc<Core>,
     tx: &UnboundedSender<AgentEvent>,
     cancel: &CancellationToken,
+    turn_start: Option<String>,
 ) -> TurnOutcome {
     let mut progress = RunProgress::new(core.limits.clone());
     let mut budget = core.budget.clone();
     let mut loop_guard = LoopGuard::new();
     let verify_configured = !core.config.verify.steps.is_empty();
+    let gate_tools = gates::GateTools::from_names(core.tools.iter().map(|tool| tool.name()));
+    let read_available = core.tools.iter().any(|tool| tool.name() == "read");
     let mut pending_compaction = false;
 
     loop {
@@ -184,7 +185,15 @@ async fn run_loop(
         pending_compaction = false;
         if force_compact || budget.exceeds_compaction_threshold(assembled.estimated_tokens) {
             let _ = tx.send(AgentEvent::State(AgentState::Compact));
-            match compact(&core.session, findings.as_ref(), if force_compact { "context_error" } else { "auto" }) {
+            match compact(
+                &core.session,
+                findings.as_ref(),
+                if force_compact {
+                    "context_error"
+                } else {
+                    "auto"
+                },
+            ) {
                 Ok((summary, tokens_before)) => {
                     let _ = tx.send(AgentEvent::Compacted {
                         summary: summary.clone(),
@@ -303,11 +312,12 @@ async fn run_loop(
 
         if !has_calls {
             let _ = tx.send(AgentEvent::State(AgentState::SettleGates));
-            let facts = analyze_turn(
+            let facts = gates::analyze_turn_since(
                 &core.session.lock().expect("session lock"),
                 verify_configured,
+                turn_start.as_deref(),
             );
-            match gates::settle(&facts, &mut progress) {
+            match gates::settle(&facts, &mut progress, gate_tools) {
                 SettleDecision::Done => return TurnOutcome::ok(TurnStatus::Done),
                 SettleDecision::Continue { message, .. } => {
                     if let Err(err) = append_user(&core.session, &message) {
@@ -356,7 +366,18 @@ async fn run_loop(
         }
 
         let _ = tx.send(AgentEvent::State(AgentState::ToolBatch));
-        let batch = execute_batch(core, tx, cancel, &mut progress, &mut loop_guard, &calls).await;
+        let batch = execute_batch(
+            core,
+            tx,
+            cancel,
+            &mut progress,
+            &mut loop_guard,
+            &calls,
+            gate_tools,
+            read_available,
+            turn_start.as_deref(),
+        )
+        .await;
         let _ = tx.send(AgentEvent::State(AgentState::PostTool));
 
         if let Some((code, message)) = batch.guard {
@@ -373,11 +394,7 @@ async fn run_loop(
         if batch.end_turn {
             if let Some(request) = batch.thread_split {
                 let findings = core.findings_summary();
-                match compact_with_reason(
-                    &core.session,
-                    findings.as_ref(),
-                    "thread_split",
-                ) {
+                match compact_with_reason(&core.session, findings.as_ref(), "thread_split") {
                     Ok((summary, tokens_before)) => {
                         let _ = tx.send(AgentEvent::Compacted {
                             summary,
@@ -385,7 +402,9 @@ async fn run_loop(
                         });
                     }
                     Err(err) => {
-                        let _ = tx.send(AgentEvent::Notice(format!("thread compaction failed: {err}")));
+                        let _ = tx.send(AgentEvent::Notice(format!(
+                            "thread compaction failed: {err}"
+                        )));
                     }
                 }
                 if let Some(kickoff) = request.kickoff {
@@ -488,45 +507,44 @@ async fn stream_assistant(
     estimated_tokens: u32,
     char_count: usize,
 ) -> Result<AssistantData, ProviderError> {
+    if cancel.is_cancelled() {
+        return Err(ProviderError::new(
+            ErrorClass::Cancelled,
+            "generation cancelled",
+        ));
+    }
     let (etx, mut erx) = tokio::sync::mpsc::unbounded_channel();
-    let stream = core.provider.chat_stream(request, etx, cancel.clone());
-    tokio::pin!(stream);
+    let child = cancel.child_token();
+    let provider = core.provider.clone();
+    let task = tokio::spawn(async move {
+        provider.chat_stream(request, etx, child).await;
+    });
     let mut accum = StreamAccum::new();
     let mut failure: Option<ProviderError> = None;
-
-    loop {
-        tokio::select! {
-            _ = &mut stream => {
-                while let Ok(item) = erx.try_recv() {
-                    if let Some(err) = handle_stream_item(item, &mut accum, tx, budget, estimated_tokens, char_count, cancel) {
-                        failure = Some(err);
-                        break;
-                    }
-                }
-                break;
-            }
-            item = erx.recv() => {
-                match item {
-                    Some(item) => {
-                        if let Some(err) = handle_stream_item(item, &mut accum, tx, budget, estimated_tokens, char_count, cancel) {
-                            failure = Some(err);
-                            break;
-                        }
-                    }
-                    None => {
-                        let _ = (&mut stream).await;
-                        break;
-                    }
-                }
-            }
+    while let Some(item) = erx.recv().await {
+        if let Some(err) = handle_stream_item(
+            item,
+            &mut accum,
+            tx,
+            budget,
+            estimated_tokens,
+            char_count,
+            cancel,
+        ) {
+            failure = Some(err);
+            break;
         }
     }
-
+    task.abort();
+    let _ = task.await;
     if let Some(err) = failure {
         return Err(err);
     }
     if cancel.is_cancelled() {
-        return Err(ProviderError::new(ErrorClass::Cancelled, "generation cancelled"));
+        return Err(ProviderError::new(
+            ErrorClass::Cancelled,
+            "generation cancelled",
+        ));
     }
     Ok(accum.finalize())
 }
@@ -542,7 +560,10 @@ fn handle_stream_item(
     cancel: &CancellationToken,
 ) -> Option<ProviderError> {
     if cancel.is_cancelled() {
-        return Some(ProviderError::new(ErrorClass::Cancelled, "generation cancelled"));
+        return Some(ProviderError::new(
+            ErrorClass::Cancelled,
+            "generation cancelled",
+        ));
     }
     match item {
         Err(err) => Some(err),
@@ -610,6 +631,7 @@ struct ThreadSplit {
     kickoff: Option<String>,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_batch(
     core: &std::sync::Arc<Core>,
     tx: &UnboundedSender<AgentEvent>,
@@ -617,6 +639,9 @@ async fn execute_batch(
     progress: &mut RunProgress,
     loop_guard: &mut LoopGuard,
     calls: &[ToolCall],
+    gate_tools: gates::GateTools,
+    read_available: bool,
+    turn_start: Option<&str>,
 ) -> BatchOutcome {
     let mut deferred: Vec<CustomData> = Vec::new();
     let mut inferred_mutations = 0usize;
@@ -649,7 +674,11 @@ async fn execute_batch(
             summary: summary_args.clone(),
         });
 
-        let tool = core.tools.iter().find(|tool| tool.name() == call.name).cloned();
+        let tool = core
+            .tools
+            .iter()
+            .find(|tool| tool.name() == call.name)
+            .cloned();
         let raw = arguments_raw(&call.arguments);
         let mut args_path: Option<String> = None;
         let mut result;
@@ -681,7 +710,8 @@ async fn execute_batch(
                     repaired = Some(args.clone());
                     result = ToolResult::ok("");
 
-                    if matches!(call.name.as_str(), "edit" | "write" | "patch")
+                    if read_available
+                        && matches!(call.name.as_str(), "edit" | "write" | "patch")
                         && let Some(path) = &args_path
                     {
                         let resolved = match ctx.resolve(path) {
@@ -712,27 +742,26 @@ async fn execute_batch(
                     }
 
                     if !result.is_error {
-                        let current = gates::analyze_turn(
+                        let current = gates::analyze_turn_since(
                             &core.session.lock().expect("session lock"),
                             false,
+                            turn_start,
                         );
-                        if let Some(block) = gates::todo_edit_gate(
-                            &call.name,
-                            current.mutations + inferred_mutations,
-                            unique_file_count(&current.files, &inferred_files),
-                            plan_present || current.todo_plan_present,
-                        ) {
+                        if gate_tools.todo
+                            && let Some(block) = gates::todo_edit_gate(
+                                &call.name,
+                                current.mutations + inferred_mutations,
+                                unique_file_count(&current.files, &inferred_files),
+                                plan_present || current.todo_plan_present,
+                            )
+                        {
                             result = block;
                         }
                     }
 
                     if !result.is_error && matches!(call.name.as_str(), "bash" | "bg") {
                         if let Some(command) = args.get("command").and_then(|v| v.as_str()) {
-                            let gate = core
-                                .security
-                                .lock()
-                                .expect("security state")
-                                .gate(command);
+                            let gate = core.security.lock().expect("security state").gate(command);
                             if let Err(message) = gate {
                                 result = ToolResult::err("SEC_SCOPE", message);
                             }
@@ -742,11 +771,8 @@ async fn execute_batch(
                     if result.is_error {
                         // Keep the failure and skip execution.
                     } else {
-                        let signature = format!(
-                            "{}:{}",
-                            call.name,
-                            super::repair::canonical_json(&args)
-                        );
+                        let signature =
+                            format!("{}:{}", call.name, super::repair::canonical_json(&args));
                         match loop_guard.check_and_record(signature) {
                             LoopDecision::Tripped { reason } => {
                                 result = ToolResult::err("loop_guard", reason.clone());
@@ -821,8 +847,7 @@ async fn execute_batch(
                         }
                         if custom.kind == "fs-change" {
                             changed = true;
-                            if let Some(path) =
-                                custom.payload.get("path").and_then(|v| v.as_str())
+                            if let Some(path) = custom.payload.get("path").and_then(|v| v.as_str())
                             {
                                 inferred_mutations += 1;
                                 inferred_files.insert(path.to_string());
@@ -1025,9 +1050,11 @@ fn compact_session(
     let thread_id = session
         .latest_custom_on_path("thread-state")
         .and_then(|entry| match &entry.kind {
-            EntryKind::Custom(custom) => {
-                custom.payload.get("thread_id").and_then(|v| v.as_str()).map(str::to_string)
-            }
+            EntryKind::Custom(custom) => custom
+                .payload
+                .get("thread_id")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
             _ => None,
         });
     session.append(EntryKind::Compaction(CompactionData {

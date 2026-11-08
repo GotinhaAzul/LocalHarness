@@ -30,7 +30,7 @@ pub struct SkillIndex {
 
 impl SkillIndex {
     pub fn bundled() -> Self {
-        bundled()
+        crate::skills::bundled()
     }
 
     pub fn load(paths: &Paths, trust: bool) -> Self {
@@ -68,7 +68,10 @@ impl SkillIndex {
     }
 
     pub fn names(&self) -> Vec<&str> {
-        self.skills.iter().map(|skill| skill.name.as_str()).collect()
+        self.skills
+            .iter()
+            .map(|skill| skill.name.as_str())
+            .collect()
     }
 
     /// Compact index injected into the system prompt.
@@ -91,9 +94,9 @@ fn load_skill_dir(dir: &Path) -> Option<Skill> {
         dir.join("skill.md"),
         dir.to_path_buf(),
     ];
-    let path = candidates
-        .into_iter()
-        .find(|candidate| candidate.is_file() && candidate.extension().is_some_and(|e| e == "md"))?;
+    let path = candidates.into_iter().find(|candidate| {
+        candidate.is_file() && candidate.extension().is_some_and(|e| e == "md")
+    })?;
     load_skill_file(&path, false)
 }
 

@@ -7,7 +7,9 @@ pub mod compact;
 use crate::provider::{ChatMessage, ToolCall};
 use crate::session::{AssistantData, EntryKind, Session};
 
-pub use archive::{BATCH_CAP_CHARS, CappedContent, RECALL_CAP_CHARS, RESULT_CAP_CHARS, cap_batch, cap_result};
+pub use archive::{
+    BATCH_CAP_CHARS, CappedContent, RECALL_CAP_CHARS, RESULT_CAP_CHARS, cap_batch, cap_result,
+};
 pub use budget::TokenBudget;
 pub use compact::{CompactionSummary, FindingSummary, build_summary};
 

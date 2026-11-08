@@ -14,9 +14,7 @@ pub const MAX_EVIDENCE_CHARS: usize = 2000;
 pub const MAX_TEXT_CHARS: usize = 1000;
 pub const MAX_TITLE_CHARS: usize = 200;
 
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
     Critical,
@@ -251,9 +249,7 @@ impl Engagement {
 
     pub fn update(&mut self, id: &str, patch: FindingPatch) -> Result<Finding, String> {
         let Some(index) = self.findings.iter().position(|f| f.id == id) else {
-            return Err(format!(
-                "no finding {id:?}; `finding list` shows ids"
-            ));
+            return Err(format!("no finding {id:?}; `finding list` shows ids"));
         };
         let mut finding = self.findings[index].clone();
         if let Some(title) = patch.title {
@@ -291,7 +287,11 @@ impl Engagement {
     }
 
     pub fn counts(&self) -> (usize, usize, usize) {
-        let open: Vec<_> = self.findings.iter().filter(|f| f.status == Status::Open).collect();
+        let open: Vec<_> = self
+            .findings
+            .iter()
+            .filter(|f| f.status == Status::Open)
+            .collect();
         let high = open
             .iter()
             .filter(|f| matches!(f.severity, Severity::Critical | Severity::High))

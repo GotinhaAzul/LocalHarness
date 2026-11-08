@@ -51,7 +51,11 @@ impl TokenBudget {
     }
 
     pub fn estimate_messages(&self, messages: &[ChatMessage]) -> u32 {
-        messages.iter().map(|m| self.estimate_text(&m.role()) + self.estimate_char_len(m.char_len())).sum::<u32>() + 8
+        messages
+            .iter()
+            .map(|m| self.estimate_text(&m.role()) + self.estimate_char_len(m.char_len()))
+            .sum::<u32>()
+            + 8
     }
 
     pub fn estimate_char_len(&self, chars: usize) -> u32 {
@@ -73,7 +77,8 @@ impl TokenBudget {
     pub fn observe_usage(&mut self, prompt_tokens: u32, estimated_tokens: u32) {
         if prompt_tokens > 0 {
             self.last_prompt_tokens = Some(prompt_tokens);
-            self.last_estimation_error = Some(i64::from(prompt_tokens) - i64::from(estimated_tokens));
+            self.last_estimation_error =
+                Some(i64::from(prompt_tokens) - i64::from(estimated_tokens));
         }
     }
 

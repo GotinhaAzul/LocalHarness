@@ -169,9 +169,10 @@ impl Session {
 
     /// Latest custom entry of `kind` on the active branch.
     pub fn latest_custom_on_path(&self, kind: &str) -> Option<&Entry> {
-        self.branch_entries().into_iter().rev().find(|e| {
-            matches!(&e.kind, EntryKind::Custom(c) if c.kind == kind)
-        })
+        self.branch_entries()
+            .into_iter()
+            .rev()
+            .find(|e| matches!(&e.kind, EntryKind::Custom(c) if c.kind == kind))
     }
 
     pub fn customs_on_path(&self, kind: &str) -> Vec<&Entry> {
@@ -213,7 +214,8 @@ impl Session {
 
     pub fn append_custom(&mut self, kind: impl Into<String>) -> Result<Entry> {
         let mut data = CustomData::new(kind);
-        data.payload.insert("at".into(), Utc::now().to_rfc3339().into());
+        data.payload
+            .insert("at".into(), Utc::now().to_rfc3339().into());
         self.append(EntryKind::Custom(data))
     }
 
@@ -257,7 +259,9 @@ impl Session {
                 EntryKind::Assistant(a) => {
                     out.push_str("## Assistant\n\n");
                     if let Some(reasoning) = &a.reasoning {
-                        out.push_str(&format!("<details><summary>Reasoning</summary>\n\n{reasoning}\n\n</details>\n\n"));
+                        out.push_str(&format!(
+                            "<details><summary>Reasoning</summary>\n\n{reasoning}\n\n</details>\n\n"
+                        ));
                     }
                     if let Some(content) = &a.content {
                         out.push_str(content);
@@ -269,8 +273,7 @@ impl Session {
                                 "_call {} {}_\n\n```json\n{}\n```\n\n",
                                 call.name,
                                 call.id,
-                                serde_json::to_string_pretty(&call.arguments)
-                                    .unwrap_or_default()
+                                serde_json::to_string_pretty(&call.arguments).unwrap_or_default()
                             ));
                         }
                     }
@@ -302,13 +305,7 @@ impl Session {
         out
     }
 
-    fn make_entry(
-        &self,
-        seq: u64,
-        id: &str,
-        parent: Option<String>,
-        kind: EntryKind,
-    ) -> Entry {
+    fn make_entry(&self, seq: u64, id: &str, parent: Option<String>, kind: EntryKind) -> Entry {
         Entry {
             v: FORMAT_VERSION,
             seq,

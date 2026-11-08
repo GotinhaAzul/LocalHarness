@@ -229,8 +229,8 @@ impl ArtifactStore {
         let Some(root) = &self.root else {
             return Ok(0);
         };
-        let cutoff = std::time::SystemTime::now()
-            - std::time::Duration::from_secs(u64::from(days) * 86_400);
+        let cutoff =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(u64::from(days) * 86_400);
         let mut removed = 0;
         let Ok(entries) = std::fs::read_dir(root) else {
             return Ok(0);

@@ -155,6 +155,17 @@ pub struct FileStamp {
     pub len: u64,
 }
 
+impl FileStamp {
+    /// Stat a path, returning `None` when it does not exist.
+    pub fn stamp_for(path: &std::path::Path) -> Option<Self> {
+        let meta = std::fs::metadata(path).ok()?;
+        Some(Self {
+            mtime: meta.modified().ok()?,
+            len: meta.len(),
+        })
+    }
+}
+
 impl ReadTracker {
     pub fn record(&mut self, path: &std::path::Path, stamp: FileStamp) {
         self.stamps.insert(path.to_path_buf(), stamp);
@@ -169,10 +180,7 @@ impl ReadTracker {
     }
 
     pub fn is_current(&self, path: &std::path::Path) -> bool {
-        match (
-            self.stamps.get(path),
-            Self::stamp_for(path),
-        ) {
+        match (self.stamps.get(path), Self::stamp_for(path)) {
             (Some(known), Some(actual)) => *known == actual,
             _ => false,
         }

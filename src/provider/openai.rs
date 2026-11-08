@@ -11,9 +11,11 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::ModelConfig;
 
-use super::sse::{SseFrame, SseParser};
-use super::types::{ChatMessage, ChatRequest, ErrorClass, ProviderError, StreamEvent, StreamItem, Usage};
 use super::Provider;
+use super::sse::{SseFrame, SseParser};
+use super::types::{
+    ChatMessage, ChatRequest, ErrorClass, ProviderError, StreamEvent, StreamItem, Usage,
+};
 
 #[derive(Debug, Clone)]
 struct Timeouts {
@@ -92,7 +94,10 @@ impl OpenAiCompatProvider {
                 } else {
                     format!("request to {} failed: {err}", self.base_url)
                 };
-                return Attempt::Failed(ProviderError::new(ErrorClass::Connection, self.scrub(msg)));
+                return Attempt::Failed(ProviderError::new(
+                    ErrorClass::Connection,
+                    self.scrub(msg),
+                ));
             }
         };
 
@@ -260,7 +265,8 @@ impl OpenAiCompatProvider {
                 *yielded = true;
                 let _ = tx.send(Ok(StreamEvent::Delta(content)));
             }
-            for (fallback_index, call) in delta.tool_calls.unwrap_or_default().into_iter().enumerate()
+            for (fallback_index, call) in
+                delta.tool_calls.unwrap_or_default().into_iter().enumerate()
             {
                 let index = call.index.unwrap_or(fallback_index);
                 let (name, arguments) = match call.function {
@@ -565,7 +571,10 @@ fn reasoning_text(delta: &Delta, configured: Option<&str>) -> Option<String> {
             return value;
         }
     }
-    delta.reasoning_content.clone().or_else(|| delta.reasoning.clone())
+    delta
+        .reasoning_content
+        .clone()
+        .or_else(|| delta.reasoning.clone())
 }
 
 #[cfg(test)]
@@ -612,7 +621,10 @@ mod tests {
         assert_eq!(body["stream"], true);
         assert_eq!(body["stream_options"]["include_usage"], true);
         assert_eq!(body["stop"][0], "<|im_end|>");
-        assert_eq!(body["messages"][1]["tool_calls"][0]["function"]["name"], "read");
+        assert_eq!(
+            body["messages"][1]["tool_calls"][0]["function"]["name"],
+            "read"
+        );
         assert_eq!(
             body["messages"][1]["tool_calls"][0]["function"]["arguments"],
             "{\"path\":\"a.rs\"}"
@@ -637,7 +649,10 @@ mod tests {
             reasoning: Some("b".into()),
             ..Delta::default()
         };
-        assert_eq!(reasoning_text(&delta, Some("reasoning")).as_deref(), Some("b"));
+        assert_eq!(
+            reasoning_text(&delta, Some("reasoning")).as_deref(),
+            Some("b")
+        );
         assert_eq!(
             reasoning_text(&delta, Some("reasoning_content")).as_deref(),
             Some("a")

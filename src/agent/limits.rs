@@ -123,12 +123,7 @@ impl RunProgress {
         self.tool_calls + n <= self.limits.max_tool_calls
     }
 
-    pub fn record_tool_result(
-        &mut self,
-        fingerprint: &str,
-        changed_file: bool,
-        verified_ok: bool,
-    ) {
+    pub fn record_tool_result(&mut self, fingerprint: &str, changed_file: bool, verified_ok: bool) {
         self.tool_calls += 1;
         self.stall.observe(fingerprint, changed_file, verified_ok);
     }

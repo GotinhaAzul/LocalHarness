@@ -89,7 +89,8 @@ pub async fn create_runtime(
         }
     }
     let context_window = config.context_window();
-    let provider: Arc<dyn Provider> = Arc::new(OpenAiCompatProvider::new(&config.model, model.clone())?);
+    let provider: Arc<dyn Provider> =
+        Arc::new(OpenAiCompatProvider::new(&config.model, model.clone())?);
 
     let security = Arc::new(Mutex::new(SecurityState::load(
         &paths,
@@ -183,4 +184,50 @@ pub async fn create_runtime(
         core: Arc::new(core),
         session: session_handle,
     })
+}
+
+/// Rebuild the core between turns after a config change (`/model`,
+/// `/profile`, `/theme`), reusing the open session and run state.
+pub async fn rebuild_core(old: &Arc<Core>, mut config: Config) -> Result<Arc<Core>> {
+    let model = if config.model.model.trim().is_empty() {
+        old.provider.model().to_string()
+    } else {
+        config.model.model.trim().to_string()
+    };
+    config.model.model = model.clone();
+    let provider: Arc<dyn Provider> = Arc::new(OpenAiCompatProvider::new(&config.model, model)?);
+    let registry = ToolRegistry::builtin();
+    let external_tools = external::load_tools(&old.paths, config.trust).unwrap_or_else(|err| {
+        tracing::warn!(%err, "external tools were not loaded");
+        Vec::new()
+    });
+    let tools = registry
+        .select(config.profile(), &external_tools)
+        .map_err(anyhow::Error::msg)?;
+    let tool_specs = ToolRegistry::specs(&tools);
+    let skills = SkillIndex::load(&old.paths, config.trust);
+    let system_prompt = prompt::build_system_prompt(&config, &old.paths, &skills, &tools);
+    let (_, model_profile) = config.model_profile();
+    let budget = TokenBudget::new(config.context_window(), config.model.max_output_tokens);
+    let limits = RunLimits::from(&config.budgets);
+    Ok(Arc::new(Core {
+        config,
+        paths: old.paths.clone(),
+        provider,
+        registry,
+        tools,
+        tool_specs,
+        session: old.session.clone(),
+        artifacts: old.artifacts.clone(),
+        reads: old.reads.clone(),
+        bg: old.bg.clone(),
+        security: old.security.clone(),
+        budget,
+        limits,
+        system_prompt,
+        model_profile,
+        cancel: old.cancel.clone(),
+        tool_timeout: old.tool_timeout,
+        path_jail: old.path_jail,
+    }))
 }

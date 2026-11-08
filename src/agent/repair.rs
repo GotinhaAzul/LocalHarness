@@ -201,7 +201,10 @@ fn drop_unknown(map: &mut Map<String, Value>, schema: &Value) -> Vec<String> {
 pub fn repair(tool: &str, raw: &str, schema: &Value) -> Result<Value, RepairError> {
     let mut value = parse_raw(raw)?;
     let Value::Object(map) = &mut value else {
-        return Err(RepairError::new("bad_arguments", "arguments must be an object"));
+        return Err(RepairError::new(
+            "bad_arguments",
+            "arguments must be an object",
+        ));
     };
     apply_aliases(map);
     apply_defaults(tool, map);
@@ -234,7 +237,10 @@ pub fn repair(tool: &str, raw: &str, schema: &Value) -> Result<Value, RepairErro
 
 fn validate(tool: &str, value: &Value, schema: &Value) -> Result<(), RepairError> {
     let Some(map) = value.as_object() else {
-        return Err(RepairError::new("bad_arguments", "arguments must be an object"));
+        return Err(RepairError::new(
+            "bad_arguments",
+            "arguments must be an object",
+        ));
     };
     let required = schema
         .get("required")
@@ -246,9 +252,7 @@ fn validate(tool: &str, value: &Value, schema: &Value) -> Result<(), RepairError
             let example = example_for(tool, &required);
             return Err(RepairError::new(
                 "missing_argument",
-                format!(
-                    "{tool} requires \"{key}\"; call {tool} with {example}"
-                ),
+                format!("{tool} requires \"{key}\"; call {tool} with {example}"),
             ));
         }
     }
@@ -335,7 +339,9 @@ fn example_for(tool: &str, required: &[&str]) -> String {
         "read" => json!({"path": "src/main.rs"}),
         "write" => json!({"path": "src/main.rs", "content": "..."}),
         "edit" => json!({"path": "src/main.rs", "old": "exact text", "new": "replacement"}),
-        "patch" => json!({"path": "src/main.rs", "anchor": "exact text", "replacement": "new text"}),
+        "patch" => {
+            json!({"path": "src/main.rs", "anchor": "exact text", "replacement": "new text"})
+        }
         "bash" => json!({"command": "cargo test"}),
         "grep" => json!({"pattern": "fn main"}),
         "glob" => json!({"pattern": "src/**/*.rs"}),
@@ -442,7 +448,9 @@ pub fn interactive_command(command: &str) -> Option<&'static str> {
         return Some("a terminal multiplexer");
     }
     if ["psql", "mysql", "sqlite3", "redis-cli"].contains(&program)
-        && !rest.iter().any(|arg| *arg == "-c" || *arg == "--command" || *arg == "-e")
+        && !rest
+            .iter()
+            .any(|arg| *arg == "-c" || *arg == "--command" || *arg == "-e")
     {
         return Some("an interactive database shell");
     }
@@ -459,9 +467,7 @@ pub fn interactive_command(command: &str) -> Option<&'static str> {
 
 fn remedy_for(blocked: &str) -> &'static str {
     match blocked {
-        "vim" | "nano" | "emacs" | "an editor" => {
-            "Use read, edit, write, or patch to change files"
-        }
+        "vim" | "nano" | "emacs" | "an editor" => "Use read, edit, write, or patch to change files",
         "a pager" => "Read the file with read, or pipe through head",
         "top" | "watch" => "Use `bg` for a long-running monitor, or bash with `ps`",
         "a terminal multiplexer" => "Run the underlying command directly, or use bg",
@@ -493,7 +499,12 @@ mod tests {
     #[test]
     fn aliases_and_stringified_scalars_are_repaired() {
         let schema = schema_for("read");
-        let value = repair("read", r#"{"file":"a.rs","limit":"20","startLine":"3"}"#, &schema).unwrap();
+        let value = repair(
+            "read",
+            r#"{"file":"a.rs","limit":"20","startLine":"3"}"#,
+            &schema,
+        )
+        .unwrap();
         assert_eq!(value["path"], "a.rs");
         assert_eq!(value["limit"], 20);
         assert_eq!(value["start"], 3);

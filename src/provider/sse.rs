@@ -112,10 +112,7 @@ mod tests {
         let frames = parser.push(b"data: one\n\ndata: two\n\n");
         assert_eq!(
             frames,
-            vec![
-                SseFrame::Data("one".into()),
-                SseFrame::Data("two".into())
-            ]
+            vec![SseFrame::Data("one".into()), SseFrame::Data("two".into())]
         );
     }
 

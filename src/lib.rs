@@ -20,6 +20,6 @@ pub mod ui;
 pub use agent::{Core, run_turn};
 pub use config::Config;
 pub use paths::Paths;
-pub use provider::{Provider, OpenAiCompatProvider};
+pub use provider::{OpenAiCompatProvider, Provider};
 pub use session::Session;
 pub use tools::{Tool, ToolContext, ToolRegistry, ToolResult};

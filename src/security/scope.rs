@@ -32,7 +32,8 @@ impl Scope {
 
     pub fn remove(&mut self, target: &str) -> bool {
         let before = self.targets.len();
-        self.targets.retain(|t| !t.eq_ignore_ascii_case(target.trim()));
+        self.targets
+            .retain(|t| !t.eq_ignore_ascii_case(target.trim()));
         self.targets.len() != before
     }
 
@@ -147,18 +148,44 @@ fn parse_ip(value: &str) -> Option<IpAddr> {
 
 /// Commands whose targets are checked against scope.
 const SECURITY_TOOLS: &[&str] = &[
-    "nmap", "masscan", "sqlmap", "nikto", "nuclei", "ffuf", "gobuster", "feroxbuster", "dirb",
-    "dirsearch", "hydra", "medusa", "msfconsole", "msfvenom", "meterpreter", "responder",
-    "crackmapexec", "netexec", "bloodhound", "certipy", "rubeus", "chisel", "ligolo", "pangolin",
+    "nmap",
+    "masscan",
+    "sqlmap",
+    "nikto",
+    "nuclei",
+    "ffuf",
+    "gobuster",
+    "feroxbuster",
+    "dirb",
+    "dirsearch",
+    "hydra",
+    "medusa",
+    "msfconsole",
+    "msfvenom",
+    "meterpreter",
+    "responder",
+    "crackmapexec",
+    "netexec",
+    "bloodhound",
+    "certipy",
+    "rubeus",
+    "chisel",
+    "ligolo",
+    "pangolin",
 ];
 
 /// Extract candidate targets from a shell command. Best-effort by design.
 pub fn extract_targets(command: &str) -> Vec<String> {
     let mut targets = Vec::new();
     for raw in command.split_whitespace() {
-        let token = raw
-            .trim_matches(|c: char| c == '"' || c == '\'' || c == ',' || c == ';' || c == '(' || c == ')');
-        if token.is_empty() || token.starts_with('-') || token.starts_with('<') || token.starts_with('>') {
+        let token = raw.trim_matches(|c: char| {
+            c == '"' || c == '\'' || c == ',' || c == ';' || c == '(' || c == ')'
+        });
+        if token.is_empty()
+            || token.starts_with('-')
+            || token.starts_with('<')
+            || token.starts_with('>')
+        {
             continue;
         }
         // Skip shell operators and assignments.
@@ -183,7 +210,10 @@ pub fn extract_targets(command: &str) -> Vec<String> {
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' || c == ':');
         if looks_like_ip || looks_like_url || looks_like_domain {
-            if !targets.iter().any(|t: &String| t.eq_ignore_ascii_case(&candidate)) {
+            if !targets
+                .iter()
+                .any(|t: &String| t.eq_ignore_ascii_case(&candidate))
+            {
                 targets.push(candidate);
             }
         }
@@ -218,7 +248,9 @@ pub fn gate_command(command: &str, scope: &Scope) -> Result<(), String> {
     if targets.is_empty() {
         return Ok(());
     }
-    scope.check(&targets).map_err(|violation| violation.to_string())
+    scope
+        .check(&targets)
+        .map_err(|violation| violation.to_string())
 }
 
 #[cfg(test)]
@@ -241,7 +273,8 @@ mod tests {
 
     #[test]
     fn extracts_ips_urls_domains() {
-        let targets = extract_targets("nmap -sV 10.0.0.5 https://app.example.com:443/x example.org");
+        let targets =
+            extract_targets("nmap -sV 10.0.0.5 https://app.example.com:443/x example.org");
         assert!(targets.contains(&"10.0.0.5".to_string()));
         assert!(targets.contains(&"app.example.com".to_string()));
         assert!(targets.contains(&"example.org".to_string()));
