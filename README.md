@@ -1,8 +1,15 @@
 # LocalHarness
 
-Local-first agent harness for coding and security work. One static Rust binary,
-one OpenAI-compatible endpoint, a polished TUI and a headless mode. No Node, no
-cloud, no telemetry.
+<p align="center">
+  <a href="https://github.com/GotinhaAzul/LocalHarness/actions/workflows/ci.yml"><img src="https://github.com/GotinhaAzul/LocalHarness/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue" alt="License: MIT OR Apache-2.0">
+  <img src="https://img.shields.io/badge/rust-1.88%2B-orange" alt="Rust 1.88+">
+  <img src="https://img.shields.io/badge/platform-linux%20x86__64%20%7C%20aarch64-lightgrey" alt="Linux x86_64 and aarch64">
+</p>
+
+**Local-first agent harness for coding and security work.** One static Rust
+binary, one OpenAI-compatible endpoint, a polished TUI, and a headless mode.
+No Node, no cloud, no telemetry.
 
 LocalHarness owns its agent loop, tools, context management, session tree, and
 interface. The product stance is simple: **anything the model is unreliable at
@@ -24,6 +31,22 @@ measures progress, and stops loops; the model does the work.
 +--------------------------------------------------------------------------------+
 ```
 
+## Why LocalHarness
+
+- **Local by default.** No telemetry, analytics, or phone-home. The endpoint is
+  localhost unless you point it elsewhere.
+- **Model-agnostic.** Any engine speaking the OpenAI chat-completions API:
+  llama.cpp, Ollama, vLLM, and anything compatible.
+- **Enforced, not prompted.** Read-before-edit, scope, budgets, loop detection,
+  stall detection, todo planning, and verification are code paths, not requests
+  in a system prompt.
+- **Code-aware tools.** Language-server diagnostics after edits, a cached repo
+  map, test/verify loops, and undo that refuses to clobber your own work.
+- **Security engagements.** Evidence capture, attack-surface inventory, Sigma
+  detection, findings, and an attack-path graph, scoped to an authorized target.
+- **One binary.** `lh` is a single static Rust binary with a TUI and a JSONL
+  headless mode. Nothing to install at runtime.
+
 ## Build
 
 ```sh
@@ -34,11 +57,12 @@ cargo build --release
 Requires Rust 1.88 or newer, Linux x86_64 or aarch64. Dependencies are pinned in
 `Cargo.lock`; release builds use `--locked`.
 
-## Point it at a local model
+## Quick start
 
-Any engine that implements the OpenAI chat-completions API works. Start one,
-then run `lh`. If the endpoint exposes exactly one model it is selected
-automatically.
+### Point it at a model
+
+Start an OpenAI-compatible server, then run `lh`. If the endpoint exposes
+exactly one model it is selected automatically.
 
 llama.cpp (tool calling must be enabled):
 
@@ -62,13 +86,35 @@ vllm serve Qwen/Qwen3-35B-A3B --enable-auto-tool-choice --tool-call-parser herme
 lh --endpoint http://127.0.0.1:8000 --model Qwen/Qwen3-35B-A3B
 ```
 
-Facts are collected from optional endpoints (`/v1/models`,
-`/props`, `/tokenize`, `/api/show`). Missing probes only degrade estimates; they
-never fail a turn. See [docs/model-setup.md](docs/model-setup.md) for model
-profiles, thinking/reasoning handling, and troubleshooting.
+`lh` also starts with no reachable endpoint or model. The TUI opens with
+`not logged in` and turns stay disabled until you sign in:
+
+```text
+/login http://127.0.0.1:8080             auto-select the endpoint's only model
+/login http://127.0.0.1:8080 qwen3       choose a model
+/login http://host:8000 model sk-...     remote endpoint with a bearer token
+```
+
+`/login` validates `GET /v1/models` and saves `endpoint`, `model`, and `api_key`
+to the global config with `0600` permissions. `/model` lists the models the
+current endpoint exposes and switches the session with `/model <name>`.
+Headless `--print` still requires a selected model.
 
 Point at a different endpoint with `--endpoint` or `LH_ENDPOINT` (default
-`http://127.0.0.1:8080`). A non-local endpoint is allowed but warned about.
+`http://127.0.0.1:8080`). Both `http://host:8080` and `http://host:8080/v1` are
+accepted, so you can paste the base URL an engine prints. A non-local endpoint
+is allowed but warned about; see [docs/model-setup.md](docs/model-setup.md) for a
+tailnet example.
+
+Facts are collected from optional endpoints (`/v1/models`, `/props`,
+`/tokenize`, `/api/show`). Missing probes only degrade estimates; they never
+fail a turn. See [docs/model-setup.md](docs/model-setup.md) for model profiles,
+thinking/reasoning handling, and troubleshooting.
+
+The harness does not launch servers on its own. If an endpoint is down and you
+want it started automatically, set the optional `[model] start_command`; it runs
+once at startup, only when the endpoint is unreachable. See
+[docs/configuration.md](docs/configuration.md).
 
 ## Headless
 
@@ -104,19 +150,38 @@ checkout and fork are non-destructive. `/sessions` switches sessions.
 | `Ctrl+R` | toggle reasoning |
 | `/` | slash-command completion |
 
-Slash commands: `/help /quit /model /profile /theme /tree /fork /sessions
-/compact /tools /skill /workflow /sec /trust /export /clear /debug`.
+Slash commands: `/help /quit /login /model /profile /theme /tree /fork
+/sessions /compact /tools /skill /workflow /sec /trust /export /clear /debug`.
 
 ## Tools
 
-Seventeen built-ins in three packs. `full` (core + coding + security) is the
+Twenty-three built-ins in three packs. `full` (core + coding + security) is the
 default; `coding`, `security`, and `minimal` narrow it.
 
 | Pack | Tools |
 |---|---|
-| Core | `read` `write` `edit` `patch` `bash` `grep` `glob` `todo` `verify` `recall` `thread` `bg` |
-| Coding | `lsp` `test` `review` |
-| Security | `finding` `iocs` |
+| Core | `read` `write` `edit` `patch` `undo` `bash` `grep` `glob` `todo` `verify` `recall` `thread` `bg` |
+| Coding | `repo_map` `lsp` `test` `review` |
+| Security | `surface` `evidence` `detect` `attack_path` `finding` `iocs` |
+
+`repo_map` returns a cached, budget-capped outline of files and top-level
+symbols; a compact version is included in the system prompt. `write`, `edit`,
+and `patch` append language-server diagnostics for the changed file when a
+supported server is installed and the file belongs to a real project. A
+missing or cold server never fails an edit.
+
+`undo` reverts the last `edit`, `patch`, or `write` to a file, one step per
+call, from snapshots kept in the session (no git involved). It refuses when the
+file changed after the harness wrote it, so it never discards your own edits.
+Changes made through `bash` are not tracked.
+
+Security tools operate inside the active engagement. `bash`, `bg`, and
+external tool runs append an evidence entry with the target, command,
+timestamps, exit status, output artifact, and SHA-256 digest. `surface` parses
+nmap/HTTP/TLS output into one inventory; `detect` validates and runs a Sigma
+subset against local logs; `attack_path` queries the graph derived from the
+surface, findings, and evidence. `finding add` auto-links the last tool's
+evidence entry, or accepts `evidence_id` explicitly.
 
 Tool results are capped and archived; `recall` reads a range of an artifact.
 Guards enforce read-before-edit, scope, loop detection, budgets, stall
@@ -172,4 +237,9 @@ cargo audit && cargo deny check   # advisories
 ```
 
 No test requires a real model or network. [ARCHITECTURE.md](ARCHITECTURE.md) is
-the implementation specification. License: MIT OR Apache-2.0.
+the implementation specification.
+
+## License
+
+MIT OR Apache-2.0. See [LICENSE-MIT](LICENSE-MIT) and
+[LICENSE-APACHE](LICENSE-APACHE).
