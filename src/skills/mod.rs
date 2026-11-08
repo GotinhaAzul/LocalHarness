@@ -7,19 +7,91 @@ use std::path::{Path, PathBuf};
 
 use crate::paths::Paths;
 
+/// Most reference files picked up from one skill directory.
+const MAX_REFERENCES: usize = 40;
+
+/// Where a skill reference's text lives.
+#[derive(Debug, Clone)]
+pub enum ReferenceSource {
+    Embedded(&'static str),
+    File(PathBuf),
+}
+
+/// A supporting document shipped with a skill, loaded on demand.
+#[derive(Debug, Clone)]
+pub struct SkillReference {
+    /// Path relative to the skill, e.g. `references/recon.md`.
+    pub path: String,
+    pub source: ReferenceSource,
+}
+
+impl SkillReference {
+    pub fn text(&self) -> Option<String> {
+        match &self.source {
+            ReferenceSource::Embedded(text) => Some(text.trim().to_string()),
+            ReferenceSource::File(path) => std::fs::read_to_string(path)
+                .ok()
+                .map(|text| text.trim().to_string()),
+        }
+    }
+
+    /// `references/recon.md` answers to that path, `recon.md`, and `recon`.
+    fn matches(&self, needle: &str) -> bool {
+        let needle = needle.trim().trim_start_matches("./");
+        let file = self.path.rsplit('/').next().unwrap_or(&self.path);
+        let stem = file.rsplit_once('.').map(|(stem, _)| stem).unwrap_or(file);
+        needle == self.path || needle == file || needle == stem
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Skill {
     pub name: String,
     pub description: String,
     pub when: Option<String>,
+    /// The main instructions, without references.
     pub body: String,
+    pub references: Vec<SkillReference>,
     pub source: Option<PathBuf>,
     pub bundled: bool,
 }
 
 impl Skill {
+    /// Instructions plus every reference, for `/skill` where the user asked
+    /// for the whole thing.
     pub fn full_text(&self) -> String {
-        self.body.clone()
+        let mut out = self.body.clone();
+        if !self.references.is_empty() {
+            out.push_str("\n\n## References\n");
+            for reference in &self.references {
+                if let Some(text) = reference.text() {
+                    out.push_str(&format!("\n### {}\n\n{text}\n", reference.path));
+                }
+            }
+        }
+        out
+    }
+
+    /// Instructions plus a list of references the model can load one at a
+    /// time with the `skill` tool.
+    pub fn instructions_text(&self) -> String {
+        let mut out = self.body.clone();
+        if !self.references.is_empty() {
+            out.push_str(&format!(
+                "\n\n## References\n\nLoad one when the task needs it: skill {{\"name\":\"{}\",\"reference\":\"<path>\"}}\n",
+                self.name
+            ));
+            for reference in &self.references {
+                out.push_str(&format!("- {}\n", reference.path));
+            }
+        }
+        out
+    }
+
+    pub fn reference(&self, needle: &str) -> Option<&SkillReference> {
+        self.references
+            .iter()
+            .find(|reference| reference.matches(needle))
     }
 }
 
@@ -97,7 +169,51 @@ fn load_skill_dir(dir: &Path) -> Option<Skill> {
     let path = candidates.into_iter().find(|candidate| {
         candidate.is_file() && candidate.extension().is_some_and(|e| e == "md")
     })?;
-    load_skill_file(&path, false)
+    let mut skill = load_skill_file(&path, false)?;
+    if dir.is_dir() {
+        skill.references = discover_references(dir, &path);
+    }
+    Some(skill)
+}
+
+/// Markdown and text files under a skill directory, other than the skill
+/// file itself, sorted by path.
+fn discover_references(dir: &Path, main: &Path) -> Vec<SkillReference> {
+    let mut found = Vec::new();
+    let mut stack = vec![(dir.to_path_buf(), 0usize)];
+    while let Some((current, depth)) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&current) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            // Symlinks are skipped so a skill cannot point outside itself.
+            if kind.is_symlink() {
+                continue;
+            }
+            if kind.is_dir() {
+                if depth < 3 {
+                    stack.push((path, depth + 1));
+                }
+            } else if path != main
+                && path
+                    .extension()
+                    .is_some_and(|ext| ext == "md" || ext == "txt")
+                && let Ok(relative) = path.strip_prefix(dir)
+            {
+                found.push(SkillReference {
+                    path: relative.to_string_lossy().replace('\\', "/"),
+                    source: ReferenceSource::File(path.clone()),
+                });
+            }
+        }
+    }
+    found.sort_by(|a, b| a.path.cmp(&b.path));
+    found.truncate(MAX_REFERENCES);
+    found
 }
 
 /// Parse one Markdown skill file with optional YAML frontmatter.
@@ -123,6 +239,7 @@ pub fn load_skill_file(path: &Path, bundled: bool) -> Option<Skill> {
         description: one_line(&description),
         when,
         body: body.trim().to_string(),
+        references: Vec::new(),
         source: Some(path.to_path_buf()),
         bundled,
     })
@@ -197,20 +314,34 @@ const BLUE_REFERENCES: &[(&str, &str)] = &[
         "references/detection-engineering.md",
         include_str!("bundled/security-blue-references/detection-engineering.md"),
     ),
+    (
+        "references/secure-code-review.md",
+        include_str!("bundled/security-blue-references/secure-code-review.md"),
+    ),
+    (
+        "references/supply-chain.md",
+        include_str!("bundled/security-blue-references/supply-chain.md"),
+    ),
+    (
+        "references/hardening.md",
+        include_str!("bundled/security-blue-references/hardening.md"),
+    ),
 ];
 
-fn bundled_skill(main: &str, references: &[(&str, &str)], name: &str) -> Skill {
+fn bundled_skill(main: &str, references: &[(&str, &'static str)], name: &str) -> Skill {
     let (meta, body) = split_frontmatter(main);
-    let mut full = body.trim().to_string();
-    full.push_str("\n\n## Bundled references\n\nThese reference documents are part of the skill; they are reproduced here because they are embedded in the binary.\n");
-    for (path, text) in references {
-        full.push_str(&format!("\n### {path}\n\n{}\n", text.trim()));
-    }
     Skill {
         name: meta.get("name").cloned().unwrap_or_else(|| name.into()),
         description: one_line(meta.get("description").map(String::as_str).unwrap_or("")),
         when: meta.get("when").cloned(),
-        body: full,
+        body: body.trim().to_string(),
+        references: references
+            .iter()
+            .map(|(path, text)| SkillReference {
+                path: path.to_string(),
+                source: ReferenceSource::Embedded(text),
+            })
+            .collect(),
         source: None,
         bundled: true,
     }
@@ -253,5 +384,47 @@ mod tests {
         assert!(red.body.contains("references/authorization.md"));
         assert!(red.body.len() > 2000);
         assert!(index.index_text().contains("security-blue"));
+        // The full text (for /skill) inlines references; the tool text lists them.
+        assert!(red.full_text().len() > red.body.len() + 10_000);
+        let listed = red.instructions_text();
+        assert!(listed.contains("- references/recon.md"));
+        assert!(listed.len() < red.body.len() + 1000);
+        assert!(red.reference("recon").unwrap().text().unwrap().len() > 500);
+    }
+
+    #[test]
+    fn every_reference_a_bundled_skill_names_is_embedded() {
+        let pattern = regex::Regex::new(r"references/[a-z0-9-]+\.md").unwrap();
+        for skill in bundled().skills {
+            for found in pattern.find_iter(&skill.body) {
+                assert!(
+                    skill.reference(found.as_str()).is_some(),
+                    "{} names {} but does not embed it",
+                    skill.name,
+                    found.as_str()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn skill_directories_expose_reference_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill = dir.path().join("deploy");
+        std::fs::create_dir_all(skill.join("references")).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: deploy\ndescription: Ship it\n---\n\nSee references/rollback.md\n",
+        )
+        .unwrap();
+        std::fs::write(skill.join("references/rollback.md"), "Roll back with x.\n").unwrap();
+        std::fs::write(skill.join("notes.bin"), "ignored").unwrap();
+        let loaded = load_skill_dir(&skill).unwrap();
+        assert_eq!(loaded.references.len(), 1);
+        assert_eq!(loaded.references[0].path, "references/rollback.md");
+        assert_eq!(
+            loaded.reference("rollback.md").unwrap().text().as_deref(),
+            Some("Roll back with x.")
+        );
     }
 }

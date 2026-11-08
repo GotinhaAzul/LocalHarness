@@ -27,6 +27,8 @@ pub struct HeaderData {
     pub cache: Option<u32>,
     pub session: String,
     pub trust: bool,
+    /// The context window is a fallback or an upper bound, not a measurement.
+    pub window_guess: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -50,22 +52,11 @@ impl Default for FooterData {
     }
 }
 
-fn sep() -> Span<'static> {
-    Span::raw("  ")
-}
-
 fn spans_width(spans: &[Span<'_>]) -> usize {
     spans
         .iter()
         .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
         .sum()
-}
-
-fn item(spans: &mut Vec<Span<'static>>, next: Vec<Span<'static>>) {
-    if !spans.is_empty() {
-        spans.push(sep());
-    }
-    spans.extend(next);
 }
 
 /// Format a token count as `999`, `12.4k`, or `128k`.
@@ -162,14 +153,29 @@ pub fn clip_end(text: &str, max: usize) -> String {
 }
 
 struct HeaderFlags {
-    app: bool,
     profile: bool,
     session: bool,
     throughput: bool,
     cache: bool,
+    gauge: bool,
 }
 
-fn context_spans(data: &HeaderData, compact: bool, theme: &Theme) -> Vec<Span<'static>> {
+fn dot(theme: &Theme) -> Span<'static> {
+    Span::styled(" · ", theme.style(Role::Border))
+}
+
+fn join(groups: Vec<Vec<Span<'static>>>, theme: &Theme) -> Vec<Span<'static>> {
+    let mut out = Vec::new();
+    for group in groups.into_iter().filter(|group| !group.is_empty()) {
+        if !out.is_empty() {
+            out.push(dot(theme));
+        }
+        out.extend(group);
+    }
+    out
+}
+
+fn context_spans(data: &HeaderData, gauge: bool, theme: &Theme) -> Vec<Span<'static>> {
     let used = format_tokens(data.used);
     let window = format_tokens(data.window);
     let ratio = if data.window == 0 {
@@ -184,43 +190,39 @@ fn context_spans(data: &HeaderData, compact: bool, theme: &Theme) -> Vec<Span<'s
     } else {
         Role::Success
     };
+    let mut spans = Vec::new();
+    if gauge {
+        let cells = 8usize;
+        let filled = ((ratio.clamp(0.0, 1.0)) * cells as f64).ceil() as usize;
+        let filled = filled.min(cells);
+        spans.push(Span::styled("▰".repeat(filled), theme.style(role)));
+        spans.push(Span::styled(
+            "▱".repeat(cells - filled),
+            theme.style(Role::Border),
+        ));
+        spans.push(Span::styled(
+            format!(" {}% ", (ratio * 100.0).round().clamp(0.0, 999.0) as u32),
+            theme.style(role),
+        ));
+    }
     let mut text = format!("{used}/{window}");
     if data.completion > 0 {
         text.push('+');
         text.push_str(&format_tokens(data.completion));
     }
-    let mut spans = vec![Span::styled(text, theme.style(Role::Fg))];
-    if !compact {
-        let cells = 6usize;
-        let filled = ((ratio.clamp(0.0, 1.0)) * cells as f64).round() as usize;
-        let filled = filled.min(cells);
-        let gauge = format!(
-            "[{}{}] {}%",
-            "#".repeat(filled),
-            "-".repeat(cells - filled),
-            (ratio * 100.0).round().clamp(0.0, 999.0) as u32
-        );
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled(gauge, theme.bold(role)));
+    spans.push(Span::styled(text, theme.style(Role::Muted)));
+    if data.window_guess {
+        spans.push(Span::styled("?", theme.bold(Role::Warning)));
     }
     spans
 }
 
-fn header_spans(
+fn header_sides(
     data: &HeaderData,
     cwd: &str,
     flags: &HeaderFlags,
-    compact_context: bool,
     theme: &Theme,
-) -> Vec<Span<'static>> {
-    let mut spans = Vec::new();
-    if flags.app {
-        item(
-            &mut spans,
-            vec![Span::styled("LocalHarness", theme.bold(Role::Accent))],
-        );
-    }
-    item(&mut spans, vec![Span::raw(cwd.to_string())]);
+) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
     let git_role = if !data.git.in_repo {
         Role::Muted
     } else if data.git.dirty {
@@ -228,26 +230,29 @@ fn header_spans(
     } else {
         Role::Success
     };
-    item(
-        &mut spans,
+    let mut left = vec![
+        vec![Span::styled(cwd.to_string(), theme.style(Role::Fg))],
         vec![Span::styled(data.git.label(), theme.style(git_role))],
-    );
+    ];
     if flags.profile && !data.profile.is_empty() {
-        item(
-            &mut spans,
-            vec![Span::styled(data.profile.clone(), theme.style(Role::Muted))],
-        );
+        left.push(vec![Span::styled(
+            data.profile.clone(),
+            theme.style(Role::Muted),
+        )]);
     }
+    if !data.trust {
+        left.push(vec![Span::styled("untrusted", theme.style(Role::Warning))]);
+    }
+
     let (model, model_role) = if data.logged_in {
         (data.model.clone(), Role::Assistant)
     } else {
         ("not logged in".to_string(), Role::Warning)
     };
-    item(
-        &mut spans,
+    let mut right = vec![
         vec![Span::styled(model, theme.bold(model_role))],
-    );
-    item(&mut spans, context_spans(data, compact_context, theme));
+        context_spans(data, flags.gauge, theme),
+    ];
     if flags.throughput {
         let mut speed = format!("{:.0} tok/s", data.tok_s.max(0.0));
         if flags.cache
@@ -255,48 +260,38 @@ fn header_spans(
         {
             speed.push_str(&format!(" · cache {cache}%"));
         }
-        item(
-            &mut spans,
-            vec![Span::styled(speed, theme.style(Role::Muted))],
-        );
+        right.push(vec![Span::styled(speed, theme.style(Role::Muted))]);
     }
     if flags.session && !data.session.is_empty() {
-        let trust_role = if data.trust {
-            Role::Success
-        } else {
-            Role::Warning
-        };
-        let trust = if data.trust { "trusted" } else { "untrusted" };
-        item(
-            &mut spans,
-            vec![
-                Span::styled(data.session.clone(), theme.style(Role::Muted)),
-                Span::raw(" "),
-                Span::styled(trust, theme.style(trust_role)),
-            ],
-        );
+        right.push(vec![Span::styled(
+            data.session.clone(),
+            theme.style(Role::Muted),
+        )]);
     }
-    spans
+    (join(left, theme), join(right, theme))
 }
 
-/// Build the one-line header for the given width.
+/// Build the one-line info bar for the given width: location on the left,
+/// model and context on the right.
 pub fn header_line(data: &HeaderData, width: usize, theme: &Theme) -> Line<'static> {
-    let compact_context = width < 80;
     let mut flags = HeaderFlags {
-        app: width >= 70,
         profile: width >= 70,
-        session: width >= 80,
+        session: width >= 90,
         throughput: width >= 100,
-        cache: width >= 100,
+        cache: width >= 110,
+        gauge: width >= 70,
     };
-    let mut cwd = display_cwd(&data.cwd);
-    let mut spans = header_spans(data, &cwd, &flags, compact_context, theme);
     let limit = width.max(1);
+    let mut cwd = display_cwd(&data.cwd);
+    let measure = |left: &[Span<'static>], right: &[Span<'static>]| {
+        // One leading space plus at least two between the sides.
+        1 + spans_width(left) + 2 + spans_width(right)
+    };
+    let (mut left, mut right) = header_sides(data, &cwd, &flags, theme);
 
-    // Drop optional items in the required order: cache, throughput, session,
-    // profile, then the app name. Working directory, model, and context
-    // always remain.
-    while spans_width(&spans) > limit {
+    // Drop optional items in order: cache, throughput, session, profile, and
+    // the gauge. Working directory, model, and context always remain.
+    while measure(&left, &right) > limit {
         if flags.cache {
             flags.cache = false;
         } else if flags.throughput {
@@ -305,21 +300,28 @@ pub fn header_line(data: &HeaderData, width: usize, theme: &Theme) -> Line<'stat
             flags.session = false;
         } else if flags.profile {
             flags.profile = false;
-        } else if flags.app {
-            flags.app = false;
+        } else if flags.gauge {
+            flags.gauge = false;
         } else {
             break;
         }
-        spans = header_spans(data, &cwd, &flags, compact_context, theme);
+        (left, right) = header_sides(data, &cwd, &flags, theme);
     }
 
     // Middle-truncate the working directory when everything else is required.
     let mut cwd_width = UnicodeWidthStr::width(cwd.as_str());
-    while spans_width(&spans) > limit && cwd_width > 4 {
+    while measure(&left, &right) > limit && cwd_width > 4 {
         cwd_width -= 1;
         cwd = middle_truncate(&display_cwd(&data.cwd), cwd_width);
-        spans = header_spans(data, &cwd, &flags, compact_context, theme);
+        (left, right) = header_sides(data, &cwd, &flags, theme);
     }
+    let gap = limit
+        .saturating_sub(1 + spans_width(&left) + spans_width(&right))
+        .max(2);
+    let mut spans = vec![Span::raw(" ")];
+    spans.extend(left);
+    spans.push(Span::raw(" ".repeat(gap)));
+    spans.extend(right);
     Line::from(spans)
 }
 
@@ -330,19 +332,21 @@ pub fn footer_line(data: &FooterData, width: usize, theme: &Theme) -> Line<'stat
         Some(notice) => (notice.as_str(), data.notice_role),
         None => (data.hints.as_str(), Role::Muted),
     };
+    let width = width.saturating_sub(2);
     let status_width = UnicodeWidthStr::width(data.status.as_str());
     let left_max = width.saturating_sub(status_width + 1);
     let left = clip_end(left, left_max.max(1));
     let left_width = UnicodeWidthStr::width(left.as_str());
     let padding = width.saturating_sub(left_width + status_width).max(1);
     let mut spans = vec![
+        Span::raw(" "),
         Span::styled(left, theme.style(left_role)),
         Span::raw(" ".repeat(padding)),
     ];
     if status_width <= width {
         spans.push(Span::styled(
             data.status.clone(),
-            theme.bold(data.status_role),
+            theme.style(data.status_role),
         ));
     }
     Line::from(spans)
@@ -376,19 +380,106 @@ pub struct ToolsModal {
     pub scroll: usize,
 }
 
+/// Model picker over the endpoint's (or gateway's) `/v1/models` list. Typing
+/// narrows the list with a case-insensitive substring filter.
+#[derive(Debug, Clone, Default)]
+pub struct ModelsModal {
+    pub items: Vec<String>,
+    pub current: String,
+    pub endpoint: String,
+    pub filter: String,
+    /// Index into [`ModelsModal::filtered`].
+    pub selected: usize,
+    pub scroll: usize,
+}
+
+impl ModelsModal {
+    pub fn new(items: Vec<String>, current: String, endpoint: String) -> Self {
+        let selected = items.iter().position(|item| item == &current).unwrap_or(0);
+        ModelsModal {
+            items,
+            current,
+            endpoint,
+            filter: String::new(),
+            selected,
+            scroll: 0,
+        }
+    }
+
+    pub fn filtered(&self) -> Vec<&str> {
+        let needle = self.filter.to_lowercase();
+        self.items
+            .iter()
+            .filter(|item| needle.is_empty() || item.to_lowercase().contains(&needle))
+            .map(String::as_str)
+            .collect()
+    }
+
+    pub fn selected_model(&self) -> Option<String> {
+        self.filtered()
+            .get(self.selected)
+            .map(|model| model.to_string())
+    }
+
+    pub fn move_by(&mut self, delta: isize) {
+        let count = self.filtered().len();
+        if count == 0 {
+            self.selected = 0;
+            return;
+        }
+        self.selected = (self.selected as isize + delta).clamp(0, count as isize - 1) as usize;
+    }
+
+    pub fn push_filter(&mut self, ch: char) {
+        self.filter.push(ch);
+        self.selected = 0;
+        self.scroll = 0;
+    }
+
+    pub fn pop_filter(&mut self) {
+        self.filter.pop();
+        self.selected = 0;
+        self.scroll = 0;
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum ModalData {
     Tree(TreeView),
     Sessions(SessionsModal),
     Tools(ToolsModal),
+    Models(ModelsModal),
 }
 
 impl ModalData {
-    pub fn title(&self) -> &'static str {
+    pub fn title(&self) -> String {
         match self {
-            ModalData::Tree(_) => " Session tree ",
-            ModalData::Sessions(_) => " Sessions ",
-            ModalData::Tools(_) => " Tools ",
+            ModalData::Tree(_) => " Session tree ".into(),
+            ModalData::Sessions(_) => " Sessions · Enter resume · Esc close ".into(),
+            ModalData::Tools(_) => " Tools ".into(),
+            ModalData::Models(view) => {
+                let shown = view.filtered().len();
+                let filter = if view.filter.is_empty() {
+                    "type to filter".to_string()
+                } else {
+                    format!("filter: {}", view.filter)
+                };
+                format!(
+                    " Models · {} · {shown}/{} · {filter} · Enter select · Esc close ",
+                    view.endpoint,
+                    view.items.len()
+                )
+            }
+        }
+    }
+
+    /// Number of rows the modal displays, for sizing the popup.
+    pub fn row_count(&self) -> usize {
+        match self {
+            ModalData::Tree(view) => view.rows.len(),
+            ModalData::Sessions(view) => view.items.len(),
+            ModalData::Tools(view) => view.items.len(),
+            ModalData::Models(view) => view.filtered().len().max(1),
         }
     }
 
@@ -397,6 +488,7 @@ impl ModalData {
             ModalData::Tree(view) => view.scroll,
             ModalData::Sessions(view) => view.scroll,
             ModalData::Tools(view) => view.scroll,
+            ModalData::Models(view) => view.scroll,
         }
     }
 
@@ -420,6 +512,16 @@ impl ModalData {
                 }
                 view.scroll = view.scroll.min(view.items.len().saturating_sub(height));
             }
+            ModalData::Models(view) => {
+                let count = view.filtered().len();
+                view.selected = view.selected.min(count.saturating_sub(1));
+                if view.selected < view.scroll {
+                    view.scroll = view.selected;
+                } else if view.selected >= view.scroll + height {
+                    view.scroll = view.selected + 1 - height;
+                }
+                view.scroll = view.scroll.min(count.saturating_sub(height));
+            }
         }
     }
 
@@ -429,6 +531,7 @@ impl ModalData {
             ModalData::Tree(view) => tree_lines(view, width, theme),
             ModalData::Sessions(view) => sessions_lines(view, width, theme),
             ModalData::Tools(view) => tools_lines(view, width, theme),
+            ModalData::Models(view) => models_lines(view, width, theme),
         }
     }
 }
@@ -515,6 +618,43 @@ pub fn sessions_lines(view: &SessionsModal, width: usize, theme: &Theme) -> Vec<
     }
     if lines.is_empty() {
         lines.push(Line::styled("(no sessions)", theme.style(Role::Muted)));
+    }
+    lines
+}
+
+pub fn models_lines(view: &ModelsModal, width: usize, theme: &Theme) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    for (index, model) in view.filtered().into_iter().enumerate() {
+        let current = model == view.current;
+        let mut spans = vec![
+            Span::styled(if current { "* " } else { "  " }, theme.bold(Role::Accent)),
+            Span::styled(
+                clip_end(model, width.saturating_sub(14).max(10)),
+                if current {
+                    theme.bold(Role::Fg)
+                } else {
+                    theme.style(Role::Fg)
+                },
+            ),
+        ];
+        if current {
+            spans.push(Span::styled("  (current)", theme.style(Role::Muted)));
+        }
+        let mut line = Line::from(spans);
+        if index == view.selected {
+            line = line.style(selected_style(theme));
+        }
+        lines.push(line);
+    }
+    if lines.is_empty() {
+        lines.push(Line::styled(
+            if view.items.is_empty() {
+                "(the endpoint reports no models)"
+            } else {
+                "(no models match the filter)"
+            },
+            theme.style(Role::Muted),
+        ));
     }
     lines
 }

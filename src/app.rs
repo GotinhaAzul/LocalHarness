@@ -9,7 +9,7 @@ use std::time::Duration;
 use anyhow::{Context as _, Result, bail};
 use tokio_util::sync::CancellationToken;
 
-use crate::agent::{Core, RunLimits, prompt};
+use crate::agent::{Core, RunLimits, WindowSource, prompt};
 use crate::config::Config;
 use crate::context::TokenBudget;
 use crate::external;
@@ -158,24 +158,10 @@ pub async fn create_runtime(
     config.model.model = model.clone();
     let probe_provider = OpenAiCompatProvider::new(&config.model, model.clone())?;
 
-    // Optional context probe only when no explicit context was configured.
     let (_, profile) = config.model_profile();
-    if !model.is_empty()
-        && profile.context_window.is_none()
-        && config.model.context_window.is_none()
-    {
-        let probed = tokio::time::timeout(
-            Duration::from_secs(3),
-            probe::probe_context_window(&probe_provider),
-        )
-        .await
-        .ok()
-        .flatten();
-        if let Some(window) = probed {
-            config.model.context_window = Some(window);
-        }
-    }
-    let context_window = config.context_window();
+    let window_cache: Arc<Mutex<std::collections::HashMap<String, u32>>> = Default::default();
+    let (context_window, window_source) =
+        resolve_window(&config, &probe_provider, None, &window_cache).await;
     let provider: Arc<dyn Provider> =
         Arc::new(OpenAiCompatProvider::new(&config.model, model.clone())?);
     warn_if_remote(&config.model.endpoint);
@@ -293,6 +279,9 @@ pub async fn create_runtime(
         tool_timeout: Duration::from_secs(660),
         path_jail: options.path_jail,
         server_window: Default::default(),
+        window_source,
+        detected_window: Default::default(),
+        window_cache,
     };
 
     Ok(Runtime {
@@ -311,6 +300,18 @@ pub async fn rebuild_core(old: &Arc<Core>, mut config: Config) -> Result<Arc<Cor
     };
     config.model.model = model.clone();
     let provider: Arc<dyn Provider> = Arc::new(OpenAiCompatProvider::new(&config.model, model)?);
+    // Same endpoint and model: keep the detected window and any truncation
+    // limit seen from the server instead of probing again.
+    let same_target = old.provider.model() == provider.model()
+        && old.config.model.endpoint == config.model.endpoint;
+    let reuse = same_target.then_some((old.budget.context_window, old.window_source));
+    let (context_window, window_source) =
+        resolve_window(&config, provider.as_ref(), reuse, &old.window_cache).await;
+    let (server_window, detected_window) = if same_target {
+        (old.server_window.clone(), old.detected_window.clone())
+    } else {
+        Default::default()
+    };
     let registry = ToolRegistry::builtin();
     let external_tools = external::load_tools(&old.paths, config.trust).unwrap_or_else(|err| {
         tracing::warn!(%err, "external tools were not loaded");
@@ -327,7 +328,11 @@ pub async fn rebuild_core(old: &Arc<Core>, mut config: Config) -> Result<Arc<Cor
     let system_prompt =
         prompt::build_system_prompt(&config, &old.paths, &skills, &tools, Some(&repo_brief));
     let (_, model_profile) = config.model_profile();
-    let budget = TokenBudget::new(config.context_window(), config.model.max_output_tokens);
+    let mut budget = TokenBudget::new(context_window, config.model.max_output_tokens);
+    if same_target {
+        // The tokenizer calibration only holds for the same model.
+        budget.chars_per_token = old.budget.chars_per_token;
+    }
     let limits = RunLimits::from(&config.budgets);
     Ok(Arc::new(Core {
         config,
@@ -348,8 +353,47 @@ pub async fn rebuild_core(old: &Arc<Core>, mut config: Config) -> Result<Arc<Cor
         cancel: old.cancel.clone(),
         tool_timeout: old.tool_timeout,
         path_jail: old.path_jail,
-        server_window: Default::default(),
+        server_window,
+        window_source,
+        detected_window,
+        window_cache: old.window_cache.clone(),
     }))
+}
+
+/// Context window for `provider`'s model: an explicit config or model-profile
+/// value, else a probe of the endpoint, else the default. `reuse` carries a
+/// previous probe for the same endpoint and model.
+async fn resolve_window(
+    config: &Config,
+    provider: &dyn Provider,
+    reuse: Option<(u32, WindowSource)>,
+    cache: &Mutex<std::collections::HashMap<String, u32>>,
+) -> (u32, WindowSource) {
+    let (_, profile) = config.model_profile();
+    if profile.context_window.is_some() || config.model.context_window.is_some() {
+        return (config.context_window(), WindowSource::Configured);
+    }
+    if let Some((window, source @ WindowSource::Probed(_))) = reuse {
+        return (window, source);
+    }
+    if provider.model().trim().is_empty() {
+        return (config.context_window(), WindowSource::Default);
+    }
+    let key = Core::window_key(&config.model.endpoint, provider.model());
+    if let Some(window) = cache.lock().ok().and_then(|cache| cache.get(&key).copied()) {
+        return (window, WindowSource::Probed(probe::WindowProbe::Remembered));
+    }
+    let probed = tokio::time::timeout(
+        Duration::from_secs(3),
+        probe::probe_context_window(provider),
+    )
+    .await
+    .ok()
+    .flatten();
+    match probed {
+        Some((window, how)) => (window, WindowSource::Probed(how)),
+        None => (config.context_window(), WindowSource::Default),
+    }
 }
 
 fn warn_if_remote(endpoint: &str) {
@@ -376,6 +420,111 @@ fn warn_if_remote(endpoint: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A LocalAI-style gateway: `/v1/models` without context sizes, no
+    /// `/props`, and llama.cpp `/slots` for whichever backend is loaded.
+    async fn gateway(n_ctx: u64) -> String {
+        use axum::routing::{get, post};
+        let models = || async {
+            axum::Json(serde_json::json!({"object": "list", "data": [
+                {"id": "spark26", "object": "model", "owned_by": "localai"},
+                {"id": "gemma", "object": "model", "owned_by": "localai"},
+            ]}))
+        };
+        let slots =
+            move || async move { axum::Json(serde_json::json!([{"id": 0, "n_ctx": n_ctx}])) };
+        let chat = || async {
+            let body = concat!(
+                "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"},\"finish_reason\":null}]}\n\n",
+                "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n"
+            );
+            (
+                [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                body,
+            )
+        };
+        let app = axum::Router::new()
+            .route("/v1/models", get(models))
+            .route("/slots", get(slots))
+            .route("/v1/chat/completions", post(chat));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{address}")
+    }
+
+    #[tokio::test]
+    async fn gateway_window_is_detected_after_the_first_reply_and_remembered() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("work");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let paths = Paths {
+            config_dir: dir.path().join("config"),
+            data_dir: dir.path().join("data"),
+            cwd,
+            project_id: "test".into(),
+            sessions_dir_override: None,
+        };
+        let mut config = Config::builtin();
+        config.model.endpoint = gateway(65_536).await;
+        config.model.model = "gemma".into();
+        let runtime = create_runtime(
+            config,
+            paths,
+            RuntimeOptions {
+                no_session: true,
+                ..RuntimeOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        // Several models behind the gateway: /slots is ambiguous at startup.
+        let core = runtime.core.clone();
+        assert_eq!(core.window_source, WindowSource::Default);
+        assert!(!core.effective_window().1.is_reliable());
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let outcome = crate::agent::spawn_turn(
+            core.clone(),
+            "hi".into(),
+            tx,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        let mut detected = None;
+        while let Ok(event) = rx.try_recv() {
+            if let crate::agent::AgentEvent::WindowDetected { window, .. } = event {
+                detected = Some(window);
+            }
+        }
+        assert_eq!(detected, Some(65_536));
+        let (window, source) = core.effective_window();
+        assert_eq!(window, 65_536);
+        assert!(source.is_reliable());
+
+        // Switching away and back reuses the detected window.
+        let mut other = core.config.clone();
+        other.model.model = "spark26".into();
+        let spark = rebuild_core(&core, other).await.unwrap();
+        assert_eq!(
+            spark.effective_window().0,
+            crate::config::DEFAULT_CONTEXT_WINDOW
+        );
+        let mut back = spark.config.clone();
+        back.model.model = "gemma".into();
+        let gemma = rebuild_core(&spark, back).await.unwrap();
+        assert_eq!(gemma.effective_window().0, 65_536);
+        assert_eq!(
+            gemma.window_source,
+            WindowSource::Probed(probe::WindowProbe::Remembered)
+        );
+    }
 
     #[tokio::test]
     async fn starts_without_a_model_when_the_endpoint_is_down() {

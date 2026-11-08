@@ -174,6 +174,30 @@ fn read_state(session: &Session) -> TodoState {
     TodoState { tasks, note }
 }
 
+/// Status of one plan step, for display.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanStatus {
+    Pending,
+    InProgress,
+    Completed,
+}
+
+/// The current plan on the session's active branch, for the UI.
+pub fn plan_snapshot(session: &Session) -> Vec<(String, PlanStatus)> {
+    read_state(session)
+        .tasks
+        .into_iter()
+        .map(|task| {
+            let status = match task.status {
+                TaskStatus::Pending => PlanStatus::Pending,
+                TaskStatus::InProgress => PlanStatus::InProgress,
+                TaskStatus::Completed => PlanStatus::Completed,
+            };
+            (task.content, status)
+        })
+        .collect()
+}
+
 fn state_details(state: &TodoState) -> Value {
     let mut entry = state.payload();
     entry.insert("kind".into(), json!("todo-state"));

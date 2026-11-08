@@ -18,8 +18,11 @@ The TUI shows `not logged in` and blocks turns until `/login` succeeds:
 `/login` probes `GET /v1/models`, rejects a model the endpoint does not list,
 and saves `endpoint`, `model`, and `api_key` to the global config. Re-login to a
 different endpoint without a model clears the old model and API key before
-auto-selecting. `/model` prints the endpoint's model list and switches with
-`/model <name>`; the switch lasts for the session.
+auto-selecting. `/model` opens a picker over every model the endpoint lists. Behind a gateway
+(LiteLLM, OpenRouter, a vLLM router) that is every connected model; type to
+filter, arrows to move, Enter to switch. `/model <name>` switches directly. The
+switch lasts for the session; `/login` saves a default. If the endpoint cannot
+list models, `/model` prints the error instead.
 
 If the endpoint does not implement `/v1/models`, set the connection manually in
 `~/.config/localharness/config.toml`, `--endpoint`/`--model`, or `LH_ENDPOINT`/

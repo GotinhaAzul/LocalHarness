@@ -302,6 +302,9 @@ fn render_event(event: AgentEvent, json: bool) -> Result<Option<TurnStatus>> {
             AgentEvent::Context { used, window } => {
                 json!({"type":"context","used":used,"window":window})
             }
+            AgentEvent::WindowDetected { window, source } => {
+                json!({"type":"window_detected","window":window,"source":source})
+            }
             AgentEvent::Compacted {
                 summary,
                 tokens_before,

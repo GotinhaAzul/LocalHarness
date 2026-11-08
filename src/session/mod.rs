@@ -56,7 +56,15 @@ impl Session {
         }
 
         paths.ensure_dirs()?;
-        let id = new_session_id();
+        // Ids are second-resolution plus the pid, so a second session created
+        // by this process within the same second (`/new`) takes a suffix.
+        let base = new_session_id();
+        let mut id = base.clone();
+        let mut suffix = 2;
+        while paths.session_file(&id).exists() {
+            id = format!("{base}-{suffix}");
+            suffix += 1;
+        }
         let path = paths.session_file(&id);
         let store = SessionStore::create(&path)
             .with_context(|| format!("cannot create session {}", path.display()))?;

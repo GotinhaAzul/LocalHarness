@@ -74,7 +74,12 @@ pub fn build_system_prompt(
 
     let index = skills.index_text();
     if !index.trim().is_empty() {
-        out.push_str("## Skills\n\nThese are available on request. The user can load one with /skill <name>.\n\n");
+        let can_load = tools.iter().any(|tool| tool.name() == "skill");
+        if can_load {
+            out.push_str("## Skills\n\nSkills are expert instructions for specific kinds of work. When a task matches a skill's description, load it with the skill tool before starting, then follow it. Load a skill once per conversation; its references only when needed. The user can also load one with /skill <name>.\n\n");
+        } else {
+            out.push_str("## Skills\n\nThese are available on request. The user can load one with /skill <name>.\n\n");
+        }
         out.push_str(&index);
         out.push('\n');
     }

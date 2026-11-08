@@ -25,9 +25,34 @@ Locations:
 - Project: `.harness/skills/<name>/SKILL.md` (requires trust)
 
 The system prompt carries a compact index of name, description, and when to use
-each skill. `/skill <name>` appends the full text to the conversation. Skills are
-data: they cannot grant security scope, load tools, or bypass a guard. Bundled
-`security-red` and `security-blue` include their reference documents inline.
+each skill. Write the `description` and `when` for the model: they are how it
+decides to load the skill.
+
+**The model loads skills itself** with the `skill` tool (core pack, read-only):
+
+| Call | Result |
+|---|---|
+| `{}` | the skill index |
+| `{"name": "security-blue"}` | the instructions plus a list of its references |
+| `{"name": "security-blue", "reference": "hardening"}` | one reference document |
+
+References load on demand, so a skill with large supporting documents costs
+little until they are needed. A skill already loaded since the last compaction
+is not sent again. Skill results are kept inline up to 24k characters instead
+of being archived like other tool output.
+
+**You load skills** with `/skill <name>`, which appends the instructions and
+every reference to the conversation at once.
+
+References are the other `.md` and `.txt` files in the skill directory (up to
+three levels deep, symlinks ignored), named by relative path, e.g.
+`references/rollback.md`. The model can ask for `references/rollback.md`,
+`rollback.md`, or `rollback`. Bundled `security-red` and `security-blue` embed
+theirs in the binary.
+
+Skills are data: they cannot grant security scope, load tools, or bypass a
+guard. Project skills load only in trusted sessions, for the tool and for
+`/skill` alike.
 
 ## Workflows
 

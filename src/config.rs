@@ -77,10 +77,15 @@ impl Config {
             "minimal".into(),
             ProfileConfig {
                 packs: vec![],
-                tools: vec!["read".into(), "bash".into(), "verify".into()],
+                tools: vec![
+                    "read".into(),
+                    "bash".into(),
+                    "verify".into(),
+                    "skill".into(),
+                ],
                 model_profile: None,
                 prompt: None,
-                description: Some("read, bash, verify".into()),
+                description: Some("read, bash, verify, skill".into()),
                 theme: None,
             },
         );
@@ -432,6 +437,9 @@ pub struct UiConfig {
     pub color_mode: ColorMode,
     pub show_reasoning: bool,
     pub show_token_counts: bool,
+    /// Capture the mouse so the wheel scrolls the conversation. Terminal text
+    /// selection then needs Shift (Option on macOS) held while dragging.
+    pub mouse: bool,
 }
 
 impl Default for UiConfig {
@@ -441,6 +449,7 @@ impl Default for UiConfig {
             color_mode: ColorMode::Auto,
             show_reasoning: false,
             show_token_counts: true,
+            mouse: true,
         }
     }
 }

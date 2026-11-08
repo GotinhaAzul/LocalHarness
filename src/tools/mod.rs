@@ -1,4 +1,4 @@
-//! Built-in tool surface: 23 static tools in three packs, plus the registry.
+//! Built-in tool surface: 24 static tools in three packs, plus the registry.
 
 pub mod attack_path;
 pub mod bash;
@@ -16,6 +16,7 @@ pub mod read;
 pub mod recall;
 pub mod repo_map;
 pub mod review;
+pub mod skill;
 pub mod surface;
 pub mod test;
 pub mod thread;
@@ -242,6 +243,12 @@ pub trait Tool: Send + Sync {
     fn read_only(&self) -> bool {
         false
     }
+    /// Character limit before this tool's result is archived instead of kept
+    /// inline. `None` uses the harness default; instructions the model asked
+    /// for (skills) must arrive whole.
+    fn result_cap(&self) -> Option<usize> {
+        None
+    }
     /// Whether runs of this tool append an engagement evidence entry.
     fn evidence_enabled(&self) -> bool {
         false
@@ -312,6 +319,7 @@ impl ToolRegistry {
             Arc::new(grep::GrepTool),
             Arc::new(glob::GlobTool),
             Arc::new(todo::TodoTool),
+            Arc::new(skill::SkillTool),
             Arc::new(verify::VerifyTool),
             Arc::new(recall::RecallTool),
             Arc::new(thread::ThreadTool),
@@ -489,7 +497,7 @@ mod tests {
         let registry = ToolRegistry::builtin();
         assert_eq!(
             registry.names().len(),
-            23,
+            24,
             "update docs when the built-in surface changes: {:?}",
             registry.names()
         );

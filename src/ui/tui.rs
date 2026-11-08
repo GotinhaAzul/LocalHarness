@@ -11,8 +11,8 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{
-    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
 };
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
@@ -31,25 +31,29 @@ use crate::git::{self, GitStatus};
 use crate::provider::{OpenAiCompatProvider, probe};
 use crate::session::{CompactionData, Entry, EntryKind, UserData};
 use crate::skills::SkillIndex;
+use crate::tools::todo::{PlanStatus, plan_snapshot};
 use crate::ui::UiOptions;
 use crate::ui::input::InputState;
-use crate::ui::render::{self, Transcript};
+use crate::ui::render::{self, ActivityData, Transcript};
 use crate::ui::theme::{Role, Theme};
 use crate::ui::tree::TreeView;
 use crate::ui::widgets::{
-    FooterData, HeaderData, ModalData, SessionItem, SessionsModal, ToolItem, ToolsModal, clip_end,
+    FooterData, HeaderData, ModalData, ModelsModal, SessionItem, SessionsModal, ToolItem,
+    ToolsModal, clip_end,
 };
 
 /// Slash commands with one-line descriptions for the completion popup.
 pub const COMMANDS: &[(&str, &str)] = &[
     ("help", "list commands and key bindings"),
     ("quit", "exit LocalHarness"),
-    ("model", "list or switch models on the endpoint"),
+    ("model", "pick a model from the endpoint or gateway"),
     ("login", "configure the endpoint, model, and API key"),
     ("profile", "switch the tool profile"),
     ("theme", "list, apply, or save a theme"),
     ("tree", "browse and checkout the session tree"),
     ("fork", "checkout the latest assistant step"),
+    ("new", "start a fresh session"),
+    ("resume", "resume a previous session"),
     ("sessions", "list and switch sessions"),
     ("compact", "append a deterministic compaction"),
     ("tools", "show the active tools"),
@@ -64,12 +68,40 @@ pub const COMMANDS: &[(&str, &str)] = &[
 
 const HELP: &str = "\
 Commands: /help /quit /login [endpoint] [model] [api-key] /model [name]
-/profile <name> /theme [name|save] /tree /fork /sessions /compact /tools
+/profile <name> /theme [name|save] /tree /fork /new /resume [id] /sessions
+/compact /tools
 /skill <name> /workflow <name> /sec ... /trust [confirm] /export [path]
 /clear /debug
 
-Keys: Enter send · Ctrl+J newline · Esc cancel · Ctrl+R reasoning
-PgUp/PgDn scroll · Home/End scroll when the prompt is empty · Ctrl+C quit";
+Keys: Enter send · Shift+Enter / Ctrl+J newline · Esc interrupt
+Ctrl+R show thinking · Ctrl+O expand tool output · Ctrl+T toggle the plan
+Scroll: mouse wheel · PgUp/PgDn half page · Shift+Up/Down one line
+Home/End top and bottom (prompt empty) · Ctrl+Home/End anytime · Ctrl+C quit
+Hold Shift while dragging to select text ([ui] mouse = false disables
+mouse capture).";
+
+/// Footer hints while idle.
+const HINTS: &str = "enter send · ⇧enter newline · / commands · wheel/pgup scroll · ctrl+r thinking · ctrl+o output";
+
+/// Lines per mouse-wheel notch.
+const WHEEL_LINES: usize = 3;
+
+const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// What the model stream is producing right now, for the activity line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamPhase {
+    Waiting,
+    Thinking,
+    Writing,
+}
+
+struct RunningTool {
+    call_id: String,
+    name: String,
+    summary: String,
+    started: Instant,
+}
 
 const LOGIN_HINT: &str = "\
 No model is selected, so turns are disabled.
@@ -97,18 +129,33 @@ fn restore_terminal() {
     if TERMINAL_ACTIVE.swap(false, Ordering::SeqCst) {
         let _ = disable_raw_mode();
         let mut out = std::io::stdout();
-        let _ = execute!(out, LeaveAlternateScreen, DisableBracketedPaste);
+        let _ = execute!(
+            out,
+            DisableMouseCapture,
+            LeaveAlternateScreen,
+            DisableBracketedPaste
+        );
     }
 }
 
 struct TerminalGuard;
 
 impl TerminalGuard {
-    fn enter() -> Result<Self> {
+    fn enter(mouse: bool) -> Result<Self> {
         install_panic_hook();
         enable_raw_mode().context("cannot enable raw mode")?;
         let mut out = std::io::stdout();
-        if let Err(error) = execute!(out, EnterAlternateScreen, EnableBracketedPaste) {
+        let entered = if mouse {
+            execute!(
+                out,
+                EnterAlternateScreen,
+                EnableBracketedPaste,
+                EnableMouseCapture
+            )
+        } else {
+            execute!(out, EnterAlternateScreen, EnableBracketedPaste)
+        };
+        if let Err(error) = entered {
             let _ = disable_raw_mode();
             return Err(error).context("cannot enter the alternate screen");
         }
@@ -137,7 +184,7 @@ struct WorkflowFile {
 
 pub async fn run(runtime: Runtime, options: UiOptions) -> Result<()> {
     let mut app = App::new(runtime, options)?;
-    let _guard = TerminalGuard::enter()?;
+    let _guard = TerminalGuard::enter(app.config.ui.mouse)?;
     let backend = CrosstermBackend::new(std::io::stdout());
     let mut terminal = Terminal::new(backend).context("cannot initialize the terminal")?;
     // Some terminals (and piped PTYs) cannot answer a cursor-position query;
@@ -267,6 +314,12 @@ struct App {
     floor_seq: u64,
     spinner: usize,
     last_width: usize,
+    turn_started: Option<Instant>,
+    stream_phase: StreamPhase,
+    running_tools: Vec<RunningTool>,
+    /// The agent's `todo` plan on the active branch.
+    plan: Vec<(String, PlanStatus)>,
+    show_plan: bool,
 }
 
 impl App {
@@ -288,7 +341,7 @@ impl App {
             Err(poison) => poison.into_inner().warnings.clone(),
         };
         let used = estimate_used(&runtime.core);
-        let window = runtime.core.budget.context_window;
+        let window = runtime.core.effective_window().0;
         let trust = config.trust || options.trust;
         let header = HeaderData {
             cwd: paths.cwd.display().to_string(),
@@ -303,6 +356,7 @@ impl App {
             cache: None,
             session: short_session_id(&session_id),
             trust,
+            window_guess: !runtime.core.effective_window().1.is_reliable(),
         };
         let mut app = App {
             runtime: Some(runtime),
@@ -333,6 +387,11 @@ impl App {
             floor_seq: 0,
             spinner: 0,
             last_width: 0,
+            turn_started: None,
+            stream_phase: StreamPhase::Waiting,
+            running_tools: Vec::new(),
+            plan: Vec::new(),
+            show_plan: true,
         };
         app.no_color = app.options.no_color;
         app.transcript = Transcript::new(app.config.ui.show_reasoning);
@@ -342,7 +401,7 @@ impl App {
         }
         if !app.header.trust {
             app.set_notice(
-                "untrusted: project .harness config, skills, workflows, and tools are ignored (restart with --trust)",
+                "untrusted: project config, skills, workflows, and tools are off · restart with --trust",
                 Role::Warning,
             );
         }
@@ -377,6 +436,7 @@ impl App {
                 Err(poison) => poison.into_inner(),
             };
             let _ = session.fsync();
+            self.plan = plan_snapshot(&session);
             render::blocks_from_session_after(&session, self.floor_seq)
         };
         self.transcript.set_session(blocks);
@@ -384,6 +444,49 @@ impl App {
         self.header.used = self.used_tokens;
         self.header.window = self.window;
         self.header.completion = self.completion_tokens;
+        self.sync_banner();
+    }
+
+    /// Refresh the welcome card and the context-window confidence marker.
+    fn sync_banner(&mut self) {
+        let Some(runtime) = &self.runtime else {
+            return;
+        };
+        let core = &runtime.core;
+        let (window_size, source) = core.effective_window();
+        self.header.window_guess = !source.is_reliable();
+        let model = if core.logged_in() {
+            (core.provider.model().to_string(), false)
+        } else {
+            ("not logged in · run /login".to_string(), true)
+        };
+        let window = format!(
+            "{} · {}",
+            crate::ui::widgets::format_tokens(window_size),
+            source.label()
+        );
+        let session = match runtime.session.lock() {
+            Ok(session) => session.id.clone(),
+            Err(poison) => poison.into_inner().id.clone(),
+        };
+        let rows = vec![
+            ("model".to_string(), model.0, model.1),
+            ("context".to_string(), window, !source.is_reliable()),
+            (
+                "cwd".to_string(),
+                crate::ui::widgets::display_cwd(&core.paths.cwd.display().to_string()),
+                false,
+            ),
+            ("session".to_string(), session, false),
+        ];
+        self.transcript.set_banner(Some(render::Block {
+            kind: render::BlockKind::Banner {
+                title: format!("LocalHarness {}", env!("CARGO_PKG_VERSION")),
+                rows,
+                hint: "/help commands · /model switch model · /resume past sessions".into(),
+            },
+            ts: None,
+        }));
     }
 
     fn update_from_core(&mut self) {
@@ -396,7 +499,7 @@ impl App {
         self.header.logged_in = runtime.core.logged_in();
         self.header.profile = self.config.profile_name().to_string();
         self.header.trust = self.config.trust || self.options.trust;
-        self.window = runtime.core.budget.context_window;
+        self.window = runtime.core.effective_window().0;
         self.header.window = self.window;
         self.header.cwd = runtime.core.paths.cwd.display().to_string();
         if let Ok(session) = runtime.session.lock() {
@@ -404,6 +507,7 @@ impl App {
         }
         self.used_tokens = estimate_used(&runtime.core);
         self.header.used = self.used_tokens;
+        self.sync_banner();
     }
 
     fn apply_git(&mut self, status: GitStatus) {
@@ -418,10 +522,23 @@ impl App {
         } else {
             Vec::new()
         };
-        let rects = render::split(
+        let activity = self.activity();
+        let plan = self.visible_plan();
+        let busy = self.turn_active;
+        self.input.set_placeholder(if busy {
+            "the agent is working · esc to interrupt"
+        } else {
+            "ask anything, or / for commands"
+        });
+        let text_width = size.width.saturating_sub(render::PROMPT_WIDTH + 1) as usize;
+        let rects = render::split_with(
             Rect::new(0, 0, size.width, size.height),
-            self.input.textarea.lines().len(),
-            debug_lines.len(),
+            render::LayoutSpec {
+                input_lines: self.input.visual_rows(text_width),
+                debug_lines: debug_lines.len(),
+                activity: activity.is_some(),
+                plan_rows: render::plan_rows(&plan),
+            },
         );
         self.transcript
             .set_viewport(rects.transcript.height as usize);
@@ -429,6 +546,8 @@ impl App {
         self.transcript
             .prepare(self.last_width, &self.theme, show_reasoning, false);
         self.input.apply_theme(&self.theme);
+        self.input
+            .fit_viewport(text_width as u16, rects.input.height.saturating_sub(2));
 
         let completions = self.input.completions(COMMANDS);
         let completion_index = self
@@ -452,6 +571,9 @@ impl App {
                     completions: completions.clone(),
                     completion_index,
                     modal,
+                    activity: activity.clone(),
+                    plan: plan.clone(),
+                    busy,
                 };
                 render::draw(frame, &scene, &self.theme);
             })
@@ -460,25 +582,15 @@ impl App {
     }
 
     fn footer(&self) -> FooterData {
-        let (status, status_role) = if self.cancelling {
-            ("cancelling".to_string(), Role::Warning)
+        // Login and trust state live in the info bar; the footer is hints or
+        // a transient notice only.
+        let (status, status_role) = (String::new(), Role::Muted);
+        let hints = if !self.transcript.follow {
+            "End or Ctrl+End to return to the bottom · wheel/pgup/pgdn scroll".to_string()
         } else if self.turn_active {
-            (
-                format!("streaming · {}", state_label(self.turn_state)),
-                Role::Accent,
-            )
-        } else if !self.header.logged_in {
-            ("not logged in".to_string(), Role::Warning)
-        } else if self.header.trust {
-            ("trusted".to_string(), Role::Success)
+            "esc interrupt · ctrl+o tool output · wheel/pgup scroll".to_string()
         } else {
-            ("untrusted".to_string(), Role::Warning)
-        };
-        let hints = if self.transcript.new_output {
-            "↓ new output · End to follow".to_string()
-        } else {
-            "Enter send · Ctrl+J newline · Esc cancel · PgUp/PgDn scroll · Ctrl+R reasoning · Ctrl+C quit"
-                .to_string()
+            HINTS.to_string()
         };
         let (notice, notice_role) = match &self.notice {
             Some((text, role, _)) => (Some(text.clone()), *role),
@@ -490,6 +602,97 @@ impl App {
             status_role,
             notice,
             notice_role,
+        }
+    }
+
+    /// The live status line: what the agent is doing right now.
+    fn activity(&self) -> Option<ActivityData> {
+        if !self.turn_active {
+            return None;
+        }
+        let spinner = SPINNER[self.spinner % SPINNER.len()];
+        let elapsed = self
+            .turn_started
+            .map(|at| at.elapsed().as_secs())
+            .unwrap_or(0);
+        let mut meta = vec![render::elapsed_label(elapsed)];
+        if self.completion_tokens > 0 {
+            meta.push(format!(
+                "↓ {} tokens",
+                crate::ui::widgets::format_tokens(self.completion_tokens)
+            ));
+        }
+        if self.cancelling {
+            meta.push("ctrl+c to force quit".into());
+            return Some(ActivityData {
+                spinner,
+                label: "Interrupting…".into(),
+                detail: String::new(),
+                meta: meta.join(" · "),
+                role: Role::Warning,
+            });
+        }
+        meta.push("esc to interrupt".into());
+        let (label, detail) = match (self.turn_state, self.running_tools.as_slice()) {
+            (_, [tool]) => (
+                format!("Running {}", tool.name),
+                format!(
+                    "· {} ({})",
+                    tool.summary,
+                    render::elapsed_label(tool.started.elapsed().as_secs())
+                ),
+            ),
+            (_, [_, ..]) => (
+                format!("Running {} tools", self.running_tools.len()),
+                format!(
+                    "· {}",
+                    self.running_tools
+                        .iter()
+                        .map(|tool| tool.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            ),
+            (Some(AgentState::StreamModel), []) => match self.stream_phase {
+                StreamPhase::Waiting => ("Waiting for the model…".into(), String::new()),
+                StreamPhase::Thinking => ("Thinking…".into(), String::new()),
+                StreamPhase::Writing => ("Writing…".into(), String::new()),
+            },
+            (Some(AgentState::Compact), []) => ("Compacting context…".into(), String::new()),
+            (Some(AgentState::ToolBatch), []) => ("Running tools…".into(), String::new()),
+            (Some(AgentState::PostTool), []) => ("Reading tool results…".into(), String::new()),
+            (Some(AgentState::SettleGates), []) => ("Verifying…".into(), String::new()),
+            _ => ("Preparing context…".into(), String::new()),
+        };
+        Some(ActivityData {
+            spinner,
+            label,
+            detail,
+            meta: meta.join(" · "),
+            role: Role::Accent,
+        })
+    }
+
+    /// The plan shows while there is open work, or during a turn.
+    fn visible_plan(&self) -> Vec<(String, PlanStatus)> {
+        let open = self
+            .plan
+            .iter()
+            .any(|(_, status)| *status != PlanStatus::Completed);
+        if self.show_plan && (open || self.turn_active) {
+            self.plan.clone()
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn refresh_plan(&mut self) {
+        if let Some(runtime) = &self.runtime {
+            let session = match runtime.session.lock() {
+                Ok(session) => session,
+                Err(poison) => poison.into_inner(),
+            };
+            self.plan = plan_snapshot(&session);
         }
     }
 
@@ -541,9 +744,11 @@ impl App {
                     .unwrap_or_else(|| "no timings yet".into()),
             ),
             format!(
-                "provider {} · model {}",
+                "provider {} · model {} · window {} ({})",
                 self.config.model.endpoint,
                 runtime.core.provider.model(),
+                runtime.core.effective_window().0,
+                runtime.core.effective_window().1.label(),
             ),
             format!(
                 "profile {} · trust {} · theme {}",
@@ -561,7 +766,7 @@ impl App {
     }
 
     fn on_tick(&mut self) {
-        self.spinner = (self.spinner + 1) % 4;
+        self.spinner = (self.spinner + 1) % SPINNER.len();
         if let Some((_, _, at)) = &self.notice
             && at.elapsed() > Duration::from_secs(8)
         {
@@ -623,6 +828,9 @@ impl App {
         self.turn_active = true;
         self.cancelling = false;
         self.turn_state = Some(AgentState::AssembleContext);
+        self.turn_started = Some(Instant::now());
+        self.stream_phase = StreamPhase::Waiting;
+        self.running_tools.clear();
         self.completion_tokens = 0;
         self.tok_s = 0.0;
         self.token_events.clear();
@@ -640,13 +848,14 @@ impl App {
         }
         self.cancelling = true;
         self.turn_cancel.cancel();
-        self.set_notice("cancelling…", Role::Warning);
     }
 
     fn finish_turn(&mut self, outcome: Option<TurnOutcome>) {
         self.turn_active = false;
         self.cancelling = false;
         self.turn_state = None;
+        self.turn_started = None;
+        self.running_tools.clear();
         self.agent_rx = None;
         self.agent_task = None;
         self.transcript.finish_turn();
@@ -701,17 +910,24 @@ impl App {
                 self.turn_state = Some(AgentState::AssembleContext);
             }
             AgentEvent::State(state) => {
+                if state == AgentState::StreamModel && self.turn_state != Some(state) {
+                    self.stream_phase = StreamPhase::Waiting;
+                }
                 self.turn_state = Some(state);
             }
             AgentEvent::TextDelta(text) => {
                 let tokens = (text.chars().count() as u64).div_ceil(4).max(1);
                 self.record_tokens(tokens);
                 self.completion_tokens = self.completion_tokens.saturating_add(tokens as u32);
+                self.stream_phase = StreamPhase::Writing;
                 self.transcript.text_delta(&text);
             }
             AgentEvent::ReasoningDelta(text) => {
                 let tokens = (text.chars().count() as u64).div_ceil(4).max(1);
                 self.record_tokens(tokens);
+                if self.stream_phase == StreamPhase::Waiting {
+                    self.stream_phase = StreamPhase::Thinking;
+                }
                 self.transcript.reasoning_delta(&text);
             }
             AgentEvent::ToolStarted {
@@ -721,6 +937,12 @@ impl App {
             } => {
                 self.turn_state = Some(AgentState::ToolBatch);
                 self.transcript.tool_started(&call_id, &name, &summary);
+                self.running_tools.push(RunningTool {
+                    call_id,
+                    name,
+                    summary,
+                    started: Instant::now(),
+                });
             }
             AgentEvent::ToolFinished {
                 call_id,
@@ -738,6 +960,10 @@ impl App {
                     &preview,
                     artifact,
                 );
+                self.running_tools.retain(|tool| tool.call_id != call_id);
+                if name == "todo" {
+                    self.refresh_plan();
+                }
             }
             AgentEvent::Usage(usage) => {
                 if usage.prompt_tokens > 0 {
@@ -756,6 +982,19 @@ impl App {
                 self.window = window;
                 self.header.used = used;
                 self.header.window = window;
+            }
+            AgentEvent::WindowDetected { window, source } => {
+                self.window = window;
+                self.header.window = window;
+                self.header.window_guess = false;
+                self.sync_banner();
+                self.set_notice(
+                    format!(
+                        "context window: {} ({source})",
+                        crate::ui::widgets::format_tokens(window)
+                    ),
+                    Role::Success,
+                );
             }
             AgentEvent::Compacted {
                 summary,
@@ -802,7 +1041,19 @@ impl App {
         match event {
             Event::Key(key) => self.handle_key(key).await,
             Event::Paste(text) => self.input.insert_text(&text),
+            Event::Mouse(mouse) => self.handle_mouse(mouse),
             Event::Resize(_, _) => {}
+            _ => {}
+        }
+    }
+
+    fn handle_mouse(&mut self, mouse: MouseEvent) {
+        if self.modal.is_some() {
+            return;
+        }
+        match mouse.kind {
+            MouseEventKind::ScrollUp => self.transcript.scroll_up(WHEEL_LINES),
+            MouseEventKind::ScrollDown => self.transcript.scroll_down(WHEEL_LINES),
             _ => {}
         }
     }
@@ -852,6 +1103,32 @@ impl App {
             return;
         }
 
+        if ctrl && matches!(key.code, KeyCode::Char('o') | KeyCode::Char('O')) {
+            let expand = !self.transcript.expand_tools();
+            self.transcript.set_expand_tools(expand);
+            self.set_notice(
+                if expand {
+                    "tool output expanded"
+                } else {
+                    "tool output collapsed"
+                },
+                Role::Muted,
+            );
+            return;
+        }
+        if ctrl && matches!(key.code, KeyCode::Char('t') | KeyCode::Char('T')) {
+            self.show_plan = !self.show_plan;
+            self.set_notice(
+                if self.show_plan {
+                    "plan shown"
+                } else {
+                    "plan hidden"
+                },
+                Role::Muted,
+            );
+            return;
+        }
+
         match key.code {
             KeyCode::Esc => {
                 if self.turn_active {
@@ -860,18 +1137,27 @@ impl App {
                 return;
             }
             KeyCode::PageUp => {
-                self.transcript.scroll_up(8);
+                self.transcript.scroll_up(self.transcript.page());
                 return;
             }
             KeyCode::PageDown => {
-                self.transcript.scroll_down(8);
+                self.transcript.scroll_down(self.transcript.page());
                 return;
             }
-            KeyCode::Home => {
+            KeyCode::Up if shift => {
+                self.transcript.scroll_up(1);
+                return;
+            }
+            KeyCode::Down if shift => {
+                self.transcript.scroll_down(1);
+                return;
+            }
+            // Home/End edit the prompt when it has text; Ctrl always scrolls.
+            KeyCode::Home if ctrl || self.input.is_empty() => {
                 self.transcript.scroll_home();
                 return;
             }
-            KeyCode::End => {
+            KeyCode::End if ctrl || self.input.is_empty() => {
                 self.transcript.scroll_end();
                 return;
             }
@@ -964,6 +1250,7 @@ impl App {
         let mut target: Option<String> = None;
         let mut focus_input = false;
         let mut switch: Option<PathBuf> = None;
+        let mut pick_model: Option<String> = None;
 
         match &mut modal {
             ModalData::Tree(view) => match key.code {
@@ -1026,6 +1313,25 @@ impl App {
                 }
                 _ => {}
             },
+            // Letters feed the filter, so navigation is arrows/PgUp/PgDn only.
+            ModalData::Models(view) => match key.code {
+                KeyCode::Esc => close = true,
+                KeyCode::Up => view.move_by(-1),
+                KeyCode::Down => view.move_by(1),
+                KeyCode::PageUp => view.move_by(-15),
+                KeyCode::PageDown => view.move_by(15),
+                KeyCode::Home => view.move_by(isize::MIN / 2),
+                KeyCode::End => view.move_by(isize::MAX / 2),
+                KeyCode::Backspace => view.pop_filter(),
+                KeyCode::Enter => pick_model = view.selected_model(),
+                KeyCode::Char(ch)
+                    if !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key.modifiers.contains(KeyModifiers::ALT) =>
+                {
+                    view.push_filter(ch);
+                }
+                _ => {}
+            },
         }
 
         if let Some(target) = target {
@@ -1048,6 +1354,12 @@ impl App {
         if let Some(path) = switch {
             self.modal = None;
             self.switch_session(path).await;
+            return;
+        }
+
+        if let Some(model) = pick_model {
+            self.modal = None;
+            self.switch_model(&model).await;
             return;
         }
 
@@ -1083,6 +1395,8 @@ impl App {
             "theme" => self.command_theme(rest),
             "tree" => self.command_tree(),
             "fork" => self.command_fork(),
+            "new" => self.command_new().await,
+            "resume" => self.command_resume(rest).await,
             "sessions" => self.command_sessions(),
             "compact" => self.command_compact(),
             "tools" => self.command_tools(),
@@ -1130,6 +1444,25 @@ impl App {
                 return;
             };
             let current = core.provider.model().to_string();
+            // An interactive picker when the endpoint (or a gateway in front
+            // of several engines) lists models; the text listing otherwise.
+            if let Ok(models) = probe_endpoint_models(&core.config.model).await
+                && !models.is_empty()
+            {
+                let current = if core.logged_in() {
+                    current
+                } else {
+                    String::new()
+                };
+                let mut modal = ModalData::Models(ModelsModal::new(
+                    models,
+                    current,
+                    core.config.model.endpoint.clone(),
+                ));
+                modal.ensure_visible(15);
+                self.modal = Some(modal);
+                return;
+            }
             let mut lines = vec![
                 format!("endpoint: {}", core.config.model.endpoint),
                 format!(
@@ -1171,6 +1504,18 @@ impl App {
             self.set_notice("usage: /model <name>", Role::Error);
             return;
         }
+        self.switch_model(name).await;
+    }
+
+    /// Switch the active model for this session; the saved config is untouched.
+    async fn switch_model(&mut self, name: &str) {
+        if self
+            .core()
+            .is_some_and(|core| core.logged_in() && core.provider.model() == name)
+        {
+            self.set_notice(format!("model: {name} (unchanged)"), Role::Muted);
+            return;
+        }
         let previous = self.config.clone();
         self.config.model.model = name.to_string();
         let config = self.config.clone();
@@ -1179,7 +1524,17 @@ impl App {
             self.set_notice(format!("model change failed: {error}"), Role::Error);
             return;
         }
-        self.set_notice(format!("model: {name}"), Role::Success);
+        let window = self
+            .core()
+            .map(|core| {
+                format!(
+                    " · context {} ({})",
+                    crate::ui::widgets::format_tokens(core.effective_window().0),
+                    core.effective_window().1.label()
+                )
+            })
+            .unwrap_or_default();
+        self.set_notice(format!("model: {name}{window}"), Role::Success);
     }
 
     async fn command_login(&mut self, rest: &str) {
@@ -1371,10 +1726,11 @@ impl App {
         self.header.logged_in = core.logged_in();
         self.header.profile = self.config.profile_name().to_string();
         self.header.trust = self.config.trust || self.options.trust;
-        self.window = core.budget.context_window;
+        self.window = core.effective_window().0;
         self.header.window = self.window;
         self.used_tokens = estimate_used(&core);
         self.header.used = self.used_tokens;
+        self.sync_banner();
         Ok(())
     }
 
@@ -1478,6 +1834,64 @@ impl App {
         }
     }
 
+    async fn command_new(&mut self) {
+        let Some(runtime) = &self.runtime else {
+            return;
+        };
+        let empty = match runtime.session.lock() {
+            Ok(session) => session.tree.entries().len() <= 1,
+            Err(poison) => poison.into_inner().tree.entries().len() <= 1,
+        };
+        if empty {
+            self.set_notice("already in a fresh session", Role::Muted);
+            return;
+        }
+        self.open_session(None).await;
+    }
+
+    async fn command_resume(&mut self, argument: &str) {
+        let Some(runtime) = &self.runtime else {
+            return;
+        };
+        let current = match runtime.session.lock() {
+            Ok(session) => session.path.clone(),
+            Err(poison) => poison.into_inner().path.clone(),
+        };
+        let Some(current) = current else {
+            self.set_notice("sessions are disabled (--no-session)", Role::Warning);
+            return;
+        };
+        let items: Vec<SessionItem> = scan_sessions(&runtime.core.paths)
+            .into_iter()
+            .filter(|item| item.path != current)
+            .collect();
+        if items.is_empty() {
+            self.set_notice("no other sessions to resume for this project", Role::Muted);
+            return;
+        }
+        let argument = argument.trim();
+        if argument.is_empty() {
+            self.modal = Some(ModalData::Sessions(SessionsModal {
+                items,
+                selected: 0,
+                scroll: 0,
+            }));
+            return;
+        }
+        let path = if argument == "last" {
+            Ok(items[0].path.clone())
+        } else {
+            match_session(&items, argument)
+        };
+        match path {
+            Ok(path) => self.switch_session(path).await,
+            Err(message) => {
+                self.transcript.push_note("resume", message, true);
+                self.set_notice(format!("no session matches {argument:?}"), Role::Error);
+            }
+        }
+    }
+
     fn command_sessions(&mut self) {
         let Some(runtime) = &self.runtime else {
             return;
@@ -1578,7 +1992,11 @@ impl App {
             );
             return;
         };
-        let content = format!("[skill: {}]\n\n{}", skill.name, skill.full_text());
+        let content = format!(
+            "{}\n\n{}",
+            crate::tools::skill::skill_marker(&skill.name),
+            skill.full_text()
+        );
         let result = {
             let mut session = match runtime.session.lock() {
                 Ok(session) => session,
@@ -1766,7 +2184,11 @@ impl App {
             if result.is_ok() {
                 for skill_name in &workflow.skills {
                     if let Some(skill) = skills.get(skill_name) {
-                        let content = format!("[skill: {}]\n\n{}", skill.name, skill.full_text());
+                        let content = format!(
+                            "{}\n\n{}",
+                            crate::tools::skill::skill_marker(&skill.name),
+                            skill.full_text()
+                        );
                         if let Err(error) = session.append(EntryKind::User(UserData { content })) {
                             result = Err(error);
                             break;
@@ -2012,7 +2434,7 @@ impl App {
         self.options.skills = SkillIndex::load(&paths, true);
         self.header.trust = true;
         self.header.profile = self.config.profile_name().to_string();
-        self.window = core.budget.context_window;
+        self.window = core.effective_window().0;
         self.header.window = self.window;
         self.used_tokens = estimate_used(&core);
         self.header.used = self.used_tokens;
@@ -2105,6 +2527,12 @@ impl App {
     }
 
     async fn switch_session(&mut self, path: PathBuf) {
+        self.open_session(Some(path)).await;
+    }
+
+    /// Replace the runtime with one on `target`, or on a fresh session when
+    /// `target` is `None`. On failure the previous session is reopened.
+    async fn open_session(&mut self, target: Option<PathBuf>) {
         if self.turn_active {
             self.set_notice(
                 "cancel the running turn before switching sessions",
@@ -2126,25 +2554,37 @@ impl App {
             Ok(session) => session.path.clone(),
             Err(poison) => poison.into_inner().path.clone(),
         };
-        let Some(old_resume) = old_resume else {
+        // An ephemeral (--no-session) run can start a new ephemeral session,
+        // but cannot resume one from disk.
+        let ephemeral = old_resume.is_none();
+        if ephemeral && target.is_some() {
             self.set_notice("sessions are disabled (--no-session)", Role::Warning);
             return;
-        };
+        }
+        if let Some(runtime) = &self.runtime
+            && let Ok(mut session) = runtime.session.lock()
+        {
+            let _ = session.fsync();
+        }
         let old = self.runtime.take();
         drop(old);
 
         let options = RuntimeOptions {
             path_jail,
             engagement: engagement.clone(),
-            no_session: false,
-            resume: Some(path.clone()),
+            no_session: ephemeral,
+            resume: target.clone(),
             continue_last: false,
         };
         match app::create_runtime(config.clone(), paths.clone(), options).await {
             Ok(runtime) => {
                 self.runtime = Some(runtime);
                 self.after_session_switch();
-                self.set_notice(format!("session: {}", path.display()), Role::Success);
+                let notice = match &target {
+                    Some(path) => format!("session: {}", path.display()),
+                    None => format!("new session {}", self.header.session),
+                };
+                self.set_notice(notice, Role::Success);
             }
             Err(error) => {
                 self.set_notice(
@@ -2154,8 +2594,8 @@ impl App {
                 let options = RuntimeOptions {
                     path_jail,
                     engagement,
-                    no_session: false,
-                    resume: Some(old_resume),
+                    no_session: ephemeral,
+                    resume: old_resume,
                     continue_last: false,
                 };
                 match app::create_runtime(config, paths, options).await {
@@ -2431,6 +2871,32 @@ fn scan_sessions(paths: &crate::paths::Paths) -> Vec<SessionItem> {
     found.into_iter().map(|(_, item)| item).collect()
 }
 
+/// Resolve `/resume <id>`: an exact id, else a unique id prefix or suffix (the
+/// header shows the last 8 characters).
+fn match_session(items: &[SessionItem], needle: &str) -> Result<PathBuf, String> {
+    if let Some(item) = items.iter().find(|item| item.id == needle) {
+        return Ok(item.path.clone());
+    }
+    let matches: Vec<&SessionItem> = items
+        .iter()
+        .filter(|item| item.id.starts_with(needle) || item.id.ends_with(needle))
+        .collect();
+    match matches.as_slice() {
+        [only] => Ok(only.path.clone()),
+        [] => Err(format!(
+            "no session id matches {needle:?}.\nRun /resume to pick from a list, or /resume last."
+        )),
+        many => Err(format!(
+            "{needle:?} matches {} sessions:\n{}\n\nUse a longer id.",
+            many.len(),
+            many.iter()
+                .map(|item| format!("  {}  {}  {}", item.id, item.when, item.preview))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )),
+    }
+}
+
 fn first_user_preview(path: &Path) -> String {
     let Ok(file) = std::fs::File::open(path) else {
         return "(unreadable)".into();
@@ -2473,6 +2939,7 @@ mod tests {
             cache: Some(91),
             session: session.into(),
             trust: true,
+            window_guess: false,
         }
     }
 
@@ -2505,6 +2972,9 @@ mod tests {
                     completions: Vec::new(),
                     completion_index: 0,
                     modal: None,
+                    activity: None,
+                    plan: Vec::new(),
+                    busy: false,
                 };
                 render::draw(frame, &scene, &theme);
             })
@@ -2540,7 +3010,7 @@ mod tests {
         assert!(text.contains("qwen3.5-35b-a3b"), "model missing:\n{text}");
         assert!(text.contains("12.4k/64k"), "context missing:\n{text}");
         assert!(text.contains("tok/s"));
-        assert!(text.contains("trusted"));
+        assert!(text.contains("▰"), "context gauge missing:\n{text}");
     }
 
     #[test]
@@ -2575,10 +3045,11 @@ mod tests {
             Theme::bundled("omarchy"),
         );
         let after = draw_scene(120, 20, header("model", "session"), Theme::bundled("light"));
-        let before_cell = before.backend().buffer().cell((0, 0)).unwrap();
-        let after_cell = after.backend().buffer().cell((0, 0)).unwrap();
-        assert_eq!(before_cell.symbol(), "L");
-        assert_eq!(after_cell.symbol(), "L");
+        // The info bar is the second-to-last row; column 1 starts the cwd.
+        let before_cell = before.backend().buffer().cell((1, 18)).unwrap();
+        let after_cell = after.backend().buffer().cell((1, 18)).unwrap();
+        assert_eq!(before_cell.symbol(), "/");
+        assert_eq!(after_cell.symbol(), "/");
         assert_ne!(
             before_cell.style().fg,
             after_cell.style().fg,
@@ -2623,18 +3094,211 @@ mod tests {
         format!("http://{address}")
     }
 
-    fn transcript_text(transcript: &Transcript) -> String {
-        transcript
-            .lines()
+    /// A `/v1/models` endpoint whose entries advertise `max_model_len`, like vLLM.
+    async fn sized_model_endpoint(models: &[(&str, u64)]) -> String {
+        let data: Vec<serde_json::Value> = models
             .iter()
-            .map(|line| {
-                line.spans
-                    .iter()
-                    .map(|span| span.content.as_ref())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
+            .map(|(id, ctx)| serde_json::json!({"id": id, "object": "model", "max_model_len": ctx}))
+            .collect();
+        let body = Arc::new(serde_json::json!({"object": "list", "data": data}).to_string());
+        let app = axum::Router::new().route(
+            "/v1/models",
+            axum::routing::get(move || {
+                let body = body.clone();
+                async move {
+                    (
+                        [(axum::http::header::CONTENT_TYPE, "application/json")],
+                        body.as_ref().clone(),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{address}")
+    }
+
+    #[tokio::test]
+    async fn switching_models_reprobes_the_context_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("work");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let paths = crate::paths::Paths {
+            config_dir: dir.path().join("config"),
+            data_dir: dir.path().join("data"),
+            cwd,
+            project_id: "test".into(),
+            sessions_dir_override: None,
+        };
+        let base = sized_model_endpoint(&[("small", 8192), ("big", 131072)]).await;
+        let mut config = Config::builtin();
+        config.model.endpoint = base;
+        config.model.model = "small".into();
+        let runtime = app::create_runtime(
+            config,
+            paths,
+            RuntimeOptions {
+                no_session: true,
+                ..RuntimeOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        let mut app = App::new(
+            runtime,
+            UiOptions {
+                no_color: true,
+                trust: false,
+                skills: SkillIndex::bundled(),
+            },
+        )
+        .unwrap();
+        assert_eq!(app.header.window, 8192);
+        // The probe result is not written back as if the user configured it.
+        assert_eq!(app.config.model.context_window, None);
+
+        app.switch_model("big").await;
+        assert_eq!(app.header.model, "big");
+        assert_eq!(app.header.window, 131072);
+        assert_eq!(app.core().unwrap().budget.context_window, 131072);
+
+        // An explicit value always wins over the probe.
+        let mut pinned = app.config.clone();
+        pinned.model.context_window = Some(20_000);
+        pinned.model.model = "small".into();
+        app.rebuild_core_with(pinned).await.unwrap();
+        assert_eq!(app.header.window, 20_000);
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn models_modal_filters_and_clamps_selection() {
+        let mut view = ModelsModal::new(
+            vec![
+                "openai/gpt-x".into(),
+                "anthropic/claude".into(),
+                "local/qwen3".into(),
+            ],
+            "local/qwen3".into(),
+            "http://gw".into(),
+        );
+        assert_eq!(view.selected_model().as_deref(), Some("local/qwen3"));
+        view.push_filter('A');
+        view.push_filter('n');
+        assert_eq!(view.filtered(), vec!["anthropic/claude"]);
+        view.move_by(5);
+        assert_eq!(view.selected_model().as_deref(), Some("anthropic/claude"));
+        view.push_filter('z');
+        assert!(view.selected_model().is_none());
+        view.pop_filter();
+        view.pop_filter();
+        view.pop_filter();
+        assert_eq!(view.filtered().len(), 3);
+    }
+
+    #[test]
+    fn match_session_by_prefix_suffix_and_ambiguity() {
+        let item = |id: &str| SessionItem {
+            id: id.into(),
+            preview: String::new(),
+            when: String::new(),
+            path: PathBuf::from(format!("{id}.jsonl")),
+        };
+        let items = vec![item("20261108-aaaa1111"), item("20261107-bbbb2222")];
+        assert_eq!(
+            match_session(&items, "aaaa1111").unwrap(),
+            PathBuf::from("20261108-aaaa1111.jsonl")
+        );
+        assert_eq!(
+            match_session(&items, "20261107").unwrap(),
+            PathBuf::from("20261107-bbbb2222.jsonl")
+        );
+        assert!(
+            match_session(&items, "2026")
+                .unwrap_err()
+                .contains("matches 2 sessions")
+        );
+        assert!(match_session(&items, "zzz").is_err());
+    }
+
+    #[tokio::test]
+    async fn new_and_resume_switch_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("work");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let paths = crate::paths::Paths {
+            config_dir: dir.path().join("config"),
+            data_dir: dir.path().join("data"),
+            cwd,
+            project_id: "test".into(),
+            sessions_dir_override: None,
+        };
+        let base = model_endpoint(&["m"]).await;
+        let mut config = Config::builtin();
+        config.model.endpoint = base;
+        config.model.model = "m".into();
+        let runtime = app::create_runtime(config, paths, RuntimeOptions::default())
+            .await
+            .unwrap();
+        let mut app = App::new(
+            runtime,
+            UiOptions {
+                no_color: true,
+                trust: false,
+                skills: SkillIndex::bundled(),
+            },
+        )
+        .unwrap();
+        let session_path = |app: &App| {
+            app.runtime
+                .as_ref()
+                .unwrap()
+                .session
+                .lock()
+                .unwrap()
+                .path
+                .clone()
+                .unwrap()
+        };
+        let first = session_path(&app);
+
+        // /new on an untouched session does not litter another file.
+        app.command_new().await;
+        assert_eq!(session_path(&app), first);
+
+        app.runtime
+            .as_ref()
+            .unwrap()
+            .session
+            .lock()
+            .unwrap()
+            .append(EntryKind::User(UserData {
+                content: "first session message".into(),
+            }))
+            .unwrap();
+        app.command_new().await;
+        let second = session_path(&app);
+        assert_ne!(second, first);
+
+        // /resume lists only the other sessions; /resume last reopens the first.
+        app.command_resume("").await;
+        match &app.modal {
+            Some(ModalData::Sessions(view)) => {
+                assert_eq!(view.items.len(), 1);
+                assert_eq!(view.items[0].path, first);
+                assert_eq!(view.items[0].preview, "first session message");
+            }
+            _ => panic!("expected the sessions picker"),
+        }
+        app.modal = None;
+        app.command_resume("last").await;
+        assert_eq!(session_path(&app), first);
     }
 
     #[tokio::test]
@@ -2691,17 +3355,26 @@ mod tests {
         assert_eq!(app.header.model, "beta");
         assert_eq!(app.config.model.endpoint, base);
 
-        // /model with no argument lists the endpoint's models and the switch.
+        // /model with no argument opens a picker over the endpoint's models,
+        // with the current model preselected.
         app.command_model("").await;
-        app.transcript.prepare(160, &app.theme, false, true);
-        let text = transcript_text(&app.transcript);
-        assert!(text.contains("available models"), "transcript:\n{text}");
-        assert!(text.contains("alpha"), "transcript:\n{text}");
-        assert!(text.contains("beta  (current)"), "transcript:\n{text}");
-        assert!(
-            text.contains("switch with /model <name>"),
-            "transcript:\n{text}"
-        );
+        match &app.modal {
+            Some(ModalData::Models(view)) => {
+                assert_eq!(view.items, vec!["alpha".to_string(), "beta".to_string()]);
+                assert_eq!(view.selected_model().as_deref(), Some("beta"));
+            }
+            _ => panic!("expected the models picker"),
+        }
+        // Typing filters; Enter switches the session's model.
+        for ch in "alp".chars() {
+            app.handle_modal_key(key(KeyCode::Char(ch))).await;
+        }
+        app.handle_modal_key(key(KeyCode::Enter)).await;
+        assert!(app.modal.is_none());
+        assert_eq!(app.header.model, "alpha");
+        // The picker switch lasts for the session; the saved config keeps beta.
+        let saved = std::fs::read_to_string(&config_path).unwrap();
+        assert!(saved.contains("beta"), "config:\n{saved}");
 
         // A login without a model auto-selects the endpoint's only model and
         // replaces the previous endpoint's selection.

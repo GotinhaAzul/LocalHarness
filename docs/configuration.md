@@ -44,6 +44,7 @@ theme = "omarchy"
 color_mode = "auto"             # auto | truecolor | 256 | 16
 show_reasoning = false
 show_token_counts = true
+mouse = true                    # wheel scrolls the conversation; Shift+drag selects text
 
 [session]
 dir = ""                        # default data dir's sessions/
@@ -88,8 +89,8 @@ The TUI does not require `[model]` to be resolved at startup. If the endpoint is
 down or `model` is empty, the harness opens with `not logged in`; `/login`
 validates `GET /v1/models`, applies the selection, and writes `endpoint`,
 `model`, and `api_key` to the global config file (replacing only those keys,
-with `0600` permissions). `/model` lists the endpoint's models and switches the
-current session without rewriting the config. Headless `--print` exits with an
+with `0600` permissions). `/model` opens a filterable picker over the endpoint's
+models and switches the current session without rewriting the config. Headless `--print` exits with an
 error until a model is selected.
 
 `start_command` is optional. When set, it runs through `sh -c` once at startup

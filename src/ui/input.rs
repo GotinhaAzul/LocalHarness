@@ -1,10 +1,10 @@
 //! Multiline input, history, and slash-command completion.
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::style::Modifier;
 use ratatui::style::Style;
-use ratatui::text::Span;
 use ratatui::widgets::{Block, Borders};
-use ratatui_textarea::{CursorMove, TextArea};
+use ratatui_textarea::{CursorMove, TextArea, WrapMode};
 
 use crate::ui::theme::{Role, Theme};
 
@@ -29,6 +29,7 @@ impl InputState {
         textarea.set_placeholder_text("type a message, or /help");
         textarea.set_max_histories(200);
         textarea.set_cursor_line_style(Style::default());
+        textarea.set_wrap_mode(WrapMode::WordOrGlyph);
         textarea.move_cursor(CursorMove::End);
         InputState {
             textarea,
@@ -225,20 +226,66 @@ impl InputState {
         self.completion_index = 0;
     }
 
+    /// Screen rows the prompt needs at `width` columns with soft wrapping.
+    pub fn visual_rows(&self, width: usize) -> usize {
+        let width = width.max(1);
+        self.textarea
+            .lines()
+            .iter()
+            .map(|line| crate::ui::markdown::wrap_plain(line, width).len().max(1))
+            .sum()
+    }
+
+    /// Settle the textarea's viewport for a `width`×`height` prompt. The
+    /// textarea only scrolls to keep the cursor visible, so after the box
+    /// grows it would keep hiding rows that now fit; scroll those back.
+    pub fn fit_viewport(&mut self, width: u16, height: u16) {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        use ratatui::widgets::Widget as _;
+
+        if width == 0 || height == 0 {
+            return;
+        }
+        // Rendering once records the real viewport size in the textarea.
+        let area = Rect::new(0, 0, width, height);
+        (&self.textarea).render(area, &mut Buffer::empty(area));
+        let (top, _) = self.textarea.scroll_offset();
+        if top > 0 && self.visual_rows(width as usize) <= height as usize {
+            // `scroll` drags the cursor into the old viewport; put it back.
+            let ratatui_textarea::DataCursor(row, col) = self.textarea.cursor();
+            self.textarea
+                .scroll((-(top.min(i16::MAX as u16) as i16), 0));
+            self.textarea.move_cursor(CursorMove::Jump(
+                row.min(u16::MAX as usize) as u16,
+                col.min(u16::MAX as usize) as u16,
+            ));
+        }
+    }
+
+    pub fn set_placeholder(&mut self, text: &str) {
+        if self.textarea.placeholder_text() != text {
+            self.textarea.set_placeholder_text(text);
+        }
+    }
+
     /// Apply the active theme to the textarea widget.
     pub fn apply_theme(&mut self, theme: &Theme) {
         self.textarea.set_style(theme.style(Role::Fg));
-        self.textarea
-            .set_cursor_style(Style::default().fg(theme.color(Role::Cursor)));
+        // A block cursor: a foreground-only style is invisible on a space.
+        self.textarea.set_cursor_style(
+            Style::default()
+                .fg(theme.color(Role::Bg))
+                .bg(theme.color(Role::Cursor))
+                .add_modifier(Modifier::BOLD),
+        );
         self.textarea.set_cursor_line_style(Style::default());
         self.textarea
             .set_placeholder_style(theme.style(Role::Muted));
-        let title = Span::styled(" Input ", theme.bold(Role::Muted));
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(theme.style(Role::Border))
-            .title(title);
-        self.textarea.set_block(block);
+        // The surrounding rounded box and prompt glyph are drawn by the
+        // painter; the textarea itself is borderless.
+        self.textarea
+            .set_block(Block::default().borders(Borders::NONE));
     }
 }
 
@@ -312,6 +359,21 @@ mod tests {
 
         input.set_text("/help");
         assert!(input.completions(COMMANDS).is_empty());
+    }
+
+    #[test]
+    fn refitting_after_growth_shows_every_row_and_keeps_the_cursor() {
+        let mut input = InputState::new();
+        let long = "word ".repeat(30);
+        input.insert_text(long.trim_end());
+        // Typed while the box was one row high, then the box grows.
+        input.fit_viewport(40, 1);
+        assert!(input.textarea.scroll_offset().0 > 0);
+        input.fit_viewport(40, 4);
+        assert_eq!(input.textarea.scroll_offset().0, 0);
+        input.insert_text("!");
+        assert!(input.text().ends_with("word!"), "{}", input.text());
+        assert_eq!(input.visual_rows(40), 4);
     }
 
     #[test]

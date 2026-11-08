@@ -171,6 +171,9 @@ fn harness_config(dir: &std::path::Path, scripts: Vec<Script>, config: Config) -
         tool_timeout: std::time::Duration::from_secs(10),
         path_jail: false,
         server_window: Default::default(),
+        window_source: localharness::agent::WindowSource::Default,
+        detected_window: Default::default(),
+        window_cache: Default::default(),
     };
     Harness {
         core: Arc::new(core),
@@ -1150,4 +1153,34 @@ async fn cancellation_mid_stream_keeps_partial_text() {
             .iter()
             .any(|entry| matches!(&entry.kind, EntryKind::Error(data) if data.code == "cancelled"))
     );
+}
+
+#[tokio::test]
+async fn the_model_loads_a_skill_and_it_arrives_whole() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness(
+        dir.path(),
+        vec![
+            tool_script("skill", serde_json::json!({"name": "security-red"})),
+            text_script("Loaded; following the skill."),
+        ],
+        &["skill", "read"],
+    );
+    let (outcome, _) = run(&harness, "start a lab engagement").await;
+    assert_eq!(outcome.status, TurnStatus::Done);
+    let result = last_tool_result(&harness.session);
+    // Larger than the default 2.5k cap, yet inline and complete.
+    assert!(
+        result.chars().count() > 3000,
+        "{} chars",
+        result.chars().count()
+    );
+    assert!(!result.contains("(truncated;"), "{result}");
+    assert!(result.contains("[skill: security-red]"));
+    assert!(result.contains("references/reporting.md"));
+    // The skill text reached the model in the follow-up request.
+    let requests = harness.provider.requests.lock().unwrap();
+    let last = requests.last().unwrap();
+    let sent = format!("{:?}", last.messages);
+    assert!(sent.contains("[skill: security-red]"));
 }

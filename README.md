@@ -96,8 +96,9 @@ lh --endpoint http://127.0.0.1:8000 --model Qwen/Qwen3-35B-A3B
 ```
 
 `/login` validates `GET /v1/models` and saves `endpoint`, `model`, and `api_key`
-to the global config with `0600` permissions. `/model` lists the models the
-current endpoint exposes and switches the session with `/model <name>`.
+to the global config with `0600` permissions. `/model` opens a picker over the
+models the endpoint exposes (every model behind a gateway such as LiteLLM or
+OpenRouter); type to filter, Enter to switch. `/model <name>` switches directly.
 Headless `--print` still requires a selected model.
 
 Point at a different endpoint with `--endpoint` or `LH_ENDPOINT` (default
@@ -133,7 +134,9 @@ cancelled. `--json` emits newline-delimited events.
 
 One JSONL file per session tree, append-only, under
 `~/.local/share/localharness/sessions/<project-id>/`. `/tree` shows branches;
-checkout and fork are non-destructive. `/sessions` switches sessions.
+checkout and fork are non-destructive. `/new` starts a fresh session;
+`/resume` picks a previous one (`/resume last`, or `/resume <id>` by id prefix
+or suffix). `/sessions` lists every session for the project.
 `--no-session` writes nothing: no session, no artifacts.
 
 ## Keys
@@ -150,17 +153,18 @@ checkout and fork are non-destructive. `/sessions` switches sessions.
 | `Ctrl+R` | toggle reasoning |
 | `/` | slash-command completion |
 
-Slash commands: `/help /quit /login /model /profile /theme /tree /fork
-/sessions /compact /tools /skill /workflow /sec /trust /export /clear /debug`.
+Slash commands: `/help /quit /login /model /profile /theme /tree /fork /new
+/resume /sessions /compact /tools /skill /workflow /sec /trust /export /clear
+/debug`.
 
 ## Tools
 
-Twenty-three built-ins in three packs. `full` (core + coding + security) is the
+Twenty-four built-ins in three packs. `full` (core + coding + security) is the
 default; `coding`, `security`, and `minimal` narrow it.
 
 | Pack | Tools |
 |---|---|
-| Core | `read` `write` `edit` `patch` `undo` `bash` `grep` `glob` `todo` `verify` `recall` `thread` `bg` |
+| Core | `read` `write` `edit` `patch` `undo` `bash` `grep` `glob` `todo` `skill` `verify` `recall` `thread` `bg` |
 | Coding | `repo_map` `lsp` `test` `review` |
 | Security | `surface` `evidence` `detect` `attack_path` `finding` `iocs` |
 
@@ -207,8 +211,9 @@ Read [docs/security.md](docs/security.md) before using it on client work.
 ## Extend it
 
 - **Profiles** select packs/tools, a model profile, and optional prompt text.
-- **Skills** are Markdown instructions; the index is always visible, full text
-  loads with `/skill <name>`.
+- **Skills** are Markdown instructions; the index is always visible. The model
+  loads a matching skill itself with the `skill` tool, or you load one with
+  `/skill <name>`.
 - **Workflows** are playbooks plus a profile and tool allowlist.
 - **External tools** are any executable speaking one JSON object in, one JSON
   object out. See [docs/external-tools.md](docs/external-tools.md).

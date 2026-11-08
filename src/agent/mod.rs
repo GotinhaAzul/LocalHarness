@@ -50,12 +50,88 @@ pub struct Core {
     /// Prompt limit observed from a server that silently truncates (0 when
     /// none was seen). Shared across turns; reset when the core is rebuilt.
     pub server_window: Arc<std::sync::atomic::AtomicU32>,
+    /// Where `budget.context_window` came from.
+    pub window_source: WindowSource,
+    /// Window learned from the server during this core's turns (0 = none),
+    /// overriding a guessed `budget.context_window`.
+    pub detected_window: Arc<std::sync::atomic::AtomicU32>,
+    /// Windows learned per `endpoint|model`, shared across core rebuilds so
+    /// switching models back and forth keeps what was detected.
+    pub window_cache: Arc<Mutex<std::collections::HashMap<String, u32>>>,
+}
+
+/// Origin of the context window, shown in the UI so a fallback guess is never
+/// mistaken for a measured value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowSource {
+    /// `context_window` in the config or the active model profile.
+    Configured,
+    /// Detected from the endpoint for the selected model.
+    Probed(crate::provider::probe::WindowProbe),
+    /// Nothing configured or detected: `DEFAULT_CONTEXT_WINDOW`.
+    Default,
+}
+
+impl WindowSource {
+    pub fn label(self) -> &'static str {
+        match self {
+            WindowSource::Configured => "configured",
+            WindowSource::Probed(probe) => probe.label(),
+            WindowSource::Default => "default (not detected)",
+        }
+    }
+
+    /// False when the value is a guess (default or a trained maximum).
+    pub fn is_reliable(self) -> bool {
+        !matches!(
+            self,
+            WindowSource::Default
+                | WindowSource::Probed(crate::provider::probe::WindowProbe::OllamaTrained)
+        )
+    }
 }
 
 impl Core {
     /// A model is selected. The harness can start without one; `/login` sets it.
     pub fn logged_in(&self) -> bool {
         !self.provider.model().trim().is_empty()
+    }
+
+    /// The window in force and where it came from, including a window
+    /// detected from the server after this core was built.
+    pub fn effective_window(&self) -> (u32, WindowSource) {
+        let detected = self
+            .detected_window
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if detected > 0 {
+            (
+                detected,
+                WindowSource::Probed(crate::provider::probe::WindowProbe::Served),
+            )
+        } else {
+            (self.budget.context_window, self.window_source)
+        }
+    }
+
+    /// Key for [`Core::window_cache`].
+    pub fn window_key(endpoint: &str, model: &str) -> String {
+        format!(
+            "{}|{}",
+            crate::provider::endpoint_urls(endpoint).api,
+            model.trim()
+        )
+    }
+
+    /// Record a window learned from the server for the current model.
+    pub fn remember_window(&self, window: u32) {
+        self.detected_window
+            .store(window, std::sync::atomic::Ordering::Relaxed);
+        if let Ok(mut cache) = self.window_cache.lock() {
+            cache.insert(
+                Self::window_key(&self.config.model.endpoint, self.provider.model()),
+                window,
+            );
+        }
     }
 
     pub fn tool_context(&self) -> ToolContext {
@@ -118,6 +194,11 @@ pub enum AgentEvent {
     Context {
         used: u32,
         window: u32,
+    },
+    /// The real context window was learned from the server mid-session.
+    WindowDetected {
+        window: u32,
+        source: String,
     },
     Compacted {
         summary: String,

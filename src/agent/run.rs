@@ -101,6 +101,14 @@ async fn run_loop(
 ) -> TurnOutcome {
     let mut progress = RunProgress::new(core.limits.clone());
     let mut budget = core.budget.clone();
+    let detected = core
+        .detected_window
+        .load(std::sync::atomic::Ordering::Relaxed);
+    if detected > 0 && detected != budget.context_window {
+        budget = budget.resized_to(detected, core.config.model.max_output_tokens);
+    }
+    // Probe the served window once per turn while it is still a guess.
+    let mut window_probe_pending = !core.window_source.is_reliable() && detected == 0;
     let known_window = core
         .server_window
         .load(std::sync::atomic::Ordering::Relaxed);
@@ -290,9 +298,24 @@ async fn run_loop(
                 }
                 progress.context_retry_used = true;
                 pending_compaction = true;
-                let _ = tx.send(AgentEvent::Notice(
-                    "context window exceeded; compacting before retrying".into(),
-                ));
+                // llama.cpp names its real window in the rejection.
+                if let Some(window) = crate::provider::probe::window_from_overflow(&err.message)
+                    && window < budget.context_window
+                {
+                    core.remember_window(window);
+                    core.server_window
+                        .store(window, std::sync::atomic::Ordering::Relaxed);
+                    budget = budget.shrunk_to(window);
+                    window_probe_pending = false;
+                    let _ = tx.send(AgentEvent::WindowDetected {
+                        window,
+                        source: "the server's overflow error".into(),
+                    });
+                }
+                let _ = tx.send(AgentEvent::Notice(format!(
+                    "context window exceeded; compacting to fit {} tokens before retrying",
+                    budget.context_window
+                )));
                 continue;
             }
             Err(err) => {
@@ -311,6 +334,23 @@ async fn run_loop(
                 return TurnOutcome::error(&code, err.message);
             }
         };
+
+        if window_probe_pending {
+            window_probe_pending = false;
+            if let Some(window) = detect_served_window(core).await {
+                let known = core
+                    .server_window
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                let window = if known > 0 { window.min(known) } else { window };
+                core.remember_window(window);
+                budget = budget.resized_to(window, core.config.model.max_output_tokens);
+                let _ = tx.send(AgentEvent::WindowDetected {
+                    window,
+                    source: "llama.cpp after the first reply".into(),
+                });
+                context_window_event(tx, &budget, &assistant);
+            }
+        }
 
         if let Some(limit) = budget.truncated_at.take()
             && limit < budget.context_window
@@ -519,6 +559,18 @@ async fn run_loop(
             return TurnOutcome::ok(TurnStatus::Stalled);
         }
     }
+}
+
+/// The served model's window, read right after it answered: a gateway has it
+/// loaded then, so `/slots` and `/props` describe this model.
+async fn detect_served_window(core: &Core) -> Option<u32> {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        crate::provider::probe::served_window(core.provider.as_ref()),
+    )
+    .await
+    .ok()
+    .flatten()
 }
 
 fn context_window_event(
@@ -1212,8 +1264,19 @@ async fn execute_batch(
             "[tool] {} - {}\n{}",
             call.name, summary_args, result.content
         );
-        let mut capped = cap_result(&ctx.artifacts, &result.content);
-        if batch_chars + capped.content.chars().count() > BATCH_CAP_CHARS {
+        let cap_override = tool.as_deref().and_then(|tool| tool.result_cap());
+        let content_chars = result.content.chars().count();
+        let mut capped = match cap_override {
+            Some(limit) if content_chars <= limit => context::CappedContent {
+                content: result.content.clone(),
+                artifact: None,
+                original_chars: content_chars,
+                truncated: false,
+            },
+            _ => cap_result(&ctx.artifacts, &result.content),
+        };
+        if cap_override.is_none() && batch_chars + capped.content.chars().count() > BATCH_CAP_CHARS
+        {
             match ctx.artifacts.write(&result.content) {
                 Ok(artifact) => {
                     capped.content = format!(
@@ -1384,6 +1447,16 @@ fn arguments_raw(value: &Value) -> String {
 }
 
 fn summarize_args(args: &Value) -> String {
+    if let Some(name) = args.get("name").and_then(|v| v.as_str())
+        && args
+            .as_object()
+            .is_some_and(|map| map.keys().all(|key| key == "name" || key == "reference"))
+    {
+        return match args.get("reference").and_then(|v| v.as_str()) {
+            Some(reference) => preview(&format!("{name} › {reference}"), 80),
+            None => preview(name, 80),
+        };
+    }
     for key in ["path", "command", "pattern", "action", "artifact", "text"] {
         if let Some(value) = args.get(key).and_then(|v| v.as_str()) {
             return preview(value, 80);

@@ -47,6 +47,14 @@ impl TokenBudget {
         shrunk
     }
 
+    /// The same budget against a different window (larger or smaller),
+    /// keeping calibration and the configured output reservation.
+    pub fn resized_to(&self, window: u32, max_output_tokens: u32) -> Self {
+        let mut resized = Self::new(window, max_output_tokens.min(window / 4));
+        resized.chars_per_token = self.chars_per_token;
+        resized
+    }
+
     /// `context_window - max_output_tokens - safety_margin`, floored.
     pub fn usable_prompt(&self) -> u32 {
         self.context_window
