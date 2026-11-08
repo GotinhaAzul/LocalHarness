@@ -1,8 +1,11 @@
-//! Built-in tool surface: 17 static tools in three packs, plus the registry.
+//! Built-in tool surface: 23 static tools in three packs, plus the registry.
 
+pub mod attack_path;
 pub mod bash;
 pub mod bg;
+pub mod detect;
 pub mod edit;
+pub mod evidence;
 pub mod finding;
 pub mod glob;
 pub mod grep;
@@ -11,17 +14,20 @@ pub mod lsp;
 pub mod patch;
 pub mod read;
 pub mod recall;
+pub mod repo_map;
 pub mod review;
+pub mod surface;
 pub mod test;
 pub mod thread;
 pub mod todo;
+pub mod undo;
 pub mod verify;
 pub mod write;
 
 pub use bg::BgRegistry;
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
@@ -73,6 +79,22 @@ impl ToolResult {
             details: Some(json!({"code": code})),
         }
     }
+
+    /// Append language-server diagnostics for a successful mutation. A missing
+    /// server or a still-indexing server adds nothing and never fails the edit.
+    pub async fn with_diagnostics(mut self, ctx: &ToolContext, path: &Path) -> Self {
+        if self.is_error {
+            return self;
+        }
+        if let Some(diagnostics) = ctx.lsp.diagnostics_after_edit(ctx, path).await {
+            self.content.push_str("\n\n");
+            self.content.push_str(&diagnostics);
+            if let Some(details) = self.details.as_mut().and_then(Value::as_object_mut) {
+                details.insert("diagnostics".to_string(), Value::Bool(true));
+            }
+        }
+        self
+    }
 }
 
 /// Everything a tool may touch. Cloning is cheap; fields are shared.
@@ -90,6 +112,8 @@ pub struct ToolContext {
     pub bg: Arc<Mutex<bg::BgRegistry>>,
     pub security: Arc<Mutex<SecurityState>>,
     pub paths: Paths,
+    /// Shared language-server clients used by `lsp` and post-edit diagnostics.
+    pub lsp: Arc<lsp::LspService>,
 }
 
 impl ToolContext {
@@ -218,17 +242,39 @@ pub trait Tool: Send + Sync {
     fn read_only(&self) -> bool {
         false
     }
+    /// Whether runs of this tool append an engagement evidence entry.
+    fn evidence_enabled(&self) -> bool {
+        false
+    }
+    /// The command or invocation recorded with the evidence entry.
+    fn evidence_command(&self, args: &Value) -> Option<String> {
+        args.get("command")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    }
     async fn call(&self, ctx: &ToolContext, args: Value) -> ToolResult;
 }
 
 #[derive(Default)]
 pub struct ToolRegistry {
     tools: Vec<Arc<dyn Tool>>,
+    lsp: Arc<lsp::LspService>,
+    repo: Arc<repo_map::RepoIndex>,
 }
 
 impl ToolRegistry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The shared language-server service also used by post-edit diagnostics.
+    pub fn lsp(&self) -> Arc<lsp::LspService> {
+        self.lsp.clone()
+    }
+
+    /// The cached repository index used by `repo_map` and the prompt brief.
+    pub fn repo(&self) -> Arc<repo_map::RepoIndex> {
+        self.repo.clone()
     }
 
     pub fn register(&mut self, tool: Arc<dyn Tool>) {
@@ -254,11 +300,14 @@ impl ToolRegistry {
     /// All built-in tools in canonical order.
     pub fn builtin() -> Self {
         let mut registry = Self::new();
+        let lsp = registry.lsp.clone();
+        let repo = registry.repo.clone();
         for tool in [
             Arc::new(read::ReadTool) as Arc<dyn Tool>,
             Arc::new(write::WriteTool),
             Arc::new(edit::EditTool),
             Arc::new(patch::PatchTool),
+            Arc::new(undo::UndoTool),
             Arc::new(bash::BashTool),
             Arc::new(grep::GrepTool),
             Arc::new(glob::GlobTool),
@@ -267,9 +316,14 @@ impl ToolRegistry {
             Arc::new(recall::RecallTool),
             Arc::new(thread::ThreadTool),
             Arc::new(bg::BgTool),
-            Arc::new(lsp::LspTool::new()),
+            Arc::new(repo_map::RepoMapTool::new(repo)),
+            Arc::new(lsp::LspTool::with_service(lsp)),
             Arc::new(test::TestTool),
             Arc::new(review::ReviewTool),
+            Arc::new(surface::SurfaceTool),
+            Arc::new(evidence::EvidenceTool),
+            Arc::new(detect::DetectTool),
+            Arc::new(attack_path::AttackPathTool),
             Arc::new(finding::FindingTool),
             Arc::new(iocs::IocsTool),
         ] {
@@ -420,5 +474,41 @@ mod tests {
         assert!(error.content.contains("path_jail"), "{}", error.content);
         ctx.path_jail = false;
         assert!(ctx.resolve("link/secret.txt").is_ok());
+    }
+
+    #[test]
+    fn repo_map_is_a_read_only_coding_tool() {
+        let registry = ToolRegistry::builtin();
+        let tool = registry.get("repo_map").expect("repo_map is registered");
+        assert_eq!(tool.pack(), ToolPack::Coding);
+        assert!(tool.read_only());
+    }
+
+    #[test]
+    fn security_tools_are_registered() {
+        let registry = ToolRegistry::builtin();
+        assert_eq!(
+            registry.names().len(),
+            23,
+            "update docs when the built-in surface changes: {:?}",
+            registry.names()
+        );
+        for name in [
+            "surface",
+            "evidence",
+            "detect",
+            "attack_path",
+            "finding",
+            "iocs",
+        ] {
+            let tool = registry
+                .get(name)
+                .unwrap_or_else(|| panic!("{name} is registered"));
+            assert_eq!(tool.pack(), ToolPack::Security, "{name}");
+        }
+        assert!(registry.get("surface").unwrap().read_only());
+        assert!(registry.get("evidence").unwrap().read_only());
+        assert!(registry.get("attack_path").unwrap().read_only());
+        assert!(!registry.get("detect").unwrap().read_only());
     }
 }

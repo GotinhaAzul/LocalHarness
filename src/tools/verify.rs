@@ -90,7 +90,12 @@ impl Tool for VerifyTool {
     }
 
     fn schema(&self) -> Value {
-        serde_json::from_str(r#"{"type":"object","properties":{"step":{"type":"string"}},"required":[],"additionalProperties":false}"#).expect("valid schema")
+        crate::tools::object_schema(
+            json!({
+                "step": {"type": "string", "description": "Run only this configured step (e.g. \"test\"); omit to run all."}
+            }),
+            &[],
+        )
     }
 
     fn pack(&self) -> ToolPack {
@@ -437,6 +442,7 @@ mod tests {
             bg: Arc::new(Mutex::new(BgRegistry::new())),
             security: Arc::new(Mutex::new(SecurityState::default())),
             paths,
+            lsp: Arc::new(crate::tools::lsp::LspService::new()),
         };
         (dir, ctx)
     }

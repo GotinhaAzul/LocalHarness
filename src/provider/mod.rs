@@ -15,6 +15,28 @@ pub use types::{
     ToolSpec, Usage, redact,
 };
 
+/// Server root and OpenAI API base derived from a configured endpoint.
+///
+/// Accepts both `http://host:8080` and `http://host:8080/v1`; the `/v1` suffix
+/// is optional so users can paste the base URL their engine prints.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EndpointUrls {
+    /// Server root: llama.cpp `/props` and `/tokenize`, Ollama `/api/show`.
+    pub root: String,
+    /// OpenAI API base: `/chat/completions` and `/models` live here.
+    pub api: String,
+}
+
+pub fn endpoint_urls(endpoint: &str) -> EndpointUrls {
+    let trimmed = endpoint.trim().trim_end_matches('/');
+    let root = trimmed.strip_suffix("/v1").unwrap_or(trimmed);
+    let root = root.trim_end_matches('/').to_string();
+    EndpointUrls {
+        api: format!("{root}/v1"),
+        root,
+    }
+}
+
 /// A chat-completions stream. Events are pushed to `tx`; the stream ends when
 /// the provider closes the channel. Cancellation is cooperative.
 #[async_trait]
@@ -69,4 +91,30 @@ pub async fn collect_stream(
         }
     }
     events
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn endpoint_accepts_plain_and_v1_forms() {
+        for endpoint in [
+            "http://127.0.0.1:8080",
+            "http://127.0.0.1:8080/",
+            "http://127.0.0.1:8080/v1",
+            "http://127.0.0.1:8080/v1/",
+        ] {
+            let urls = endpoint_urls(endpoint);
+            assert_eq!(urls.root, "http://127.0.0.1:8080", "{endpoint}");
+            assert_eq!(urls.api, "http://127.0.0.1:8080/v1", "{endpoint}");
+        }
+    }
+
+    #[test]
+    fn endpoint_keeps_a_custom_prefix() {
+        let urls = endpoint_urls("http://host:9000/openai/v1");
+        assert_eq!(urls.root, "http://host:9000/openai");
+        assert_eq!(urls.api, "http://host:9000/openai/v1");
+    }
 }

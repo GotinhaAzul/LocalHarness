@@ -340,7 +340,15 @@ impl Tool for ThreadTool {
     }
 
     fn schema(&self) -> Value {
-        serde_json::from_str(r#"{"type":"object","properties":{"action":{"type":"string","enum":["split","note","close","status"]},"title":{"type":"string"},"objective":{"type":"string"},"note":{"type":"string"}},"required":["action"],"additionalProperties":false}"#).expect("valid schema")
+        crate::tools::object_schema(
+            json!({
+                "action": {"type": "string", "enum": ["split", "note", "close", "status"], "description": "split starts a fresh thread and compacts context; note records a fact; close ends the thread."},
+                "title": {"type": "string", "description": "split: short name for the new thread."},
+                "objective": {"type": "string", "description": "split: goal and first open step for the new thread."},
+                "note": {"type": "string", "description": "note: fact to keep; close: one-line outcome."}
+            }),
+            &["action"],
+        )
     }
 
     fn pack(&self) -> ToolPack {
@@ -601,6 +609,7 @@ mod tests {
             bg: Arc::new(Mutex::new(BgRegistry::new())),
             security: Arc::new(Mutex::new(SecurityState::default())),
             paths,
+            lsp: Arc::new(crate::tools::lsp::LspService::new()),
         };
         (dir, ctx)
     }

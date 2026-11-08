@@ -51,9 +51,17 @@ impl Tool for WriteTool {
     }
 
     async fn call(&self, ctx: &ToolContext, args: Value) -> ToolResult {
-        match run(ctx, &args) {
+        let raw = args
+            .get("path")
+            .and_then(|value| value.as_str())
+            .map(str::to_string);
+        let result = match run(ctx, &args) {
             Ok(result) => result,
-            Err(err) => err,
+            Err(err) => return err,
+        };
+        match raw.as_deref().map(|raw| ctx.resolve(raw)) {
+            Some(Ok(path)) => result.with_diagnostics(ctx, &path).await,
+            _ => result,
         }
     }
 }
@@ -125,11 +133,19 @@ fn run(ctx: &ToolContext, args: &Value) -> Result<ToolResult, ToolResult> {
     }
 
     let mode = if existed { file_mode(&path) } else { 0o600 };
+    let previous = crate::tools::undo::previous_text(&path);
+    let change = crate::tools::undo::record_change(
+        ctx,
+        previous
+            .as_ref()
+            .map(Option::as_deref)
+            .map_err(Clone::clone),
+        content,
+    );
     atomic_write(&path, content.as_bytes(), mode)
         .map_err(|err| ToolResult::err("WRITE_FAILED", format!("cannot write {display}: {err}")))?;
 
-    // The on-disk text changed underneath the tracker; force a re-read.
-    lock_reads(ctx).clear();
+    record_own_write(ctx, &path);
 
     let added = crate::tools::read::line_count(content);
     let text = format!(
@@ -137,15 +153,29 @@ fn run(ctx: &ToolContext, args: &Value) -> Result<ToolResult, ToolResult> {
         content.len(),
         if existed { ", replaced" } else { ", created" }
     );
-    Ok(ToolResult::ok(text).with_details(json!({
-        "path": display,
-        "created": !existed,
-        "added": added,
-        "bytes": content.len(),
-    })))
+    Ok(
+        ToolResult::ok(text).with_details(crate::tools::undo::merge_details(
+            json!({
+                "path": display,
+                "created": !existed,
+                "added": added,
+                "bytes": content.len(),
+            }),
+            change,
+        )),
+    )
 }
 
 /// Borrow the read tracker without panicking on a poisoned lock.
+/// Re-stamp a file the harness itself just wrote. The model authored the new
+/// text and saw the result, so a re-read would only cost a turn; any later
+/// change by something else still breaks the stamp and requires a read.
+pub(crate) fn record_own_write(ctx: &ToolContext, path: &Path) {
+    if let Some(stamp) = crate::tools::FileStamp::stamp_for(path) {
+        lock_reads(ctx).record(path, stamp);
+    }
+}
+
 pub(crate) fn lock_reads(ctx: &ToolContext) -> MutexGuard<'_, ReadTracker> {
     ctx.reads
         .lock()
@@ -237,6 +267,7 @@ pub(crate) fn test_context(dir: &Path) -> ToolContext {
         bg: Arc::new(Mutex::new(BgRegistry::default())),
         security: Arc::new(Mutex::new(SecurityState::default())),
         paths,
+        lsp: Arc::new(crate::tools::lsp::LspService::new()),
     }
 }
 

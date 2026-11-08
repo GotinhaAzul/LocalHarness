@@ -25,8 +25,11 @@ defaults. Environment variables fill the gaps.
 ```toml
 [model]
 endpoint = "http://127.0.0.1:8080"
+# The /v1 suffix is optional. Both forms work, including a tailnet host:
+# endpoint = "http://desktopserver:8088/v1"
 model = ""                      # auto-select if /v1/models has one entry
 api_key = ""
+start_command = ""              # optional; run once if the endpoint is down
 context_window = 32768
 temperature = 0.2
 top_p = 0.95
@@ -80,6 +83,19 @@ extra_body = { chat_template_kwargs = { enable_thinking = true } }
 `model_profile = "auto"` matches by model-name prefix declared in `match`; the
 `default` profile is the fallback. `[model] context_window` is used only when
 the model profile does not set one.
+
+The TUI does not require `[model]` to be resolved at startup. If the endpoint is
+down or `model` is empty, the harness opens with `not logged in`; `/login`
+validates `GET /v1/models`, applies the selection, and writes `endpoint`,
+`model`, and `api_key` to the global config file (replacing only those keys,
+with `0600` permissions). `/model` lists the endpoint's models and switches the
+current session without rewriting the config. Headless `--print` exits with an
+error until a model is selected.
+
+`start_command` is optional. When set, it runs through `sh -c` once at startup
+if `GET /v1/models` fails, and the harness waits up to 30 seconds for the
+endpoint to answer. It is not run when the endpoint is already reachable, and it
+is not retried during the session. The command runs as the invoking user.
 
 ## Verify steps
 

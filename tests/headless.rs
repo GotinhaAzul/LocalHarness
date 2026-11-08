@@ -111,6 +111,27 @@ async fn run_lh(env: &Env, base: &str, extra: &[&str]) -> std::process::Output {
         .expect("cannot run lh")
 }
 
+async fn run_lh_no_model(env: &Env, base: &str, extra: &[&str]) -> std::process::Output {
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_lh"));
+    command
+        .arg("--endpoint")
+        .arg(base)
+        .arg("--no-session")
+        .args(extra)
+        .current_dir(&env.cwd)
+        .env("LH_CONFIG_DIR", &env.config_dir)
+        .env("LH_DATA_DIR", &env.data_dir)
+        .env_remove("LH_ENDPOINT")
+        .env_remove("LH_MODEL")
+        .env_remove("LH_API_KEY")
+        .env_remove("LH_PROFILE")
+        .env_remove("LH_TRUST");
+    tokio::time::timeout(std::time::Duration::from_secs(30), command.output())
+        .await
+        .expect("lh timed out")
+        .expect("cannot run lh")
+}
+
 #[tokio::test]
 async fn print_streams_text_and_exits_zero() {
     let (base, fake) = spawn().await;
@@ -164,6 +185,116 @@ async fn endpoint_down_is_prescriptive() {
             || stderr.to_ascii_lowercase().contains("endpoint"),
         "stderr: {stderr}"
     );
+}
+
+#[tokio::test]
+async fn print_requires_a_model() {
+    let env = env();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
+    let output = run_lh_no_model(&env, &base, &["--print", "hi"]).await;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_ne!(output.status.code(), Some(0));
+    assert!(
+        stderr.contains("no model") && stderr.contains("/login"),
+        "stderr: {stderr}"
+    );
+}
+
+#[derive(Clone, Default)]
+struct RepoFake {
+    requests: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    calls: std::sync::Arc<AtomicUsize>,
+}
+
+async fn repo_chat(State(fake): State<RepoFake>, body: String) -> Response {
+    let value: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+    fake.requests.lock().unwrap().push(value);
+    let call = fake.calls.fetch_add(1, Ordering::SeqCst);
+    let frames = if call == 0 {
+        let arguments = serde_json::json!({"path": "src", "budget": 1000}).to_string();
+        format!(
+            "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+            serde_json::json!({
+                "choices": [{"delta": {"tool_calls": [{
+                    "index": 0,
+                    "id": "call_1",
+                    "function": {"name": "repo_map", "arguments": arguments}
+                }]}}]
+            }),
+            serde_json::json!({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}),
+        )
+    } else {
+        concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"mapped\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        )
+        .to_string()
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream"),
+        )
+        .body(Body::from_stream(stream::iter(
+            frames
+                .as_bytes()
+                .chunks(11)
+                .map(|chunk| Ok::<Bytes, Infallible>(Bytes::copy_from_slice(chunk)))
+                .collect::<Vec<_>>(),
+        )))
+        .unwrap()
+}
+
+async fn spawn_repo_server() -> (String, RepoFake) {
+    let fake = RepoFake::default();
+    let app = Router::new()
+        .route("/v1/chat/completions", post(repo_chat))
+        .route("/v1/models", axum::routing::get(models))
+        .with_state(fake.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (format!("http://{address}"), fake)
+}
+
+#[tokio::test]
+async fn print_calls_repo_map_and_prompt_contains_the_map() {
+    let (base, fake) = spawn_repo_server().await;
+    let env = env();
+    std::fs::create_dir_all(env.cwd.join("src")).unwrap();
+    std::fs::write(env.cwd.join("src/main.rs"), "fn main() {}\n").unwrap();
+
+    let output = run_lh(&env, &base, &["--print", "map it"]).await;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
+    assert!(stdout.contains("mapped"), "stdout: {stdout}");
+
+    let requests = fake.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2, "requests: {requests:?}");
+    let system = requests[0]["messages"][0]["content"]
+        .as_str()
+        .expect("system prompt");
+    assert!(
+        system.contains("## Repository map"),
+        "system prompt: {system}"
+    );
+    assert!(system.contains("src/main.rs"), "system prompt: {system}");
+
+    let messages = requests[1]["messages"].as_array().expect("messages");
+    let tool = messages
+        .iter()
+        .find(|message| message["role"] == "tool")
+        .expect("repo_map result");
+    let content = tool["content"].as_str().expect("tool content");
+    assert!(content.contains("src/main.rs"), "tool result: {content}");
+    assert!(content.contains("fn main"), "tool result: {content}");
 }
 
 #[derive(Clone, Default)]

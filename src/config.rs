@@ -315,6 +315,9 @@ pub struct ModelConfig {
     pub endpoint: String,
     pub model: String,
     pub api_key: String,
+    /// Optional shell command run once at startup when the endpoint is
+    /// unreachable. Empty disables it.
+    pub start_command: String,
     /// `None` means "not explicitly configured".
     pub context_window: Option<u32>,
     pub temperature: f32,
@@ -332,6 +335,7 @@ impl Default for ModelConfig {
             endpoint: DEFAULT_ENDPOINT.into(),
             model: String::new(),
             api_key: String::new(),
+            start_command: String::new(),
             context_window: None,
             temperature: 0.2,
             top_p: 0.95,
@@ -356,6 +360,68 @@ impl ModelConfig {
     }
     pub fn stream_idle_timeout(&self) -> Duration {
         Duration::from_secs(self.stream_idle_timeout_secs.max(1))
+    }
+
+    /// Persist endpoint, model, and API key under `[model]` in `path`,
+    /// preserving every other setting. Used by `/login` and `/model`.
+    pub fn save_connection(&self, path: &Path) -> Result<()> {
+        use std::io::Write as _;
+
+        let mut value = if path.exists() {
+            let raw = std::fs::read_to_string(path)
+                .with_context(|| format!("cannot read {}", path.display()))?;
+            toml::from_str::<toml::Value>(&raw)
+                .with_context(|| format!("invalid TOML in {}", path.display()))?
+        } else {
+            toml::Value::Table(Default::default())
+        };
+        let root = value.as_table_mut().context("config root is not a table")?;
+        let model = root
+            .entry("model".to_string())
+            .or_insert_with(|| toml::Value::Table(Default::default()));
+        let model = model.as_table_mut().context("[model] is not a table")?;
+        model.insert(
+            "endpoint".to_string(),
+            toml::Value::String(self.endpoint.trim().to_string()),
+        );
+        model.insert(
+            "model".to_string(),
+            toml::Value::String(self.model.trim().to_string()),
+        );
+        model.insert(
+            "api_key".to_string(),
+            toml::Value::String(self.api_key.clone()),
+        );
+        let raw = toml::to_string_pretty(&value).context("cannot serialize config")?;
+
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("cannot create {}", parent.display()))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+            }
+        }
+        let temporary = path.with_extension("toml.tmp");
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&temporary)
+            .with_context(|| format!("cannot write {}", temporary.display()))?;
+        file.write_all(raw.as_bytes())
+            .with_context(|| format!("cannot write {}", temporary.display()))?;
+        file.sync_all()
+            .with_context(|| format!("cannot flush {}", temporary.display()))?;
+        drop(file);
+        std::fs::rename(&temporary, path)
+            .with_context(|| format!("cannot replace {}", path.display()))?;
+        Ok(())
     }
 }
 
@@ -622,5 +688,57 @@ mod tests {
         assert_eq!(base["a"]["y"].as_integer(), Some(2));
         assert_eq!(base["c"]["q"].as_integer(), Some(4));
         assert_eq!(base["b"]["z"].as_integer(), Some(3));
+    }
+
+    #[test]
+    fn save_connection_preserves_unrelated_settings_and_is_private() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[model]\nendpoint = \"http://old:1\"\nmodel = \"old\"\napi_key = \"old\"\nstart_command = \"server --start\"\n\n[ui]\ntheme = \"light\"\n",
+        )
+        .unwrap();
+        let model = ModelConfig {
+            endpoint: "http://new:2".into(),
+            model: "new-model".into(),
+            api_key: "secret".into(),
+            ..ModelConfig::default()
+        };
+        model.save_connection(&path).unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let parsed: toml::Value = toml::from_str(&raw).unwrap();
+        assert_eq!(parsed["model"]["endpoint"].as_str(), Some("http://new:2"));
+        assert_eq!(parsed["model"]["model"].as_str(), Some("new-model"));
+        assert_eq!(parsed["model"]["api_key"].as_str(), Some("secret"));
+        assert_eq!(
+            parsed["model"]["start_command"].as_str(),
+            Some("server --start")
+        );
+        assert_eq!(parsed["ui"]["theme"].as_str(), Some("light"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(
+                mode & 0o777,
+                0o600,
+                "config with an API key must be private"
+            );
+        }
+    }
+
+    #[test]
+    fn save_connection_creates_the_config_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested/config.toml");
+        let model = ModelConfig {
+            endpoint: "http://127.0.0.1:8080".into(),
+            model: "m".into(),
+            ..ModelConfig::default()
+        };
+        model.save_connection(&path).unwrap();
+        assert!(path.is_file());
     }
 }

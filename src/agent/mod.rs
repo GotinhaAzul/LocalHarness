@@ -2,6 +2,7 @@
 
 pub mod gates;
 pub mod limits;
+pub mod output;
 pub mod prompt;
 pub mod repair;
 pub mod run;
@@ -46,9 +47,17 @@ pub struct Core {
     pub cancel: CancellationToken,
     pub tool_timeout: Duration,
     pub path_jail: bool,
+    /// Prompt limit observed from a server that silently truncates (0 when
+    /// none was seen). Shared across turns; reset when the core is rebuilt.
+    pub server_window: Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl Core {
+    /// A model is selected. The harness can start without one; `/login` sets it.
+    pub fn logged_in(&self) -> bool {
+        !self.provider.model().trim().is_empty()
+    }
+
     pub fn tool_context(&self) -> ToolContext {
         self.tool_context_with(self.cancel.clone())
     }
@@ -70,6 +79,7 @@ impl Core {
             bg: self.bg.clone(),
             security: self.security.clone(),
             paths: self.paths.clone(),
+            lsp: self.registry.lsp(),
         }
     }
 

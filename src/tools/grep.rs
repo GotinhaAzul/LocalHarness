@@ -89,14 +89,42 @@ fn run(ctx: &ToolContext, args: &Value) -> Result<ToolResult, ToolResult> {
         .clamp(1, MAX_MATCHES as u64) as usize;
     let case_sensitive = optional_bool(args, "case_sensitive").unwrap_or(false);
 
-    let mut regex_builder = RegexBuilder::new(&pattern);
-    regex_builder.case_insensitive(!case_sensitive);
-    let regex = regex_builder.build().map_err(|err| {
-        ToolResult::err(
-            "bad_pattern",
-            format!(r#"invalid regex: {err}; example: "fn\s+\w+\(" matches a function signature."#),
-        )
-    })?;
+    let build = |source: &str| {
+        RegexBuilder::new(source)
+            .case_insensitive(!case_sensitive)
+            .build()
+    };
+    // An invalid regex is almost always code pasted as a pattern (`foo(`,
+    // `arr[0]`). Searching it literally answers the question instead of
+    // spending a turn on an error.
+    let (regex, fallback) = match build(&pattern) {
+        Ok(regex) => (regex, None),
+        Err(err) => {
+            let reason = err
+                .to_string()
+                .lines()
+                .rev()
+                .find(|line| !line.trim().is_empty())
+                .unwrap_or("parse error")
+                .trim()
+                .trim_start_matches("error: ")
+                .to_string();
+            let literal = build(&regex::escape(&pattern)).map_err(|err| {
+                ToolResult::err(
+                    "bad_pattern",
+                    format!(r#"invalid regex: {err}; example: "fn\s+\w+\(" matches a function signature."#),
+                )
+            })?;
+            let note = format!(
+                "note: {pattern:?} is not a valid regex ({reason}); searched it as literal text. Rust regex has no look-around or backreferences; escape ( [ {{ . * + ? | with \\ for regex matching."
+            );
+            (literal, Some(note))
+        }
+    };
+    let prefix = fallback
+        .as_ref()
+        .map(|note| format!("{note}\n"))
+        .unwrap_or_default();
 
     let matcher = match optional_str(args, "glob") {
         Some(glob) => {
@@ -193,15 +221,16 @@ fn run(ctx: &ToolContext, args: &Value) -> Result<ToolResult, ToolResult> {
     }
 
     if matches == 0 {
-        let text = format!("no matches for {pattern:?} in {root_display}");
+        let text = format!("{prefix}no matches for {pattern:?} in {root_display}");
         return Ok(ToolResult::ok(text).with_details(json!({
             "matches": 0,
             "files": 0,
             "truncated": false,
+            "literal_fallback": fallback.is_some(),
         })));
     }
 
-    let mut text = out.join("\n");
+    let mut text = prefix + &out.join("\n");
     if truncated {
         text.push_str(&format!(
             "\n[truncated at {max_matches} matches; narrow the pattern, path, or glob]"
@@ -211,6 +240,7 @@ fn run(ctx: &ToolContext, args: &Value) -> Result<ToolResult, ToolResult> {
         "matches": matches,
         "files": files_with_matches,
         "truncated": truncated,
+        "literal_fallback": fallback.is_some(),
     })))
 }
 
@@ -343,18 +373,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalid_regex_is_reported_with_example() {
+    async fn invalid_regex_falls_back_to_a_literal_search() {
         let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "let v = call(arr[0]);\nother\n").unwrap();
         let ctx = test_context(dir.path());
 
-        let result = GrepTool.call(&ctx, json!({"pattern": "["})).await;
-        assert!(result.is_error);
+        let result = GrepTool.call(&ctx, json!({"pattern": "call(arr["})).await;
+        assert!(!result.is_error, "{}", result.content);
         assert!(
-            result.content.starts_with("[bad_pattern]"),
+            result.content.contains("searched it as literal text"),
             "{}",
             result.content
         );
-        assert!(result.content.contains("example:"), "{}", result.content);
+        assert!(result.content.contains("a.rs:1"), "{}", result.content);
+        assert_eq!(result.details.unwrap()["literal_fallback"], true);
     }
 
     #[tokio::test]

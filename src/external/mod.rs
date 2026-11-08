@@ -365,6 +365,15 @@ impl Tool for ExternalTool {
         false
     }
 
+    fn evidence_enabled(&self) -> bool {
+        true
+    }
+
+    fn evidence_command(&self, args: &Value) -> Option<String> {
+        let args = serde_json::to_string(args).unwrap_or_else(|_| "{}".into());
+        Some(format!("{} {}", self.manifest.command, args))
+    }
+
     async fn call(&self, ctx: &ToolContext, args: Value) -> ToolResult {
         if ctx.is_cancelled() {
             return ToolResult::err(
@@ -738,6 +747,7 @@ mod tests {
             bg: Arc::new(Mutex::new(BgRegistry::new())),
             security: Arc::new(Mutex::new(security)),
             paths,
+            lsp: Arc::new(crate::tools::lsp::LspService::new()),
         }
     }
 

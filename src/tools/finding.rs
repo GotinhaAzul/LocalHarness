@@ -30,24 +30,69 @@ impl FindingTool {
 
         let session_id = ctx.session.lock().ok().map(|session| session.id.clone());
         let explicit_artifact = optional_str(args, "artifact");
+        let explicit_evidence = optional_str(args, "evidence_id");
 
         let mut evidence = non_empty(args, "evidence");
         let mut evidence_ref = explicit_ref(args);
         let mut entry_id = optional_str(args, "entry");
 
-        if evidence.is_none() {
+        if evidence.is_none() && explicit_evidence.is_none() {
             let Some((content, entry, artifact)) = last_tool_result(ctx) else {
                 return Err(arg_err(
                     "evidence is required when the branch has no tool result; pass {\"evidence\":\"...\"} or run a tool first",
                 ));
             };
             evidence = Some(clip(&content, MAX_EVIDENCE_CHARS));
-            evidence_ref = Some(EvidenceRef {
+            let reference = EvidenceRef {
+                evidence: None,
                 session: session_id.clone(),
                 entry: Some(entry.clone()),
                 artifact: explicit_artifact.or(artifact),
-            });
+            };
+            evidence_ref = Some(reference);
             entry_id = Some(entry);
+        }
+        if explicit_evidence.is_none()
+            && entry_id.is_none()
+            && evidence_ref
+                .as_ref()
+                .and_then(|reference| reference.entry.as_ref())
+                .is_none()
+            && let Some((_, entry, _)) = last_tool_result(ctx)
+        {
+            entry_id = Some(entry);
+        }
+
+        let mut state = lock_security(ctx)?;
+        let engagement = state
+            .ensure_engagement(&ctx.paths)
+            .map_err(|err| security_io(&ctx.paths, err))?;
+        if let Some(id) = explicit_evidence.as_deref() {
+            if engagement.evidence.get(id).is_none() {
+                return Err(ToolResult::err(
+                    "EVIDENCE_NOT_FOUND",
+                    format!("no evidence {id:?}; `evidence list` shows ids"),
+                ));
+            }
+            if evidence.is_none()
+                && let Ok((_, content)) = engagement.evidence.read(id)
+            {
+                evidence = Some(clip(&content, MAX_EVIDENCE_CHARS));
+            }
+        }
+        if explicit_evidence.is_none()
+            && evidence_ref
+                .as_ref()
+                .and_then(|reference| reference.evidence.as_ref())
+                .is_none()
+            && let (Some(session), Some(entry)) = (&session_id, &entry_id)
+            && let Some(chain) = engagement.evidence.last_for_entry(session, entry)
+        {
+            let reference = evidence_ref.get_or_insert_with(EvidenceRef::default);
+            reference.evidence = Some(chain.id.clone());
+            if reference.artifact.is_none() {
+                reference.artifact = Some(chain.artifact.clone());
+            }
         }
 
         let new = NewFinding {
@@ -61,11 +106,6 @@ impl FindingTool {
             session_id,
             entry_id,
         };
-
-        let mut state = lock_security(ctx)?;
-        let engagement = state
-            .ensure_engagement(&ctx.paths)
-            .map_err(|err| security_io(&ctx.paths, err))?;
         let finding = engagement
             .add(new)
             .map_err(|msg| ToolResult::err("FINDING_ARGS", msg))?;
@@ -310,13 +350,15 @@ fn non_empty(args: &Value, key: &str) -> Option<String> {
 }
 
 fn explicit_ref(args: &Value) -> Option<EvidenceRef> {
+    let evidence = optional_str(args, "evidence_id");
     let session = optional_str(args, "session");
     let entry = optional_str(args, "entry");
     let artifact = optional_str(args, "artifact");
-    if session.is_none() && entry.is_none() && artifact.is_none() {
+    if evidence.is_none() && session.is_none() && entry.is_none() && artifact.is_none() {
         return None;
     }
     Some(EvidenceRef {
+        evidence,
         session,
         entry,
         artifact,
@@ -397,13 +439,14 @@ impl Tool for FindingTool {
             "properties": {
                 "action": {"type": "string", "enum": ["add", "update", "list", "report"]},
                 "id": {"type": "string", "description": "finding id from `list`, e.g. f1"},
-                "title": {"type": "string"},
+                "title": {"type": "string", "description": "add: one-line summary of the issue."},
                 "severity": {"type": "string", "enum": ["critical", "high", "medium", "low", "info"]},
-                "status": {"type": "string", "enum": ["open", "fixed", "accepted", "false-positive"]},
+                "status": {"type": "string", "enum": ["open", "fixed", "accepted", "false-positive"], "description": "update: new status."},
                 "target": {"type": "string", "description": "affected asset, host, or URL"},
                 "evidence": {"type": "string", "description": "request/response or observation proving the finding"},
-                "impact": {"type": "string"},
-                "remediation": {"type": "string"},
+                "evidence_id": {"type": "string", "description": "engagement evidence id, e.g. e3"},
+                "impact": {"type": "string", "description": "What an attacker gains."},
+                "remediation": {"type": "string", "description": "How to fix it."},
                 "session": {"type": "string", "description": "session id for the evidence ref"},
                 "entry": {"type": "string", "description": "session entry id for the evidence ref"},
                 "artifact": {"type": "string", "description": "artifact id holding the evidence"}
@@ -487,6 +530,7 @@ mod tests {
             bg: Arc::new(Mutex::new(BgRegistry::new())),
             security: Arc::new(Mutex::new(security)),
             paths,
+            lsp: Arc::new(crate::tools::lsp::LspService::new()),
         }
     }
 
@@ -595,6 +639,92 @@ mod tests {
         assert_eq!(reference.session.as_deref(), Some("ephemeral"));
         assert_eq!(reference.entry.as_deref(), Some("e1"));
         assert_eq!(reference.artifact.as_deref(), Some("art-7"));
+    }
+
+    #[tokio::test]
+    async fn add_links_and_validates_an_explicit_evidence_id() {
+        use crate::security::evidence::NewEvidence;
+        use chrono::Utc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(dir.path());
+        {
+            let mut state = ctx.security.lock().unwrap();
+            let engagement = state.ensure_engagement(&ctx.paths).unwrap();
+            let now = Utc::now();
+            engagement
+                .evidence
+                .add(NewEvidence {
+                    tool: "bash".into(),
+                    session: Some("ephemeral".into()),
+                    entry: Some("t0".into()),
+                    target: "app.test".into(),
+                    command: "curl https://app.test".into(),
+                    started: now,
+                    finished: now,
+                    duration_ms: 1,
+                    exit_code: Some(0),
+                    timed_out: false,
+                    cancelled: false,
+                    is_error: false,
+                    output: "HTTP/1.1 500 Internal Server Error\n".into(),
+                    summary: None,
+                })
+                .unwrap();
+        }
+
+        let added = FindingTool
+            .call(
+                &ctx,
+                json!({
+                    "action": "add",
+                    "title": "Server error",
+                    "severity": "medium",
+                    "target": "https://app.test",
+                    "evidence_id": "e1"
+                }),
+            )
+            .await;
+        assert!(!added.is_error, "{}", added.content);
+        {
+            let state = ctx.security.lock().unwrap();
+            let finding = &state.engagement.as_ref().unwrap().findings[0];
+            assert!(
+                finding
+                    .evidence
+                    .as_deref()
+                    .is_some_and(|evidence| evidence.contains("HTTP/1.1 500")),
+                "{:?}",
+                finding.evidence
+            );
+            assert_eq!(
+                finding
+                    .evidence_ref
+                    .as_ref()
+                    .and_then(|reference| reference.evidence.as_deref()),
+                Some("e1")
+            );
+        }
+
+        let bad = FindingTool
+            .call(
+                &ctx,
+                json!({
+                    "action": "add",
+                    "title": "Bad reference",
+                    "severity": "low",
+                    "target": "app.test",
+                    "evidence": "x",
+                    "evidence_id": "e99"
+                }),
+            )
+            .await;
+        assert!(bad.is_error);
+        assert!(
+            bad.content.contains("EVIDENCE_NOT_FOUND"),
+            "{}",
+            bad.content
+        );
     }
 
     #[tokio::test]

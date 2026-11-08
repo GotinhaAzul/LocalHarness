@@ -195,6 +195,30 @@ fn match_task(tasks: &[Task], needle: &str) -> Option<usize> {
     if let Some(index) = tasks.iter().position(|task| task.content == needle) {
         return Some(index);
     }
+    // `list` numbers tasks from 1, so "2", "#2", and a copied "2. Add tests"
+    // all name the second task rather than a substring match on "2".
+    let digits: String = needle
+        .trim_start_matches('#')
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    let rest = needle.trim_start_matches('#')[digits.len()..].trim_start_matches(['.', ')', ':']);
+    if let Ok(number) = digits.parse::<usize>()
+        && (1..=tasks.len()).contains(&number)
+    {
+        let rest = rest.trim();
+        if rest.is_empty()
+            || tasks[number - 1]
+                .content
+                .to_lowercase()
+                .contains(&rest.to_lowercase())
+        {
+            return Some(number - 1);
+        }
+        if let Some(index) = tasks.iter().position(|task| task.content == rest) {
+            return Some(index);
+        }
+    }
     let lower = needle.to_lowercase();
     tasks
         .iter()
@@ -227,7 +251,15 @@ impl Tool for TodoTool {
     }
 
     fn schema(&self) -> Value {
-        serde_json::from_str(r#"{"type":"object","properties":{"action":{"type":"string","enum":["plan","start","done","list"]},"tasks":{"type":"array","items":{"type":"string"}},"task":{"type":"string"},"note":{"type":"string"}},"required":["action"],"additionalProperties":false}"#).expect("valid schema")
+        crate::tools::object_schema(
+            json!({
+                "action": {"type": "string", "enum": ["plan", "start", "done", "list"], "description": "plan replaces the list and starts task 1; start/done take task; list shows state."},
+                "tasks": {"type": "array", "items": {"type": "string"}, "description": "plan: ordered task titles."},
+                "task": {"type": "string", "description": "start/done: task number from list (e.g. \"2\") or a title substring; done defaults to the active task."},
+                "note": {"type": "string", "description": "done: what was finished and how it was checked."}
+            }),
+            &["action"],
+        )
     }
 
     fn pack(&self) -> ToolPack {
@@ -461,6 +493,24 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use tokio_util::sync::CancellationToken;
 
+    #[test]
+    fn task_numbers_name_tasks_by_position() {
+        let tasks: Vec<Task> = ["Fix bug 2", "Add tests", "Update docs"]
+            .iter()
+            .map(|content| Task {
+                content: content.to_string(),
+                status: TaskStatus::Pending,
+            })
+            .collect();
+        // "2" is the second task, not a substring hit on "Fix bug 2".
+        assert_eq!(match_task(&tasks, "2"), Some(1));
+        assert_eq!(match_task(&tasks, "#3"), Some(2));
+        assert_eq!(match_task(&tasks, "2. Add tests"), Some(1));
+        assert_eq!(match_task(&tasks, "Fix bug 2"), Some(0));
+        assert_eq!(match_task(&tasks, "docs"), Some(2));
+        assert_eq!(match_task(&tasks, "9"), None);
+    }
+
     fn test_ctx() -> (tempfile::TempDir, ToolContext) {
         let dir = tempfile::tempdir().expect("tempdir");
         let cwd = dir.path().to_path_buf();
@@ -492,6 +542,7 @@ mod tests {
             bg: Arc::new(Mutex::new(BgRegistry::new())),
             security: Arc::new(Mutex::new(SecurityState::default())),
             paths,
+            lsp: Arc::new(crate::tools::lsp::LspService::new()),
         };
         (dir, ctx)
     }

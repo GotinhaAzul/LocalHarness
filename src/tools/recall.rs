@@ -44,7 +44,14 @@ impl Tool for RecallTool {
     }
 
     fn schema(&self) -> Value {
-        serde_json::from_str(r#"{"type":"object","properties":{"artifact":{"type":"string"},"start":{"type":"integer"},"end":{"type":"integer"}},"required":["artifact"],"additionalProperties":false}"#).expect("valid schema")
+        crate::tools::object_schema(
+            json!({
+                "artifact": {"type": "string", "description": "Artifact id named in a truncated result, e.g. \"out-3\"."},
+                "start": {"type": "integer", "description": "First line, 1-based (default 1)."},
+                "end": {"type": "integer", "description": "Last line, inclusive (default 120)."}
+            }),
+            &["artifact"],
+        )
     }
 
     fn pack(&self) -> ToolPack {
@@ -216,6 +223,7 @@ mod tests {
             bg: Arc::new(Mutex::new(BgRegistry::new())),
             security: Arc::new(Mutex::new(SecurityState::default())),
             paths,
+            lsp: Arc::new(crate::tools::lsp::LspService::new()),
         };
         (dir, ctx)
     }

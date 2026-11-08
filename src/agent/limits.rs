@@ -79,6 +79,12 @@ pub struct RunProgress {
     pub review_nudged: bool,
     pub context_retry_used: bool,
     pub last_stop: Option<StopReason>,
+    /// Harness nudges spent on broken output this turn.
+    pub output_recoveries: u32,
+    /// Whether the user was told that tool calls are arriving as text.
+    pub text_calls_noticed: bool,
+    /// Whether a reply was already discarded for silent server truncation.
+    pub truncation_retry_used: bool,
 }
 
 impl RunProgress {
@@ -96,6 +102,9 @@ impl RunProgress {
             review_nudged: false,
             context_retry_used: false,
             last_stop: None,
+            output_recoveries: 0,
+            text_calls_noticed: false,
+            truncation_retry_used: false,
         }
     }
 

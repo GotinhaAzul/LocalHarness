@@ -413,13 +413,29 @@ impl Tool for BgTool {
         "Start and supervise background processes: start, status, logs, stop (max 4 live)."
     }
 
+    fn evidence_enabled(&self) -> bool {
+        true
+    }
+
+    fn evidence_command(&self, args: &Value) -> Option<String> {
+        if let Some(command) = args.get("command").and_then(Value::as_str) {
+            return Some(command.to_string());
+        }
+        let action = args
+            .get("action")
+            .and_then(Value::as_str)
+            .unwrap_or("status");
+        let id = args.get("id").and_then(Value::as_str).unwrap_or("");
+        Some(format!("bg {action} {id}").trim().to_string())
+    }
+
     fn schema(&self) -> Value {
         object_schema(
             json!({
                 "action": {"type": "string", "enum": ["start", "status", "logs", "stop"]},
-                "command": {"type": "string", "description": "Command for action=start"},
-                "id": {"type": "string", "description": "Process id, for example bg-1"},
-                "lines": {"type": "integer", "minimum": 1, "maximum": MAX_LOG_LINES}
+                "command": {"type": "string", "description": "start: shell command to run in the background."},
+                "id": {"type": "string", "description": "logs/stop: process id from start, e.g. bg-1; status lists all when omitted."},
+                "lines": {"type": "integer", "minimum": 1, "maximum": MAX_LOG_LINES, "description": "logs: trailing lines to show."}
             }),
             &["action"],
         )

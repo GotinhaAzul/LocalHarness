@@ -84,7 +84,7 @@ pub struct ChatRequest {
     pub reasoning_field: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Usage {
     #[serde(default)]
     pub prompt_tokens: u32,
@@ -92,6 +92,20 @@ pub struct Usage {
     pub completion_tokens: u32,
     #[serde(default)]
     pub total_tokens: u32,
+    /// Prompt tokens served from the server's prefix cache, when reported
+    /// (`prompt_tokens_details.cached_tokens`, or llama.cpp `timings.cache_n`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_tokens: Option<u32>,
+    /// Server time spent on the uncached part of the prompt (llama.cpp).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_ms: Option<u32>,
+    /// Time from sending the request to the first streamed token, measured
+    /// by the harness, so it is available from every engine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_token_ms: Option<u32>,
+    /// Generation speed in tokens per second.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_per_sec: Option<f32>,
 }
 
 impl Usage {
@@ -100,8 +114,59 @@ impl Usage {
             prompt_tokens: prompt,
             completion_tokens: completion,
             total_tokens: prompt + completion,
+            ..Self::default()
         }
     }
+
+    /// Fold in a later, possibly partial report: llama.cpp can send
+    /// `timings` and `usage` in different chunks. Known values win.
+    pub fn merge(&mut self, other: &Usage) {
+        if other.prompt_tokens > 0 {
+            self.prompt_tokens = other.prompt_tokens;
+        }
+        if other.completion_tokens > 0 {
+            self.completion_tokens = other.completion_tokens;
+        }
+        if other.total_tokens > 0 {
+            self.total_tokens = other.total_tokens;
+        }
+        self.cached_tokens = other.cached_tokens.or(self.cached_tokens);
+        self.prompt_ms = other.prompt_ms.or(self.prompt_ms);
+        self.first_token_ms = other.first_token_ms.or(self.first_token_ms);
+        self.tokens_per_sec = other.tokens_per_sec.or(self.tokens_per_sec);
+    }
+
+    /// Share of the prompt reused from the server cache, 0-100.
+    pub fn cache_percent(&self) -> Option<u32> {
+        let cached = self.cached_tokens?;
+        (self.prompt_tokens > 0).then(|| {
+            ((u64::from(cached.min(self.prompt_tokens)) * 100) / u64::from(self.prompt_tokens))
+                as u32
+        })
+    }
+
+    /// One compact line for the UI: `cache 94% · prompt 0.4s · first token
+    /// 0.6s · 31 tok/s`. Empty when nothing was measured.
+    pub fn perf_line(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(percent) = self.cache_percent() {
+            parts.push(format!("cache {percent}%"));
+        }
+        if let Some(ms) = self.prompt_ms {
+            parts.push(format!("prompt {}", seconds(ms)));
+        }
+        if let Some(ms) = self.first_token_ms {
+            parts.push(format!("first token {}", seconds(ms)));
+        }
+        if let Some(rate) = self.tokens_per_sec {
+            parts.push(format!("{rate:.0} tok/s"));
+        }
+        parts.join(" · ")
+    }
+}
+
+fn seconds(ms: u32) -> String {
+    format!("{:.1}s", f64::from(ms) / 1000.0)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -193,6 +258,32 @@ pub fn redact(mut message: String, secrets: &[&str]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partial_usage_reports_merge_and_render() {
+        let mut usage = Usage::new(1000, 0);
+        let timings = Usage {
+            cached_tokens: Some(940),
+            prompt_ms: Some(420),
+            tokens_per_sec: Some(31.4),
+            ..Usage::default()
+        };
+        usage.merge(&timings);
+        usage.merge(&Usage::new(0, 80));
+        assert_eq!((usage.prompt_tokens, usage.completion_tokens), (1000, 80));
+        usage.first_token_ms = Some(610);
+        assert_eq!(
+            usage.perf_line(),
+            "cache 94% · prompt 0.4s · first token 0.6s · 31 tok/s"
+        );
+        assert_eq!(Usage::new(10, 2).perf_line(), "");
+        // Old session files without the new fields still load.
+        let old: Usage =
+            serde_json::from_str(r#"{"prompt_tokens":5,"completion_tokens":1,"total_tokens":6}"#)
+                .unwrap();
+        assert_eq!(old.cached_tokens, None);
+        assert!(!serde_json::to_string(&old).unwrap().contains("cached"));
+    }
 
     #[test]
     fn usage_total_is_derived_in_constructor() {

@@ -191,6 +191,12 @@ pub async fn run(cli: Cli) -> Result<i32> {
 
     let runtime = create_runtime(config.clone(), paths.clone(), options).await?;
 
+    if cli.print.is_some() && !runtime.core.logged_in() {
+        bail!(
+            "no model is selected. Start the inference server and run `/login` in the TUI, or pass --model (or set LH_MODEL)."
+        );
+    }
+
     if config.session.clean_artifacts {
         if let Err(err) = runtime.core.artifacts.clean_all() {
             tracing::warn!(%err, "cannot clean artifacts");

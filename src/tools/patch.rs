@@ -3,8 +3,8 @@
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-use crate::tools::edit::{diff_report, nearest_window, read_text, require_fresh};
-use crate::tools::write::{atomic_write, file_mode, lock_reads};
+use crate::tools::edit::{diff_report, locate, nearest_window, read_text, require_fresh};
+use crate::tools::write::{atomic_write, file_mode, record_own_write};
 use crate::tools::{
     Tool, ToolContext, ToolPack, ToolResult, display_path, optional_u64, required_str,
 };
@@ -46,9 +46,17 @@ impl Tool for PatchTool {
     }
 
     async fn call(&self, ctx: &ToolContext, args: Value) -> ToolResult {
-        match run(ctx, &args) {
+        let raw = args
+            .get("path")
+            .and_then(|value| value.as_str())
+            .map(str::to_string);
+        let result = match run(ctx, &args) {
             Ok(result) => result,
-            Err(err) => err,
+            Err(err) => return err,
+        };
+        match raw.as_deref().map(|raw| ctx.resolve(raw)) {
+            Some(Ok(path)) => result.with_diagnostics(ctx, &path).await,
+            _ => result,
         }
     }
 }
@@ -85,13 +93,14 @@ fn run(ctx: &ToolContext, args: &Value) -> Result<ToolResult, ToolResult> {
     let before = read_text(&path, &display)?;
     require_fresh(ctx, &path, &display)?;
 
-    let total = before.match_indices(&anchor).count();
-    if total == 0 {
+    let Some(located) = locate(&before, &anchor, replacement) else {
         return Err(ToolResult::err(
             "NO_MATCH",
             nearest_window(&display, &before, &anchor),
         ));
-    }
+    };
+    let (anchor, replacement) = (located.needle, located.replacement.as_str());
+    let total = before.match_indices(&anchor).count();
     if occurrence > total {
         return Err(ToolResult::err(
             "OCCURRENCE_RANGE",
@@ -113,19 +122,29 @@ fn run(ctx: &ToolContext, args: &Value) -> Result<ToolResult, ToolResult> {
     );
 
     let (diff, added, removed) = diff_report(&before, &after, MAX_DIFF_LINES);
+    let change = crate::tools::undo::record_change(ctx, Ok(Some(&before)), &after);
     atomic_write(&path, after.as_bytes(), file_mode(&path))
         .map_err(|err| ToolResult::err("PATCH_FAILED", format!("cannot write {display}: {err}")))?;
-    lock_reads(ctx).clear();
+    record_own_write(ctx, &path);
 
+    let how = located
+        .how
+        .map(|how| format!("; {how}"))
+        .unwrap_or_default();
     let text = format!(
-        "patched {display} (occurrence {occurrence} of {total}, +{added} -{removed})\n{diff}"
+        "patched {display} (occurrence {occurrence} of {total}, +{added} -{removed}{how})\n{diff}"
     );
-    Ok(ToolResult::ok(text).with_details(json!({
-        "path": display,
-        "added": added,
-        "removed": removed,
-        "replacements": 1,
-    })))
+    Ok(
+        ToolResult::ok(text).with_details(crate::tools::undo::merge_details(
+            json!({
+                "path": display,
+                "added": added,
+                "removed": removed,
+                "replacements": 1,
+            }),
+            change,
+        )),
+    )
 }
 
 #[cfg(test)]

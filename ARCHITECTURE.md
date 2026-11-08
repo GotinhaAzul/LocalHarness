@@ -113,10 +113,15 @@ Probes improve accuracy but are never required.
 
 | Probe | Engine | Use |
 |---|---|---|
-| `GET /v1/models` | all | model list, auto-select when exactly one |
+| `GET /v1/models` | all | model list, auto-select when exactly one; `/login` validation |
 | `GET /props` | llama.cpp | `n_ctx`, chat template, slots |
 | `POST /tokenize` | llama.cpp, vLLM | exact token counts |
 | `GET /api/show` | Ollama | context length, model metadata |
+
+A missing endpoint or model never blocks the TUI. Startup probes with a short
+timeout; if no model resolves, the core is built in a logged-out state, the
+session records a warning, and `/login` later validates and applies the
+connection. Headless `--print` rejects the logged-out state.
 
 Fallbacks: `context_window` from config (default 32768), and a calibrated
 characters-per-token ratio. Calibration is corrected from `usage.prompt_tokens`
@@ -209,7 +214,8 @@ States: `Idle`, `AssembleContext`, `Compact`, `StreamModel`, `ToolBatch`,
 ### 3.2 Turn flow
 
 1. Append the user entry to the session branch.
-2. Assemble context from the active branch.
+2. Assemble context from the active branch, including the cached repository
+   brief in the system prompt.
 3. If the prompt budget is exceeded, write a compaction entry and rebuild.
 4. Send the model request with the profile's tool list.
 5. Stream text, reasoning, and tool calls. Emit UI events.
@@ -235,16 +241,37 @@ observable.
 
 - Parse `function.arguments` as JSON; if it is a JSON string containing an
   object, parse twice.
-- Coerce stringified numbers and booleans.
+- Drop `null` values; a null optional means "not provided".
+- Coerce stringified numbers and booleans, whole floats to integers, and
+  scalars to strings where the schema expects a string.
+- Recover arrays sent as a JSON-encoded string or a bulleted/numbered list.
 - Unwrap single-element arrays where the schema expects a scalar.
-- Map alias keys: `file`/`filepath`/`path`, `cmd`/`command`, `old`/`oldText`,
-  `new`/`newText`, `start`/`startLine`, `end`/`endLine`.
-- Apply defaults: `read.limit`, `bash.timeout`, `grep.max_matches`.
+- Map alias keys per tool, from the names other harnesses train models on:
+  `file_path`/`file`/`filepath` to `path`, `cmd` to `command`,
+  `old_string`/`oldText` to `edit.old` or `patch.anchor`, `new_string`/`newText`
+  to `edit.new` or `patch.replacement`, `query`/`regex` to `grep.pattern`, and
+  similar. An alias applies only when the tool declares the canonical key, and
+  never overwrites a canonical key the model also sent.
+- Fold enum values: case, surrounding space, and `_` vs `-` are ignored, and a
+  few synonyms are accepted (`complete` for `todo` `done`, `kill` for `bg`
+  `stop`).
+- Infer an omitted `action` only when unambiguous (`todo` with `tasks` is
+  `plan`, `bg` with `command` is `start`).
+- Apply defaults: `bash.timeout`, `grep.max_matches`, `recall` range. `read`
+  applies its own page size so an explicit `end` is never clipped.
+- Drop undeclared keys and say so: the result carries
+  `note: ignored unknown argument(s) ...; <tool> accepts ...`, and a
+  `missing_argument` error names the dropped keys that likely caused it.
 - Generate a synthetic `call_<n>` id when the provider omits one.
 - Reject no-op edits and interactive-only commands with the exact call shape to
   use instead.
-- Reject a call to a tool that is not in the active list with
-  `unknown tool "<name>"; active tools: ...`.
+- Resolve tool names before any gate runs: strip `functions.` / `default_api:`
+  prefixes and case drift, and route unambiguous foreign names (`read_file`,
+  `str_replace`, `shell`, `run_command`, ...) to the active tool with a note
+  naming the canonical tool. Gates see the canonical name, so routing never
+  bypasses the read or scope gates.
+- Reject any other unknown tool with
+  `unknown tool "<name>"; did you mean <nearest>? active tools: ...`.
 - On failure, return `is_error: true` with a prescriptive message, never a
   schema dump.
 
@@ -252,7 +279,7 @@ observable.
 
 | Guard | Behavior |
 |---|---|
-| Read-before-edit | `edit`/`write` on an existing file require a prior `read` with a matching stat stamp (`mtime`, size). A changed file requires a re-read. Creation is allowed. |
+| Read-before-edit | `edit`/`write` on an existing file require a prior `read` with a matching stat stamp (`mtime`, size). A changed file requires a re-read. Creation is allowed. A successful `edit`/`patch`/`write` re-stamps only the file it wrote, so consecutive edits need no re-read while any outside change still does. |
 | Scope gate | Security-sensitive commands are checked against the user-set engagement scope. No scope blocks with `SEC_SCOPE` and the `/sec scope add` call. Best-effort, not a sandbox. |
 | Loop guard | Signature is tool name plus canonical arguments. Same call three times in 24 calls, or a 2-4 call cycle three times, blocks the call and ends the turn with a recovery instruction. No automatic session replacement in v1. |
 | Interactive command guard | Blocks `vim`, `less`, `top`, `htop`, `watch`, `nano`, `ssh` without a command, and similar TTY-only invocations. |
@@ -290,6 +317,22 @@ Guards are inert when their required tool is absent from the active profile.
 
 At most two settle continuations per turn, shared by verify and todo gates.
 The review nudge is one-shot and does not count against the verify cap.
+
+### 3.7 Output recovery
+
+Local servers often lack a reasoning or tool parser, and small models loop.
+`agent/output.rs` repairs what can be repaired deterministically; anything
+else becomes a harness message (`[localharness] <kind>: ...`) and the loop
+continues. Nudges are capped at three per turn.
+
+| Symptom | Handling |
+|---|---|
+| `<think>` / `<thinking>` in content | Split out while streaming (tags may straddle deltas) and stored as reasoning; text before a lone `</think>` too. |
+| Tool calls written as text | With `tool_mode` `repair` or `auto`, parsed into native calls before gates run (formats in `docs/model-setup.md`). Fenced/bare JSON must name an active tool and end the reply. |
+| Exact repetition | The stream is checked as it grows; a tail of one unit repeated at least 5 times and 600 bytes stops generation, keeps one copy, and nudges. Repeated loops end the turn as `stalled`. |
+| `finish_reason = length` | A cut tool call (arguments not valid JSON) does not run; the model is told to send smaller calls. Cut prose is continued. A reply that spent the budget thinking is told to act. |
+| Empty reply | One nudge to call a tool or answer. |
+| Silent prompt truncation | A usage report under 1 token per 6 characters on a prompt of 12,000+ characters means the server dropped part of the prompt. Calibration skips the sample, the budget shrinks to the observed window for the rest of the session, the reply is discarded, and the call is retried once after compaction. |
 
 ---
 
@@ -512,7 +555,15 @@ deletes entries.
     <engagement>/
       scope.toml
       findings.jsonl
+      evidence.jsonl
+      evidence/
+        e1.txt
+      surface.json
 ```
+
+- Evidence artifacts are append-only and `0600`; each ledger entry carries the
+  SHA-256 of the artifact. The surface inventory is rewritten atomically after
+  each command that produces observations.
 
 - `project-id` is the first 12 hex characters of SHA-256 over the canonical
   working directory.
@@ -541,8 +592,8 @@ deletes entries.
 
 ### 6.1 Built-in tool surface
 
-Seventeen tools. Static per model call. The default `full` profile includes all
-three packs.
+Twenty-three tools. Static per model call. The default `full` profile includes
+all three packs.
 
 | Pack | Tool | Purpose |
 |---|---|---|
@@ -550,6 +601,7 @@ three packs.
 | Core | `write` | Create or replace a file |
 | Core | `edit` | Exact-text replacement |
 | Core | `patch` | Anchor/range edit with recovery diagnostics |
+| Core | `undo` | Revert the last harness change to a file, one step per call |
 | Core | `bash` | Non-interactive command with timeout |
 | Core | `grep` | Regex search with context, gitignore-aware |
 | Core | `glob` | File discovery |
@@ -559,8 +611,13 @@ three packs.
 | Core | `thread` | Split, note, close, status |
 | Core | `bg` | Background process start/status/logs/stop |
 | Coding | `lsp` | outline, definition, references, diagnostics, hover |
+| Coding | `repo_map` | Cached file and symbol outline |
 | Coding | `test` | One file or one test; first failure only |
 | Coding | `review` | Working-tree stats, risks, hunks |
+| Security | `surface` | Read hosts, ports, services, URLs, technologies |
+| Security | `evidence` | List, show, verify the evidence chain |
+| Security | `detect` | Validate/run Sigma-subset rules, map hits to findings |
+| Security | `attack_path` | Ranked graph paths, choke points, node detail |
 | Security | `finding` | Engagement findings ledger and report |
 | Security | `iocs` | Extract and defang indicators |
 
@@ -578,7 +635,25 @@ code and, where useful, the exact call shape.
 - `write` and `edit` are atomic (temp file plus rename) and record `fs-change`.
 - `edit` preflight handles: multiple matches (list line numbers), whitespace-
   only match (show the verbatim excerpt), and no match (show the closest
-  window). It never blocks an edit that would succeed.
+  window). It never blocks an edit that would succeed. When the exact text is
+  absent, `edit` and `patch` try lossless fallbacks in order: LF text against a
+  CRLF file, a `read` line-number gutter copied into the text, and trailing
+  whitespace drift on whole lines when exactly one window fits. The result says
+  which fallback matched. Indentation is never normalized.
+- `grep` searches an invalid regex as literal text and says so, instead of
+  failing the call.
+- `undo` reverts the harness's own changes without git. Before `edit`,
+  `patch`, or `write` change a file, its previous text goes to the session
+  artifact store; the change's `fs-change` entry records the snapshot id (or
+  `created` for a new file) and a SHA-256 of what was written. Undo walks the
+  active branch's `fs-change` entries, skipping ones an earlier undo reverted,
+  so it follows `/tree` and survives resume. It restores the snapshot (or
+  deletes a file the change created) only when the file's current hash equals
+  the recorded one, so edits by the user, a formatter, or `bash` are never
+  discarded; content hashing, unlike stat stamps, keeps chained undos working.
+  Undo records its own `fs-change`, so verify and review gates see it. Previous
+  files over 4 MB or not UTF-8 are not snapshotted and undo says why. Changes
+  made through `bash` are not tracked.
 - `bash` uses `bash -lc`, captures stdout/stderr separately, caps output, and
   kills the process group on timeout. Interactive-only commands are blocked.
 - `bg` starts a process in its own group, captures output to an artifact, and
@@ -599,6 +674,14 @@ code and, where useful, the exact call shape.
   indexing returns "retry" rather than a kill. Diagnostics wait for the first
   `publishDiagnostics` after `didOpen`/`didChange`, or 2.5 s. Clients are
   disposed after 10 minutes idle or on session shutdown.
+- `repo_map` walks the tree with gitignore rules, caches per-file symbols by
+  mtime and size, and returns a character-budgeted map. It skips binary files,
+  files above 256 KB, and build/vendor directories. A compact map is injected
+  into the system prompt at startup.
+- `write`, `edit`, and `patch` request post-edit diagnostics through the shared
+  LSP service when the file belongs to a project with a server marker. Only
+  errors and warnings are appended, capped at 8 entries; an unavailable or cold
+  server leaves the mutation result untouched.
 - `test` detects vitest, jest, go, cargo, pytest, or an npm test script. It runs
   one file or one test and returns only the first failure, capped at 2500
   characters. Parsers strip ANSI and progress noise.
@@ -609,8 +692,27 @@ code and, where useful, the exact call shape.
 - `finding` supports `add`, `update`, `list`, `report`. Severities: critical,
   high, medium, low, info. Statuses: open, fixed, accepted, false-positive.
   `add` requires title, severity, target, and evidence. Evidence can reference
-  a session entry, an artifact, or inline text. Caps: 50 findings, 2000 chars of
-  evidence, 1000 chars of impact/remediation.
+  a session entry, an artifact, inline text, or an engagement evidence id.
+  `add` auto-links the last tool's evidence entry when one exists. Caps: 50
+  findings, 2000 chars of evidence, 1000 chars of impact/remediation.
+- `evidence` lists, shows, and verifies engagement evidence entries. Each entry
+  stores tool, target, command, start/finish time, duration, exit code, error
+  flags, artifact path, byte count, and SHA-256. Verification recomputes the
+  hash from the artifact.
+- `surface` is read-only. `bash`, `bg`, and external tool output is parsed after
+  each run; nmap XML/grepable/normal output, URLs, HTTP headers, and TLS
+  fingerprints merge into one engagement inventory. Assets outside a configured
+  scope are not stored; identities and credentials are references, with
+  credentials hashed.
+- `detect` validates and runs a Sigma subset: mapping/list selections, field
+  modifiers `contains`, `startswith`, `endswith`, `re`, `exists`, `all`,
+  `cased`, and conditions with `and`, `or`, `not`, parentheses, and quantified
+  `of` selectors. JSONL records and plain-text lines are supported. Hits create
+  findings by default and always append a detection evidence entry.
+- `attack_path` builds a directed graph (`identity`/`credential` -> `asset` ->
+  `service` -> `technology`) from the surface, findings, and evidence. It
+  returns summaries, ranked simple paths, betweenness choke points, and node
+  views, never a raw graph dump.
 - `iocs` extracts URLs, domains, IPv4/IPv6, SHA-256/SHA-1/MD5, emails, and CVEs.
   Output is defanged by default. File scans cap at 2,000,000 characters.
 
@@ -621,6 +723,7 @@ code and, where useful, the exact call shape.
 | `read` | 4 MB file, 800 lines per call |
 | `write` | 256 KB content |
 | `edit` / `patch` | 256 KB file, 200 diff lines returned |
+| `undo` | 4 MB snapshot; snapshots live as long as session artifacts |
 | `bash` | 600 s maximum, 1 MiB captured, 64 KB preview |
 | `grep` | 200 matches, 5 lines of context |
 | `glob` | 200 paths |
@@ -628,9 +731,15 @@ code and, where useful, the exact call shape.
 | `verify` | 1 MiB combined output, 1400-char failure excerpt |
 | `recall` | 4000 chars per call |
 | `lsp` | 200 outline symbols, 20 references, 5 definitions, 40 diagnostics, 25 hover lines |
+| `repo_map` | 5000 files, 24 symbols per file, 8000 chars per call |
+| post-edit diagnostics | 8 entries, 1200 chars |
 | `test` | 600 s maximum, 2500-char result |
 | `review` | 400 diff lines default, 12 findings |
 | `finding` | 50 per engagement, 2000-char evidence |
+| `evidence` | 20,000 entries, 4 MiB per artifact |
+| `surface` | 10,000 assets |
+| `detect` | 300 rule files, 500 files / 250k lines per run, 500 hits |
+| `attack_path` | 400 nodes for full betweenness; 5000 simple paths |
 | `iocs` | 100 per category, 2,000,000 input chars |
 | tool result | 2500 chars per result, 8000 chars per batch |
 | compaction | 4500 chars |
@@ -823,22 +932,73 @@ Security is a first-class pack and a first-class posture.
 
 ### 8.4 Findings, evidence, and reports
 
-- Findings live in an engagement file under
-  `~/.local/share/localharness/engagements/<name>/findings.jsonl`.
-- A finding records: id, title, severity, status, target, evidence, impact,
-  remediation, created/updated time, session id, and entry id.
-- Evidence may be inline (capped) or a reference to a session entry or
-  artifact. `finding add` can auto-attach the last tool result as evidence.
+- Findings live in `engagements/<name>/findings.jsonl`. A finding records id,
+  title, severity, status, target, evidence, impact, remediation, created/updated
+  time, session id, entry id, and an optional evidence reference.
 - `/sec report` writes Markdown grouped by severity, with evidence, impact, and
-  remediation. `/sec` shows scope, counts, and commands.
-- Engagement directories are `0700`; files are `0600`.
+  remediation. `/sec` shows scope, finding counts, evidence count, and surface
+  size. Engagement directories are `0700`; files are `0600`.
+- `bash`, `bg`, and external tool runs append an immutable evidence entry when
+  an engagement is active. Entries are stored in
+  `engagements/<name>/evidence.jsonl`; output goes to
+  `engagements/<name>/evidence/eN.txt`.
+- An entry records id, tool, session/entry ids, target, command, start/finish
+  time, duration, exit code, timeout/cancel flags, error flag, artifact path,
+  byte count, and SHA-256. `evidence verify` recomputes the digest.
+- The output is the tool result content (already capped by the tool), not a
+  second copy of a model-facing preview rule.
+- `finding add` auto-links the last tool result's evidence entry when available;
+  `evidence_id=eN` links explicitly after checking the id exists. Reports render
+  the evidence id, artifact, session, and entry.
+- A missing or failed evidence write never fails the command, but it is logged.
 
-### 8.5 IOC extraction
+### 8.5 Attack-surface map
+
+- `bash`, `bg`, and external tool output is parsed after each run. Supported
+  inputs: nmap XML, grepable, and normal output; URLs; HTTP `Server`/
+  `X-Powered-By`/`X-Generator` headers; TLS version/cipher fingerprints; and
+  conservative identity/credential markers.
+- The inventory is one `surface.json` per engagement. It merges hosts, aliases,
+  ports, protocols, services, products, versions, TLS flags, URLs, technologies,
+  identities, hashed credential references, and evidence ids.
+- With a configured scope, assets outside scope are dropped. Without a scope,
+  observations are stored but marked out of scope. `surface` is read-only and
+  can list or show entries.
+- Credentials are stored as `cred:<sha256 prefix>`; URL userinfo is stripped
+  before a URL is stored.
+
+### 8.6 Detection-as-code
+
+- `detect` implements a deterministic Sigma subset. Supported selections are
+  mappings (all fields match), lists of mappings (any mapping matches), keyword
+  lists, and single strings. Field modifiers: `contains`, `startswith`,
+  `endswith`, `re`, `exists`, `all`, `cased`.
+- Conditions support `and`, `or`, `not`, parentheses, `1 of pattern*`,
+  `all of pattern*`, `any of pattern*`, and `them`. Unsupported syntax is
+  reported by `detect validate`, never guessed.
+- Targets are JSONL records or plain-text lines. A plain line is matched as
+  `{"message": line}` plus the raw line for keyword selections.
+- Hits create findings by default (`finding=false` disables) and always append
+  a detection evidence entry. Findings dedupe by title and target.
+
+### 8.7 Attack-path graph
+
+- Nodes: assets, services, technologies, identities, and hashed credentials.
+  Edges: identity/credential -> asset, asset -> service, service -> technology.
+- Findings add risk to the matching asset and, when a port is present or
+  implied by an HTTP(S) URL, the service. Evidence targets add asset nodes.
+- `attack_path` exposes summary, ranked simple paths, betweenness choke points,
+  and node views. It never returns the raw graph.
+- Paths are ranked by summed node risk, then hop count. Betweenness is computed
+  in code over the undirected projection; above 400 nodes it falls back to
+  degree ranking.
+
+### 8.8 IOC extraction
 
 `iocs` extracts and defangs indicators. Limits: 100 per category, 2,000,000
 input characters. Missing input and unreadable files return prescriptive errors.
 
-### 8.6 Trust model
+### 8.9 Trust model
 
 - Global config (`~/.config/localharness/`) is trusted because the user wrote it.
 - Project `.harness/` config, profiles, skills, workflows, tools, and verify
@@ -851,7 +1011,7 @@ input characters. Missing input and unreadable files return prescriptive errors.
   untrusted data in the system prompt. This reduces, but does not eliminate,
   prompt injection.
 
-### 8.7 Data handling
+### 8.10 Data handling
 
 - No telemetry, no analytics, no phone-home.
 - Endpoint defaults to `http://127.0.0.1:8080`. A non-local endpoint is allowed
@@ -870,7 +1030,7 @@ input characters. Missing input and unreadable files return prescriptive errors.
 - `--path-jail` restricts file tools to the working directory. It does not
   restrict `bash`; the docs say so and point to containerization.
 
-### 8.8 Supply chain
+### 8.11 Supply chain
 
 - `Cargo.lock` is committed. Release builds use `--locked`.
 - CI runs `cargo audit` and `cargo deny` (or equivalent) and fails on new
@@ -992,7 +1152,8 @@ cursor = "#c0caf5"
 - Throughput: rolling tokens/second over the last few seconds.
 - Session: short id and trusted/untrusted marker.
 - At narrow widths, drop throughput, then session id, then profile; never drop
-  cwd, context, or model.
+  cwd, context, or model. With no model selected, the model slot reads
+  `not logged in` and the footer says the same.
 
 ### 9.5 Input and commands
 
@@ -1002,9 +1163,11 @@ cursor = "#c0caf5"
   cursor within the textarea.
 - `Ctrl+C` cancels the current run; a second `Ctrl+C` quits.
 - `Ctrl+D` quits when the input is empty.
-- Slash commands: `/help`, `/quit`, `/model`, `/profile`, `/theme`, `/tree`,
-  `/fork`, `/sessions`, `/compact`, `/tools`, `/skill`, `/workflow`, `/sec`,
-  `/trust`, `/export`, `/clear`, `/debug`.
+- Slash commands: `/help`, `/quit`, `/login`, `/model`, `/profile`, `/theme`,
+  `/tree`, `/fork`, `/sessions`, `/compact`, `/tools`, `/skill`, `/workflow`,
+  `/sec`, `/trust`, `/export`, `/clear`, `/debug`. `/login` validates and saves
+  the endpoint/model/key; `/model` lists endpoint models and switches the
+  session.
 - Slash completion shows a filtered popup with descriptions.
 - Paste is bracketed and inserted literally. Large pastes are accepted; the
   model sees them as user content.
@@ -1060,7 +1223,8 @@ Model resolution is layered:
   not set one.
 - `--model`, `--endpoint`, and `LH_MODEL`/`LH_ENDPOINT` choose the endpoint and
   model name; they do not change the model profile unless `--model-profile` is
-  passed.
+  passed. `/login` writes `endpoint`, `model`, and `api_key` to the global
+  config; a trusted project config still overrides them on the next start.
 
 Environment variables: `LH_ENDPOINT`, `LH_MODEL`, `LH_API_KEY`, `LH_PROFILE`,
 `LH_MODEL_PROFILE`, `LH_THEME`, `LH_NO_SESSION`, `LH_TRUST`.
@@ -1179,16 +1343,21 @@ src/
     mod.rs                registry, schema, result types
     read.rs write.rs edit.rs patch.rs bash.rs grep.rs glob.rs
     todo.rs verify.rs recall.rs thread.rs bg.rs
-    lsp/ test.rs review.rs
+    lsp.rs repo_map.rs test.rs review.rs
+    surface.rs evidence.rs detect.rs attack_path.rs
     finding.rs iocs.rs
   external/
     mod.rs                manifest discovery and trust
     manifest.rs           TOML schema
     runner.rs             stdin/stdout protocol, timeout, process group
   security/
-    mod.rs                scope, findings, report
+    mod.rs                security state and scope gate
     scope.rs              target extraction and CIDR/wildcard match
-    findings.rs           ledger and reducers
+    findings.rs           findings ledger and reducers
+    evidence.rs           evidence ledger and SHA-256 artifacts
+    surface.rs            nmap/HTTP/TLS inventory and parsers
+    detect.rs             Sigma-subset rules and matcher
+    graph.rs              attack-path graph and queries
     report.rs             Markdown report
   ui/
     mod.rs                app state and run loop
@@ -1254,6 +1423,13 @@ Build:
 - Scope matching: CIDR, wildcard, target extraction.
 - IOC extraction and defanging.
 - Test output parsers: pytest, jest/vitest, go, cargo, ANSI, garbage.
+- Repository map: declaration extraction per language, scope narrowing, cache
+  invalidation, budget truncation.
+- Post-edit diagnostics: compact error/warning rendering, clean batches, and a
+  fake stdio language server that publishes diagnostics for an edit.
+- Security: evidence hash/verify, surface parsers, Sigma conditions, graph
+  paths/chokes, evidence auto-linking, and automatic surface ingestion from a
+  bash result.
 - Review risk scan and truncation.
 - Theme parser: hex, names, indexed, invalid values.
 - Markdown renderer: headings, lists, code fences, diffs, incomplete input.
@@ -1341,9 +1517,9 @@ a new message, and resume the session.
 
 ### M3 - Packs
 
-- Coding: `lsp`, `test`, `review`.
-- Security: `finding`, `iocs`, scope gate, evidence capture, report export,
-  bundled red/blue skills.
+- Coding: `repo_map`, `lsp`, `test`, `review`.
+- Security: `surface`, `evidence`, `detect`, `attack_path`, `finding`, `iocs`,
+  scope gate, evidence capture, report export, bundled red/blue skills.
 - Background shell.
 - End-to-end pack workflows.
 
@@ -1372,7 +1548,7 @@ a new message, and resume the session.
 | Provider | OpenAI-compatible endpoint only | Any local engine works; no server management |
 | Cloud | Not in v1 | Local-first posture; no auth/catalog scope |
 | Packs | Coding and security equal; `full` default | The product is both; profiles narrow |
-| Tool surface | 17 static built-ins; no tool search | Small-model reliability and debuggability |
+| Tool surface | 23 static built-ins; no tool search | Small-model reliability and debuggability |
 | Extensibility | Profiles, skills, workflows, external tools | Users add tools/workflows, not loop behavior |
 | Scripting | None in v1 | Avoid a second API and loop complexity |
 | Sessions | Tree in one JSONL file | `/tree`, fork, branch-aware state, easy resume |

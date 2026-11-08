@@ -399,6 +399,7 @@ mod tests {
             bg: Arc::new(Mutex::new(BgRegistry::new())),
             security: Arc::new(Mutex::new(security)),
             paths,
+            lsp: Arc::new(crate::tools::lsp::LspService::new()),
         }
     }
 

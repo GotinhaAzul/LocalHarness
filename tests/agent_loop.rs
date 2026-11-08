@@ -170,6 +170,7 @@ fn harness_config(dir: &std::path::Path, scripts: Vec<Script>, config: Config) -
         cancel: CancellationToken::new(),
         tool_timeout: std::time::Duration::from_secs(10),
         path_jail: false,
+        server_window: Default::default(),
     };
     Harness {
         core: Arc::new(core),
@@ -197,6 +198,168 @@ async fn run(
     (outcome, events)
 }
 
+#[tokio::test]
+async fn bash_records_evidence_and_findings_link_to_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness(
+        dir.path(),
+        vec![
+            tool_script("bash", json!({"command": "echo hello"})),
+            tool_script(
+                "finding",
+                json!({
+                    "action": "add",
+                    "title": "Evidence link",
+                    "severity": "low",
+                    "target": "example.com"
+                }),
+            ),
+            text_script("done"),
+        ],
+        &["bash", "finding"],
+    );
+    {
+        let mut state = harness.core.security.lock().unwrap();
+        state
+            .ensure_engagement(&harness.core.paths)
+            .expect("engagement");
+    }
+    let (outcome, _) = run(&harness, "run a command").await;
+    assert_eq!(outcome.status, TurnStatus::Done);
+
+    let state = harness.core.security.lock().unwrap();
+    let engagement = state.engagement.as_ref().expect("engagement");
+    assert_eq!(
+        engagement.evidence.list().len(),
+        1,
+        "one bash evidence entry"
+    );
+    let evidence = &engagement.evidence.list()[0];
+    assert_eq!(evidence.tool, "bash");
+    assert_eq!(evidence.exit_code, Some(0));
+    let (_, output) = engagement.evidence.read(&evidence.id).unwrap();
+    assert!(output.contains("hello"), "{output}");
+    assert!(engagement.evidence.verify(&evidence.id).unwrap().1);
+
+    assert_eq!(engagement.findings.len(), 1);
+    let finding = &engagement.findings[0];
+    assert_eq!(
+        finding
+            .evidence_ref
+            .as_ref()
+            .and_then(|reference| reference.evidence.as_deref()),
+        Some(evidence.id.as_str())
+    );
+    assert_eq!(
+        finding
+            .evidence_ref
+            .as_ref()
+            .and_then(|reference| reference.artifact.as_deref()),
+        Some(evidence.artifact.as_str())
+    );
+}
+
+#[tokio::test]
+async fn bash_output_updates_the_surface_inventory() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness(
+        dir.path(),
+        vec![
+            tool_script(
+                "bash",
+                json!({"command": "printf 'Nmap scan report for example.com\\n443/tcp open https nginx\\n'"}),
+            ),
+            text_script("done"),
+        ],
+        &["bash"],
+    );
+    {
+        let mut state = harness.core.security.lock().unwrap();
+        state
+            .add_scope(&harness.core.paths, "example.com")
+            .expect("scope");
+    }
+    let (outcome, _) = run(&harness, "scan").await;
+    assert_eq!(outcome.status, TurnStatus::Done);
+
+    let state = harness.core.security.lock().unwrap();
+    let engagement = state.engagement.as_ref().expect("engagement");
+    let asset = engagement
+        .surface
+        .get("example.com")
+        .expect("surface asset");
+    assert!(asset.in_scope);
+    assert!(asset.ports.contains_key("443/tcp"));
+    assert_eq!(asset.ports["443/tcp"].service, "https");
+    assert_eq!(asset.ports["443/tcp"].product, "nginx");
+    assert_eq!(engagement.evidence.list().len(), 1);
+}
+
+#[tokio::test]
+async fn security_flow_links_surface_detection_and_graph() {
+    let dir = tempfile::tempdir().unwrap();
+    let rules = dir.path().join("rules");
+    std::fs::create_dir_all(&rules).unwrap();
+    std::fs::write(
+        rules.join("evil.yml"),
+        "title: Evil marker\nid: evil-marker\nlevel: high\ndetection:\n  selection:\n    message|contains: evil\n  condition: selection\n",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("sample.log"), "ok\nevil happened\n").unwrap();
+
+    let harness = harness(
+        dir.path(),
+        vec![
+            tool_script(
+                "bash",
+                json!({"command": "printf 'Nmap scan report for example.com\\n443/tcp open https nginx\\n'"}),
+            ),
+            tool_script(
+                "detect",
+                json!({"action": "run", "rules": "rules", "target": "sample.log"}),
+            ),
+            tool_script("attack_path", json!({"action": "summary"})),
+            text_script("done"),
+        ],
+        &["bash", "detect", "attack_path"],
+    );
+    {
+        let mut state = harness.core.security.lock().unwrap();
+        state
+            .add_scope(&harness.core.paths, "example.com")
+            .expect("scope");
+    }
+    let (outcome, _) = run(&harness, "security flow").await;
+    assert_eq!(outcome.status, TurnStatus::Done);
+
+    let state = harness.core.security.lock().unwrap();
+    let engagement = state.engagement.as_ref().expect("engagement");
+    assert_eq!(
+        engagement.evidence.list().len(),
+        2,
+        "bash + detect evidence"
+    );
+    let asset = engagement
+        .surface
+        .get("example.com")
+        .expect("surface asset");
+    assert!(asset.ports.contains_key("443/tcp"));
+    assert_eq!(engagement.findings.len(), 1);
+    let finding = &engagement.findings[0];
+    assert_eq!(finding.title, "Detection: Evil marker");
+    assert_eq!(
+        finding
+            .evidence_ref
+            .as_ref()
+            .and_then(|reference| reference.evidence.as_deref()),
+        Some("e2")
+    );
+    drop(state);
+    let graph = last_tool_result(&harness.session);
+    assert!(graph.contains("asset:example.com"), "{graph}");
+    assert!(graph.contains("service:example.com:443/tcp"), "{graph}");
+}
+
 fn last_tool_result(session: &SessionHandle) -> String {
     let session = session.lock().unwrap();
     session
@@ -210,6 +373,18 @@ fn last_tool_result(session: &SessionHandle) -> String {
         .unwrap_or_default()
 }
 
+fn tool_results(session: &SessionHandle) -> Vec<String> {
+    let session = session.lock().unwrap();
+    session
+        .branch_entries()
+        .into_iter()
+        .filter_map(|entry| match &entry.kind {
+            EntryKind::ToolResult(result) => Some(result.content.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
 fn last_assistant(session: &SessionHandle) -> String {
     let session = session.lock().unwrap();
     session
@@ -221,6 +396,345 @@ fn last_assistant(session: &SessionHandle) -> String {
             _ => None,
         })
         .unwrap_or_default()
+}
+
+fn assistants(session: &SessionHandle) -> Vec<localharness::session::AssistantData> {
+    let session = session.lock().unwrap();
+    session
+        .branch_entries()
+        .into_iter()
+        .filter_map(|entry| match &entry.kind {
+            EntryKind::Assistant(assistant) => Some(assistant.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn user_messages(session: &SessionHandle) -> Vec<String> {
+    let session = session.lock().unwrap();
+    session
+        .branch_entries()
+        .into_iter()
+        .filter_map(|entry| match &entry.kind {
+            EntryKind::User(user) => Some(user.content.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn finish_script(deltas: &[&str], finish: &str) -> Script {
+    let mut events: Vec<StreamEvent> = deltas
+        .iter()
+        .map(|d| StreamEvent::Delta(d.to_string()))
+        .collect();
+    events.push(StreamEvent::Finish(finish.into()));
+    Script::Events(events)
+}
+
+#[tokio::test]
+async fn tool_calls_written_as_text_are_executed() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.rs"), "fn main() {}\n").unwrap();
+    let harness = harness(
+        dir.path(),
+        vec![
+            finish_script(
+                &[
+                    "<think>I should look at the file.</think>\n\nReading it.\n<tool_",
+                    "call>\n{\"name\": \"read\", \"arguments\": {\"path\": \"a.rs\"}}\n</tool_call>",
+                ],
+                "stop",
+            ),
+            text_script("It has a main function."),
+        ],
+        &["read"],
+    );
+    let (outcome, events) = run(&harness, "what is in a.rs").await;
+    assert_eq!(outcome.status, TurnStatus::Done);
+    let results = tool_results(&harness.session);
+    assert_eq!(results.len(), 1);
+    assert!(results[0].contains("fn main() {}"), "{}", results[0]);
+    let first = &assistants(&harness.session)[0];
+    assert_eq!(first.content.as_deref(), Some("Reading it."));
+    assert_eq!(
+        first.reasoning.as_deref(),
+        Some("I should look at the file.")
+    );
+    assert_eq!(first.tool_calls.as_ref().unwrap()[0].name, "read");
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Notice(n) if n.contains("--jinja")))
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::ReasoningDelta(_)))
+    );
+}
+
+#[tokio::test]
+async fn native_tool_mode_leaves_text_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut harness = harness(
+        dir.path(),
+        vec![text_script(
+            "<tool_call>{\"name\":\"read\",\"arguments\":{\"path\":\"a\"}}</tool_call>",
+        )],
+        &["read"],
+    );
+    Arc::get_mut(&mut harness.core)
+        .unwrap()
+        .model_profile
+        .tool_mode = localharness::config::ToolMode::Native;
+    let (outcome, _) = run(&harness, "go").await;
+    assert_eq!(outcome.status, TurnStatus::Done);
+    assert!(tool_results(&harness.session).is_empty());
+}
+
+#[tokio::test]
+async fn repetition_loops_are_cut_and_nudged() {
+    let dir = tempfile::tempdir().unwrap();
+    let unit = "I will check the config file now.\n";
+    let looping: Vec<String> = std::iter::repeat_n(unit.to_string(), 200).collect();
+    let refs: Vec<&str> = looping.iter().map(String::as_str).collect();
+    let harness = harness(
+        dir.path(),
+        vec![finish_script(&refs, "length"), text_script("Done.")],
+        &["read"],
+    );
+    let (outcome, events) = run(&harness, "go").await;
+    assert_eq!(outcome.status, TurnStatus::Done);
+    let first = &assistants(&harness.session)[0];
+    let content = first.content.as_deref().unwrap();
+    assert!(
+        content.len() < 1200,
+        "loop was cut early: {} bytes",
+        content.len()
+    );
+    assert_eq!(first.stop_reason.as_deref(), Some("repetition"));
+    assert!(
+        user_messages(&harness.session)
+            .iter()
+            .any(|m| m.contains("repetition guard"))
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Notice(n) if n.contains("looping")))
+    );
+    assert_eq!(last_assistant(&harness.session), "Done.");
+}
+
+#[tokio::test]
+async fn endless_repetition_stops_the_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let looping: Vec<String> =
+        std::iter::repeat_n("again and again and again\n".to_string(), 100).collect();
+    let refs: Vec<&str> = looping.iter().map(String::as_str).collect();
+    let scripts = (0..5).map(|_| finish_script(&refs, "stop")).collect();
+    let harness = harness(dir.path(), scripts, &["read"]);
+    let (outcome, _) = run(&harness, "go").await;
+    assert_eq!(outcome.status, TurnStatus::Stalled);
+    assert_eq!(
+        harness.provider.requests.lock().unwrap().len(),
+        4,
+        "3 nudges, then stop"
+    );
+}
+
+#[tokio::test]
+async fn output_limit_cut_tool_call_does_not_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness(
+        dir.path(),
+        vec![
+            Script::Events(vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call_1".into()),
+                    name: Some("write".into()),
+                    arguments: Some("{\"path\":\"big.rs\",\"content\":\"fn a() {}\\nfn b".into()),
+                },
+                StreamEvent::Finish("length".into()),
+            ]),
+            text_script("I will write it in parts."),
+        ],
+        &["write"],
+    );
+    let (outcome, events) = run(&harness, "write big.rs").await;
+    assert_eq!(outcome.status, TurnStatus::Done);
+    assert!(!dir.path().join("big.rs").exists());
+    assert!(tool_results(&harness.session).is_empty());
+    let nudges = user_messages(&harness.session);
+    assert!(
+        nudges
+            .iter()
+            .any(|m| m.contains("while writing the write call")),
+        "{nudges:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Notice(n) if n.contains("max_output_tokens")))
+    );
+}
+
+#[tokio::test]
+async fn cut_off_prose_and_empty_replies_continue() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness(
+        dir.path(),
+        vec![
+            finish_script(&["The answer has three parts. First"], "length"),
+            finish_script(&[], "stop"),
+            text_script(", second, and third."),
+        ],
+        &["read"],
+    );
+    let (outcome, _) = run(&harness, "explain").await;
+    assert_eq!(outcome.status, TurnStatus::Done);
+    let nudges = user_messages(&harness.session);
+    assert!(
+        nudges
+            .iter()
+            .any(|m| m.contains("Continue exactly where it stopped")),
+        "{nudges:?}"
+    );
+    assert!(
+        nudges.iter().any(|m| m.contains("empty response")),
+        "{nudges:?}"
+    );
+    assert_eq!(last_assistant(&harness.session), ", second, and third.");
+}
+
+#[tokio::test]
+async fn silent_server_truncation_is_detected_and_retried() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness(
+        dir.path(),
+        vec![
+            Script::Events(vec![
+                StreamEvent::Delta("I have no tools.".into()),
+                StreamEvent::Finish("stop".into()),
+                // ~20k chars of prompt reported as 1000 tokens.
+                StreamEvent::Usage(Usage::new(1000, 4)),
+            ]),
+            text_script("answer"),
+        ],
+        &["read"],
+    );
+    let prompt = "Explain this log.\n".repeat(1200);
+    let (outcome, events) = run(&harness, &prompt).await;
+    assert_eq!(outcome.status, TurnStatus::Done);
+    assert_eq!(harness.provider.requests.lock().unwrap().len(), 2);
+    assert!(
+        assistants(&harness.session)
+            .iter()
+            .all(|a| a.content.as_deref() != Some("I have no tools.")),
+        "the reply written without the system prompt is discarded"
+    );
+    assert_eq!(last_assistant(&harness.session), "answer");
+    assert!(
+        harness
+            .core
+            .server_window
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0,
+        "the real window is remembered for later turns"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Notice(n) if n.contains("OLLAMA_CONTEXT_LENGTH")))
+    );
+}
+
+#[tokio::test]
+async fn cache_and_timing_reports_are_stored_with_the_reply() {
+    let dir = tempfile::tempdir().unwrap();
+    let timings = Usage {
+        cached_tokens: Some(18),
+        prompt_ms: Some(40),
+        tokens_per_sec: Some(30.0),
+        ..Usage::default()
+    };
+    let harness = harness(
+        dir.path(),
+        vec![Script::Events(vec![
+            StreamEvent::Delta("hello".into()),
+            StreamEvent::Finish("stop".into()),
+            StreamEvent::Usage(timings),
+            StreamEvent::Usage(Usage::new(20, 4)),
+        ])],
+        &["read"],
+    );
+    let (_, events) = run(&harness, "hi").await;
+    let usage = assistants(&harness.session)[0].usage.clone().unwrap();
+    assert_eq!((usage.prompt_tokens, usage.completion_tokens), (20, 4));
+    assert_eq!(usage.cache_percent(), Some(90));
+    assert_eq!(usage.tokens_per_sec, Some(30.0));
+    assert!(
+        usage.first_token_ms.is_some(),
+        "harness measures first token"
+    );
+    let last = events
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            AgentEvent::Usage(usage) => Some(usage.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert!(
+        last.perf_line().contains("cache 90%"),
+        "{}",
+        last.perf_line()
+    );
+}
+
+#[tokio::test]
+async fn undo_reverts_harness_edits_through_the_loop() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.rs"), "let x = 1;\n").unwrap();
+    let harness = harness(
+        dir.path(),
+        vec![
+            tool_script("read", json!({"path":"a.rs"})),
+            tool_script("edit", json!({"path":"a.rs","old":"x = 1","new":"x = 2"})),
+            tool_script("write", json!({"path":"b.rs","content":"new file\n"})),
+            tool_script("undo", json!({"path":"./a.rs"})),
+            tool_script("undo", json!({"path":"b.rs"})),
+            tool_script("undo", json!({"path":"a.rs"})),
+            text_script("reverted"),
+        ],
+        &["read", "edit", "write", "undo"],
+    );
+    let (outcome, _) = run(&harness, "try and revert").await;
+    assert_eq!(outcome.status, TurnStatus::Done);
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("a.rs")).unwrap(),
+        "let x = 1;\n"
+    );
+    assert!(
+        !dir.path().join("b.rs").exists(),
+        "undo deletes a file write created"
+    );
+    let results = tool_results(&harness.session);
+    assert!(results[3].contains("restored a.rs"), "{}", results[3]);
+    assert!(results[4].contains("deleted b.rs"), "{}", results[4]);
+    assert!(results[5].contains("NOTHING_TO_UNDO"), "{}", results[5]);
+    // Undo is a recorded mutation, so verify and review gates see it.
+    let session = harness.session.lock().unwrap();
+    let undo_changes = session
+        .branch_entries()
+        .iter()
+        .filter(|entry| {
+            matches!(&entry.kind, EntryKind::Custom(custom)
+            if custom.kind == "fs-change" && custom.payload.get("undo") == Some(&json!(true)))
+        })
+        .count();
+    assert_eq!(undo_changes, 2);
 }
 
 #[tokio::test]
@@ -292,6 +806,77 @@ async fn unknown_tool_gets_a_result_and_turn_continues() {
     let result = last_tool_result(&harness.session);
     assert!(result.contains("unknown_tool"), "{result}");
     assert_eq!(last_assistant(&harness.session), "recovered");
+}
+
+#[tokio::test]
+async fn foreign_tool_and_argument_names_are_translated() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.rs"), "fn main() {\n    let x = 1;\n}\n").unwrap();
+    let harness = harness(
+        dir.path(),
+        vec![
+            tool_script("read_file", json!({"file_path":"a.rs"})),
+            tool_script(
+                "functions.str_replace",
+                json!({"file_path":"a.rs","old_string":"x = 1","new_string":"x = 2"}),
+            ),
+            // A second edit of the same file needs no re-read: the harness
+            // wrote it and the model saw the diff.
+            tool_script(
+                "edit",
+                json!({"path":"a.rs","old":"let x","new":"let y","bogus":true}),
+            ),
+            text_script("done"),
+        ],
+        &["read", "edit"],
+    );
+    let (outcome, _) = run(&harness, "bump it").await;
+    assert_eq!(outcome.status, TurnStatus::Done);
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("a.rs")).unwrap(),
+        "fn main() {\n    let y = 2;\n}\n"
+    );
+    let results = tool_results(&harness.session);
+    assert!(results[0].starts_with("[tool] read"), "{}", results[0]);
+    assert!(results[0].contains("ran read"), "{}", results[0]);
+    assert!(results[1].contains("ran edit"), "{}", results[1]);
+    assert!(
+        results[2].contains("ignored unknown argument(s) bogus"),
+        "{}",
+        results[2]
+    );
+}
+
+#[tokio::test]
+async fn routed_tool_names_still_pass_the_scope_gate() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness(
+        dir.path(),
+        vec![
+            tool_script("shell", json!({"cmd":"nmap 192.0.2.10"})),
+            text_script("blocked"),
+        ],
+        &["bash"],
+    );
+    let (_, _) = run(&harness, "scan").await;
+    let result = last_tool_result(&harness.session);
+    assert!(result.contains("SEC_SCOPE"), "{result}");
+}
+
+#[tokio::test]
+async fn unknown_tool_suggests_the_nearest_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness(
+        dir.path(),
+        vec![
+            tool_script("gerp", json!({"pattern":"x"})),
+            text_script("ok"),
+        ],
+        &["read", "grep"],
+    );
+    let (_, _) = run(&harness, "search").await;
+    let result = last_tool_result(&harness.session);
+    assert!(result.contains("did you mean grep?"), "{result}");
 }
 
 #[tokio::test]

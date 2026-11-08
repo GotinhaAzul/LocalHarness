@@ -3,9 +3,13 @@
 //! Security is a first-class posture: scope is user-set only, the scope gate is
 //! a speed bump rather than a sandbox, and findings are engagement-global.
 
+pub mod detect;
+pub mod evidence;
 pub mod findings;
+pub mod graph;
 pub mod report;
 pub mod scope;
+pub mod surface;
 
 use std::path::{Path, PathBuf};
 
@@ -36,7 +40,16 @@ impl SecurityState {
         } else {
             Scope::default()
         };
-        let engagement = if paths.engagement_dir(&name).join("findings.jsonl").exists() {
+        let engagement_dir = paths.engagement_dir(&name);
+        let active = [
+            "scope.toml",
+            "findings.jsonl",
+            "evidence.jsonl",
+            "surface.json",
+        ]
+        .iter()
+        .any(|file| engagement_dir.join(file).exists());
+        let engagement = if active {
             Some(Engagement::open(paths, &name)?)
         } else {
             None
@@ -80,7 +93,9 @@ impl SecurityState {
 
     pub fn add_scope(&mut self, paths: &Paths, target: &str) -> Result<()> {
         self.scope.add(target).map_err(anyhow::Error::msg)?;
-        self.save_scope(paths)
+        self.save_scope(paths)?;
+        self.ensure_engagement(paths)?;
+        Ok(())
     }
 
     pub fn remove_scope(&mut self, paths: &Paths, target: &str) -> Result<bool> {
@@ -111,13 +126,16 @@ impl SecurityState {
             Some(engagement) => {
                 let (open, high, _) = engagement.counts();
                 format!(
-                    "findings: {} open ({} high/critical) of {}",
+                    "findings: {} open ({} high/critical) of {}\nevidence: {} entries\nsurface: {} assets, {} services",
                     open,
                     high,
-                    engagement.findings.len()
+                    engagement.findings.len(),
+                    engagement.evidence.list().len(),
+                    engagement.surface.assets().len(),
+                    engagement.surface.service_count()
                 )
             }
-            None => "findings: none recorded".to_string(),
+            None => "findings: none recorded\nevidence: none\nsurface: empty".to_string(),
         };
         format!("engagement: {}\n{scope}\n{findings}", self.engagement_name)
     }

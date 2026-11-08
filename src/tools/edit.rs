@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use similar::{ChangeTag, DiffTag, TextDiff};
 
 use crate::tools::read::split_lines;
-use crate::tools::write::{atomic_write, file_mode, lock_reads};
+use crate::tools::write::{atomic_write, file_mode, lock_reads, record_own_write};
 use crate::tools::{
     Tool, ToolContext, ToolPack, ToolResult, display_path, optional_bool, required_str,
 };
@@ -30,7 +30,7 @@ impl Tool for EditTool {
     }
 
     fn description(&self) -> &'static str {
-        "Exact-text replacement in an existing file; read it first."
+        "Replace exact text in an existing file (read it first). `old` must match once unless replace_all is true."
     }
 
     fn schema(&self) -> Value {
@@ -38,7 +38,8 @@ impl Tool for EditTool {
             json!({
                 "path": {"type": "string", "description": "File to edit, relative to the working directory."},
                 "old": {"type": "string", "description": "Exact text to replace; must appear verbatim and uniquely."},
-                "new": {"type": "string", "description": "Replacement text; empty deletes the match."}
+                "new": {"type": "string", "description": "Replacement text; empty deletes the match."},
+                "replace_all": {"type": "boolean", "description": "Replace every occurrence of `old` (default false)."}
             }),
             &["path", "old", "new"],
         )
@@ -53,9 +54,17 @@ impl Tool for EditTool {
     }
 
     async fn call(&self, ctx: &ToolContext, args: Value) -> ToolResult {
-        match run(ctx, &args) {
+        let raw = args
+            .get("path")
+            .and_then(|value| value.as_str())
+            .map(str::to_string);
+        let result = match run(ctx, &args) {
             Ok(result) => result,
-            Err(err) => err,
+            Err(err) => return err,
+        };
+        match raw.as_deref().map(|raw| ctx.resolve(raw)) {
+            Some(Ok(path)) => result.with_diagnostics(ctx, &path).await,
+            _ => result,
         }
     }
 }
@@ -86,13 +95,14 @@ fn run(ctx: &ToolContext, args: &Value) -> Result<ToolResult, ToolResult> {
     let before = read_text(&path, &display)?;
     require_fresh(ctx, &path, &display)?;
 
-    let count = before.match_indices(&old).count();
-    if count == 0 {
+    let Some(located) = locate(&before, &old, new) else {
         return Err(ToolResult::err(
             "NO_MATCH",
             nearest_window(&display, &before, &old),
         ));
-    }
+    };
+    let (old, new) = (located.needle, located.replacement.as_str());
+    let count = before.match_indices(&old).count();
     if count > 1 && !replace_all {
         let lines: Vec<usize> = before
             .match_indices(&old)
@@ -122,20 +132,30 @@ fn run(ctx: &ToolContext, args: &Value) -> Result<ToolResult, ToolResult> {
     let replacements = if replace_all { count } else { 1 };
     let (diff, added, removed) = diff_report(&before, &after, MAX_DIFF_LINES);
 
+    let change = crate::tools::undo::record_change(ctx, Ok(Some(&before)), &after);
     atomic_write(&path, after.as_bytes(), file_mode(&path))
         .map_err(|err| ToolResult::err("EDIT_FAILED", format!("cannot write {display}: {err}")))?;
-    lock_reads(ctx).clear();
+    record_own_write(ctx, &path);
 
     let plural = if replacements == 1 { "" } else { "s" };
+    let how = located
+        .how
+        .map(|how| format!("; {how}"))
+        .unwrap_or_default();
     let text = format!(
-        "edited {display} ({replacements} replacement{plural}, +{added} -{removed})\n{diff}"
+        "edited {display} ({replacements} replacement{plural}, +{added} -{removed}{how})\n{diff}"
     );
-    Ok(ToolResult::ok(text).with_details(json!({
-        "path": display,
-        "added": added,
-        "removed": removed,
-        "replacements": replacements,
-    })))
+    Ok(
+        ToolResult::ok(text).with_details(crate::tools::undo::merge_details(
+            json!({
+                "path": display,
+                "added": added,
+                "removed": removed,
+                "replacements": replacements,
+            }),
+            change,
+        )),
+    )
 }
 
 fn line_of(content: &str, index: usize) -> usize {
@@ -143,6 +163,139 @@ fn line_of(content: &str, index: usize) -> usize {
         .bytes()
         .filter(|byte| *byte == b'\n')
         .count()
+}
+
+/// Where `needle` sits in a file and what to put in its place.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Located {
+    /// The needle as it appears verbatim in the file.
+    pub needle: String,
+    /// The replacement, adjusted the same way as the needle.
+    pub replacement: String,
+    /// Which normalization made it match; `None` for an exact match.
+    pub how: Option<&'static str>,
+}
+
+/// Find `needle` in `content`, exactly or after one lossless normalization.
+///
+/// Local models cannot reproduce text they never saw (`read` strips `\r`),
+/// and often paste `read`'s line-number gutter or drop trailing spaces. Each
+/// fallback runs only when the exact text is absent, and the trailing-space
+/// fallback only when exactly one whole-line window fits. Indentation is never
+/// normalized: it is meaningful in Python, YAML, and Makefiles.
+pub(crate) fn locate(content: &str, needle: &str, replacement: &str) -> Option<Located> {
+    let found = |needle: &str| !needle.is_empty() && content.contains(needle);
+    if found(needle) {
+        return Some(Located {
+            needle: needle.to_string(),
+            replacement: replacement.to_string(),
+            how: None,
+        });
+    }
+    let crlf = content.contains("\r\n");
+    let to_crlf = |text: &str| text.replace("\r\n", "\n").replace('\n', "\r\n");
+    if crlf && needle.contains('\n') && found(&to_crlf(needle)) {
+        return Some(Located {
+            needle: to_crlf(needle),
+            replacement: to_crlf(replacement),
+            how: Some("matched after converting line endings to CRLF"),
+        });
+    }
+    if let Some(stripped) = strip_gutter(needle) {
+        let replacement = strip_gutter(replacement).unwrap_or_else(|| replacement.to_string());
+        let how = Some("matched after removing line-number prefixes copied from read");
+        if found(&stripped) {
+            return Some(Located {
+                needle: stripped,
+                replacement,
+                how,
+            });
+        }
+        if crlf && found(&to_crlf(&stripped)) {
+            return Some(Located {
+                needle: to_crlf(&stripped),
+                replacement: to_crlf(&replacement),
+                how,
+            });
+        }
+    }
+    let window = unique_trailing_space_window(content, needle)?;
+    Some(Located {
+        needle: window,
+        replacement: if crlf {
+            to_crlf(replacement)
+        } else {
+            replacement.to_string()
+        },
+        how: Some("matched after ignoring trailing whitespace"),
+    })
+}
+
+/// Remove a `read`-style line-number gutter (`  12  text`, `12\ttext`,
+/// `12→text`, `12: text`, `12| text`) when every non-blank line carries one.
+fn strip_gutter(text: &str) -> Option<String> {
+    let mut out = Vec::new();
+    let mut prefixed = 0usize;
+    for line in text.split('\n') {
+        if line.trim().is_empty() {
+            out.push(line);
+            continue;
+        }
+        let start = line.len() - line.trim_start().len();
+        let digits = line[start..]
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .count();
+        if digits == 0 {
+            return None;
+        }
+        let rest = &line[start + digits..];
+        let body = ["  ", "\t", "→", ": ", "| ", ":", "|"]
+            .iter()
+            .find_map(|sep| rest.strip_prefix(sep))?;
+        out.push(body);
+        prefixed += 1;
+    }
+    (prefixed > 0).then(|| out.join("\n"))
+}
+
+/// The single run of whole file lines equal to `needle`'s lines once trailing
+/// whitespace is ignored, returned verbatim from the file.
+fn unique_trailing_space_window(content: &str, needle: &str) -> Option<String> {
+    let wanted: Vec<&str> = split_lines(needle).iter().map(|l| l.trim_end()).collect();
+    if wanted.is_empty() || wanted.iter().all(|line| line.is_empty()) {
+        return None;
+    }
+    // Byte offsets of each line start, plus where each line's text ends.
+    let mut spans = Vec::new();
+    let mut offset = 0;
+    for raw in content.split_inclusive('\n') {
+        let text = raw.trim_end_matches('\n').trim_end_matches('\r');
+        spans.push((offset, offset + text.len(), offset + raw.len()));
+        offset += raw.len();
+    }
+    let mut hit = None;
+    for start in 0..spans.len().saturating_sub(wanted.len() - 1) {
+        let matches = wanted.iter().enumerate().all(|(i, line)| {
+            let (from, to, _) = spans[start + i];
+            content[from..to].trim_end() == *line
+        });
+        if matches {
+            if hit.is_some() {
+                return None;
+            }
+            hit = Some(start);
+        }
+    }
+    let start = hit?;
+    let (from, _, _) = spans[start];
+    let (_, text_end, line_end) = spans[start + wanted.len() - 1];
+    let end = if needle.ends_with('\n') {
+        line_end
+    } else {
+        text_end
+    };
+    Some(content[from..end].to_string())
 }
 
 /// Enforce read-before-edit.
@@ -420,6 +573,89 @@ mod tests {
         let read = ReadTool.call(&ctx, json!({"path": "a.txt"})).await;
         assert!(!read.is_error, "{}", read.content);
         ctx
+    }
+
+    async fn edit(ctx: &ToolContext, old: &str, new: &str) -> ToolResult {
+        EditTool
+            .call(ctx, json!({"path": "a.txt", "old": old, "new": new}))
+            .await
+    }
+
+    fn on_disk(dir: &tempfile::TempDir) -> String {
+        std::fs::read_to_string(dir.path().join("a.txt")).unwrap()
+    }
+
+    #[tokio::test]
+    async fn crlf_files_accept_lf_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = prepared(&dir, "a\r\nb\r\nc\r\n").await;
+        let result = edit(&ctx, "a\nb", "x\ny").await;
+        assert!(!result.is_error, "{}", result.content);
+        assert!(result.content.contains("CRLF"), "{}", result.content);
+        assert_eq!(on_disk(&dir), "x\r\ny\r\nc\r\n");
+    }
+
+    #[tokio::test]
+    async fn copied_line_number_gutters_are_stripped() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = prepared(&dir, "fn main() {\n    let x = 1;\n}\n").await;
+        let result = edit(
+            &ctx,
+            "1  fn main() {\n2      let x = 1;",
+            "1  fn run() {\n2      let x = 2;",
+        )
+        .await;
+        assert!(!result.is_error, "{}", result.content);
+        assert!(result.content.contains("line-number"), "{}", result.content);
+        assert_eq!(on_disk(&dir), "fn run() {\n    let x = 2;\n}\n");
+    }
+
+    #[tokio::test]
+    async fn trailing_whitespace_drift_matches_a_unique_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = prepared(&dir, "alpha  \nbeta\t\ngamma\n").await;
+        let result = edit(&ctx, "alpha\nbeta", "one\ntwo").await;
+        assert!(!result.is_error, "{}", result.content);
+        assert!(
+            result.content.contains("trailing whitespace"),
+            "{}",
+            result.content
+        );
+        assert_eq!(on_disk(&dir), "one\ntwo\ngamma\n");
+    }
+
+    #[tokio::test]
+    async fn ambiguous_or_indentation_drift_is_not_guessed() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = prepared(&dir, "x \ny\nx\t\ny\n").await;
+        let result = edit(&ctx, "x\ny\n", "z\n").await;
+        assert!(result.is_error, "two windows fit; {}", result.content);
+        let ctx = prepared(&dir, "if a:\n    run()\n").await;
+        let result = edit(&ctx, "if a:\n  run()", "if b:\n  run()").await;
+        assert!(
+            result.content.starts_with("[NO_MATCH]"),
+            "{}",
+            result.content
+        );
+        assert_eq!(on_disk(&dir), "if a:\n    run()\n");
+    }
+
+    #[tokio::test]
+    async fn consecutive_edits_need_no_reread_but_external_changes_do() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = prepared(&dir, "one\ntwo\n").await;
+        std::fs::write(dir.path().join("b.txt"), "other\n").unwrap();
+        ReadTool.call(&ctx, json!({"path": "b.txt"})).await;
+        assert!(!edit(&ctx, "one", "1").await.is_error);
+        assert!(!edit(&ctx, "two", "2").await.is_error);
+        // Editing a.txt left b.txt's stamp intact.
+        let other = EditTool
+            .call(&ctx, json!({"path": "b.txt", "old": "other", "new": "x"}))
+            .await;
+        assert!(!other.is_error, "{}", other.content);
+        std::fs::write(dir.path().join("a.txt"), "changed elsewhere\n").unwrap();
+        let stale = edit(&ctx, "changed", "c").await;
+        assert!(stale.content.contains("READ_FIRST"), "{}", stale.content);
     }
 
     #[tokio::test]

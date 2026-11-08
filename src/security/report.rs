@@ -44,6 +44,9 @@ pub fn render(engagement: &Engagement) -> String {
             }
             if let Some(reference) = &finding.evidence_ref {
                 let mut parts = Vec::new();
+                if let Some(evidence) = &reference.evidence {
+                    parts.push(format!("evidence `{evidence}`"));
+                }
                 if let Some(session) = &reference.session {
                     parts.push(format!("session `{session}`"));
                 }

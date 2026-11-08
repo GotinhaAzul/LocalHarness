@@ -6,6 +6,7 @@ use serde_json::json;
 
 use super::Provider;
 use super::types::{ErrorClass, ProviderError};
+use super::{EndpointUrls, endpoint_urls};
 
 #[derive(Debug, Clone, Default)]
 pub struct Capabilities {
@@ -32,32 +33,53 @@ pub struct OllamaModel {
     pub family: Option<String>,
 }
 
-fn client_and_base(provider: &dyn Provider) -> Result<(&reqwest::Client, &str), ProviderError> {
+fn client_and_urls(
+    provider: &dyn Provider,
+) -> Result<(&reqwest::Client, EndpointUrls), ProviderError> {
     let client = provider.client().ok_or_else(|| {
         ProviderError::new(
             ErrorClass::BadRequest,
             "this provider does not expose HTTP probes",
         )
     })?;
-    Ok((client, provider.endpoint().trim_end_matches('/')))
+    Ok((client, endpoint_urls(provider.endpoint())))
 }
 
-fn request(provider: &dyn Provider, url: &str) -> Result<reqwest::RequestBuilder, ProviderError> {
-    let (client, _) = client_and_base(provider)?;
-    let mut req = client.get(url).timeout(Duration::from_secs(10));
+fn request_with_timeout(
+    provider: &dyn Provider,
+    url: &str,
+    timeout: Duration,
+) -> Result<reqwest::RequestBuilder, ProviderError> {
+    let (client, _) = client_and_urls(provider)?;
+    let mut req = client.get(url).timeout(timeout);
     if !provider.api_key().is_empty() {
         req = req.bearer_auth(provider.api_key());
     }
     Ok(req)
 }
 
+fn request(provider: &dyn Provider, url: &str) -> Result<reqwest::RequestBuilder, ProviderError> {
+    request_with_timeout(provider, url, Duration::from_secs(10))
+}
+
 /// `GET /v1/models`, returning model ids.
 pub async fn list_models(provider: &dyn Provider) -> Result<Vec<String>, ProviderError> {
-    let (_, base) = client_and_base(provider)?;
-    let url = format!("{base}/v1/models");
-    let response = request(provider, &url)?.send().await.map_err(|err| {
-        ProviderError::new(ErrorClass::Connection, format!("/v1/models failed: {err}"))
-    })?;
+    list_models_with_timeout(provider, Duration::from_secs(10)).await
+}
+
+/// `GET /v1/models` with an explicit request timeout.
+pub async fn list_models_with_timeout(
+    provider: &dyn Provider,
+    timeout: Duration,
+) -> Result<Vec<String>, ProviderError> {
+    let (_, urls) = client_and_urls(provider)?;
+    let url = format!("{}/models", urls.api);
+    let response = request_with_timeout(provider, &url, timeout)?
+        .send()
+        .await
+        .map_err(|err| {
+            ProviderError::new(ErrorClass::Connection, format!("/v1/models failed: {err}"))
+        })?;
     if !response.status().is_success() {
         return Err(ProviderError::new(
             ErrorClass::BadRequest,
@@ -81,8 +103,8 @@ pub async fn list_models(provider: &dyn Provider) -> Result<Vec<String>, Provide
 
 /// `GET /props` on llama.cpp.
 pub async fn llama_props(provider: &dyn Provider) -> Result<LlamaProps, ProviderError> {
-    let (_, base) = client_and_base(provider)?;
-    let url = format!("{base}/props");
+    let (_, urls) = client_and_urls(provider)?;
+    let url = format!("{}/props", urls.root);
     let response = request(provider, &url)?.send().await.map_err(|err| {
         ProviderError::new(ErrorClass::Connection, format!("/props failed: {err}"))
     })?;
@@ -113,8 +135,8 @@ pub async fn llama_props(provider: &dyn Provider) -> Result<LlamaProps, Provider
 
 /// `POST /tokenize` on llama.cpp and vLLM. Returns token ids.
 pub async fn tokenize(provider: &dyn Provider, text: &str) -> Result<Vec<u32>, ProviderError> {
-    let (client, base) = client_and_base(provider)?;
-    let url = format!("{base}/tokenize");
+    let (client, urls) = client_and_urls(provider)?;
+    let url = format!("{}/tokenize", urls.root);
     let mut req = client
         .post(&url)
         .json(&json!({"content": text}))
@@ -162,8 +184,8 @@ pub async fn ollama_show(
     provider: &dyn Provider,
     model: &str,
 ) -> Result<OllamaModel, ProviderError> {
-    let (client, base) = client_and_base(provider)?;
-    let url = format!("{base}/api/show");
+    let (client, urls) = client_and_urls(provider)?;
+    let url = format!("{}/api/show", urls.root);
     let mut req = client
         .post(&url)
         .json(&json!({"name": model}))

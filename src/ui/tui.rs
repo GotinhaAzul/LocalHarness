@@ -28,6 +28,7 @@ use crate::app::{self, Runtime, RuntimeOptions};
 use crate::config::Config;
 use crate::context;
 use crate::git::{self, GitStatus};
+use crate::provider::{OpenAiCompatProvider, probe};
 use crate::session::{CompactionData, Entry, EntryKind, UserData};
 use crate::skills::SkillIndex;
 use crate::ui::UiOptions;
@@ -43,7 +44,8 @@ use crate::ui::widgets::{
 pub const COMMANDS: &[(&str, &str)] = &[
     ("help", "list commands and key bindings"),
     ("quit", "exit LocalHarness"),
-    ("model", "set the model id and rebuild the core"),
+    ("model", "list or switch models on the endpoint"),
+    ("login", "configure the endpoint, model, and API key"),
     ("profile", "switch the tool profile"),
     ("theme", "list, apply, or save a theme"),
     ("tree", "browse and checkout the session tree"),
@@ -61,12 +63,22 @@ pub const COMMANDS: &[(&str, &str)] = &[
 ];
 
 const HELP: &str = "\
-Commands: /help /quit /model <name> /profile <name> /theme [name|save] /tree /fork
-/sessions /compact /tools /skill <name> /workflow <name> /sec ... /trust [confirm]
-/export [path] /clear /debug
+Commands: /help /quit /login [endpoint] [model] [api-key] /model [name]
+/profile <name> /theme [name|save] /tree /fork /sessions /compact /tools
+/skill <name> /workflow <name> /sec ... /trust [confirm] /export [path]
+/clear /debug
 
 Keys: Enter send · Ctrl+J newline · Esc cancel · Ctrl+R reasoning
 PgUp/PgDn scroll · Home/End scroll when the prompt is empty · Ctrl+C quit";
+
+const LOGIN_HINT: &str = "\
+No model is selected, so turns are disabled.
+Start an OpenAI-compatible server, then:
+  /login http://127.0.0.1:8080            auto-select when it exposes one model
+  /login http://127.0.0.1:8080 <model>    choose a model
+  /login <endpoint> <model> <api-key>     remote endpoint with a bearer token
+
+/model lists the models the current endpoint exposes.";
 
 static TERMINAL_ACTIVE: AtomicBool = AtomicBool::new(false);
 
@@ -246,6 +258,8 @@ struct App {
     notice: Option<(String, Role, Instant)>,
     token_events: VecDeque<(Instant, u64)>,
     tok_s: f32,
+    /// The last model call's usage, with server and harness timings.
+    last_usage: Option<crate::provider::Usage>,
     used_tokens: u32,
     completion_tokens: u32,
     window: u32,
@@ -281,10 +295,12 @@ impl App {
             git: GitStatus::none(),
             profile: config.profile_name().to_string(),
             model: runtime.core.provider.model().to_string(),
+            logged_in: runtime.core.logged_in(),
             used,
             window,
             completion: 0,
             tok_s: 0.0,
+            cache: None,
             session: short_session_id(&session_id),
             trust,
         };
@@ -309,6 +325,7 @@ impl App {
             notice: None,
             token_events: VecDeque::new(),
             tok_s: 0.0,
+            last_usage: None,
             used_tokens: used,
             completion_tokens: 0,
             window,
@@ -328,6 +345,10 @@ impl App {
                 "untrusted: project .harness config, skills, workflows, and tools are ignored (restart with --trust)",
                 Role::Warning,
             );
+        }
+        if !app.header.logged_in {
+            app.transcript.push_note("login", LOGIN_HINT, false);
+            app.set_notice("no model selected; run /login", Role::Warning);
         }
         Ok(app)
     }
@@ -372,6 +393,7 @@ impl App {
         let config = runtime.core.config.clone();
         self.config = config;
         self.header.model = runtime.core.provider.model().to_string();
+        self.header.logged_in = runtime.core.logged_in();
         self.header.profile = self.config.profile_name().to_string();
         self.header.trust = self.config.trust || self.options.trust;
         self.window = runtime.core.budget.context_window;
@@ -445,6 +467,8 @@ impl App {
                 format!("streaming · {}", state_label(self.turn_state)),
                 Role::Accent,
             )
+        } else if !self.header.logged_in {
+            ("not logged in".to_string(), Role::Warning)
         } else if self.header.trust {
             ("trusted".to_string(), Role::Success)
         } else {
@@ -509,6 +533,14 @@ impl App {
                 self.completion_tokens,
             ),
             format!(
+                "last call · {}",
+                self.last_usage
+                    .as_ref()
+                    .map(|usage| usage.perf_line())
+                    .filter(|line| !line.is_empty())
+                    .unwrap_or_else(|| "no timings yet".into()),
+            ),
+            format!(
                 "provider {} · model {}",
                 self.config.model.endpoint,
                 runtime.core.provider.model(),
@@ -544,7 +576,16 @@ impl App {
             }
         }
         let total: u64 = self.token_events.iter().map(|(_, tokens)| *tokens).sum();
-        self.tok_s = total as f32 / 3.0;
+        // Live estimate while tokens flow; afterwards the last measured rate
+        // instead of decaying to zero.
+        self.tok_s = if total > 0 {
+            total as f32 / 3.0
+        } else {
+            self.last_usage
+                .as_ref()
+                .and_then(|usage| usage.tokens_per_sec)
+                .unwrap_or(0.0)
+        };
         self.header.tok_s = self.tok_s;
         self.header.completion = self.completion_tokens;
         if self.transcript.is_dirty() && self.last_width > 0 {
@@ -572,6 +613,11 @@ impl App {
         let Some(runtime) = &self.runtime else {
             return;
         };
+        if !runtime.core.logged_in() {
+            self.transcript.push_note("login", LOGIN_HINT, false);
+            self.set_notice("no model selected; run /login", Role::Warning);
+            return;
+        }
         let core = runtime.core.clone();
         self.transcript.begin_turn(&text);
         self.turn_active = true;
@@ -649,6 +695,7 @@ impl App {
     fn handle_agent_event(&mut self, event: AgentEvent) {
         match event {
             AgentEvent::TurnStarted { model, profile } => {
+                self.header.logged_in = !model.trim().is_empty();
                 self.header.model = model;
                 self.header.profile = profile;
                 self.turn_state = Some(AgentState::AssembleContext);
@@ -699,6 +746,10 @@ impl App {
                 }
                 self.completion_tokens = usage.completion_tokens;
                 self.header.completion = usage.completion_tokens;
+                if usage.cache_percent().is_some() {
+                    self.header.cache = usage.cache_percent();
+                }
+                self.last_usage = Some(usage);
             }
             AgentEvent::Context { used, window } => {
                 self.used_tokens = used;
@@ -1027,6 +1078,7 @@ impl App {
             "help" => self.transcript.push_note("help", HELP, false),
             "quit" => self.quit = true,
             "model" => self.command_model(rest).await,
+            "login" => self.command_login(rest).await,
             "profile" => self.command_profile(rest).await,
             "theme" => self.command_theme(rest),
             "tree" => self.command_tree(),
@@ -1072,15 +1124,51 @@ impl App {
     }
 
     async fn command_model(&mut self, name: &str) {
+        let name = name.trim();
         if name.is_empty() {
-            self.transcript.push_note(
-                "model",
+            let Some(core) = self.core().cloned() else {
+                return;
+            };
+            let current = core.provider.model().to_string();
+            let mut lines = vec![
+                format!("endpoint: {}", core.config.model.endpoint),
                 format!(
-                    "model: {}\nendpoint: {}",
-                    self.config.model.model, self.config.model.endpoint
+                    "model: {}",
+                    if core.logged_in() {
+                        current.as_str()
+                    } else {
+                        "(not set)"
+                    }
                 ),
-                false,
-            );
+            ];
+            match probe_endpoint_models(&core.config.model).await {
+                Ok(models) if models.is_empty() => {
+                    lines.push("available models: (the endpoint reports none)".into());
+                    lines.push("load a model, then run /model again".into());
+                }
+                Ok(models) => {
+                    lines.push("available models:".into());
+                    for model in &models {
+                        if model == &current {
+                            lines.push(format!("  {model}  (current)"));
+                        } else {
+                            lines.push(format!("  {model}"));
+                        }
+                    }
+                    lines.push("switch with /model <name>".into());
+                }
+                Err(error) => {
+                    lines.push(format!("cannot list models: {error}"));
+                    lines.push(
+                        "start the server, or run /login <endpoint> [model] [api-key]".into(),
+                    );
+                }
+            }
+            self.transcript.push_note("models", lines.join("\n"), false);
+            return;
+        }
+        if name.split_whitespace().count() != 1 {
+            self.set_notice("usage: /model <name>", Role::Error);
             return;
         }
         let previous = self.config.clone();
@@ -1092,6 +1180,149 @@ impl App {
             return;
         }
         self.set_notice(format!("model: {name}"), Role::Success);
+    }
+
+    async fn command_login(&mut self, rest: &str) {
+        let Some(core) = self.core().cloned() else {
+            return;
+        };
+        let mut parts = rest.split_whitespace();
+        let Some(endpoint) = parts.next() else {
+            self.transcript
+                .push_note("login", login_status(&core), false);
+            return;
+        };
+        let model = parts.next();
+        let api_key = parts.next();
+        if parts.next().is_some() {
+            self.set_notice("usage: /login <endpoint> [model] [api-key]", Role::Error);
+            return;
+        }
+        let endpoint = normalize_endpoint(endpoint);
+        let mut candidate = self.config.clone();
+        let endpoint_changed = crate::provider::endpoint_urls(&candidate.model.endpoint).api
+            != crate::provider::endpoint_urls(&endpoint).api;
+        candidate.model.endpoint = endpoint.clone();
+        if endpoint_changed && model.is_none() {
+            candidate.model.model.clear();
+        }
+        if endpoint_changed && api_key.is_none() {
+            candidate.model.api_key.clear();
+        }
+        if let Some(model) = model {
+            candidate.model.model = model.to_string();
+        }
+        if let Some(api_key) = api_key {
+            candidate.model.api_key = if api_key == "-" {
+                String::new()
+            } else {
+                api_key.to_string()
+            };
+        }
+
+        let models = match probe_endpoint_models(&candidate.model).await {
+            Ok(models) => models,
+            Err(error) => {
+                self.transcript.push_note(
+                    "login",
+                    format!(
+                        "cannot log in to {endpoint}: {error}\n\nStart the inference server and retry, or check the endpoint URL."
+                    ),
+                    true,
+                );
+                self.set_notice(format!("login failed: {error}"), Role::Error);
+                return;
+            }
+        };
+
+        if candidate.model.model.trim().is_empty() {
+            match models.as_slice() {
+                [only] => candidate.model.model = only.clone(),
+                [] => {
+                    self.transcript.push_note(
+                        "login",
+                        format!(
+                            "{endpoint} reports no models.\nLoad a model, or pass its id: /login <endpoint> <model>"
+                        ),
+                        true,
+                    );
+                    self.set_notice("login failed: endpoint reports no models", Role::Error);
+                    return;
+                }
+                _ => {
+                    self.transcript.push_note(
+                        "login",
+                        format!(
+                            "{endpoint} exposes multiple models:\n{}\n\nChoose one: /login <endpoint> <model>",
+                            models.join("\n")
+                        ),
+                        true,
+                    );
+                    self.set_notice("login failed: choose a model", Role::Error);
+                    return;
+                }
+            }
+        } else if !models.is_empty()
+            && !models
+                .iter()
+                .any(|available| available == candidate.model.model.trim())
+        {
+            self.transcript.push_note(
+                "login",
+                format!(
+                    "{endpoint} has no model {:?}. Available:\n{}\n\nRetry with: /login <endpoint> <model>",
+                    candidate.model.model,
+                    models.join("\n")
+                ),
+                true,
+            );
+            self.set_notice("login failed: model not found", Role::Error);
+            return;
+        }
+
+        let previous = self.config.clone();
+        if let Err(error) = self.rebuild_core_with(candidate).await {
+            self.config = previous;
+            self.set_notice(format!("login failed: {error}"), Role::Error);
+            return;
+        }
+        let model = self.config.model.model.clone();
+        let key_state = if self.config.model.api_key.is_empty() {
+            "not set"
+        } else {
+            "set"
+        };
+        match self.persist_connection() {
+            Ok(path) => {
+                self.transcript.push_note(
+                    "login",
+                    format!(
+                        "endpoint: {endpoint}\nmodel: {model}\napi key: {key_state}\nsaved: {}",
+                        path.display()
+                    ),
+                    false,
+                );
+                self.set_notice(format!("logged in · {model} · saved"), Role::Success);
+            }
+            Err(error) => {
+                self.transcript.push_note(
+                    "login",
+                    format!("logged in as {model}, but settings were not saved: {error}"),
+                    true,
+                );
+                self.set_notice(
+                    format!("logged in · settings not saved: {error}"),
+                    Role::Warning,
+                );
+            }
+        }
+    }
+
+    fn persist_connection(&self) -> Result<PathBuf> {
+        let core = self.core().context("no runtime")?;
+        let path = core.paths.config_file();
+        core.config.model.save_connection(&path)?;
+        Ok(path)
     }
 
     async fn command_profile(&mut self, name: &str) {
@@ -1137,6 +1368,7 @@ impl App {
         }
         self.config = core.config.clone();
         self.header.model = core.provider.model().to_string();
+        self.header.logged_in = core.logged_in();
         self.header.profile = self.config.profile_name().to_string();
         self.header.trust = self.config.trust || self.options.trust;
         self.window = core.budget.context_window;
@@ -2002,6 +2234,54 @@ impl App {
     }
 }
 
+const LOGIN_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
+fn normalize_endpoint(raw: &str) -> String {
+    let trimmed = raw.trim().trim_end_matches('/');
+    if trimmed.contains("://") {
+        trimmed.to_string()
+    } else {
+        format!("http://{trimmed}")
+    }
+}
+
+async fn probe_endpoint_models(config: &crate::config::ModelConfig) -> Result<Vec<String>> {
+    let provider = OpenAiCompatProvider::new(config, config.model.clone())?;
+    tokio::time::timeout(LOGIN_PROBE_TIMEOUT, probe::list_models(&provider))
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "listing models timed out after {}s",
+                LOGIN_PROBE_TIMEOUT.as_secs()
+            )
+        })?
+        .map_err(anyhow::Error::from)
+}
+
+fn login_status(core: &Core) -> String {
+    let config = &core.config;
+    format!(
+        "status: {}\nendpoint: {}\nmodel: {}\napi key: {}\n\nusage:\n  /login <endpoint> [model] [api-key]\n  /login http://127.0.0.1:8080             auto-select one model\n  /login http://127.0.0.1:8080 <model>     choose a model\n  /login <endpoint> <model> -             clear the API key\n\nendpoint, model, and key are saved to {}.",
+        if core.logged_in() {
+            "logged in"
+        } else {
+            "not logged in"
+        },
+        config.model.endpoint,
+        if core.logged_in() {
+            core.provider.model()
+        } else {
+            "(not set)"
+        },
+        if config.model.api_key.is_empty() {
+            "not set"
+        } else {
+            "set"
+        },
+        core.paths.config_file().display()
+    )
+}
+
 fn estimate_used(core: &Arc<Core>) -> u32 {
     let session = match core.session.lock() {
         Ok(session) => session,
@@ -2185,10 +2465,12 @@ mod tests {
             git: GitStatus::none(),
             profile: "full".into(),
             model: model.into(),
+            logged_in: true,
             used: 12400,
             window: 64000,
             completion: 0,
             tok_s: 24.0,
+            cache: Some(91),
             session: session.into(),
             trust: true,
         }
@@ -2302,5 +2584,133 @@ mod tests {
             after_cell.style().fg,
             "theme switch should recolor the header"
         );
+    }
+
+    #[test]
+    fn header_shows_not_logged_in_without_a_model() {
+        let mut header = header("", "session");
+        header.logged_in = false;
+        let terminal = draw_scene(120, 20, header, Theme::bundled("omarchy"));
+        let text = buffer_text(&terminal);
+        assert!(text.contains("not logged in"), "header:\n{text}");
+    }
+
+    async fn model_list(
+        axum::extract::State(models): axum::extract::State<Arc<Vec<String>>>,
+    ) -> axum::response::Response {
+        let data: Vec<serde_json::Value> = models
+            .iter()
+            .map(|id| serde_json::json!({"id": id, "object": "model"}))
+            .collect();
+        let body = serde_json::json!({"object": "list", "data": data}).to_string();
+        axum::response::Response::builder()
+            .status(axum::http::StatusCode::OK)
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(body))
+            .unwrap()
+    }
+
+    async fn model_endpoint(models: &[&str]) -> String {
+        let state: Arc<Vec<String>> = Arc::new(models.iter().map(|m| m.to_string()).collect());
+        let app = axum::Router::new()
+            .route("/v1/models", axum::routing::get(model_list))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{address}")
+    }
+
+    fn transcript_text(transcript: &Transcript) -> String {
+        transcript
+            .lines()
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[tokio::test]
+    async fn login_configures_a_model_and_model_command_lists_choices() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("work");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let config_dir = dir.path().join("config");
+        let config_path = config_dir.join("config.toml");
+        let paths = crate::paths::Paths {
+            config_dir,
+            data_dir: dir.path().join("data"),
+            cwd,
+            project_id: "test".into(),
+            sessions_dir_override: None,
+        };
+
+        // Reserve a port and close it so the initial endpoint is unreachable.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let down = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+
+        let mut config = Config::builtin();
+        config.model.endpoint = down;
+        config.model.model.clear();
+        let runtime = app::create_runtime(
+            config,
+            paths,
+            RuntimeOptions {
+                no_session: true,
+                ..RuntimeOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        let mut app = App::new(
+            runtime,
+            UiOptions {
+                no_color: true,
+                trust: false,
+                skills: SkillIndex::bundled(),
+            },
+        )
+        .unwrap();
+        assert!(!app.header.logged_in);
+
+        app.start_turn("hello".into());
+        assert!(!app.turn_active, "turns must be blocked before login");
+
+        // /login validates the endpoint, selects the named model, and saves.
+        let base = model_endpoint(&["alpha", "beta"]).await;
+        app.command_login(&format!("{base} beta")).await;
+        assert!(app.header.logged_in);
+        assert_eq!(app.header.model, "beta");
+        assert_eq!(app.config.model.endpoint, base);
+
+        // /model with no argument lists the endpoint's models and the switch.
+        app.command_model("").await;
+        app.transcript.prepare(160, &app.theme, false, true);
+        let text = transcript_text(&app.transcript);
+        assert!(text.contains("available models"), "transcript:\n{text}");
+        assert!(text.contains("alpha"), "transcript:\n{text}");
+        assert!(text.contains("beta  (current)"), "transcript:\n{text}");
+        assert!(
+            text.contains("switch with /model <name>"),
+            "transcript:\n{text}"
+        );
+
+        // A login without a model auto-selects the endpoint's only model and
+        // replaces the previous endpoint's selection.
+        let single = model_endpoint(&["only-model"]).await;
+        app.command_login(&single).await;
+        assert_eq!(app.header.model, "only-model");
+        let saved = std::fs::read_to_string(&config_path).unwrap();
+        let parsed: toml::Value = toml::from_str(&saved).unwrap();
+        assert_eq!(parsed["model"]["endpoint"].as_str(), Some(single.as_str()));
+        assert_eq!(parsed["model"]["model"].as_str(), Some("only-model"));
     }
 }

@@ -220,11 +220,15 @@ impl Tool for BashTool {
         "Run a non-interactive shell command with a timeout (default 120s, max 600s)."
     }
 
+    fn evidence_enabled(&self) -> bool {
+        true
+    }
+
     fn schema(&self) -> Value {
         object_schema(
             json!({
                 "command": {"type": "string", "description": "Shell command run with bash -lc"},
-                "timeout": {"type": "integer", "minimum": 1, "maximum": MAX_TIMEOUT_SECS},
+                "timeout": {"type": "integer", "minimum": 1, "maximum": MAX_TIMEOUT_SECS, "description": "Seconds (default 120). Use bg for servers and watchers."},
                 "cwd": {"type": "string", "description": "Working directory, relative to the session cwd"}
             }),
             &["command"],
@@ -378,6 +382,7 @@ pub(crate) fn test_context(dir: &Path) -> ToolContext {
         bg: Arc::new(Mutex::new(BgRegistry::new())),
         security: Arc::new(Mutex::new(SecurityState::empty())),
         paths,
+        lsp: Arc::new(crate::tools::lsp::LspService::new()),
     }
 }
 

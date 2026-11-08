@@ -4,6 +4,8 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::PathBuf;
 
+use super::evidence::EvidenceLedger;
+use super::surface::SurfaceMap;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -104,6 +106,8 @@ impl std::fmt::Display for Status {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct EvidenceRef {
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub entry: Option<String>,
@@ -163,6 +167,8 @@ pub struct Engagement {
     pub name: String,
     pub dir: PathBuf,
     pub findings: Vec<Finding>,
+    pub evidence: EvidenceLedger,
+    pub surface: SurfaceMap,
     next_id: u32,
 }
 
@@ -172,6 +178,8 @@ impl Engagement {
         let dir = paths.engagement_dir(name);
         std::fs::create_dir_all(&dir)?;
         let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        let evidence = EvidenceLedger::open(&dir)?;
+        let surface = SurfaceMap::open(&dir)?;
         let path = dir.join("findings.jsonl");
         let mut findings: Vec<Finding> = Vec::new();
         let mut positions: BTreeMap<String, usize> = BTreeMap::new();
@@ -205,6 +213,8 @@ impl Engagement {
             name: name.to_string(),
             dir,
             findings,
+            evidence,
+            surface,
             next_id,
         })
     }

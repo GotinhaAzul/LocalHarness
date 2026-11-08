@@ -11,11 +11,11 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::ModelConfig;
 
-use super::Provider;
 use super::sse::{SseFrame, SseParser};
 use super::types::{
     ChatMessage, ChatRequest, ErrorClass, ProviderError, StreamEvent, StreamItem, Usage,
 };
+use super::{EndpointUrls, Provider, endpoint_urls};
 
 #[derive(Debug, Clone)]
 struct Timeouts {
@@ -27,6 +27,7 @@ struct Timeouts {
 pub struct OpenAiCompatProvider {
     client: reqwest::Client,
     base_url: String,
+    urls: EndpointUrls,
     api_key: String,
     model: String,
     timeouts: Timeouts,
@@ -39,7 +40,8 @@ impl OpenAiCompatProvider {
             .build()?;
         Ok(Self {
             client,
-            base_url: config.endpoint.trim_end_matches('/').to_string(),
+            base_url: config.endpoint.trim().trim_end_matches('/').to_string(),
+            urls: endpoint_urls(&config.endpoint),
             api_key: config.api_key.clone(),
             model: model.into(),
             timeouts: Timeouts {
@@ -55,7 +57,7 @@ impl OpenAiCompatProvider {
     }
 
     fn url(&self) -> String {
-        format!("{}/v1/chat/completions", self.base_url)
+        format!("{}/chat/completions", self.urls.api)
     }
 
     fn scrub(&self, message: impl Into<String>) -> String {
@@ -247,7 +249,7 @@ impl OpenAiCompatProvider {
             return Err(ProviderError::new(class, self.scrub(message)));
         }
 
-        if let Some(usage) = chunk.usage {
+        if let Some(usage) = usage_from(chunk.usage, chunk.timings) {
             let _ = tx.send(Ok(StreamEvent::Usage(usage)));
         }
 
@@ -512,9 +514,67 @@ struct Chunk {
     #[serde(default)]
     choices: Vec<Choice>,
     #[serde(default)]
-    usage: Option<Usage>,
+    usage: Option<WireUsage>,
+    /// llama.cpp's per-request timings, sent on the final chunk.
+    #[serde(default)]
+    timings: Option<Timings>,
     #[serde(default)]
     error: Option<ApiError>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct WireUsage {
+    #[serde(default)]
+    prompt_tokens: u32,
+    #[serde(default)]
+    completion_tokens: u32,
+    #[serde(default)]
+    total_tokens: u32,
+    #[serde(default)]
+    prompt_tokens_details: Option<PromptTokensDetails>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: Option<u32>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct Timings {
+    #[serde(default)]
+    cache_n: Option<u32>,
+    #[serde(default)]
+    prompt_ms: Option<f64>,
+    #[serde(default)]
+    predicted_per_second: Option<f64>,
+}
+
+/// Normalize the usage and timing shapes engines send into one `Usage`.
+fn usage_from(usage: Option<WireUsage>, timings: Option<Timings>) -> Option<Usage> {
+    if usage.is_none() && timings.is_none() {
+        return None;
+    }
+    let wire = usage.unwrap_or_default();
+    let timings = timings.unwrap_or_default();
+    Some(Usage {
+        prompt_tokens: wire.prompt_tokens,
+        completion_tokens: wire.completion_tokens,
+        total_tokens: wire.total_tokens,
+        cached_tokens: wire
+            .prompt_tokens_details
+            .and_then(|details| details.cached_tokens)
+            .or(timings.cache_n),
+        prompt_ms: timings
+            .prompt_ms
+            .filter(|ms| ms.is_finite() && *ms >= 0.0)
+            .map(|ms| ms.round() as u32),
+        first_token_ms: None,
+        tokens_per_sec: timings
+            .predicted_per_second
+            .filter(|rate| rate.is_finite() && *rate > 0.0)
+            .map(|rate| rate as f32),
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -584,6 +644,33 @@ mod tests {
 
     fn provider() -> OpenAiCompatProvider {
         OpenAiCompatProvider::new(&ModelConfig::default(), "test-model").unwrap()
+    }
+
+    fn usage_of(chunk: &str) -> Option<Usage> {
+        let chunk: Chunk = serde_json::from_str(chunk).unwrap();
+        usage_from(chunk.usage, chunk.timings)
+    }
+
+    #[test]
+    fn cache_and_speed_are_read_from_both_engine_shapes() {
+        // OpenAI-standard details (vLLM, newer llama.cpp).
+        let usage = usage_of(
+            r#"{"choices":[],"usage":{"prompt_tokens":1000,"completion_tokens":50,"total_tokens":1050,"prompt_tokens_details":{"cached_tokens":900}}}"#,
+        )
+        .unwrap();
+        assert_eq!(usage.cached_tokens, Some(900));
+        assert_eq!(usage.cache_percent(), Some(90));
+        // llama.cpp timings, possibly on a chunk without usage.
+        let usage = usage_of(
+            r#"{"choices":[],"timings":{"cache_n":236,"prompt_n":12,"prompt_ms":30.9,"predicted_n":35,"predicted_ms":661.0,"predicted_per_second":52.94}}"#,
+        )
+        .unwrap();
+        assert_eq!(usage.prompt_tokens, 0);
+        assert_eq!(usage.cached_tokens, Some(236));
+        assert_eq!(usage.prompt_ms, Some(31));
+        assert!((usage.tokens_per_sec.unwrap() - 52.94).abs() < 0.01);
+        // Plain chunks carry nothing.
+        assert!(usage_of(r#"{"choices":[]}"#).is_none());
     }
 
     #[test]
@@ -670,5 +757,16 @@ mod tests {
     fn provider_url_is_built_once() {
         let p = provider();
         assert_eq!(p.url(), "http://127.0.0.1:8080/v1/chat/completions");
+    }
+
+    #[test]
+    fn endpoint_with_v1_suffix_is_not_doubled() {
+        let config = ModelConfig {
+            endpoint: "http://desktopserver:8088/v1/".into(),
+            ..ModelConfig::default()
+        };
+        let p = OpenAiCompatProvider::new(&config, "spark26").unwrap();
+        assert_eq!(p.url(), "http://desktopserver:8088/v1/chat/completions");
+        assert_eq!(p.base_url(), "http://desktopserver:8088/v1");
     }
 }

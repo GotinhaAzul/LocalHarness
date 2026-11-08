@@ -35,8 +35,8 @@ impl Tool for ReadTool {
             json!({
                 "path": {"type": "string", "description": "File to read, relative to the working directory."},
                 "start": {"type": "integer", "description": "First line to return, 1-based."},
-                "end": {"type": "integer", "description": "Last line to return, inclusive."},
-                "limit": {"type": "integer", "description": "Maximum lines to return (default 150, max 800)."}
+                "end": {"type": "integer", "description": "Last line to return, inclusive (up to 800 lines after start)."},
+                "limit": {"type": "integer", "description": "Lines to return when end is absent (default 150, max 800)."}
             }),
             &["path"],
         )
@@ -111,8 +111,14 @@ fn run(ctx: &ToolContext, args: &Value) -> Result<ToolResult, ToolResult> {
             format!("end={end} is before start={start_u64}; pass end >= start"),
         ));
     }
+    // An explicit `end` is the requested range; only the hard cap applies.
+    let default_lines = if optional_u64(args, "end").is_some() {
+        MAX_LINES
+    } else {
+        DEFAULT_LINES
+    };
     let limit_u64 = optional_u64(args, "limit")
-        .unwrap_or(DEFAULT_LINES)
+        .unwrap_or(default_lines)
         .clamp(1, MAX_LINES);
     let limit = usize::try_from(limit_u64).unwrap_or(MAX_LINES as usize);
 
@@ -204,6 +210,23 @@ mod tests {
     use super::*;
     use crate::tools::write::test_context;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn explicit_end_is_not_clipped_to_the_default_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let body: String = (1..=500).map(|n| format!("line{n}\n")).collect();
+        std::fs::write(dir.path().join("a.txt"), body).unwrap();
+        let ctx = test_context(dir.path());
+
+        let result = ReadTool
+            .call(&ctx, json!({"path": "a.txt", "start": 100, "end": 400}))
+            .await;
+        assert!(!result.is_error, "{}", result.content);
+        let details = result.details.unwrap();
+        assert_eq!(details["start"], 100);
+        assert_eq!(details["end"], 400);
+        assert_eq!(details["capped"], false);
+    }
 
     #[tokio::test]
     async fn numbers_lines() {

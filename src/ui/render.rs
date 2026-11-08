@@ -1296,6 +1296,7 @@ mod tests {
         let header = HeaderData {
             cwd: "/tmp/project".into(),
             model: "test".into(),
+            logged_in: true,
             window: 1000,
             ..HeaderData::default()
         };

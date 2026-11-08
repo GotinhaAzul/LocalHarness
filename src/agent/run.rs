@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::time::Instant;
 
+use chrono::{Duration as ChronoDuration, Utc};
 use serde_json::{Value, json};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
@@ -100,6 +101,12 @@ async fn run_loop(
 ) -> TurnOutcome {
     let mut progress = RunProgress::new(core.limits.clone());
     let mut budget = core.budget.clone();
+    let known_window = core
+        .server_window
+        .load(std::sync::atomic::Ordering::Relaxed);
+    if known_window > 0 && known_window < budget.context_window {
+        budget = budget.shrunk_to(known_window);
+    }
     let mut loop_guard = LoopGuard::new();
     let verify_configured = !core.config.verify.steps.is_empty();
     let gate_tools = gates::GateTools::from_names(core.tools.iter().map(|tool| tool.name()));
@@ -305,13 +312,54 @@ async fn run_loop(
             }
         };
 
+        if let Some(limit) = budget.truncated_at.take()
+            && limit < budget.context_window
+        {
+            core.server_window
+                .store(limit, std::sync::atomic::Ordering::Relaxed);
+            budget = budget.shrunk_to(limit);
+            let _ = tx.send(AgentEvent::Notice(format!(
+                "the server silently truncated the prompt to about {limit} tokens, cutting the system prompt and tools. Raise its context size (Ollama: OLLAMA_CONTEXT_LENGTH=32768 or `PARAMETER num_ctx 32768`; llama.cpp: -c 32768). Working within {limit} tokens until then."
+            )));
+            context_window_event(tx, &budget, &assistant);
+            if !progress.truncation_retry_used {
+                // That reply was written without the system prompt; drop it
+                // and retry once the context fits the real window.
+                progress.truncation_retry_used = true;
+                pending_compaction = true;
+                continue;
+            }
+        }
+        let mut assistant = assistant;
+        let recovery = recover_output(core, &mut assistant, &mut progress);
+        if let Some(notice) = recovery.notice {
+            let _ = tx.send(AgentEvent::Notice(notice));
+        }
+        if let Some(nudge) = recovery.nudge {
+            if progress.output_recoveries < MAX_OUTPUT_RECOVERIES {
+                progress.output_recoveries += 1;
+                if let Err(err) = append_assistant(&core.session, assistant)
+                    .and_then(|()| append_user(&core.session, &nudge))
+                {
+                    return TurnOutcome::error("session_write", err.to_string());
+                }
+                continue;
+            }
+            if recovery.degenerate {
+                let _ = append_assistant(&core.session, assistant);
+                let message = "the model kept repeating itself; stopped. Try again, lower the temperature, or raise the repetition penalty in the model profile's extra_body.";
+                append_error(&core.session, "repetition", message, true);
+                let _ = tx.send(AgentEvent::Guard {
+                    code: "repetition".into(),
+                    message: message.into(),
+                });
+                return TurnOutcome::ok(TurnStatus::Stalled);
+            }
+        }
         let has_calls = assistant
             .tool_calls
             .as_ref()
             .is_some_and(|calls| !calls.is_empty());
-        if assistant.content.as_deref().unwrap_or("").is_empty() && !has_calls {
-            // An empty completion is a valid stop; keep the branch valid.
-        }
         if let Some(usage) = &assistant.usage {
             let _ = tx.send(AgentEvent::Context {
                 used: usage.prompt_tokens,
@@ -473,12 +521,139 @@ async fn run_loop(
     }
 }
 
+fn context_window_event(
+    tx: &UnboundedSender<AgentEvent>,
+    budget: &TokenBudget,
+    assistant: &AssistantData,
+) {
+    if let Some(usage) = &assistant.usage {
+        let _ = tx.send(AgentEvent::Context {
+            used: usage.prompt_tokens,
+            window: budget.context_window,
+        });
+    }
+}
+
+/// A call id unique within the session, for servers that omit ids and for
+/// calls recovered from text. Per-message counters (`call_1`) repeat across
+/// messages and break result matching in replayed history.
+fn fresh_call_id(index: usize) -> String {
+    format!("call_{:x}_{}", Utc::now().timestamp_micros(), index + 1)
+}
+
+/// `stop_reason` recorded when the repetition guard cut the stream.
+const REPETITION_STOP: &str = "repetition";
+/// Nudges for broken output (loops, cut-offs, empty replies) per turn.
+const MAX_OUTPUT_RECOVERIES: u32 = 3;
+
+#[derive(Default)]
+struct OutputRecovery {
+    /// One line for the user.
+    notice: Option<String>,
+    /// A harness message for the model; the loop continues after it.
+    nudge: Option<String>,
+    degenerate: bool,
+}
+
+/// Repair what can be repaired in place (tool calls written as text) and name
+/// a nudge for what cannot (a loop, an output-limit cut, an empty reply).
+fn recover_output(
+    core: &Core,
+    assistant: &mut AssistantData,
+    progress: &mut RunProgress,
+) -> OutputRecovery {
+    let mut out = OutputRecovery::default();
+    if assistant.stop_reason.as_deref() == Some(REPETITION_STOP) {
+        // Calls streamed alongside a loop are not trustworthy.
+        assistant.tool_calls = None;
+        out.degenerate = true;
+        out.notice = Some("repetition guard: the model started looping; generation stopped".into());
+        out.nudge = Some("[localharness] repetition guard: your output began repeating itself and was stopped. Do not restate it. Take one concrete next step: a single tool call, or a short final answer.".into());
+        return out;
+    }
+
+    let has_native = assistant
+        .tool_calls
+        .as_ref()
+        .is_some_and(|calls| !calls.is_empty());
+    if !has_native
+        && core.model_profile.tool_mode != crate::config::ToolMode::Native
+        && let Some(content) = assistant.content.as_deref()
+    {
+        let active: Vec<&str> = core.tools.iter().map(|tool| tool.name()).collect();
+        if let Some(found) = super::output::extract_text_calls(content, &active) {
+            let calls: Vec<ToolCall> = found
+                .calls
+                .into_iter()
+                .enumerate()
+                .map(|(index, call)| ToolCall {
+                    id: fresh_call_id(index),
+                    name: call.name,
+                    arguments: call.arguments,
+                })
+                .collect();
+            if !progress.text_calls_noticed {
+                progress.text_calls_noticed = true;
+                out.notice = Some(format!(
+                    "recovered {} tool call(s) the model wrote as text ({}); if this repeats, enable native tool calling on the server (llama.cpp: --jinja)",
+                    calls.len(),
+                    found.format
+                ));
+            }
+            assistant.content = (!found.prose.is_empty()).then_some(found.prose);
+            assistant.tool_calls = Some(calls);
+        }
+    }
+
+    let calls = assistant.tool_calls.as_deref().unwrap_or_default();
+    let content_empty = assistant
+        .content
+        .as_deref()
+        .is_none_or(|c| c.trim().is_empty());
+    if assistant.stop_reason.as_deref() == Some("length") {
+        let cut = calls.iter().find(|call| {
+            matches!(&call.arguments, Value::String(raw) if serde_json::from_str::<Value>(raw).is_err())
+        });
+        let limit = format!(" ({} tokens)", core.config.model.max_output_tokens);
+        if let Some(call) = cut {
+            out.nudge = Some(format!(
+                "[localharness] output limit: your response hit the output token limit{limit} while writing the {} call, so the call was cut off and nothing ran. Send a smaller call: write a short file and grow it with edit, or split the content across several calls.",
+                call.name
+            ));
+            assistant.tool_calls = None;
+        } else if calls.is_empty() {
+            out.nudge = Some(if content_empty {
+                "[localharness] output limit: you used the whole output budget thinking. Stop deliberating and act now: make one tool call or give a concise answer.".to_string()
+            } else {
+                "[localharness] output limit: your response was cut off by the output token limit. Continue exactly where it stopped, without repeating what you already wrote.".to_string()
+            });
+        }
+        if out.nudge.is_some() {
+            out.notice = Some(format!(
+                "the model hit its output token limit{limit}; raise [model] max_output_tokens if this repeats"
+            ));
+        }
+    } else if calls.is_empty() && content_empty {
+        out.nudge = Some("[localharness] empty response: you returned no text and no tool call. Make the next tool call, or give your final answer.".into());
+    }
+    out
+}
+
 struct StreamAccum {
     content: String,
     reasoning: String,
     calls: BTreeMap<usize, PartialCall>,
     usage: Option<Usage>,
     finish: Option<String>,
+    think: super::output::ThinkSplitter,
+    content_loop: super::output::RepetitionGuard,
+    reasoning_loop: super::output::RepetitionGuard,
+    /// Set when the repetition guard stopped the stream.
+    degenerate: bool,
+    /// When the request was sent, and when tokens first and last arrived.
+    sent: Instant,
+    first_token: Option<Instant>,
+    last_token: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -519,6 +694,98 @@ impl StreamAccum {
             calls: BTreeMap::new(),
             usage: None,
             finish: None,
+            think: super::output::ThinkSplitter::default(),
+            content_loop: super::output::RepetitionGuard::default(),
+            reasoning_loop: super::output::RepetitionGuard::default(),
+            degenerate: false,
+            sent: Instant::now(),
+            first_token: None,
+            last_token: None,
+        }
+    }
+
+    fn token_arrived(&mut self) {
+        let now = Instant::now();
+        self.first_token.get_or_insert(now);
+        self.last_token = Some(now);
+    }
+
+    /// Add harness-side timing to the usage report: time to first token
+    /// always, and generation speed when the server did not report one.
+    fn measure(&mut self) {
+        let (Some(usage), Some(first)) = (self.usage.as_mut(), self.first_token) else {
+            return;
+        };
+        usage.first_token_ms = Some(
+            first
+                .duration_since(self.sent)
+                .as_millis()
+                .min(u128::from(u32::MAX)) as u32,
+        );
+        if usage.tokens_per_sec.is_none()
+            && usage.completion_tokens > 1
+            && let Some(last) = self.last_token
+        {
+            let secs = last.duration_since(first).as_secs_f64();
+            // Shorter spans are dominated by network jitter.
+            if secs >= 0.2 {
+                usage.tokens_per_sec = Some((f64::from(usage.completion_tokens - 1) / secs) as f32);
+            }
+        }
+    }
+
+    /// Route streamed content through the think splitter, then watch both
+    /// buffers for a degenerate loop.
+    fn push_content(&mut self, delta: &str, tx: &UnboundedSender<AgentEvent>) {
+        let pieces = self.think.push(delta);
+        self.route(pieces, tx);
+    }
+
+    fn push_reasoning(&mut self, delta: String, tx: &UnboundedSender<AgentEvent>) {
+        self.route(vec![super::output::Piece::Reasoning(delta)], tx);
+    }
+
+    fn route(&mut self, pieces: Vec<super::output::Piece>, tx: &UnboundedSender<AgentEvent>) {
+        for piece in pieces {
+            match piece {
+                super::output::Piece::Text(text) => {
+                    self.content.push_str(&text);
+                    let _ = tx.send(AgentEvent::TextDelta(text));
+                }
+                super::output::Piece::Reasoning(text) => {
+                    self.reasoning.push_str(&text);
+                    let _ = tx.send(AgentEvent::ReasoningDelta(text));
+                }
+            }
+        }
+        if let Some(keep) = self.content_loop.check(&self.content) {
+            self.content.truncate(keep);
+            self.degenerate = true;
+        }
+        if let Some(keep) = self.reasoning_loop.check(&self.reasoning) {
+            self.reasoning.truncate(keep);
+            self.degenerate = true;
+        }
+    }
+
+    /// Emit anything the think splitter held back, and move reasoning that a
+    /// template left as `...</think>` without an opening tag.
+    fn settle_reasoning(&mut self, tx: &UnboundedSender<AgentEvent>) {
+        let pieces = self.think.flush();
+        self.route(pieces, tx);
+        if !self.think.opened()
+            && let Some((reasoning, content)) = super::output::split_unopened_think(&self.content)
+        {
+            if !reasoning.is_empty() {
+                if !self.reasoning.is_empty() {
+                    self.reasoning.push('\n');
+                }
+                self.reasoning.push_str(&reasoning);
+            }
+            self.content = content;
+        }
+        if self.think.opened() {
+            self.content = self.content.trim_start().to_string();
         }
     }
 
@@ -526,7 +793,7 @@ impl StreamAccum {
         let mut calls = Vec::new();
         for (index, mut call) in self.calls {
             if call.id.trim().is_empty() {
-                call.id = format!("call_{}", index + 1);
+                call.id = fresh_call_id(index);
             }
             if call.name.trim().is_empty() {
                 continue;
@@ -556,7 +823,11 @@ impl StreamAccum {
             },
             tool_calls: if calls.is_empty() { None } else { Some(calls) },
             usage: self.usage,
-            stop_reason: self.finish.or_else(|| Some("stop".into())),
+            stop_reason: if self.degenerate {
+                Some(REPETITION_STOP.into())
+            } else {
+                self.finish.or_else(|| Some("stop".into()))
+            },
         }
     }
 }
@@ -599,9 +870,18 @@ async fn stream_assistant(
             failure = Some(err);
             break;
         }
+        if accum.degenerate {
+            // Stop paying for a loop; the provider task is aborted below.
+            break;
+        }
     }
     task.abort();
     let _ = task.await;
+    accum.settle_reasoning(tx);
+    accum.measure();
+    if let Some(usage) = &accum.usage {
+        let _ = tx.send(AgentEvent::Usage(usage.clone()));
+    }
     if let Some(err) = failure {
         *partial = accum.partial();
         return Err(err);
@@ -635,13 +915,13 @@ fn handle_stream_item(
     match item {
         Err(err) => Some(err),
         Ok(StreamEvent::Delta(text)) => {
-            accum.content.push_str(&text);
-            let _ = tx.send(AgentEvent::TextDelta(text));
+            accum.token_arrived();
+            accum.push_content(&text, tx);
             None
         }
         Ok(StreamEvent::ReasoningDelta(text)) => {
-            accum.reasoning.push_str(&text);
-            let _ = tx.send(AgentEvent::ReasoningDelta(text));
+            accum.token_arrived();
+            accum.push_reasoning(text, tx);
             None
         }
         Ok(StreamEvent::ToolCallDelta {
@@ -650,6 +930,7 @@ fn handle_stream_item(
             name,
             arguments,
         }) => {
+            accum.token_arrived();
             let call = accum.calls.entry(index).or_default();
             if let Some(id) = id {
                 merge_fragment(&mut call.id, &id);
@@ -663,10 +944,19 @@ fn handle_stream_item(
             None
         }
         Ok(StreamEvent::Usage(usage)) => {
-            budget.calibrate(char_count, usage.prompt_tokens);
-            budget.observe_usage(usage.prompt_tokens, estimated_tokens);
-            let _ = tx.send(AgentEvent::Usage(usage.clone()));
-            accum.usage = Some(usage);
+            if usage.prompt_tokens > 0 {
+                budget.calibrate(char_count, usage.prompt_tokens);
+                budget.observe_usage(usage.prompt_tokens, estimated_tokens);
+            }
+            let merged = match accum.usage.as_mut() {
+                Some(existing) => {
+                    existing.merge(&usage);
+                    existing.clone()
+                }
+                None => usage,
+            };
+            let _ = tx.send(AgentEvent::Usage(merged.clone()));
+            accum.usage = Some(merged);
             None
         }
         Ok(StreamEvent::Finish(reason)) => {
@@ -719,7 +1009,8 @@ async fn execute_batch(
     let mut thread_split: Option<ThreadSplit> = None;
 
     let ctx = core.tool_context_with(cancel.clone());
-    for (position, call) in calls.iter().enumerate() {
+    let active: Vec<&str> = core.tools.iter().map(|tool| tool.name()).collect();
+    for (position, original) in calls.iter().enumerate() {
         if cancel.is_cancelled() {
             cancelled = true;
             for remaining in &calls[position..] {
@@ -732,6 +1023,36 @@ async fn execute_batch(
             }
             break;
         }
+        // Resolve the name once so every gate below (read-first, todo, scope)
+        // sees the canonical tool, never the model's spelling of it.
+        let resolved_name = super::repair::resolve_tool_name(&original.name, &active);
+        let mut routed_note = None;
+        let mut unknown_suggestion = None;
+        let routed_call;
+        let call = match &resolved_name {
+            super::repair::ToolName::Exact(name) if *name != original.name => {
+                routed_call = ToolCall {
+                    name: name.clone(),
+                    ..original.clone()
+                };
+                &routed_call
+            }
+            super::repair::ToolName::Routed { from, to } => {
+                routed_note = Some(format!(
+                    "note: {from:?} is not a tool here; ran {to}. Call {to} directly next time."
+                ));
+                routed_call = ToolCall {
+                    name: to.clone(),
+                    ..original.clone()
+                };
+                &routed_call
+            }
+            super::repair::ToolName::Unknown { suggestion } => {
+                unknown_suggestion = suggestion.clone();
+                original
+            }
+            super::repair::ToolName::Exact(_) => original,
+        };
         let started = Instant::now();
         let summary_args = summarize_args(&call.arguments);
         let _ = tx.send(AgentEvent::ToolStarted {
@@ -747,32 +1068,41 @@ async fn execute_batch(
             .cloned();
         let raw = arguments_raw(&call.arguments);
         let mut args_path: Option<String> = None;
+        let mut evidence_args: Option<Value> = None;
         let mut result;
         let mut repaired = None;
 
         if tool.is_none() {
+            let hint = unknown_suggestion
+                .map(|name| format!("did you mean {name}? "))
+                .unwrap_or_default();
             result = ToolResult::err(
                 "unknown_tool",
                 format!(
-                    "unknown tool {:?}; active tools: {}",
+                    "unknown tool {:?}; {hint}active tools: {}",
                     call.name,
-                    core.tools
-                        .iter()
-                        .map(|t| t.name())
-                        .collect::<Vec<_>>()
-                        .join(", ")
+                    active.join(", ")
                 ),
             );
         } else {
-            match super::repair::repair(&call.name, &raw, &tool.as_ref().unwrap().schema()) {
+            let schema = tool.as_ref().unwrap().schema();
+            match super::repair::repair_with_notes(&call.name, &raw, &schema) {
                 Err(err) => {
                     result = ToolResult::err(err.code, err.message);
                 }
-                Ok(args) => {
+                Ok(repaired_args) => {
+                    if let Some(note) = repaired_args.note(&call.name, &schema) {
+                        routed_note = Some(match routed_note.take() {
+                            Some(existing) => format!("{existing}\n{note}"),
+                            None => note,
+                        });
+                    }
+                    let args = repaired_args.args;
                     args_path = args
                         .get("path")
                         .and_then(|v| v.as_str())
                         .map(str::to_string);
+                    evidence_args = Some(args.clone());
                     repaired = Some(args.clone());
                     result = ToolResult::ok("");
 
@@ -874,6 +1204,10 @@ async fn execute_batch(
         }
 
         let duration_ms = started.elapsed().as_millis() as u64;
+        let evidence_output = result.content.clone();
+        if let Some(note) = routed_note {
+            result.content = format!("{note}\n{}", result.content);
+        }
         result.content = format!(
             "[tool] {} - {}\n{}",
             call.name, summary_args, result.content
@@ -899,7 +1233,25 @@ async fn execute_batch(
             is_error: result.is_error,
             details: result.details.clone(),
         };
-        append_tool_result(&core.session, call, &tool_result, capped.artifact.clone());
+        let entry_id =
+            append_tool_result(&core.session, call, &tool_result, capped.artifact.clone());
+        if let (Some(tool), Some(args), Some(entry_id)) =
+            (tool.as_deref(), evidence_args.as_ref(), entry_id.as_deref())
+            && tool.evidence_enabled()
+            && let Err(error) = record_evidence(
+                core,
+                tool,
+                call,
+                args,
+                &evidence_output,
+                result.is_error,
+                result.details.as_ref(),
+                entry_id,
+                duration_ms,
+            )
+        {
+            tracing::warn!(%error, tool = call.name, "evidence entry was not recorded");
+        }
 
         let mut verified_ok = false;
         let mut changed = false;
@@ -955,7 +1307,7 @@ async fn execute_batch(
                     end_turn = true;
                 }
             }
-            if matches!(call.name.as_str(), "write" | "edit" | "patch")
+            if matches!(call.name.as_str(), "write" | "edit" | "patch" | "undo")
                 && let Some(path) = &args_path
             {
                 changed = true;
@@ -965,15 +1317,10 @@ async fn execute_batch(
                     .as_ref()
                     .map(|_| display_path(&ctx.cwd, &ctx.cwd.join(path)))
                     .unwrap_or_else(|| path.clone());
-                let mut custom = CustomData::new("fs-change").with("path", display);
-                if let Some(details) = &tool_result.details {
-                    for key in ["added", "removed", "created"] {
-                        if let Some(value) = details.get(key) {
-                            custom.payload.insert(key.to_string(), value.clone());
-                        }
-                    }
-                }
-                deferred.push(custom);
+                deferred.push(crate::tools::undo::fs_change_entry(
+                    display,
+                    tool_result.details.as_ref(),
+                ));
             }
         }
 
@@ -1141,15 +1488,123 @@ fn append_tool_result(
     call: &ToolCall,
     result: &ToolResult,
     artifact: Option<String>,
-) {
+) -> Option<String> {
     if let Ok(mut session) = session.lock() {
-        let _ = session.append(EntryKind::ToolResult(ToolResultData {
+        match session.append(EntryKind::ToolResult(ToolResultData {
             call_id: call.id.clone(),
             content: result.content.clone(),
             is_error: result.is_error,
             details: result.details.clone(),
             artifact,
-        }));
+        })) {
+            Ok(entry) => return Some(entry.id),
+            Err(error) => tracing::warn!(%error, "tool result entry was not written"),
+        }
+    }
+    None
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_evidence(
+    core: &Core,
+    tool: &dyn crate::tools::Tool,
+    call: &ToolCall,
+    args: &Value,
+    output: &str,
+    is_error: bool,
+    details: Option<&Value>,
+    entry_id: &str,
+    duration_ms: u64,
+) -> Result<(), String> {
+    let session_id = core.session.lock().ok().map(|session| session.id.clone());
+    let command = tool.evidence_command(args).unwrap_or_else(|| {
+        format!(
+            "{} {}",
+            call.name,
+            serde_json::to_string(args).unwrap_or_else(|_| "{}".into())
+        )
+    });
+    let target = evidence_targets(&command, args);
+    let exit_code = details
+        .and_then(|details| details.get("exit_code"))
+        .and_then(Value::as_i64);
+    let timed_out = details
+        .and_then(|details| details.get("timed_out"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let cancelled = details
+        .and_then(|details| details.get("cancelled"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let finished = Utc::now();
+    let started = finished - ChronoDuration::milliseconds(duration_ms as i64);
+
+    let mut state = core
+        .security
+        .lock()
+        .map_err(|_| "security state is poisoned; restart lh".to_string())?;
+    let scope = state.scope.clone();
+    let Some(engagement) = state.engagement.as_mut() else {
+        return Ok(());
+    };
+    let evidence = engagement
+        .evidence
+        .add(crate::security::evidence::NewEvidence {
+            tool: call.name.clone(),
+            session: session_id,
+            entry: Some(entry_id.to_string()),
+            target,
+            command,
+            started,
+            finished,
+            duration_ms,
+            exit_code,
+            timed_out,
+            cancelled,
+            is_error,
+            output: output.to_string(),
+            summary: None,
+        })
+        .map_err(|error| error.to_string())?;
+    engagement
+        .surface
+        .ingest(&evidence.command, output, &scope, &evidence.id);
+    Ok(())
+}
+
+fn evidence_targets(command: &str, args: &Value) -> String {
+    let mut targets = crate::security::extract_targets(command);
+    if targets.is_empty() {
+        let mut strings = Vec::new();
+        collect_json_strings(args, &mut strings);
+        for value in strings {
+            for target in crate::security::extract_targets(&value) {
+                if !targets
+                    .iter()
+                    .any(|existing: &String| existing.eq_ignore_ascii_case(&target))
+                {
+                    targets.push(target);
+                }
+            }
+        }
+    }
+    targets.join(", ")
+}
+
+fn collect_json_strings(value: &Value, out: &mut Vec<String>) {
+    match value {
+        Value::String(value) => out.push(value.clone()),
+        Value::Array(items) => {
+            for item in items {
+                collect_json_strings(item, out);
+            }
+        }
+        Value::Object(map) => {
+            for item in map.values() {
+                collect_json_strings(item, out);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1218,8 +1673,15 @@ mod tests {
         call.arguments = "{not json".into();
         let assistant = accum.finalize();
         let calls = assistant.tool_calls.unwrap();
-        assert_eq!(calls[0].id, "call_1");
+        assert!(calls[0].id.starts_with("call_"), "{}", calls[0].id);
         assert!(matches!(&calls[0].arguments, Value::String(_)));
+        // Ids must not repeat across messages, or replayed history pairs a
+        // call with another call's result.
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        let mut again = StreamAccum::new();
+        again.calls.entry(0).or_default().name = "read".into();
+        let second = again.finalize().tool_calls.unwrap();
+        assert_ne!(calls[0].id, second[0].id);
     }
 
     #[test]

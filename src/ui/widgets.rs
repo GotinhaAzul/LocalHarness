@@ -16,11 +16,15 @@ pub struct HeaderData {
     pub git: GitStatus,
     pub profile: String,
     pub model: String,
+    /// False until a model is selected; the header then shows `not logged in`.
+    pub logged_in: bool,
     pub used: u32,
     pub window: u32,
     /// Completion tokens streamed in the current turn, shown separately.
     pub completion: u32,
     pub tok_s: f32,
+    /// Share of the last prompt served from the server's prefix cache.
+    pub cache: Option<u32>,
     pub session: String,
     pub trust: bool,
 }
@@ -162,6 +166,7 @@ struct HeaderFlags {
     profile: bool,
     session: bool,
     throughput: bool,
+    cache: bool,
 }
 
 fn context_spans(data: &HeaderData, compact: bool, theme: &Theme) -> Vec<Span<'static>> {
@@ -233,16 +238,23 @@ fn header_spans(
             vec![Span::styled(data.profile.clone(), theme.style(Role::Muted))],
         );
     }
+    let (model, model_role) = if data.logged_in {
+        (data.model.clone(), Role::Assistant)
+    } else {
+        ("not logged in".to_string(), Role::Warning)
+    };
     item(
         &mut spans,
-        vec![Span::styled(
-            data.model.clone(),
-            theme.bold(Role::Assistant),
-        )],
+        vec![Span::styled(model, theme.bold(model_role))],
     );
     item(&mut spans, context_spans(data, compact_context, theme));
     if flags.throughput {
-        let speed = format!("{:.0} tok/s", data.tok_s.max(0.0));
+        let mut speed = format!("{:.0} tok/s", data.tok_s.max(0.0));
+        if flags.cache
+            && let Some(cache) = data.cache
+        {
+            speed.push_str(&format!(" · cache {cache}%"));
+        }
         item(
             &mut spans,
             vec![Span::styled(speed, theme.style(Role::Muted))],
@@ -275,15 +287,19 @@ pub fn header_line(data: &HeaderData, width: usize, theme: &Theme) -> Line<'stat
         profile: width >= 70,
         session: width >= 80,
         throughput: width >= 100,
+        cache: width >= 100,
     };
     let mut cwd = display_cwd(&data.cwd);
     let mut spans = header_spans(data, &cwd, &flags, compact_context, theme);
     let limit = width.max(1);
 
-    // Drop optional items in the required order: throughput, session, profile,
-    // then the app name. Working directory, model, and context always remain.
+    // Drop optional items in the required order: cache, throughput, session,
+    // profile, then the app name. Working directory, model, and context
+    // always remain.
     while spans_width(&spans) > limit {
-        if flags.throughput {
+        if flags.cache {
+            flags.cache = false;
+        } else if flags.throughput {
             flags.throughput = false;
         } else if flags.session {
             flags.session = false;

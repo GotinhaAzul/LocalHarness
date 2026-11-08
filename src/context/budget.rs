@@ -4,6 +4,11 @@ use crate::provider::ChatMessage;
 
 pub const DEFAULT_CHARS_PER_TOKEN: f64 = 3.5;
 pub const SAFETY_MARGIN_MIN: u32 = 512;
+/// Real text, code, and JSON all tokenize well under this many characters per
+/// token. A measurement above it means the server dropped part of the prompt.
+const TRUNCATION_CHARS_PER_TOKEN: f64 = 6.0;
+/// Below this size a prompt is too small to judge.
+const TRUNCATION_MIN_CHARS: usize = 12_000;
 
 #[derive(Debug, Clone)]
 pub struct TokenBudget {
@@ -13,6 +18,9 @@ pub struct TokenBudget {
     pub chars_per_token: f64,
     pub last_prompt_tokens: Option<u32>,
     pub last_estimation_error: Option<i64>,
+    /// Set when a usage report shows the server silently truncated the
+    /// prompt; holds the server's apparent prompt limit. Taken by the loop.
+    pub truncated_at: Option<u32>,
 }
 
 impl TokenBudget {
@@ -26,7 +34,17 @@ impl TokenBudget {
             chars_per_token: DEFAULT_CHARS_PER_TOKEN,
             last_prompt_tokens: None,
             last_estimation_error: None,
+            truncated_at: None,
         }
+    }
+
+    /// The same budget against a smaller real window, keeping calibration.
+    /// Output is capped at a quarter of the window so a small server window
+    /// still leaves room for the prompt.
+    pub fn shrunk_to(&self, window: u32) -> Self {
+        let mut shrunk = Self::new(window, self.max_output_tokens.min(window / 4));
+        shrunk.chars_per_token = self.chars_per_token;
+        shrunk
     }
 
     /// `context_window - max_output_tokens - safety_margin`, floored.
@@ -69,6 +87,13 @@ impl TokenBudget {
             return;
         }
         let measured = estimated_chars as f64 / f64::from(actual_prompt_tokens);
+        if measured > TRUNCATION_CHARS_PER_TOKEN && estimated_chars >= TRUNCATION_MIN_CHARS {
+            // The server truncated the prompt (Ollama does this silently at
+            // its default num_ctx). Learning from this sample would make the
+            // harness think text is cheaper and grow the prompt further.
+            self.truncated_at = Some(actual_prompt_tokens);
+            return;
+        }
         let measured = measured.clamp(1.0, 10.0);
         self.chars_per_token = (self.chars_per_token * 0.5 + measured * 0.5).clamp(1.0, 10.0);
         self.last_prompt_tokens = Some(actual_prompt_tokens);
@@ -94,6 +119,24 @@ impl TokenBudget {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn silent_server_truncation_is_detected_not_learned() {
+        let mut budget = TokenBudget::new(32_768, 4096);
+        // 40k chars reported as 2048 tokens: about 20 chars per token.
+        budget.calibrate(40_000, 2048);
+        assert_eq!(budget.truncated_at, Some(2048));
+        assert_eq!(budget.chars_per_token, DEFAULT_CHARS_PER_TOKEN);
+        // Dense but real text still calibrates.
+        let mut budget = TokenBudget::new(32_768, 4096);
+        budget.calibrate(40_000, 9_000);
+        assert_eq!(budget.truncated_at, None);
+        assert!(budget.chars_per_token > DEFAULT_CHARS_PER_TOKEN);
+        let shrunk = budget.shrunk_to(4096);
+        assert_eq!(shrunk.context_window, 4096);
+        assert_eq!(shrunk.max_output_tokens, 1024);
+        assert_eq!(shrunk.chars_per_token, budget.chars_per_token);
+    }
 
     #[test]
     fn usable_prompt_subtracts_output_and_margin() {

@@ -5,7 +5,9 @@ pub mod budget;
 pub mod compact;
 
 use crate::provider::{ChatMessage, ToolCall};
-use crate::session::{AssistantData, EntryKind, Session};
+use std::collections::HashMap;
+
+use crate::session::{AssistantData, Entry, EntryKind, Session, ToolResultData};
 
 pub use archive::{
     BATCH_CAP_CHARS, CappedContent, RECALL_CAP_CHARS, RESULT_CAP_CHARS, cap_batch, cap_result,
@@ -33,8 +35,10 @@ pub fn assemble(
         content: base_system.to_string(),
     }];
     let mut had_compaction = false;
+    let path = session.context_path();
+    let results = ToolResults::index(&path);
 
-    for entry in session.context_path() {
+    for entry in path {
         match &entry.kind {
             EntryKind::Session(_)
             | EntryKind::Checkout(_)
@@ -52,7 +56,7 @@ pub fn assemble(
                 });
             }
             EntryKind::Assistant(assistant) => {
-                push_assistant(&mut messages, assistant, session);
+                push_assistant(&mut messages, assistant, entry.seq, &results);
             }
             EntryKind::ToolResult(_) => {
                 // Emitted with the assistant message that requested it.
@@ -78,7 +82,44 @@ pub fn assemble(
     }
 }
 
-fn push_assistant(messages: &mut Vec<ChatMessage>, assistant: &AssistantData, session: &Session) {
+/// Tool results by call id, in path order. Built once per assembly: scanning
+/// the branch per call made assembly quadratic in session length.
+struct ToolResults<'a> {
+    by_id: HashMap<&'a str, Vec<(u64, &'a ToolResultData)>>,
+}
+
+impl<'a> ToolResults<'a> {
+    fn index(path: &[&'a Entry]) -> Self {
+        let mut by_id: HashMap<&str, Vec<(u64, &ToolResultData)>> = HashMap::new();
+        for entry in path {
+            if let EntryKind::ToolResult(result) = &entry.kind {
+                by_id
+                    .entry(result.call_id.as_str())
+                    .or_default()
+                    .push((entry.seq, result));
+            }
+        }
+        Self { by_id }
+    }
+
+    /// The first result for `call_id` recorded after the assistant entry at
+    /// `after`. Call ids are not unique across messages when a server omits
+    /// them, so matching by id alone can replay another call's result.
+    fn after(&self, call_id: &str, after: u64) -> Option<&'a ToolResultData> {
+        self.by_id
+            .get(call_id)?
+            .iter()
+            .find(|(seq, _)| *seq > after)
+            .map(|(_, result)| *result)
+    }
+}
+
+fn push_assistant(
+    messages: &mut Vec<ChatMessage>,
+    assistant: &AssistantData,
+    seq: u64,
+    results: &ToolResults<'_>,
+) {
     let tool_calls: Vec<ToolCall> = assistant
         .tool_calls
         .as_ref()
@@ -98,14 +139,7 @@ fn push_assistant(messages: &mut Vec<ChatMessage>, assistant: &AssistantData, se
         tool_calls: tool_calls.clone(),
     });
     for call in &tool_calls {
-        let result = session
-            .branch_entries()
-            .into_iter()
-            .find_map(|entry| match &entry.kind {
-                EntryKind::ToolResult(result) if result.call_id == call.id => Some(result),
-                _ => None,
-            });
-        let content = match result {
+        let content = match results.after(&call.id, seq) {
             Some(result) => result.content.clone(),
             None => format!(
                 "[cancelled] no result was recorded for {}; the step was interrupted",
@@ -198,6 +232,46 @@ mod tests {
             true,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn repeated_call_ids_pair_with_their_own_results() {
+        // Servers that omit ids used to get `call_1` in every message; each
+        // call must still replay with the result recorded after it.
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = session(dir.path());
+        for body in ["first body", "second body"] {
+            session
+                .append(EntryKind::Assistant(AssistantData {
+                    tool_calls: Some(vec![crate::session::ToolCall {
+                        id: "call_1".into(),
+                        name: "read".into(),
+                        arguments: json!({"path": body}),
+                    }]),
+                    ..AssistantData::default()
+                }))
+                .unwrap();
+            session
+                .append(EntryKind::ToolResult(ToolResultData {
+                    call_id: "call_1".into(),
+                    content: body.into(),
+                    is_error: false,
+                    details: None,
+                    artifact: None,
+                }))
+                .unwrap();
+        }
+        let budget = TokenBudget::new(32768, 4096);
+        let assembled = assemble("system", &session, None, &budget);
+        let tool_bodies: Vec<&str> = assembled
+            .messages
+            .iter()
+            .filter_map(|message| match message {
+                ChatMessage::Tool { content, .. } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tool_bodies, vec!["first body", "second body"]);
     }
 
     #[test]

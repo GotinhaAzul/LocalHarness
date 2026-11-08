@@ -4,7 +4,7 @@
 //! One client is kept per `(server, root)` pair. Clients are created lazily,
 //! disposed after ten minutes of inactivity, and killed when replaced.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -23,8 +23,10 @@ use crate::tools::{
 };
 
 const INIT_TIMEOUT: Duration = Duration::from_secs(15);
+const EDIT_INIT_TIMEOUT: Duration = Duration::from_secs(8);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const DIAG_WINDOW: Duration = Duration::from_millis(2500);
+const EDIT_DIAG_WINDOW: Duration = Duration::from_millis(1500);
 const DIAG_GRACE: Duration = Duration::from_millis(250);
 const IDLE_DISPOSE: Duration = Duration::from_secs(10 * 60);
 
@@ -32,6 +34,8 @@ const MAX_OUTLINE: usize = 200;
 const MAX_DEFINITIONS: usize = 5;
 const MAX_REFERENCES: usize = 20;
 const MAX_DIAGNOSTICS: usize = 40;
+const MAX_EDIT_DIAGNOSTICS: usize = 8;
+const MAX_EDIT_DIAGNOSTIC_CHARS: usize = 1200;
 const MAX_HOVER_LINES: usize = 25;
 const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
 
@@ -43,15 +47,66 @@ const ACTIONS: &[&str] = &[
     "hover",
 ];
 
-pub struct LspTool {
+pub struct LspService {
     clients: Mutex<HashMap<String, Arc<AsyncMutex<LspClient>>>>,
+    /// Roots where automatic diagnostics failed to start. Avoid paying the
+    /// startup timeout on every edit; an explicit `lsp` call clears the mark.
+    auto_skipped: Mutex<HashSet<String>>,
+    #[cfg(test)]
+    binary_overrides: Mutex<HashMap<&'static str, PathBuf>>,
 }
 
-impl LspTool {
+impl LspService {
     pub fn new() -> Self {
         Self {
             clients: Mutex::new(HashMap::new()),
+            auto_skipped: Mutex::new(HashSet::new()),
+            #[cfg(test)]
+            binary_overrides: Mutex::new(HashMap::new()),
         }
+    }
+
+    fn auto_skipped(&self, key: &str) -> bool {
+        self.auto_skipped
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .contains(key)
+    }
+
+    fn skip_auto(&self, key: &str) {
+        self.auto_skipped
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .insert(key.to_string());
+    }
+
+    fn allow_auto(&self, key: &str) {
+        self.auto_skipped
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .remove(key);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn override_binary(&self, name: &'static str, path: PathBuf) {
+        self.binary_overrides
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .insert(name, path);
+    }
+
+    fn resolve_binary(&self, name: &'static str) -> Option<PathBuf> {
+        #[cfg(test)]
+        if let Some(path) = self
+            .binary_overrides
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .get(name)
+            .cloned()
+        {
+            return Some(path);
+        }
+        find_binary(name)
     }
 
     /// Drop clients that have been idle for too long. Dropping a client kills
@@ -95,6 +150,7 @@ impl LspTool {
         binary: &Path,
         root: &Path,
         key: &str,
+        init_timeout: Duration,
     ) -> Result<Arc<AsyncMutex<LspClient>>, ToolResult> {
         let mut command = Command::new(binary);
         command
@@ -162,7 +218,7 @@ impl LspTool {
             "trace": "off"
         });
 
-        match client.request("initialize", initialize, INIT_TIMEOUT).await {
+        match client.request("initialize", initialize, init_timeout).await {
             Ok(_) => {}
             Err(RpcFailure::Timeout) => {
                 return Err(ToolResult::err(
@@ -280,7 +336,7 @@ impl LspTool {
             }
         };
 
-        let binary = find_binary(spec.binary).ok_or_else(|| {
+        let binary = self.resolve_binary(spec.binary).ok_or_else(|| {
             ToolResult::err(
                 "LSP_UNAVAILABLE",
                 format!(
@@ -329,8 +385,12 @@ impl LspTool {
 
         let client = match self.client_for_key(&key) {
             Some(client) => client,
-            None => self.connect(spec, &binary, &root, &key).await?,
+            None => {
+                self.connect(spec, &binary, &root, &key, INIT_TIMEOUT)
+                    .await?
+            }
         };
+        self.allow_auto(&key);
 
         let mut guard = client.lock().await;
         guard.last_used = Instant::now();
@@ -470,6 +530,88 @@ impl LspTool {
             "path": shown,
         })))
     }
+
+    /// Best-effort diagnostics for a file just changed by a mutation tool.
+    ///
+    /// Returns `None` when no server is installed, the server is still starting,
+    /// or no fresh batch arrives. A clean batch returns a short "none" line.
+    /// This method never reports an error: a missing language server must not
+    /// turn a successful edit into a failed tool call.
+    pub async fn diagnostics_after_edit(&self, ctx: &ToolContext, path: &Path) -> Option<String> {
+        let extension = path
+            .extension()
+            .and_then(|extension| extension.to_str())?
+            .to_ascii_lowercase();
+        let spec = server_spec_for_ext(&extension)?;
+        let binary = self.resolve_binary(spec.binary)?;
+        let meta = std::fs::metadata(path).ok()?;
+        if !meta.is_file() || meta.len() > MAX_FILE_BYTES {
+            return None;
+        }
+        let bytes = std::fs::read(path).ok()?;
+        if bytes.iter().take(4096).any(|byte| *byte == 0) {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&bytes).to_string();
+        let root = project_root_marker(path, root_markers(&extension), &ctx.cwd)?;
+        let key = format!("{}|{}", spec.binary, root.display());
+        if self.auto_skipped(&key) {
+            return None;
+        }
+        self.dispose_idle();
+        let client = match self.client_for_key(&key) {
+            Some(client) => client,
+            None => match self
+                .connect(spec, &binary, &root, &key, EDIT_INIT_TIMEOUT)
+                .await
+            {
+                Ok(client) => client,
+                Err(_) => {
+                    self.skip_auto(&key);
+                    return None;
+                }
+            },
+        };
+
+        let mut guard = client.lock().await;
+        guard.last_used = Instant::now();
+        let uri = file_url(path);
+        let seen = guard.diag_seq(&uri);
+        let (_, synced) = guard.sync_document(path, &text).await.ok()?;
+        if synced {
+            match guard.pump_diagnostics(&uri, seen, EDIT_DIAG_WINDOW).await {
+                Ok(true) => {}
+                _ => return None,
+            }
+        } else if guard.diag_seq(&uri) == 0 {
+            return None;
+        }
+        Some(render_edit_diagnostics(
+            spec.binary,
+            &guard.diagnostics_for(&uri),
+        ))
+    }
+}
+
+impl Default for LspService {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// `lsp` tool adapter over the shared service.
+pub struct LspTool {
+    service: Arc<LspService>,
+}
+
+impl LspTool {
+    pub fn new() -> Self {
+        Self::with_service(Arc::new(LspService::new()))
+    }
+
+    pub fn with_service(service: Arc<LspService>) -> Self {
+        Self { service }
+    }
 }
 
 impl Default for LspTool {
@@ -510,7 +652,7 @@ impl Tool for LspTool {
     }
 
     async fn call(&self, ctx: &ToolContext, args: Value) -> ToolResult {
-        match self.run(ctx, args).await {
+        match self.service.run(ctx, args).await {
             Ok(result) => result,
             Err(error) => error,
         }
@@ -615,18 +757,22 @@ fn root_markers(extension: &str) -> &'static [&'static str] {
 }
 
 fn project_root(file: &Path, markers: &[&str], fallback: &Path) -> PathBuf {
+    project_root_marker(file, markers, fallback).unwrap_or_else(|| fallback.to_path_buf())
+}
+
+/// Like [`project_root`], but returns `None` when no marker is found. Automatic
+/// post-edit diagnostics use this to avoid starting a server for a loose file
+/// in a directory that is not a project.
+fn project_root_marker(file: &Path, markers: &[&str], fallback: &Path) -> Option<PathBuf> {
     let bound = if file.starts_with(fallback) {
         fallback.to_path_buf()
     } else {
         PathBuf::from("/")
     };
-    let mut dir = match file.parent() {
-        Some(parent) => parent.to_path_buf(),
-        None => return fallback.to_path_buf(),
-    };
+    let mut dir = file.parent()?.to_path_buf();
     loop {
         if markers.iter().any(|marker| dir.join(marker).exists()) {
-            return dir;
+            return Some(dir);
         }
         if dir == bound || dir.parent().is_none() {
             break;
@@ -635,7 +781,7 @@ fn project_root(file: &Path, markers: &[&str], fallback: &Path) -> PathBuf {
             break;
         }
     }
-    fallback.to_path_buf()
+    None
 }
 
 fn find_binary(name: &str) -> Option<PathBuf> {
@@ -962,6 +1108,70 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
     out
 }
 
+/// Errors and warnings only, newest batch, compact enough to append to an edit.
+fn render_edit_diagnostics(server: &str, diagnostics: &[Value]) -> String {
+    let mut relevant: Vec<&Value> = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            matches!(
+                diagnostic.get("severity").and_then(Value::as_u64),
+                Some(1 | 2)
+            )
+        })
+        .collect();
+    relevant.sort_by_key(|diagnostic| {
+        diagnostic
+            .get("severity")
+            .and_then(Value::as_u64)
+            .unwrap_or(9)
+    });
+    if relevant.is_empty() {
+        return format!("diagnostics ({server}): none");
+    }
+    let mut out = format!("diagnostics ({server}):\n");
+    for diagnostic in relevant.iter().take(MAX_EDIT_DIAGNOSTICS) {
+        let line = diagnostic
+            .pointer("/range/start/line")
+            .and_then(Value::as_u64)
+            .map(|line| line + 1)
+            .unwrap_or(0);
+        let column = diagnostic
+            .pointer("/range/start/character")
+            .and_then(Value::as_u64)
+            .map(|column| column + 1)
+            .unwrap_or(0);
+        let severity = if diagnostic.get("severity").and_then(Value::as_u64) == Some(2) {
+            "warning"
+        } else {
+            "error"
+        };
+        let code = diagnostic.get("code").and_then(|code| {
+            code.as_str()
+                .map(str::to_string)
+                .or_else(|| code.as_u64().map(|number| number.to_string()))
+        });
+        let code = code.map(|code| format!(" [{code}]")).unwrap_or_default();
+        let message = diagnostic
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .lines()
+            .next()
+            .unwrap_or("");
+        out.push_str(&format!(
+            "  {line}:{column} {severity}{code} {}\n",
+            truncate_chars(message, 160)
+        ));
+    }
+    if relevant.len() > MAX_EDIT_DIAGNOSTICS {
+        out.push_str(&format!(
+            "  … {} more diagnostics\n",
+            relevant.len() - MAX_EDIT_DIAGNOSTICS
+        ));
+    }
+    truncate_chars(&out, MAX_EDIT_DIAGNOSTIC_CHARS)
+}
+
 // ---------------------------------------------------------------------------
 // JSON-RPC client
 // ---------------------------------------------------------------------------
@@ -1099,19 +1309,7 @@ impl LspClient {
             if let Some(method) = message.get("method").and_then(Value::as_str) {
                 if method == "textDocument/publishDiagnostics" {
                     if let Some(params) = message.get("params") {
-                        let uri = params
-                            .get("uri")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_string();
-                        let diagnostics = params
-                            .get("diagnostics")
-                            .and_then(Value::as_array)
-                            .cloned()
-                            .unwrap_or_default();
-                        let count = self.diag_counts.get(&uri).copied().unwrap_or(0) + 1;
-                        self.diag_counts.insert(uri.clone(), count);
-                        self.diagnostics.insert(uri, diagnostics);
+                        self.store_diagnostics(params);
                     }
                 } else if message.get("id").is_some() {
                     let id = message.get("id").cloned().unwrap_or(Value::Null);
@@ -1137,6 +1335,71 @@ impl LspClient {
 
     fn diagnostics_for(&self, uri: &str) -> Vec<Value> {
         self.diagnostics.get(uri).cloned().unwrap_or_default()
+    }
+
+    fn store_diagnostics(&mut self, params: &Value) {
+        let uri = params
+            .get("uri")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let diagnostics = params
+            .get("diagnostics")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let count = self.diag_counts.get(&uri).copied().unwrap_or(0) + 1;
+        self.diag_counts.insert(uri.clone(), count);
+        self.diagnostics.insert(uri, diagnostics);
+    }
+
+    /// Read until a fresh diagnostics batch for `uri` arrives, a server request
+    /// needs a reply, or `timeout` expires. Unlike `pump`, this returns as soon
+    /// as the notification arrives instead of waiting for a JSON-RPC response.
+    async fn pump_diagnostics(
+        &mut self,
+        uri: &str,
+        seen: u64,
+        timeout: Duration,
+    ) -> Result<bool, RpcFailure> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(false);
+            }
+            let message =
+                match tokio::time::timeout(remaining, read_message(&mut self.stdout)).await {
+                    Ok(Ok(Some(message))) => message,
+                    Ok(Ok(None)) => {
+                        self.dead = true;
+                        return Err(RpcFailure::Closed);
+                    }
+                    Ok(Err(error)) => {
+                        self.dead = true;
+                        return Err(RpcFailure::Error(format!("read failed: {error}")));
+                    }
+                    Err(_) => return Ok(false),
+                };
+
+            if let Some(method) = message.get("method").and_then(Value::as_str) {
+                if method == "textDocument/publishDiagnostics" {
+                    if let Some(params) = message.get("params") {
+                        self.store_diagnostics(params);
+                    }
+                    if self.diag_seq(uri) > seen {
+                        return Ok(true);
+                    }
+                } else if message.get("id").is_some() {
+                    let id = message.get("id").cloned().unwrap_or(Value::Null);
+                    let reply = server_request_reply(method, &message, id);
+                    let _ = self.write_message(&reply).await;
+                }
+                continue;
+            }
+            // Responses are ignored here; `wait_diagnostics` runs between
+            // requests, so there should be nothing to hand back.
+        }
     }
 
     /// Send `didOpen` the first time and `didChange` when the text changed.
@@ -1197,17 +1460,18 @@ impl LspClient {
         loop {
             if self.diag_seq(uri) > seen {
                 // Collect a possible second batch (unused imports often follow).
-                let grace_deadline = Instant::now() + DIAG_GRACE;
-                let _ = self.pump(grace_deadline).await;
+                let _ = self
+                    .pump_diagnostics(uri, self.diag_seq(uri), DIAG_GRACE)
+                    .await;
                 return Ok(());
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Ok(());
             }
-            match self.pump(deadline).await {
-                Ok(_) => continue,
-                Err(RpcFailure::Timeout) => return Ok(()),
+            match self.pump_diagnostics(uri, seen, remaining).await {
+                Ok(true) => continue,
+                Ok(false) => return Ok(()),
                 Err(failure) => return Err(failure),
             }
         }
@@ -1368,6 +1632,58 @@ mod tests {
     }
 
     #[test]
+    fn edit_diagnostics_keep_errors_and_warnings_only() {
+        let diagnostics = vec![
+            json!({
+                "range": {"start": {"line": 1, "character": 2}},
+                "severity": 1,
+                "code": "E0308",
+                "message": "mismatched types\nlong explanation"
+            }),
+            json!({
+                "range": {"start": {"line": 4, "character": 0}},
+                "severity": 3,
+                "message": "info only"
+            }),
+            json!({
+                "range": {"start": {"line": 6, "character": 1}},
+                "severity": 2,
+                "code": 42,
+                "message": "unused variable"
+            }),
+        ];
+        let rendered = render_edit_diagnostics("rust-analyzer", &diagnostics);
+        assert!(rendered.contains("2:3 error [E0308] mismatched types"));
+        assert!(rendered.contains("7:2 warning [42] unused variable"));
+        assert!(!rendered.contains("info only"));
+        assert!(rendered.chars().count() <= MAX_EDIT_DIAGNOSTIC_CHARS);
+    }
+
+    #[test]
+    fn edit_diagnostics_report_a_clean_batch() {
+        assert_eq!(
+            render_edit_diagnostics("rust-analyzer", &[]),
+            "diagnostics (rust-analyzer): none"
+        );
+    }
+
+    #[test]
+    fn project_root_marker_requires_a_real_project() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let file = dir.path().join("loose.rs");
+        std::fs::write(&file, "").expect("file");
+        assert_eq!(
+            project_root_marker(&file, &["Cargo.toml"], dir.path()),
+            None
+        );
+        std::fs::write(dir.path().join("Cargo.toml"), "").expect("marker");
+        assert_eq!(
+            project_root_marker(&file, &["Cargo.toml"], dir.path()),
+            Some(dir.path().to_path_buf())
+        );
+    }
+
+    #[test]
     fn locations_accept_plain_and_link_results() {
         let plain = json!([{
             "uri": "file:///tmp/a.rs",
@@ -1398,6 +1714,122 @@ mod tests {
         assert_eq!(
             project_root(&file, &["Cargo.toml"], dir.path()),
             dir.path().join("crate")
+        );
+    }
+
+    #[tokio::test]
+    async fn fake_server_diagnostics_are_attached_to_writes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"fake-diag\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .expect("manifest");
+        std::fs::create_dir_all(dir.path().join("src")).expect("src");
+
+        let script = dir.path().join("fake-rust-analyzer");
+        std::fs::write(
+            &script,
+            r#"#!/bin/bash
+send() {
+  local body="$1"
+  printf 'Content-Length: %s\r\n\r\n%s' "${#body}" "$body"
+}
+while true; do
+  len=""
+  while IFS= read -r line; do
+    line="${line%$'\r'}"
+    [ -z "$line" ] && break
+    case "$line" in
+      *ength:*) len="${line#*:}"; len="${len# }" ;;
+    esac
+  done
+  [ -z "$len" ] && exit 0
+  IFS= read -r -N "$len" body || exit 0
+  case "$body" in
+    *'"method":"initialize"'*)
+      id=1
+      [[ "$body" =~ \"id\":([0-9]+) ]] && id="${BASH_REMATCH[1]}"
+      send "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"capabilities\":{}}}"
+      ;;
+    *'"method":"textDocument/didOpen"'*|*'"method":"textDocument/didChange"'*)
+      uri=""
+      [[ "$body" =~ \"uri\":\"([^\"]+)\" ]] && uri="${BASH_REMATCH[1]}"
+      send "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":\"$uri\",\"diagnostics\":[{\"range\":{\"start\":{\"line\":0,\"character\":0}},\"severity\":1,\"code\":\"E0308\",\"message\":\"mismatched types\"}]}}"
+      ;;
+    *)
+      if [[ "$body" =~ \"id\":([0-9]+) ]]; then
+        send "{\"jsonrpc\":\"2.0\",\"id\":${BASH_REMATCH[1]},\"result\":null}"
+      fi
+      ;;
+  esac
+done
+"#,
+        )
+        .expect("script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))
+            .expect("executable");
+
+        let service = Arc::new(LspService::new());
+        service.override_binary("rust-analyzer", script);
+        let mut ctx = crate::tools::write::test_context(dir.path());
+        ctx.lsp = service;
+
+        let result = crate::tools::write::WriteTool
+            .call(
+                &ctx,
+                json!({"path": "src/lib.rs", "content": "pub fn bad() -> u32 { \"no\" }\n"}),
+            )
+            .await;
+        assert!(!result.is_error, "{}", result.content);
+        assert!(
+            result.content.contains("diagnostics (rust-analyzer):"),
+            "diagnostics missing from write result: {}",
+            result.content
+        );
+        assert!(
+            result.content.contains("mismatched types"),
+            "diagnostic message missing: {}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a working rust-analyzer on PATH"]
+    async fn real_rust_analyzer_reports_an_edit_error() {
+        let Some(binary) = find_binary("rust-analyzer") else {
+            eprintln!("skipping: rust-analyzer is not on PATH");
+            return;
+        };
+        let usable = std::process::Command::new(binary)
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success());
+        if !usable {
+            eprintln!("skipping: rust-analyzer is installed but not runnable");
+            return;
+        }
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"diag-smoke\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .expect("manifest");
+        std::fs::create_dir_all(dir.path().join("src")).expect("src");
+        let file = dir.path().join("src/lib.rs");
+        std::fs::write(&file, "pub fn bad() -> u32 { \"no\" }\n").expect("source");
+        let ctx = crate::tools::write::test_context(dir.path());
+        let service = LspService::new();
+        let diagnostics = service
+            .diagnostics_after_edit(&ctx, &file)
+            .await
+            .expect("rust-analyzer should publish diagnostics");
+        assert!(diagnostics.contains("error"), "{diagnostics}");
+        assert!(
+            diagnostics.contains("mismatched") || diagnostics.contains("expected"),
+            "{diagnostics}"
         );
     }
 }
