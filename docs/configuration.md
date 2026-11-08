@@ -83,7 +83,7 @@ the model profile does not set one.
 
 ## Verify steps
 
-Trusted project file `.harness/verify.toml` (or `[verify]` in config):
+Trusted project file `.harness/verify.toml`:
 
 ```toml
 [[steps]]

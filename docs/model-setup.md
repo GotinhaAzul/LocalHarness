@@ -23,7 +23,7 @@ the model profile's `context_window`, or the provider rejects long prompts.
 ```sh
 ollama serve
 ollama pull qwen3
-lh --model qwen3
+lh --endpoint http://127.0.0.1:11434 --model qwen3
 ```
 
 `GET /api/show` supplies the model context length. Tool calling needs a recent
@@ -33,6 +33,7 @@ Ollama and a tool-capable model.
 
 ```sh
 vllm serve <model> --enable-auto-tool-choice --tool-call-parser <parser>
+lh --endpoint http://127.0.0.1:8000 --model <model>
 ```
 
 Without both flags the server rejects tool definitions; the harness reports the

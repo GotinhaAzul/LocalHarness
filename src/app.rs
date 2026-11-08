@@ -111,18 +111,24 @@ pub async fn create_runtime(
     };
     let session = match session_path {
         Some(path) => {
-            let session = Session::open(&path)
+            let mut session = Session::open(&path)
                 .with_context(|| format!("cannot resume {}", path.display()))?;
-            if let Some(header) = session.header() {
+            if let Some(header) = session.header().cloned() {
                 if header.endpoint != config.model.endpoint {
-                    tracing::warn!(
-                        old = %header.endpoint,
-                        new = %config.model.endpoint,
-                        "resumed session used a different endpoint"
+                    let warning = format!(
+                        "resumed session used endpoint {}; now using {}",
+                        header.endpoint, config.model.endpoint
                     );
+                    tracing::warn!("{warning}");
+                    session.warnings.push(warning);
                 }
                 if header.model != model {
-                    tracing::warn!(old = %header.model, new = %model, "resumed session used a different model");
+                    let warning = format!(
+                        "resumed session used model {}; now using {model}",
+                        header.model
+                    );
+                    tracing::warn!("{warning}");
+                    session.warnings.push(warning);
                 }
             }
             session

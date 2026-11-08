@@ -52,17 +52,17 @@ Ollama:
 ```sh
 ollama serve
 ollama pull qwen3
-lh --model qwen3
+lh --endpoint http://127.0.0.1:11434 --model qwen3
 ```
 
 vLLM:
 
 ```sh
 vllm serve Qwen/Qwen3-35B-A3B --enable-auto-tool-choice --tool-call-parser hermes
-lh --model Qwen/Qwen3-35B-A3B
+lh --endpoint http://127.0.0.1:8000 --model Qwen/Qwen3-35B-A3B
 ```
 
-`lh probe`-style facts are collected from optional endpoints (`/v1/models`,
+Facts are collected from optional endpoints (`/v1/models`,
 `/props`, `/tokenize`, `/api/show`). Missing probes only degrade estimates; they
 never fail a turn. See [docs/model-setup.md](docs/model-setup.md) for model
 profiles, thinking/reasoning handling, and troubleshooting.
