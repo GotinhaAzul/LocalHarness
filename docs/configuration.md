@@ -43,6 +43,7 @@ show_reasoning = false
 show_token_counts = true
 
 [session]
+dir = ""                        # default data dir's sessions/
 no_session = false
 artifact_retention_days = 30
 

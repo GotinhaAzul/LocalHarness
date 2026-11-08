@@ -107,15 +107,31 @@ impl ToolContext {
             self.cwd.join(path)
         };
         let normalized = normalize(&joined);
-        if self.path_jail && !normalized.starts_with(&self.cwd) {
-            return Err(ToolResult::err(
-                "path_jail",
-                format!(
-                    "{} is outside the working directory; --path-jail is active. Use a path under {} or restart without --path-jail.",
-                    normalized.display(),
-                    self.cwd.display()
-                ),
-            ));
+        if self.path_jail {
+            let real = normalized
+                .canonicalize()
+                .or_else(|_| {
+                    normalized
+                        .parent()
+                        .map(|parent| {
+                            parent.canonicalize().map(|parent| {
+                                parent.join(normalized.file_name().unwrap_or_default())
+                            })
+                        })
+                        .unwrap_or_else(|| Ok(normalized.clone()))
+                })
+                .unwrap_or_else(|_| normalized.clone());
+            let cwd = self.cwd.canonicalize().unwrap_or_else(|_| self.cwd.clone());
+            if !real.starts_with(&cwd) {
+                return Err(ToolResult::err(
+                    "path_jail",
+                    format!(
+                        "{} is outside the working directory; --path-jail is active. Use a path under {} or restart without --path-jail.",
+                        normalized.display(),
+                        self.cwd.display()
+                    ),
+                ));
+            }
         }
         Ok(normalized)
     }
@@ -369,4 +385,40 @@ pub fn display_path(cwd: &std::path::Path, path: &std::path::Path) -> String {
         .unwrap_or(path)
         .to_string_lossy()
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_collapses_dot_and_parent() {
+        assert_eq!(
+            normalize(std::path::Path::new("/a/b/../c/./d")),
+            std::path::PathBuf::from("/a/c/d")
+        );
+    }
+
+    #[test]
+    fn path_jail_blocks_parent_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = crate::tools::write::test_context(dir.path());
+        ctx.path_jail = true;
+        let error = ctx.resolve("../outside.txt").unwrap_err();
+        assert!(error.content.contains("path_jail"), "{}", error.content);
+    }
+
+    #[test]
+    fn path_jail_blocks_symlink_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "secret").unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("link")).unwrap();
+        let mut ctx = crate::tools::write::test_context(dir.path());
+        ctx.path_jail = true;
+        let error = ctx.resolve("link/secret.txt").unwrap_err();
+        assert!(error.content.contains("path_jail"), "{}", error.content);
+        ctx.path_jail = false;
+        assert!(ctx.resolve("link/secret.txt").is_ok());
+    }
 }

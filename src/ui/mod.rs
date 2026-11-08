@@ -1,8 +1,13 @@
 //! TUI application.
 
 pub mod highlight;
+pub mod input;
 pub mod markdown;
+pub mod render;
 pub mod theme;
+pub mod tree;
+pub mod tui;
+pub mod widgets;
 
 use anyhow::Result;
 
@@ -17,6 +22,6 @@ pub struct UiOptions {
 }
 
 /// Run the interactive TUI until the user quits.
-pub async fn run(_runtime: Runtime, _options: UiOptions) -> Result<()> {
-    anyhow::bail!("the TUI is not implemented yet")
+pub async fn run(runtime: Runtime, options: UiOptions) -> Result<()> {
+    tui::run(runtime, options).await
 }

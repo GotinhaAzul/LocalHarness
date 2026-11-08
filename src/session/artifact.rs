@@ -249,6 +249,41 @@ impl ArtifactStore {
     }
 }
 
+/// Remove artifact files older than `days` under a sessions root, across all
+/// session artifact directories.
+pub fn cleanup_root(root: &Path, days: u32) -> io::Result<usize> {
+    if days == 0 {
+        return Ok(0);
+    }
+    let cutoff =
+        std::time::SystemTime::now() - std::time::Duration::from_secs(u64::from(days) * 86_400);
+    let mut removed = 0;
+    let Ok(sessions) = std::fs::read_dir(root) else {
+        return Ok(0);
+    };
+    for session in sessions.flatten() {
+        let artifacts = session.path().join("artifacts");
+        let Ok(files) = std::fs::read_dir(&artifacts) else {
+            continue;
+        };
+        for dir in files.flatten() {
+            let Ok(entries) = std::fs::read_dir(dir.path()) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                if let Ok(meta) = entry.metadata()
+                    && meta.is_file()
+                    && meta.modified().is_ok_and(|modified| modified < cutoff)
+                    && std::fs::remove_file(entry.path()).is_ok()
+                {
+                    removed += 1;
+                }
+            }
+        }
+    }
+    Ok(removed)
+}
+
 fn validate_id(id: &str) -> Result<(), String> {
     if id.is_empty()
         || id.len() > 64

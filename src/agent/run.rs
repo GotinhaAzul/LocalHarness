@@ -675,7 +675,7 @@ async fn execute_batch(
     let mut end_turn = false;
     let mut thread_split: Option<ThreadSplit> = None;
 
-    let ctx = core.tool_context();
+    let ctx = core.tool_context_with(cancel.clone());
     for (position, call) in calls.iter().enumerate() {
         if cancel.is_cancelled() {
             cancelled = true;

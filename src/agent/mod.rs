@@ -50,12 +50,19 @@ pub struct Core {
 
 impl Core {
     pub fn tool_context(&self) -> ToolContext {
+        self.tool_context_with(self.cancel.clone())
+    }
+
+    /// Tool context bound to a specific turn's cancellation token. Each turn
+    /// gets a child of `Core::cancel`, so cancelling one turn does not poison
+    /// later turns.
+    pub fn tool_context_with(&self, cancel: CancellationToken) -> ToolContext {
         ToolContext {
             cwd: self.paths.cwd.clone(),
             path_jail: self.path_jail,
             session: self.session.clone(),
             artifacts: self.artifacts.clone(),
-            cancel: self.cancel.clone(),
+            cancel,
             trust: self.config.trust,
             verify: self.config.verify.clone(),
             profile: self.config.profile_name().to_string(),

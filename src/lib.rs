@@ -9,6 +9,7 @@ pub mod cli;
 pub mod config;
 pub mod context;
 pub mod external;
+pub mod git;
 pub mod paths;
 pub mod provider;
 pub mod security;

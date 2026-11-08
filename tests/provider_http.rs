@@ -267,3 +267,51 @@ async fn models_probe_lists_ids() {
         .unwrap();
     assert_eq!(models, ["test-model"]);
 }
+
+async fn slow_chat() -> Response {
+    let frames = stream::unfold(0u32, |step| async move {
+        if step >= 8 {
+            return None;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        let frame = if step == 7 {
+            "data: [DONE]\n\n"
+        } else {
+            "data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n"
+        };
+        Some((
+            Ok::<Bytes, Infallible>(Bytes::from_static(frame.as_bytes())),
+            step + 1,
+        ))
+    });
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream"),
+        )
+        .body(Body::from_stream(frames))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn cancellation_mid_stream_returns_cancelled() {
+    let app = Router::new().route("/v1/chat/completions", post(slow_chat));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    let cancel = CancellationToken::new();
+    let cancel_task = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        cancel_task.cancel();
+    });
+    let events = collect_stream(&provider(&base), request(), cancel).await;
+    let error = events
+        .into_iter()
+        .find_map(|event| event.err())
+        .expect("cancellation should surface as an error");
+    assert_eq!(error.class, ErrorClass::Cancelled);
+}

@@ -90,7 +90,7 @@ pub struct Cli {
     #[arg(long)]
     pub clean_artifacts: bool,
 
-    /// Print diagnostic logs to stderr.
+    /// Enable debug-level diagnostic logs.
     #[arg(long)]
     pub debug: bool,
 }
@@ -148,7 +148,8 @@ pub async fn run(cli: Cli) -> Result<i32> {
     if cli.clean_artifacts {
         config.session.clean_artifacts = true;
     }
-    if cli.no_color {
+    let no_color = cli.no_color || std::env::var_os("NO_COLOR").is_some();
+    if no_color {
         config.ui.color_mode = ColorMode::Ansi16;
     }
     if cli.debug {
@@ -199,13 +200,17 @@ pub async fn run(cli: Cli) -> Result<i32> {
             .core
             .artifacts
             .cleanup_older_than(config.session.artifact_retention_days);
+        let _ = crate::session::artifact::cleanup_root(
+            &paths.artifacts_root(),
+            config.session.artifact_retention_days,
+        );
     }
 
     match cli.print.clone() {
         Some(prompt) => run_headless(runtime, prompt, cli.json).await,
         None => {
             let ui_options = UiOptions {
-                no_color: cli.no_color || config.ui.color_mode == ColorMode::Ansi16,
+                no_color: no_color || config.ui.color_mode == ColorMode::Ansi16,
                 trust,
                 skills: crate::skills::SkillIndex::load(&paths, trust),
             };

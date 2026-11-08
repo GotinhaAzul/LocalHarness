@@ -39,7 +39,8 @@ pub fn render_diff(text: &str, width: usize, theme: &Theme) -> Vec<Line<'static>
             Role::Muted
         };
         for line in wrap_plain(raw, width) {
-            lines.push(Line::styled(line, theme.style(role)));
+            let style = theme.style(role);
+            lines.push(Line::from(vec![Span::styled(line, style)]).style(style));
         }
     }
     if lines.is_empty() {
