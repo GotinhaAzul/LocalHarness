@@ -313,7 +313,6 @@ async fn run_loop(
             // An empty completion is a valid stop; keep the branch valid.
         }
         if let Some(usage) = &assistant.usage {
-            let _ = tx.send(AgentEvent::Usage(usage.clone()));
             let _ = tx.send(AgentEvent::Context {
                 used: usage.prompt_tokens,
                 window: budget.context_window,
@@ -985,7 +984,7 @@ async fn execute_batch(
             name: call.name.clone(),
             is_error: tool_result.is_error,
             duration_ms,
-            preview: preview(&tool_result.content, 300),
+            preview: preview(tool_body(&tool_result.content), 300),
             artifact: capped.artifact,
         });
 
@@ -1044,6 +1043,15 @@ fn summarize_args(args: &Value) -> String {
         }
     }
     preview(&args.to_string(), 80)
+}
+
+/// Drop the `[tool] name - summary` header line from a rendered preview.
+fn tool_body(content: &str) -> &str {
+    if content.starts_with("[tool] ") {
+        content.split_once('\n').map(|(_, body)| body).unwrap_or("")
+    } else {
+        content
+    }
 }
 
 fn preview(text: &str, max: usize) -> String {

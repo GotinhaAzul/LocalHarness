@@ -482,7 +482,7 @@ pub fn blocks_from_session_after(session: &Session, floor_seq: u64) -> Vec<Block
                             ToolStatus::Ok
                         },
                         duration_ms: None,
-                        preview: preview_text(&data.content, 800, 12),
+                        preview: preview_text(strip_tool_header(&data.content), 800, 12),
                         artifact: data.artifact.clone(),
                     },
                     ts: None,
@@ -542,6 +542,14 @@ fn clip_text(text: &str, max: usize) -> String {
         .take(max.saturating_sub(1))
         .collect::<String>()
         + "…"
+}
+
+fn strip_tool_header(content: &str) -> &str {
+    if content.starts_with("[tool] ") {
+        content.split_once('\n').map(|(_, body)| body).unwrap_or("")
+    } else {
+        content
+    }
 }
 
 fn preview_text(text: &str, max_chars: usize, max_lines: usize) -> String {

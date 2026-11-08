@@ -87,7 +87,9 @@ impl Config {
         cfg.model_profiles.insert(
             "default".into(),
             ModelProfile {
-                context_window: Some(DEFAULT_CONTEXT_WINDOW),
+                // No hard-coded window: probes fill it when available, and
+                // `DEFAULT_CONTEXT_WINDOW` is the fallback.
+                context_window: None,
                 tool_mode: ToolMode::Repair,
                 strip_reasoning: Some(true),
                 ..ModelProfile::default()
