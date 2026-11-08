@@ -38,7 +38,7 @@ jobs:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
 
   audit:
-    name: advisories (advisory)
+    name: advisories and licenses (advisory)
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
@@ -46,3 +46,6 @@ jobs:
       - uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories bans licenses sources

@@ -2026,6 +2026,9 @@ fn state_label(state: Option<AgentState>) -> &'static str {
 }
 
 fn short_session_id(id: &str) -> String {
+    if id == "ephemeral" {
+        return id.to_string();
+    }
     let chars: Vec<char> = id.chars().collect();
     if chars.len() <= 8 {
         return id.to_string();
