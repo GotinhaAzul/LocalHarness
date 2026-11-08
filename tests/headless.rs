@@ -165,3 +165,68 @@ async fn endpoint_down_is_prescriptive() {
         "stderr: {stderr}"
     );
 }
+
+#[derive(Clone, Default)]
+struct ToolFake {
+    requests: std::sync::Arc<AtomicUsize>,
+}
+
+async fn tool_chat(State(fake): State<ToolFake>) -> Response {
+    let count = fake.requests.fetch_add(1, Ordering::SeqCst);
+    let frames = match count {
+        0 => concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"write\",\"arguments\":\"{\\\"path\\\":\\\"made.txt\\\",\\\"content\\\":\\\"hello\\\"}\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n",
+        ),
+        _ => concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"wrote it\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        ),
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream"),
+        )
+        .body(Body::from_stream(stream::iter(
+            frames
+                .as_bytes()
+                .chunks(9)
+                .map(|chunk| Ok::<Bytes, Infallible>(Bytes::copy_from_slice(chunk)))
+                .collect::<Vec<_>>(),
+        )))
+        .unwrap()
+}
+
+async fn spawn_tool_server() -> (String, ToolFake) {
+    let fake = ToolFake::default();
+    let app = Router::new()
+        .route("/v1/chat/completions", post(tool_chat))
+        .route("/v1/models", axum::routing::get(models))
+        .with_state(fake.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (format!("http://{address}"), fake)
+}
+
+#[tokio::test]
+async fn print_executes_a_tool_call_and_writes_a_file() {
+    let (base, fake) = spawn_tool_server().await;
+    let env = env();
+    let output = run_lh(&env, &base, &["--print", "create made.txt"]).await;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
+    assert!(stdout.contains("wrote it"), "stdout: {stdout}");
+    assert_eq!(
+        std::fs::read_to_string(env.cwd.join("made.txt")).unwrap(),
+        "hello"
+    );
+    assert!(fake.requests.load(Ordering::SeqCst) >= 2);
+}

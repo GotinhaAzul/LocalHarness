@@ -104,11 +104,11 @@ impl Config {
             let raw = read_toml(global)?;
             deep_merge(&mut value, raw);
         }
-        if let Some(project) = project {
-            if project.exists() {
-                let raw = read_toml(project)?;
-                deep_merge(&mut value, raw);
-            }
+        if let Some(project) = project
+            && project.exists()
+        {
+            let raw = read_toml(project)?;
+            deep_merge(&mut value, raw);
         }
         let mut cfg: Config = value.try_into().context("config schema mismatch")?;
         cfg.apply_env();
@@ -119,10 +119,10 @@ impl Config {
     /// Environment overrides. `LH_ENDPOINT`, `LH_MODEL`, `LH_API_KEY`,
     /// `LH_PROFILE`, `LH_MODEL_PROFILE`, `LH_THEME` are read.
     pub fn apply_env(&mut self) {
-        if let Ok(v) = std::env::var("LH_ENDPOINT") {
-            if !v.trim().is_empty() {
-                self.model.endpoint = v;
-            }
+        if let Ok(v) = std::env::var("LH_ENDPOINT")
+            && !v.trim().is_empty()
+        {
+            self.model.endpoint = v;
         }
         if let Ok(v) = std::env::var("LH_MODEL") {
             self.model.model = v;
@@ -130,20 +130,20 @@ impl Config {
         if let Ok(v) = std::env::var("LH_API_KEY") {
             self.model.api_key = v;
         }
-        if let Ok(v) = std::env::var("LH_PROFILE") {
-            if !v.trim().is_empty() {
-                self.profile_name = v;
-            }
+        if let Ok(v) = std::env::var("LH_PROFILE")
+            && !v.trim().is_empty()
+        {
+            self.profile_name = v;
         }
-        if let Ok(v) = std::env::var("LH_MODEL_PROFILE") {
-            if !v.trim().is_empty() {
-                self.model_profile_override = Some(v);
-            }
+        if let Ok(v) = std::env::var("LH_MODEL_PROFILE")
+            && !v.trim().is_empty()
+        {
+            self.model_profile_override = Some(v);
         }
-        if let Ok(v) = std::env::var("LH_THEME") {
-            if !v.trim().is_empty() {
-                self.ui.theme = v;
-            }
+        if let Ok(v) = std::env::var("LH_THEME")
+            && !v.trim().is_empty()
+        {
+            self.ui.theme = v;
         }
         if std::env::var("LH_NO_SESSION").is_ok() {
             self.session.no_session = true;
@@ -243,6 +243,53 @@ impl Config {
 
     pub fn max_output_tokens(&self) -> u32 {
         self.model.max_output_tokens
+    }
+
+    /// Load extra profiles from `profiles/*.toml`; each file is either a
+    /// `[profile.<name>]` table or a bare profile.
+    pub fn load_profile_dirs(
+        &mut self,
+        global_dir: &Path,
+        project_dir: Option<&Path>,
+    ) -> Result<()> {
+        let mut dirs = vec![global_dir.to_path_buf()];
+        if let Some(project) = project_dir {
+            dirs.push(project.to_path_buf());
+        }
+        for dir in dirs {
+            if !dir.exists() {
+                continue;
+            }
+            let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
+                .with_context(|| format!("cannot read profile dir {}", dir.display()))?
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().is_some_and(|ext| ext == "toml"))
+                .collect();
+            files.sort();
+            for path in files {
+                let raw = read_toml(&path)?;
+                if let Some(table) = raw.get("profile").and_then(|value| value.as_table()) {
+                    for (name, value) in table {
+                        let profile: ProfileConfig =
+                            value.clone().try_into().with_context(|| {
+                                format!("invalid profile {name:?} in {}", path.display())
+                            })?;
+                        self.profiles.insert(name.clone(), profile);
+                    }
+                } else {
+                    let name = path
+                        .file_stem()
+                        .map(|stem| stem.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "profile".into());
+                    let profile: ProfileConfig = raw
+                        .try_into()
+                        .with_context(|| format!("invalid profile file {}", path.display()))?;
+                    self.profiles.insert(name, profile);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Load a profile prompt file (project-relative when inside `.harness`).
@@ -541,6 +588,27 @@ mod tests {
         assert_eq!(name, "qwen3");
         assert_eq!(cfg.context_window(), 65_536);
         assert!(profile.strip_reasoning());
+    }
+
+    #[test]
+    fn profile_directories_load_bare_and_tabled_profiles() {
+        let dir = tempfile::tempdir().unwrap();
+        let profiles = dir.path().join("profiles");
+        std::fs::create_dir_all(&profiles).unwrap();
+        std::fs::write(
+            profiles.join("review.toml"),
+            "packs = [\"core\"]\ntools = [\"read\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            profiles.join("extra.toml"),
+            "[profile.audit]\npacks = [\"core\", \"security\"]\n",
+        )
+        .unwrap();
+        let mut config = Config::builtin();
+        config.load_profile_dirs(&profiles, None).unwrap();
+        assert_eq!(config.profiles["review"].tools, ["read"]);
+        assert_eq!(config.profiles["audit"].packs, ["core", "security"]);
     }
 
     #[test]

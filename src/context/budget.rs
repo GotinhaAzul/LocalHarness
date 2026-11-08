@@ -53,7 +53,7 @@ impl TokenBudget {
     pub fn estimate_messages(&self, messages: &[ChatMessage]) -> u32 {
         messages
             .iter()
-            .map(|m| self.estimate_text(&m.role()) + self.estimate_char_len(m.char_len()))
+            .map(|m| self.estimate_text(m.role()) + self.estimate_char_len(m.char_len()))
             .sum::<u32>()
             + 8
     }

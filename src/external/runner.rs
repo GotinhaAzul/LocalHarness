@@ -229,7 +229,6 @@ async fn terminate(child: &mut Child) {
         {
             let _ = killpg(Pid::from_raw(pid as i32), Signal::SIGKILL);
         }
-        return;
     }
     #[cfg(not(unix))]
     {

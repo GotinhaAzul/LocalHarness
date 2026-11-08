@@ -133,6 +133,12 @@ impl TestTool {
     }
 }
 
+impl Default for TestTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Runner detection
 // ---------------------------------------------------------------------------
@@ -181,10 +187,10 @@ fn detect_runner(cwd: &Path, path: Option<&Path>) -> Result<Runner, ToolResult> 
     if cwd.join("Cargo.toml").exists() {
         return Ok(Runner::Cargo);
     }
-    if cwd.join("package.json").is_file() {
-        if let Some(runner) = node_runner(cwd) {
-            return Ok(runner);
-        }
+    if cwd.join("package.json").is_file()
+        && let Some(runner) = node_runner(cwd)
+    {
+        return Ok(runner);
     }
     if python_project(cwd) {
         return Ok(Runner::Pytest);

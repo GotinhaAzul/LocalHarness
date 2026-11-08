@@ -103,13 +103,13 @@ fn run(ctx: &ToolContext, args: &Value) -> Result<ToolResult, ToolResult> {
 
     let start_u64 = optional_u64(args, "start").unwrap_or(1).max(1);
     let start = usize::try_from(start_u64).unwrap_or(usize::MAX);
-    if let Some(end) = optional_u64(args, "end") {
-        if end < start_u64 {
-            return Err(ToolResult::err(
-                "invalid_args",
-                format!("end={end} is before start={start_u64}; pass end >= start"),
-            ));
-        }
+    if let Some(end) = optional_u64(args, "end")
+        && end < start_u64
+    {
+        return Err(ToolResult::err(
+            "invalid_args",
+            format!("end={end} is before start={start_u64}; pass end >= start"),
+        ));
     }
     let limit_u64 = optional_u64(args, "limit")
         .unwrap_or(DEFAULT_LINES)

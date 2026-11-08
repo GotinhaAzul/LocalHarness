@@ -115,9 +115,9 @@ fn run(ctx: &ToolContext, args: &Value) -> Result<ToolResult, ToolResult> {
     }
 
     let after = if replace_all {
-        before.replace(&old, &new)
+        before.replace(&old, new)
     } else {
-        before.replacen(&old, &new, 1)
+        before.replacen(&old, new, 1)
     };
     let replacements = if replace_all { count } else { 1 };
     let (diff, added, removed) = diff_report(&before, &after, MAX_DIFF_LINES);

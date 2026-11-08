@@ -292,23 +292,23 @@ impl ToolRegistry {
             }
         }
         for name in &profile.tools {
-            match self.get(name) {
+            let found = self
+                .get(name)
+                .or_else(|| external.iter().find(|tool| tool.name() == name).cloned());
+            match found {
                 Some(tool) => {
                     if !selected.iter().any(|t| t.name() == tool.name()) {
                         selected.push(tool);
                     }
                 }
                 None => {
+                    let mut available = self.names();
+                    available.extend(external.iter().map(|tool| tool.name()));
                     return Err(format!(
-                        "unknown tool {name:?}; active built-ins: {}",
-                        self.names().join(", ")
+                        "unknown tool {name:?}; available tools: {}",
+                        available.join(", ")
                     ));
                 }
-            }
-        }
-        for tool in external {
-            if !selected.iter().any(|t| t.name() == tool.name()) {
-                selected.push(tool.clone());
             }
         }
         Ok(selected)

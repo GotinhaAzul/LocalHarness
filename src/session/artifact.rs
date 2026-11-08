@@ -237,13 +237,12 @@ impl ArtifactStore {
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().is_some_and(|e| e == "txt") {
-                if let Ok(meta) = entry.metadata()
-                    && meta.modified().is_ok_and(|m| m < cutoff)
-                    && std::fs::remove_file(&path).is_ok()
-                {
-                    removed += 1;
-                }
+            if path.extension().is_some_and(|e| e == "txt")
+                && let Ok(meta) = entry.metadata()
+                && meta.modified().is_ok_and(|m| m < cutoff)
+                && std::fs::remove_file(&path).is_ok()
+            {
+                removed += 1;
             }
         }
         Ok(removed)

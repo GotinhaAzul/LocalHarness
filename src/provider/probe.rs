@@ -32,9 +32,7 @@ pub struct OllamaModel {
     pub family: Option<String>,
 }
 
-fn client_and_base<'a>(
-    provider: &'a dyn Provider,
-) -> Result<(&'a reqwest::Client, &'a str), ProviderError> {
+fn client_and_base(provider: &dyn Provider) -> Result<(&reqwest::Client, &str), ProviderError> {
     let client = provider.client().ok_or_else(|| {
         ProviderError::new(
             ErrorClass::BadRequest,
@@ -44,10 +42,7 @@ fn client_and_base<'a>(
     Ok((client, provider.endpoint().trim_end_matches('/')))
 }
 
-fn request<'a>(
-    provider: &'a dyn Provider,
-    url: &str,
-) -> Result<reqwest::RequestBuilder, ProviderError> {
+fn request(provider: &dyn Provider, url: &str) -> Result<reqwest::RequestBuilder, ProviderError> {
     let (client, _) = client_and_base(provider)?;
     let mut req = client.get(url).timeout(Duration::from_secs(10));
     if !provider.api_key().is_empty() {

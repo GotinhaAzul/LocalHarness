@@ -54,10 +54,6 @@ impl LspTool {
         }
     }
 
-    pub fn default() -> Self {
-        Self::new()
-    }
-
     /// Drop clients that have been idle for too long. Dropping a client kills
     /// its child process.
     fn dispose_idle(&self) {
@@ -205,12 +201,11 @@ impl LspTool {
 
         let client = Arc::new(AsyncMutex::new(client));
         let mut clients = self.clients.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(existing) = clients.get(key) {
-            if let Ok(guard) = existing.try_lock() {
-                if !guard.dead {
-                    return Ok(existing.clone());
-                }
-            }
+        if let Some(existing) = clients.get(key)
+            && let Ok(guard) = existing.try_lock()
+            && !guard.dead
+        {
+            return Ok(existing.clone());
         }
         clients.insert(key.to_string(), client.clone());
         Ok(client)
@@ -711,14 +706,14 @@ fn percent_decode(input: &str) -> String {
     let mut out = Vec::with_capacity(bytes.len());
     let mut index = 0;
     while index < bytes.len() {
-        if bytes[index] == b'%' && index + 2 < bytes.len() {
-            if let (Some(high), Some(low)) =
+        if bytes[index] == b'%'
+            && index + 2 < bytes.len()
+            && let (Some(high), Some(low)) =
                 (hex_value(bytes[index + 1]), hex_value(bytes[index + 2]))
-            {
-                out.push(high * 16 + low);
-                index += 3;
-                continue;
-            }
+        {
+            out.push(high * 16 + low);
+            index += 3;
+            continue;
         }
         out.push(bytes[index]);
         index += 1;
@@ -1154,10 +1149,10 @@ impl LspClient {
         let uri = file_url(path);
         let hash = fnv1a(text);
         let existing = self.doc_versions.get(&uri).copied();
-        if let Some((_, known)) = existing {
-            if known == hash {
-                return Ok((uri, false));
-            }
+        if let Some((_, known)) = existing
+            && known == hash
+        {
+            return Ok((uri, false));
         }
         let version = match existing {
             Some((version, _)) => version + 1,
@@ -1249,14 +1244,14 @@ async fn read_message(reader: &mut BufReader<ChildStdout>) -> io::Result<Option<
         if read == 0 {
             return Ok(None);
         }
-        let trimmed = line.trim_end_matches(|c| c == '\r' || c == '\n');
+        let trimmed = line.trim_end_matches(['\r', '\n']);
         if trimmed.is_empty() {
             break;
         }
-        if let Some((name, value)) = trimmed.split_once(':') {
-            if name.eq_ignore_ascii_case("content-length") {
-                content_length = value.trim().parse::<usize>().ok();
-            }
+        if let Some((name, value)) = trimmed.split_once(':')
+            && name.eq_ignore_ascii_case("content-length")
+        {
+            content_length = value.trim().parse::<usize>().ok();
         }
     }
     let length = match content_length {

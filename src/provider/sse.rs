@@ -30,10 +30,7 @@ impl SseParser {
         }
         self.buf.extend_from_slice(chunk);
         let mut frames = Vec::new();
-        loop {
-            let Some(pos) = self.buf.iter().position(|b| *b == b'\n') else {
-                break;
-            };
+        while let Some(pos) = self.buf.iter().position(|b| *b == b'\n') {
             let line_bytes: Vec<u8> = self.buf.drain(..=pos).collect();
             let line = String::from_utf8_lossy(&line_bytes);
             self.process_line(line.trim_end_matches(['\r', '\n']), &mut frames);

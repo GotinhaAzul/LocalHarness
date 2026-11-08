@@ -12,6 +12,8 @@ pub struct Paths {
     pub data_dir: PathBuf,
     pub cwd: PathBuf,
     pub project_id: String,
+    /// `[session] dir` override; sessions live directly under this root.
+    pub sessions_dir_override: Option<PathBuf>,
 }
 
 impl Paths {
@@ -37,6 +39,7 @@ impl Paths {
             data_dir,
             project_id: project_id(&cwd),
             cwd,
+            sessions_dir_override: None,
         })
     }
 
@@ -69,7 +72,9 @@ impl Paths {
     }
 
     pub fn sessions_root(&self) -> PathBuf {
-        self.data_dir.join("sessions")
+        self.sessions_dir_override
+            .clone()
+            .unwrap_or_else(|| self.data_dir.join("sessions"))
     }
 
     pub fn project_sessions_dir(&self) -> PathBuf {

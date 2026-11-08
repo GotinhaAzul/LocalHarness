@@ -209,13 +209,12 @@ pub fn extract_targets(command: &str) -> Vec<String> {
             && candidate
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' || c == ':');
-        if looks_like_ip || looks_like_url || looks_like_domain {
-            if !targets
+        if (looks_like_ip || looks_like_url || looks_like_domain)
+            && !targets
                 .iter()
                 .any(|t: &String| t.eq_ignore_ascii_case(&candidate))
-            {
-                targets.push(candidate);
-            }
+        {
+            targets.push(candidate);
         }
     }
     targets

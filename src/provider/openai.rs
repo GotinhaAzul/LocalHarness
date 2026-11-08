@@ -253,11 +253,11 @@ impl OpenAiCompatProvider {
 
         for choice in chunk.choices {
             let delta = choice.delta;
-            if let Some(reasoning) = reasoning_text(&delta, req.reasoning_field.as_deref()) {
-                if !reasoning.is_empty() {
-                    *yielded = true;
-                    let _ = tx.send(Ok(StreamEvent::ReasoningDelta(reasoning)));
-                }
+            if let Some(reasoning) = reasoning_text(&delta, req.reasoning_field.as_deref())
+                && !reasoning.is_empty()
+            {
+                *yielded = true;
+                let _ = tx.send(Ok(StreamEvent::ReasoningDelta(reasoning)));
             }
             if let Some(content) = delta.content
                 && !content.is_empty()

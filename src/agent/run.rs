@@ -9,14 +9,14 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 
 use crate::context::compact::{COMPACTION_BUDGET_CHARS, FindingSummary, build_summary};
-use crate::context::{self, TokenBudget, cap_result};
+use crate::context::{self, BATCH_CAP_CHARS, TokenBudget, cap_result};
 use crate::provider::{ChatMessage, ChatRequest, ErrorClass, ProviderError, StreamEvent, Usage};
 use crate::session::{
     AssistantData, CompactionData, CustomData, EntryKind, ToolCall, ToolResultData, UserData,
 };
 use crate::tools::{ToolResult, display_path};
 
-use super::gates::{self, LoopDecision, LoopGuard, SettleDecision, analyze_turn};
+use super::gates::{self, LoopDecision, LoopGuard, SettleDecision};
 use super::limits::{RunProgress, StopReason};
 use super::{AgentEvent, AgentState, Core};
 
@@ -77,10 +77,10 @@ pub async fn run_turn(
 
     let turn_start = core.session.lock().expect("session lock").active_leaf_id();
     let outcome = run_loop(&core, &tx, &cancel, turn_start).await;
-    if let Ok(mut session) = core.session.lock() {
-        if let Err(err) = session.fsync() {
-            let _ = tx.send(AgentEvent::Notice(format!("session fsync failed: {err}")));
-        }
+    if let Ok(mut session) = core.session.lock()
+        && let Err(err) = session.fsync()
+    {
+        let _ = tx.send(AgentEvent::Notice(format!("session fsync failed: {err}")));
     }
     let _ = tx.send(AgentEvent::State(match outcome.status {
         TurnStatus::Done => AgentState::Done,
@@ -180,6 +180,7 @@ async fn run_loop(
                 &budget,
             );
         }
+        account_tools(core, &budget, &mut assembled);
 
         let force_compact = pending_compaction;
         pending_compaction = false;
@@ -205,6 +206,7 @@ async fn run_loop(
                         Some(&state),
                         &budget,
                     );
+                    account_tools(core, &budget, &mut assembled);
                 }
                 Err(err) => {
                     let message = format!("compaction failed: {err}");
@@ -318,7 +320,23 @@ async fn run_loop(
                 turn_start.as_deref(),
             );
             match gates::settle(&facts, &mut progress, gate_tools) {
-                SettleDecision::Done => return TurnOutcome::ok(TurnStatus::Done),
+                SettleDecision::Done => {
+                    if gate_tools.verify
+                        && verify_configured
+                        && facts.unverified_mutations
+                        && progress.verify_attempts >= progress.limits.verify_attempts
+                    {
+                        append_custom(
+                            &core.session,
+                            "guard-trip",
+                            json!({
+                                "code": "verify_unverified",
+                                "message": "settled with changes newer than the last passing verification",
+                            }),
+                        );
+                    }
+                    return TurnOutcome::ok(TurnStatus::Done);
+                }
                 SettleDecision::Continue { message, .. } => {
                     if let Err(err) = append_user(&core.session, &message) {
                         return TurnOutcome::error("session_write", err.to_string());
@@ -389,6 +407,12 @@ async fn run_loop(
             return TurnOutcome::ok(TurnStatus::Done);
         }
         if batch.cancelled {
+            append_error(
+                &core.session,
+                "cancelled",
+                "turn cancelled during a tool batch",
+                true,
+            );
             return TurnOutcome::ok(TurnStatus::Cancelled);
         }
         if batch.end_turn {
@@ -613,9 +637,7 @@ fn merge_fragment(buffer: &mut String, fragment: &str) {
     if fragment.is_empty() {
         return;
     }
-    if buffer.is_empty() {
-        buffer.push_str(fragment);
-    } else if !buffer.ends_with(fragment) {
+    if buffer.is_empty() || !buffer.ends_with(fragment) {
         buffer.push_str(fragment);
     }
 }
@@ -631,7 +653,7 @@ struct ThreadSplit {
     kickoff: Option<String>,
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::unnecessary_unwrap)]
 async fn execute_batch(
     core: &std::sync::Arc<Core>,
     tx: &UnboundedSender<AgentEvent>,
@@ -649,6 +671,7 @@ async fn execute_batch(
     let mut plan_present = false;
     let mut guard_trip: Option<(String, String)> = None;
     let mut cancelled = false;
+    let mut batch_chars = 0usize;
     let mut end_turn = false;
     let mut thread_split: Option<ThreadSplit> = None;
 
@@ -759,12 +782,13 @@ async fn execute_batch(
                         }
                     }
 
-                    if !result.is_error && matches!(call.name.as_str(), "bash" | "bg") {
-                        if let Some(command) = args.get("command").and_then(|v| v.as_str()) {
-                            let gate = core.security.lock().expect("security state").gate(command);
-                            if let Err(message) = gate {
-                                result = ToolResult::err("SEC_SCOPE", message);
-                            }
+                    if !result.is_error
+                        && matches!(call.name.as_str(), "bash" | "bg")
+                        && let Some(command) = args.get("command").and_then(|v| v.as_str())
+                    {
+                        let gate = core.security.lock().expect("security state").gate(command);
+                        if let Err(message) = gate {
+                            result = ToolResult::err("SEC_SCOPE", message);
                         }
                     }
 
@@ -807,7 +831,26 @@ async fn execute_batch(
         }
 
         let duration_ms = started.elapsed().as_millis() as u64;
-        let capped = cap_result(&ctx.artifacts, &result.content);
+        result.content = format!(
+            "[tool] {} - {}\n{}",
+            call.name, summary_args, result.content
+        );
+        let mut capped = cap_result(&ctx.artifacts, &result.content);
+        if batch_chars + capped.content.chars().count() > BATCH_CAP_CHARS {
+            match ctx.artifacts.write(&result.content) {
+                Ok(artifact) => {
+                    capped.content = format!(
+                        "(batch cap; full result archived as {} · {} bytes · recall {} 1-120)",
+                        artifact.id, artifact.bytes, artifact.id
+                    );
+                    capped.artifact = Some(artifact.id);
+                }
+                Err(_) => {
+                    capped.content = capped.content.chars().take(200).collect::<String>();
+                }
+            }
+        }
+        batch_chars += capped.content.chars().count();
         let tool_result = ToolResult {
             content: capped.content.clone(),
             is_error: result.is_error,
@@ -877,7 +920,7 @@ async fn execute_batch(
                 inferred_files.insert(path.clone());
                 let display = repaired
                     .as_ref()
-                    .and_then(|_| Some(display_path(&ctx.cwd, &ctx.cwd.join(path))))
+                    .map(|_| display_path(&ctx.cwd, &ctx.cwd.join(path)))
                     .unwrap_or_else(|| path.clone());
                 let mut custom = CustomData::new("fs-change").with("path", display);
                 if let Some(details) = &tool_result.details {
@@ -996,6 +1039,40 @@ fn append_assistant(
     Ok(())
 }
 
+fn append_custom(session: &crate::tools::SessionHandle, kind: &str, payload: Value) {
+    if let Ok(mut session) = session.lock() {
+        let mut data = CustomData::new(kind);
+        if let Some(object) = payload.as_object() {
+            for (key, value) in object {
+                data.payload.insert(key.clone(), value.clone());
+            }
+        }
+        let _ = session.append(EntryKind::Custom(data));
+    }
+}
+
+fn account_tools(
+    core: &Core,
+    budget: &TokenBudget,
+    assembled: &mut crate::context::AssembledContext,
+) {
+    let chars: usize = core
+        .tool_specs
+        .iter()
+        .map(|tool| {
+            tool.name.len()
+                + tool.description.len()
+                + serde_json::to_string(&tool.parameters)
+                    .map(|schema| schema.len())
+                    .unwrap_or(0)
+        })
+        .sum();
+    assembled.char_count += chars;
+    assembled.estimated_tokens = assembled
+        .estimated_tokens
+        .saturating_add(budget.estimate_char_len(chars));
+}
+
 fn append_error(
     session: &crate::tools::SessionHandle,
     code: &str,
@@ -1063,6 +1140,7 @@ fn compact_session(
         reason: reason.to_string(),
         thread_id,
     }))?;
+    session.fsync()?;
     Ok((summary.summary, summary.tokens_before))
 }
 

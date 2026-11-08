@@ -390,7 +390,7 @@ impl Tool for ExternalTool {
             }
         };
 
-        if let Err(message) = validate_args(&self.name, &args, &self.schema) {
+        if let Err(message) = validate_args(self.name, &args, &self.schema) {
             return ToolResult::err("EXTERNAL_ARGS", message);
         }
 
@@ -714,6 +714,7 @@ mod tests {
             data_dir: dir.join("data"),
             cwd: dir.to_path_buf(),
             project_id: "test".to_string(),
+            sessions_dir_override: None,
         };
         let header = SessionData {
             cwd: dir.display().to_string(),

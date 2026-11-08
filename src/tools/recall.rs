@@ -189,6 +189,7 @@ mod tests {
             data_dir: cwd.join(".data"),
             cwd: cwd.clone(),
             project_id: "test".into(),
+            sessions_dir_override: None,
         };
         let header = SessionData {
             cwd: cwd.display().to_string(),

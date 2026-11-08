@@ -143,7 +143,6 @@ fn apply_defaults(tool: &str, map: &mut Map<String, Value>) {
 
 fn coerce(value: Value, schema: &Value) -> Value {
     let expected = schema.get("type").and_then(|t| t.as_str());
-    let value = value;
     if let Some(expected) = expected {
         if expected != "array"
             && matches!(&value, Value::Array(items) if items.len() == 1)
@@ -219,18 +218,17 @@ pub fn repair(tool: &str, raw: &str, schema: &Value) -> Result<Value, RepairErro
 
     validate(tool, &value, schema)?;
     reject_noops(tool, &value)?;
-    if tool == "bash" {
-        if let Some(command) = value.get("command").and_then(|v| v.as_str())
-            && let Some(blocked) = interactive_command(command)
-        {
-            return Err(RepairError::new(
-                "interactive_command",
-                format!(
-                    "`{blocked}` is interactive and would hang the harness. {}. Non-interactive alternative: bash with a single command, or bg for long-running work.",
-                    remedy_for(blocked)
-                ),
-            ));
-        }
+    if tool == "bash"
+        && let Some(command) = value.get("command").and_then(|v| v.as_str())
+        && let Some(blocked) = interactive_command(command)
+    {
+        return Err(RepairError::new(
+            "interactive_command",
+            format!(
+                "`{blocked}` is interactive and would hang the harness. {}. Non-interactive alternative: bash with a single command, or bg for long-running work.",
+                remedy_for(blocked)
+            ),
+        ));
     }
     Ok(value)
 }

@@ -97,7 +97,7 @@ pub struct Cli {
 
 pub async fn run(cli: Cli) -> Result<i32> {
     let cwd = std::env::current_dir().context("cannot read the current directory")?;
-    let paths = Paths::discover(&cwd)?;
+    let mut paths = Paths::discover(&cwd)?;
 
     let trust = cli.trust || std::env::var("LH_TRUST").is_ok();
     let project_config = if trust {
@@ -111,6 +111,15 @@ pub async fn run(cli: Cli) -> Result<i32> {
         if verify_path.exists() {
             config.verify = crate::config::VerifyConfig::load(&verify_path)?;
         }
+    }
+
+    let project_profiles = paths.project_dir().join("profiles");
+    config.load_profile_dirs(
+        &paths.global_profiles_dir(),
+        if trust { Some(&project_profiles) } else { None },
+    )?;
+    if !config.session.dir.as_os_str().is_empty() {
+        paths.sessions_dir_override = Some(config.session.dir.clone());
     }
 
     if let Some(endpoint) = cli.endpoint {
@@ -350,6 +359,11 @@ fn render_event(event: AgentEvent, json: bool) -> Result<Option<TurnStatus>> {
 
 fn init_logging(paths: &Paths, debug: bool) {
     use tracing_subscriber::filter::EnvFilter;
+    if std::env::var_os("LH_DEBUG_CONTENT").is_some() {
+        eprintln!(
+            "warning: LH_DEBUG_CONTENT is set. Prompts and tool output may appear in diagnostic logs; unset it unless debugging."
+        );
+    }
     let filter = if debug {
         EnvFilter::new("localharness=debug,warn")
     } else {

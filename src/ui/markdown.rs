@@ -123,11 +123,11 @@ fn spans_to_glyphs(spans: Vec<Span<'static>>) -> Vec<Glyph> {
 fn glyphs_to_spans(glyphs: Vec<Glyph>) -> Vec<Span<'static>> {
     let mut spans: Vec<Span<'static>> = Vec::new();
     for glyph in glyphs {
-        if let Some(last) = spans.last_mut() {
-            if last.style == glyph.style {
-                last.content.to_mut().push(glyph.c);
-                continue;
-            }
+        if let Some(last) = spans.last_mut()
+            && last.style == glyph.style
+        {
+            last.content.to_mut().push(glyph.c);
+            continue;
         }
         spans.push(Span::styled(glyph.c.to_string(), glyph.style));
     }
@@ -677,13 +677,13 @@ impl<'t> Renderer<'t> {
         let accent = self.theme.color(Role::Accent);
         let mut text = String::new();
         if self.table_cell_active() {
-            if let Some(table) = self.table.as_mut() {
-                if frame.start <= table.current_cell.len() {
-                    let slice = &mut table.current_cell[frame.start..];
-                    for span in slice.iter_mut() {
-                        span.style = span.style.fg(accent).add_modifier(Modifier::UNDERLINED);
-                        text.push_str(span.content.as_ref());
-                    }
+            if let Some(table) = self.table.as_mut()
+                && frame.start <= table.current_cell.len()
+            {
+                let slice = &mut table.current_cell[frame.start..];
+                for span in slice.iter_mut() {
+                    span.style = span.style.fg(accent).add_modifier(Modifier::UNDERLINED);
+                    text.push_str(span.content.as_ref());
                 }
             }
         } else if frame.start <= self.cur.len() {
@@ -874,7 +874,7 @@ impl<'t> Renderer<'t> {
                 self.lines.push(separator_line);
             }
             let mut wrapped: Vec<Vec<Vec<Glyph>>> = Vec::with_capacity(columns);
-            for column in 0..columns {
+            for (column, width) in widths.iter().enumerate().take(columns) {
                 let glyphs = row
                     .cells
                     .get(column)
@@ -882,8 +882,8 @@ impl<'t> Renderer<'t> {
                     .unwrap_or_default();
                 wrapped.push(wrap_glyphs(
                     &glyphs,
-                    widths[column].max(1),
-                    widths[column].max(1),
+                    (*width).max(1),
+                    (*width).max(1),
                     false,
                 ));
             }
@@ -909,11 +909,11 @@ impl<'t> Renderer<'t> {
                         let style = self.theme.bold(Role::Accent);
                         for glyph in chunk {
                             let text = glyph.c.to_string();
-                            if let Some(last) = spans.last_mut() {
-                                if last.style == style {
-                                    last.content.to_mut().push_str(&text);
-                                    continue;
-                                }
+                            if let Some(last) = spans.last_mut()
+                                && last.style == style
+                            {
+                                last.content.to_mut().push_str(&text);
+                                continue;
                             }
                             spans.push(Span::styled(text, style));
                         }

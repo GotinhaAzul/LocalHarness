@@ -102,6 +102,12 @@ impl ReviewTool {
     }
 }
 
+impl Default for ReviewTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Git access
 // ---------------------------------------------------------------------------
@@ -418,16 +424,14 @@ impl Scanner {
         {
             return Some("hard-coded bearer token; move it to configuration and rotate it");
         }
-        if let Some(regex) = &self.assignment {
-            if let Some(captures) = regex.captures(line) {
-                if let Some(value) = captures.get(2) {
-                    if !is_placeholder(value.as_str()) {
-                        return Some(
-                            "credential-like assignment with a literal value; load it from the environment",
-                        );
-                    }
-                }
-            }
+        if let Some(regex) = &self.assignment
+            && let Some(captures) = regex.captures(line)
+            && let Some(value) = captures.get(2)
+            && !is_placeholder(value.as_str())
+        {
+            return Some(
+                "credential-like assignment with a literal value; load it from the environment",
+            );
         }
         None
     }
@@ -601,18 +605,18 @@ fn scan(snapshot: &Snapshot) -> Vec<Finding> {
                 None,
                 "binary file changed; inspect it directly because diffs are not reviewable",
             ));
-        } else if let Some(stat) = stat {
-            if is_deletion_heavy(stat) {
-                let removed = stat.removed.unwrap_or(0);
-                let total = stat.added.unwrap_or(0) + removed;
-                findings.push(Finding::new(
+        } else if let Some(stat) = stat
+            && is_deletion_heavy(stat)
+        {
+            let removed = stat.removed.unwrap_or(0);
+            let total = stat.added.unwrap_or(0) + removed;
+            findings.push(Finding::new(
                     path,
                     None,
                     format!(
                         "{removed} of {total} changed lines removed; confirm the deletion is intended and not an accidental wipe"
                     ),
                 ));
-            }
         }
     }
 
@@ -648,17 +652,17 @@ fn scan(snapshot: &Snapshot) -> Vec<Finding> {
 
     let changed = snapshot.changed_paths();
     let tests_changed = changed.iter().any(|path| is_test_path(path));
-    if !tests_changed && !full(&findings) {
-        if let Some(source) = changed
+    if !tests_changed
+        && !full(&findings)
+        && let Some(source) = changed
             .iter()
             .find(|path| is_source_path(path) && !is_test_path(path))
-        {
-            findings.push(Finding::new(
+    {
+        findings.push(Finding::new(
                 source,
                 None,
                 "source changed without test changes; add or update a test, or state why none is needed",
             ));
-        }
     }
 
     findings.truncate(MAX_FINDINGS);

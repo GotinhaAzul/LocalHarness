@@ -43,10 +43,10 @@ pub async fn create_runtime(
         bail!("--no-session cannot be combined with --continue or --resume");
     }
 
-    if let Ok(endpoint) = std::env::var("LH_ENDPOINT") {
-        if !endpoint.trim().is_empty() {
-            config.model.endpoint = endpoint;
-        }
+    if let Ok(endpoint) = std::env::var("LH_ENDPOINT")
+        && !endpoint.trim().is_empty()
+    {
+        config.model.endpoint = endpoint;
     }
 
     let mut model = config.model.model.trim().to_string();
@@ -73,6 +73,7 @@ pub async fn create_runtime(
         }
     }
     config.model.model = model.clone();
+    let probe_provider = OpenAiCompatProvider::new(&config.model, model.clone())?;
 
     // Optional context probe only when no explicit context was configured.
     let (_, profile) = config.model_profile();
@@ -91,6 +92,7 @@ pub async fn create_runtime(
     let context_window = config.context_window();
     let provider: Arc<dyn Provider> =
         Arc::new(OpenAiCompatProvider::new(&config.model, model.clone())?);
+    warn_if_remote(&config.model.endpoint);
 
     let security = Arc::new(Mutex::new(SecurityState::load(
         &paths,
@@ -152,7 +154,22 @@ pub async fn create_runtime(
     let tool_specs = ToolRegistry::specs(&tools);
     let skills = SkillIndex::load(&paths, config.trust);
     let system_prompt = prompt::build_system_prompt(&config, &paths, &skills, &tools);
-    let budget = TokenBudget::new(context_window, config.model.max_output_tokens);
+    let mut budget = TokenBudget::new(context_window, config.model.max_output_tokens);
+    let sampled = tokio::time::timeout(
+        Duration::from_secs(2),
+        probe::token_count(&probe_provider, &system_prompt),
+    )
+    .await
+    .ok()
+    .flatten();
+    if let Some(tokens) = sampled
+        && tokens > 0
+    {
+        budget.calibrate(
+            system_prompt.chars().count(),
+            tokens.min(u32::MAX as usize) as u32,
+        );
+    }
     let limits = RunLimits::from(&config.budgets);
     let artifacts = session.artifacts.clone();
     let reads = Arc::new(Mutex::new(ReadTracker::default()));
@@ -230,4 +247,25 @@ pub async fn rebuild_core(old: &Arc<Core>, mut config: Config) -> Result<Arc<Cor
         tool_timeout: old.tool_timeout,
         path_jail: old.path_jail,
     }))
+}
+
+fn warn_if_remote(endpoint: &str) {
+    let host = endpoint
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(endpoint)
+        .split('/')
+        .next()
+        .unwrap_or("");
+    let host = host.split(':').next().unwrap_or(host);
+    let local = matches!(
+        host,
+        "localhost" | "127.0.0.1" | "::1" | "[::1]" | "0.0.0.0"
+    ) || host.starts_with("127.");
+    if !local {
+        tracing::warn!(%endpoint, "non-local inference endpoint configured");
+        eprintln!(
+            "warning: inference endpoint {endpoint} is not local; prompts and tool output leave this machine"
+        );
+    }
 }

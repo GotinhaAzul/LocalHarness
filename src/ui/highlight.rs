@@ -11,7 +11,7 @@ use ratatui::text::Span;
 use super::theme::{Role, Theme};
 
 /// Highlight a single line. Unknown languages return a single code-colored span.
-pub fn highlight_line<'a>(line: &'a str, language: &str, theme: &Theme) -> Vec<Span<'static>> {
+pub fn highlight_line(line: &str, language: &str, theme: &Theme) -> Vec<Span<'static>> {
     let language = normalize_language(language);
     let Some(spec) = spec_for(&language) else {
         return vec![Span::styled(line.to_string(), theme.style(Role::Code))];
@@ -64,12 +64,12 @@ pub fn highlight_line<'a>(line: &'a str, language: &str, theme: &Theme) -> Vec<S
         }
 
         // Rust raw strings: r"..." / r#"..."# / br#"..."#.
-        if spec.raw_strings {
-            if let Some(end) = scan_rust_raw(&chars, index) {
-                push(&mut pieces, string, &chars[index..end]);
-                index = end;
-                continue;
-            }
+        if spec.raw_strings
+            && let Some(end) = scan_rust_raw(&chars, index)
+        {
+            push(&mut pieces, string, &chars[index..end]);
+            index = end;
+            continue;
         }
 
         // Quoted strings, including unterminated ones.
@@ -95,14 +95,13 @@ pub fn highlight_line<'a>(line: &'a str, language: &str, theme: &Theme) -> Vec<S
             let word: String = chars[index..end].iter().collect();
             let style = if spec.keywords.contains(&word.as_str()) {
                 keyword
-            } else if spec.types.contains(&word.as_str()) {
-                typ
-            } else if spec.capital_types
-                && word
-                    .chars()
-                    .next()
-                    .map(|first| first.is_uppercase())
-                    .unwrap_or(false)
+            } else if spec.types.contains(&word.as_str())
+                || (spec.capital_types
+                    && word
+                        .chars()
+                        .next()
+                        .map(|first| first.is_uppercase())
+                        .unwrap_or(false))
             {
                 typ
             } else {
@@ -483,24 +482,20 @@ fn push(pieces: &mut Vec<(Style, String)>, style: Style, chars: &[char]) {
         return;
     }
     let text: String = chars.iter().collect();
-    if let Some((last_style, last_text)) = pieces.last_mut() {
-        if *last_style == style {
-            last_text.push_str(&text);
-            return;
-        }
+    if let Some((last_style, last_text)) = pieces.last_mut()
+        && *last_style == style
+    {
+        last_text.push_str(&text);
+        return;
     }
     pieces.push((style, text));
 }
 
 fn at(chars: &[char], index: usize, pattern: &str) -> bool {
-    let mut position = index;
-    for expected in pattern.chars() {
-        if position >= chars.len() || chars[position] != expected {
-            return false;
-        }
-        position += 1;
-    }
-    true
+    pattern
+        .chars()
+        .enumerate()
+        .all(|(offset, expected)| chars.get(index + offset).is_some_and(|c| *c == expected))
 }
 
 fn is_string_start(spec: &Spec, chars: &[char], index: usize, quote: char) -> bool {

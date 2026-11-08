@@ -109,18 +109,18 @@ fn run(ctx: &ToolContext, args: &Value) -> Result<ToolResult, ToolResult> {
         }
     }
 
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            let parent_existed = parent.exists();
-            std::fs::create_dir_all(parent).map_err(|err| {
-                ToolResult::err(
-                    "WRITE_FAILED",
-                    format!("cannot create {}: {err}", parent.display()),
-                )
-            })?;
-            if !parent_existed {
-                let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
-            }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        let parent_existed = parent.exists();
+        std::fs::create_dir_all(parent).map_err(|err| {
+            ToolResult::err(
+                "WRITE_FAILED",
+                format!("cannot create {}: {err}", parent.display()),
+            )
+        })?;
+        if !parent_existed {
+            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
         }
     }
 
@@ -214,6 +214,7 @@ pub(crate) fn test_context(dir: &Path) -> ToolContext {
         data_dir: cwd.join(".lh-data"),
         cwd: cwd.clone(),
         project_id: "test".into(),
+        sessions_dir_override: None,
     };
     let header = SessionData {
         cwd: cwd.display().to_string(),

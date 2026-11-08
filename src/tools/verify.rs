@@ -320,11 +320,10 @@ async fn collect_readers(
         let (out, err) = tokio::join!(stdout, stderr);
         (out.unwrap_or_default(), err.unwrap_or_default())
     };
-    match tokio::time::timeout(Duration::from_secs(READER_GRACE_SECS), joined).await {
-        Ok(pair) => pair,
-        // A grandchild may still hold the pipe; do not wait forever.
-        Err(_) => (Vec::new(), Vec::new()),
-    }
+    // A grandchild may still hold the pipe; do not wait forever.
+    tokio::time::timeout(Duration::from_secs(READER_GRACE_SECS), joined)
+        .await
+        .unwrap_or_default()
 }
 
 fn strip_ansi(input: &str) -> String {
@@ -339,7 +338,7 @@ fn strip_ansi(input: &str) -> String {
             Some('[') => {
                 chars.next();
                 // CSI: consume parameters until a final byte.
-                while let Some(next) = chars.next() {
+                for next in chars.by_ref() {
                     if ('@'..='~').contains(&next) {
                         break;
                     }
@@ -415,6 +414,7 @@ mod tests {
             data_dir: cwd.join(".data"),
             cwd: cwd.clone(),
             project_id: "test".into(),
+            sessions_dir_override: None,
         };
         let header = SessionData {
             cwd: cwd.display().to_string(),

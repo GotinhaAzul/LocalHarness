@@ -265,8 +265,9 @@ fn scan_file(
         if previous.map(|prev| lo > prev + 1).unwrap_or(false) {
             out.push("--".to_string());
         }
-        for index in start..=hi {
-            let line = truncate_line(lines[index], MAX_LINE_CHARS);
+        for (offset, line) in lines[start..=hi].iter().enumerate() {
+            let index = start + offset;
+            let line = truncate_line(line, MAX_LINE_CHARS);
             if hits.binary_search(&index).is_ok() {
                 out.push(format!("{label}:{}:{line}", index + 1));
             } else {

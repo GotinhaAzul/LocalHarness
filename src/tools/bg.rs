@@ -513,10 +513,10 @@ fn read_log(path: &Path) -> std::io::Result<String> {
     let mut buffer = Vec::new();
     file.read_to_end(&mut buffer)?;
     let mut text = String::from_utf8_lossy(&buffer).to_string();
-    if start > 0 {
-        if let Some(newline) = text.find('\n') {
-            text = text[newline + 1..].to_string();
-        }
+    if start > 0
+        && let Some(newline) = text.find('\n')
+    {
+        text = text[newline + 1..].to_string();
     }
     Ok(text)
 }

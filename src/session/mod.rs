@@ -250,7 +250,7 @@ impl Session {
                 header.cwd, header.endpoint, header.model, header.profile
             ));
         }
-        for entry in self.context_path() {
+        for entry in self.branch_entries() {
             match &entry.kind {
                 EntryKind::Session(_) | EntryKind::Custom(_) => {}
                 EntryKind::User(u) => {

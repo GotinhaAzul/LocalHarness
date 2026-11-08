@@ -133,7 +133,7 @@ impl SessionStore {
 
 impl Drop for SessionStore {
     fn drop(&mut self) {
-        let _ = self.lock.unlock();
+        let _ = fs2::FileExt::unlock(&self.lock);
         let _ = &self.lock_path;
     }
 }
