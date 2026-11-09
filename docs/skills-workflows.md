@@ -101,13 +101,25 @@ deduplicated and sorted.
 | Name | Purpose |
 | --- | --- |
 | `api-security` | Authorization-aware API review: surface and defaults, input handling and authorization, bounded PoV verification, scoped fix and regression |
+| `coding` | Changing an existing repository: orient, plan, small edits, narrow verification, diff review, and a short report |
+| `general-assistance` | Read-only assistance: answer questions, orient in a repository, read logs and configuration, and summarize with citations |
 | `native-code-review` | Native C/C++ and kernel memory-safety review: parser surface, length/free triage, bounded sanitizer proof, scoped fix and regression |
+| `security-blue` | Defensive work: evidence-first triage, validated Sigma detections, hardening, secure code review, and supply-chain checks |
+| `security-red` | Authorized offensive testing: scope, reconnaissance into a surface map, hypotheses, bounded proof, evidence-backed findings, and a report |
 
-Both use the `security` profile, load `security-red` and `security-methods`, and
-carry an explicit tool allowlist including `finding`, `verify`, `test`,
-`review`, `surface`, `evidence`, `bash`, and `bg`. Their prompts require
-bounded, non-destructive validation: the reproduction is the proof, and
-destructive or third-party testing stops and asks.
+The two security deep-dives preload `security-red` and `security-methods` when
+the workflow starts. The new security workflows load their skill on demand with
+the `skill` tool — the body in Phase 0, the method reference only when Phase 2
+names a bug class — so a 27B–35B model does not start with every reference in
+context. `coding` and `general-assistance` ship without a skill and rely on the
+repository's own instructions.
+
+Every workflow carries an explicit tool allowlist. The security workflows
+include `finding`, `verify`, `test`, `review`, `surface`, `evidence`, `bash`,
+and `bg`; their prompts require bounded, non-destructive validation: the
+reproduction is the proof, and destructive or third-party testing stops and
+asks. `general-assistance` has no write, edit, or project-check tools by
+design.
 
 `/workflow <name>` starts a new branch, records a checkout, applies the profile
 (deriving a workflow profile when `tools` is set), appends the workflow prompt as
@@ -122,13 +134,21 @@ and leave the session unchanged.
 ## Installable copies
 
 Every bundled workflow also ships as a valid on-disk copy under
-`src/workflows/bundled/`:
+`src/workflows/bundled/`, as `<name>.toml` plus `prompts/<name>.md`:
 
 ```text
 src/workflows/bundled/api-security.toml
+src/workflows/bundled/coding.toml
+src/workflows/bundled/general-assistance.toml
 src/workflows/bundled/native-code-review.toml
+src/workflows/bundled/security-blue.toml
+src/workflows/bundled/security-red.toml
 src/workflows/bundled/prompts/api-security.md
+src/workflows/bundled/prompts/coding.md
+src/workflows/bundled/prompts/general-assistance.md
 src/workflows/bundled/prompts/native-code-review.md
+src/workflows/bundled/prompts/security-blue.md
+src/workflows/bundled/prompts/security-red.md
 ```
 
 The TOML files are ordinary installable workflows: `prompt` is a path relative

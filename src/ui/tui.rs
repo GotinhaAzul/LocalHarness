@@ -2947,7 +2947,14 @@ mod tests {
         let mut paths = crate::paths::Paths::discover(dir.path()).unwrap();
         paths.config_dir = dir.path().join("config");
         let names = available_workflows(&paths, false);
-        for expected in ["api-security", "native-code-review"] {
+        for expected in [
+            "api-security",
+            "coding",
+            "general-assistance",
+            "native-code-review",
+            "security-blue",
+            "security-red",
+        ] {
             assert!(
                 names.iter().any(|name| name == expected),
                 "missing {expected}: {names:?}"

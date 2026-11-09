@@ -35,16 +35,27 @@ struct WorkflowFile {
 
 const BUNDLED: &[(&str, &str)] = &[
     ("api-security", include_str!("bundled/api-security.toml")),
+    ("coding", include_str!("bundled/coding.toml")),
+    (
+        "general-assistance",
+        include_str!("bundled/general-assistance.toml"),
+    ),
     (
         "native-code-review",
         include_str!("bundled/native-code-review.toml"),
     ),
+    ("security-blue", include_str!("bundled/security-blue.toml")),
+    ("security-red", include_str!("bundled/security-red.toml")),
 ];
 
 fn bundled_prompt(name: &str) -> Option<&'static str> {
     match name {
         "api-security" => Some(include_str!("bundled/prompts/api-security.md")),
+        "coding" => Some(include_str!("bundled/prompts/coding.md")),
+        "general-assistance" => Some(include_str!("bundled/prompts/general-assistance.md")),
         "native-code-review" => Some(include_str!("bundled/prompts/native-code-review.md")),
+        "security-blue" => Some(include_str!("bundled/prompts/security-blue.md")),
+        "security-red" => Some(include_str!("bundled/prompts/security-red.md")),
         _ => None,
     }
 }
@@ -137,10 +148,17 @@ mod tests {
             );
         }
         let names = names();
-        assert!(names.contains(&"api-security"));
-        assert!(names.contains(&"native-code-review"));
-        assert!(get("api-security").is_some());
-        assert!(get("native-code-review").is_some());
+        for expected in [
+            "api-security",
+            "coding",
+            "general-assistance",
+            "native-code-review",
+            "security-blue",
+            "security-red",
+        ] {
+            assert!(names.contains(&expected), "missing {expected}");
+            assert!(get(expected).is_some(), "missing {expected}");
+        }
         assert!(get("does-not-exist").is_none());
     }
 

@@ -1,0 +1,6 @@
+name = "security-red"
+description = "Authorized offensive testing: scope and rules of engagement, reconnaissance into a surface map, hypothesis, bounded proof, evidence-backed findings, and a report"
+profile = "security"
+prompt = "prompts/security-red.md"
+skills = []
+tools = ["read", "write", "edit", "patch", "grep", "glob", "bash", "bg", "repo_map", "todo", "verify", "recall", "thread", "test", "review", "surface", "evidence", "attack_path", "finding", "iocs", "skill"]
