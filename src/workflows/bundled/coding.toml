@@ -1,0 +1,6 @@
+name = "coding"
+description = "Change an existing repository safely: orient, plan, small edits, narrow verification, diff review, and a short report"
+profile = "coding"
+prompt = "prompts/coding.md"
+skills = []
+tools = ["read", "write", "edit", "patch", "undo", "bash", "bg", "grep", "glob", "todo", "verify", "recall", "thread", "repo_map", "lsp", "test", "review", "skill"]

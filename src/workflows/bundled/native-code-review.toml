@@ -3,4 +3,4 @@ description = "Ongoing review of native C/C++ and kernel code for memory-safety 
 profile = "security"
 prompt = "prompts/native-code-review.md"
 skills = ["security-red", "security-methods"]
-tools = ["read", "write", "edit", "grep", "glob", "bash", "bg", "finding", "iocs", "verify", "test", "review", "surface", "evidence"]
+tools = ["read", "write", "edit", "patch", "undo", "grep", "glob", "bash", "bg", "todo", "skill", "verify", "recall", "thread", "repo_map", "test", "review", "surface", "evidence", "finding", "iocs"]

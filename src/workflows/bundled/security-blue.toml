@@ -1,0 +1,6 @@
+name = "security-blue"
+description = "Defensive security: evidence-first triage, detection engineering with validated Sigma rules, hardening, secure code review, and supply-chain checks"
+profile = "security"
+prompt = "prompts/security-blue.md"
+skills = []
+tools = ["read", "write", "edit", "patch", "undo", "grep", "glob", "bash", "bg", "repo_map", "todo", "verify", "recall", "thread", "test", "review", "detect", "iocs", "evidence", "finding", "skill"]

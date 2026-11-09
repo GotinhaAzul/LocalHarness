@@ -2114,6 +2114,9 @@ impl App {
             let base = config.profile().clone();
             let derived_name = format!("workflow-{}", sanitize_name(name));
             let mut derived = base;
+            // A workflow's tool list is an allowlist: drop the base profile's
+            // packs so unlisted tools in those packs are not silently enabled.
+            derived.packs.clear();
             derived.tools = workflow.tools.clone();
             derived.description = workflow
                 .description
@@ -2947,7 +2950,14 @@ mod tests {
         let mut paths = crate::paths::Paths::discover(dir.path()).unwrap();
         paths.config_dir = dir.path().join("config");
         let names = available_workflows(&paths, false);
-        for expected in ["api-security", "native-code-review"] {
+        for expected in [
+            "api-security",
+            "coding",
+            "general-assistance",
+            "native-code-review",
+            "security-blue",
+            "security-red",
+        ] {
             assert!(
                 names.iter().any(|name| name == expected),
                 "missing {expected}: {names:?}"
