@@ -89,13 +89,7 @@ fn run(ctx: &ToolContext, args: &Value) -> Result<ToolResult, ToolResult> {
         }
     } else {
         let mut walker = WalkBuilder::new(&root);
-        walker
-            .hidden(true)
-            .parents(true)
-            .git_ignore(true)
-            .git_global(true)
-            .ignore(true)
-            .follow_links(false);
+        crate::tools::configure_walker(&mut walker, crate::tools::glob_names_hidden(&pattern));
 
         for entry in walker.build() {
             if ctx.is_cancelled() {
@@ -162,6 +156,28 @@ mod tests {
     use super::*;
     use crate::tools::write::test_context;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn hidden_directories_match_when_the_pattern_names_them() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".github/workflows")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        std::fs::write(dir.path().join(".github/workflows/ci.yml"), "").unwrap();
+        std::fs::write(dir.path().join(".git/config.yml"), "").unwrap();
+        let ctx = test_context(dir.path());
+        let result = GlobTool
+            .call(&ctx, json!({"pattern": ".github/**/*.yml"}))
+            .await;
+        assert!(
+            result.content.contains(".github/workflows/ci.yml"),
+            "{}",
+            result.content
+        );
+        let result = GlobTool.call(&ctx, json!({"pattern": "**/*.yml"})).await;
+        assert!(!result.content.contains("ci.yml"), "{}", result.content);
+        let result = GlobTool.call(&ctx, json!({"pattern": "**/.git*/**"})).await;
+        assert!(!result.content.contains("config.yml"), "{}", result.content);
+    }
 
     #[tokio::test]
     async fn returns_sorted_relative_paths() {

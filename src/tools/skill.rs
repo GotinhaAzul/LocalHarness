@@ -299,6 +299,7 @@ mod tests {
             .lock()
             .unwrap()
             .append(EntryKind::User(UserData {
+                attachments: Vec::new(),
                 content: "[skill: security-blue]\n\nbody".into(),
             }))
             .unwrap();

@@ -117,9 +117,41 @@ pub struct SessionData {
     pub app: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UserData {
     pub content: String,
+    /// Files the user mentioned with `@path`, snapshotted when the prompt
+    /// was sent. The model sees them after `content`; the transcript shows
+    /// only what the user typed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<Attachment>,
+}
+
+/// One `@path` file snapshot attached to a user message.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Attachment {
+    /// Path relative to the working directory, as displayed.
+    pub path: String,
+    /// Line-numbered text, exactly as the `read` tool would return it.
+    pub content: String,
+}
+
+impl UserData {
+    /// The message the model sees: the prompt followed by any attachments.
+    pub fn model_content(&self) -> String {
+        if self.attachments.is_empty() {
+            return self.content.clone();
+        }
+        let mut text = self.content.clone();
+        text.push_str("\n\n[files attached by the user with @mentions; they count as read]");
+        for attachment in &self.attachments {
+            text.push_str(&format!(
+                "\n\n<file path=\"{}\">\n{}\n</file>",
+                attachment.path, attachment.content
+            ));
+        }
+        text
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -212,6 +244,7 @@ mod tests {
             parent: None,
             ts: Utc::now(),
             kind: EntryKind::User(UserData {
+                attachments: Vec::new(),
                 content: "Fix the parser bug".into(),
             }),
         };

@@ -222,6 +222,7 @@ mod tests {
             id,
             parent,
             EntryKind::User(UserData {
+                attachments: Vec::new(),
                 content: text.into(),
             }),
         )

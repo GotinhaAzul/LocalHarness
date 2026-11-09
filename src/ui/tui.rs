@@ -33,6 +33,7 @@ use crate::session::{CompactionData, Entry, EntryKind, UserData};
 use crate::skills::SkillIndex;
 use crate::tools::todo::{PlanStatus, plan_snapshot};
 use crate::ui::UiOptions;
+use crate::ui::complete::{self, Completion};
 use crate::ui::input::InputState;
 use crate::ui::render::{self, ActivityData, Transcript};
 use crate::ui::theme::{Role, Theme};
@@ -75,6 +76,8 @@ Commands: /help /quit /login [endpoint] [model] [api-key] /model [name]
 /clear /debug
 
 Keys: Enter send · Shift+Enter / Ctrl+J newline · Esc interrupt
+Tab complete commands, arguments, and paths · Shift+Tab previous choice
+@path in a prompt attaches that file for the model
 Ctrl+R show thinking · Ctrl+O expand tool output · Ctrl+T toggle the plan
 Scroll: mouse wheel · PgUp/PgDn half page · Shift+Up/Down one line
 Home/End top and bottom (prompt empty) · Ctrl+Home/End anytime · Ctrl+C quit
@@ -82,7 +85,7 @@ Hold Shift while dragging to select text ([ui] mouse = false disables
 mouse capture).";
 
 /// Footer hints while idle.
-const HINTS: &str = "enter send · ⇧enter newline · / commands · wheel/pgup scroll · ctrl+r thinking · ctrl+o output";
+const HINTS: &str = "enter send · ⇧enter newline · / commands · tab complete · @file attach · ctrl+r thinking · ctrl+o output";
 
 /// Lines per mouse-wheel notch.
 const WHEEL_LINES: usize = 3;
@@ -321,6 +324,8 @@ struct App {
     /// The agent's `todo` plan on the active branch.
     plan: Vec<(String, PlanStatus)>,
     show_plan: bool,
+    /// What slash-command arguments can complete to.
+    completion_sources: complete::Sources,
 }
 
 impl App {
@@ -393,10 +398,13 @@ impl App {
             running_tools: Vec::new(),
             plan: Vec::new(),
             show_plan: true,
+            completion_sources: complete::Sources::default(),
         };
         app.no_color = app.options.no_color;
         app.transcript = Transcript::new(app.config.ui.show_reasoning);
         app.refresh_session_blocks();
+        app.refresh_completion_sources(true);
+        app.attach_prompt_history();
         for warning in warnings {
             app.transcript.push_note("session warning", warning, false);
         }
@@ -415,6 +423,122 @@ impl App {
 
     fn core(&self) -> Option<&Arc<Core>> {
         self.runtime.as_ref().map(|runtime| &runtime.core)
+    }
+
+    /// Persist Up-arrow history per project, next to its sessions. Skipped
+    /// with `--no-session`, which promises not to write session data.
+    fn attach_prompt_history(&mut self) {
+        let Some(runtime) = &self.runtime else {
+            return;
+        };
+        let sessions_enabled = match runtime.session.lock() {
+            Ok(session) => session.path.is_some(),
+            Err(poison) => poison.into_inner().path.is_some(),
+        };
+        if sessions_enabled {
+            let path = runtime
+                .core
+                .paths
+                .project_sessions_dir()
+                .join("prompt_history.jsonl");
+            self.input.attach_history_file(path);
+        }
+    }
+
+    /// Re-read what slash-command arguments complete to. Session previews
+    /// read every session file, so they refresh only when asked.
+    fn refresh_completion_sources(&mut self, sessions: bool) {
+        let Some(runtime) = &self.runtime else {
+            return;
+        };
+        let paths = runtime.core.paths.clone();
+        let trust = self.config.trust || self.options.trust;
+        let sources = &mut self.completion_sources;
+        sources.cwd = paths.cwd.clone();
+        sources.home = dirs::home_dir();
+        sources.themes = available_theme_names(&paths);
+        sources.profiles = self
+            .config
+            .profiles
+            .iter()
+            .map(|(name, data)| (name.clone(), data.description.clone().unwrap_or_default()))
+            .collect();
+        sources.skills = SkillIndex::load(&paths, trust)
+            .names()
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        sources.workflows = available_workflows(&paths, trust);
+        if sessions {
+            sources.sessions = scan_sessions(&paths)
+                .into_iter()
+                .map(|item| (item.id, item.preview))
+                .collect();
+        }
+    }
+
+    /// The completion for the prompt as it stands, or `None` when there is
+    /// nothing useful to show.
+    fn current_completion(&self) -> Option<Completion> {
+        let before = self.input.before_cursor();
+        complete::complete(
+            &before,
+            COMMANDS,
+            &self.completion_sources,
+            self.input.popup_open(),
+        )
+        .filter(|completion| !completion.is_settled())
+    }
+
+    fn accept_candidate(&mut self, completion: &Completion, index: usize) {
+        let Some(candidate) = completion.candidates.get(index) else {
+            return;
+        };
+        let command = candidate.value.trim_start_matches('/');
+        let insertion = completion.insertion(candidate, complete::takes_args(command));
+        self.input
+            .replace_before_cursor(completion.start, &insertion);
+    }
+
+    /// Tab: complete the token at the cursor. A unique match is accepted; an
+    /// ambiguous one first extends to the shared prefix, then opens (or, if
+    /// already showing, accepts from) the popup.
+    fn tab_complete(&mut self) -> bool {
+        let visible = self.current_completion().is_some();
+        if !self.input.popup_open() {
+            self.input.open_popup();
+        }
+        let Some(completion) = self.current_completion() else {
+            // `/help` + Tab: a settled command that takes arguments gets its
+            // separating space.
+            let before = self.input.before_cursor();
+            if let Some(settled) =
+                complete::complete(&before, COMMANDS, &self.completion_sources, true)
+                && settled.is_settled()
+            {
+                self.accept_candidate(&settled, 0);
+                return true;
+            }
+            self.input.reset_completion();
+            return false;
+        };
+        if completion.candidates.len() == 1 {
+            self.accept_candidate(&completion, 0);
+            return true;
+        }
+        if let Some(prefix) = completion.common_extension() {
+            self.input.replace_before_cursor(completion.start, &prefix);
+            self.input.open_popup();
+            return true;
+        }
+        if visible {
+            let index = self
+                .input
+                .completion_index
+                .min(completion.candidates.len() - 1);
+            self.accept_candidate(&completion, index);
+        }
+        true
     }
 
     fn cwd_path(&self) -> PathBuf {
@@ -529,7 +653,7 @@ impl App {
         self.input.set_placeholder(if busy {
             "the agent is working · esc to interrupt"
         } else {
-            "ask anything, or / for commands"
+            "ask anything · @file attaches · / for commands"
         });
         let text_width = size.width.saturating_sub(render::PROMPT_WIDTH + 1) as usize;
         let rects = render::split_with(
@@ -550,7 +674,20 @@ impl App {
         self.input
             .fit_viewport(text_width as u16, rects.input.height.saturating_sub(2));
 
-        let completions = self.input.completions(COMMANDS);
+        let completion = self.current_completion();
+        let completion_title = completion
+            .as_ref()
+            .map(|completion| completion.kind.title())
+            .unwrap_or("");
+        let completions: Vec<(String, String)> = completion
+            .map(|completion| {
+                completion
+                    .candidates
+                    .into_iter()
+                    .map(|candidate| (candidate.label, candidate.description))
+                    .collect()
+            })
+            .unwrap_or_default();
         let completion_index = self
             .input
             .completion_index
@@ -571,6 +708,7 @@ impl App {
                     footer: footer.clone(),
                     completions: completions.clone(),
                     completion_index,
+                    completion_title,
                     modal,
                     activity: activity.clone(),
                     plan: plan.clone(),
@@ -1176,8 +1314,23 @@ impl App {
                     self.input.insert_newline();
                     return;
                 }
-                if let Some(name) = self.input.partial_command(COMMANDS) {
-                    self.input.accept_completion(name);
+                // A partial command or argument runs as its highlighted
+                // completion: `/the dr` + Enter runs `/theme dracula`.
+                if let Some(completion) = self.current_completion()
+                    && completion.kind != complete::Kind::Path
+                    && !completion.token.is_empty()
+                    && self.input.cursor_at_end()
+                    && !completion
+                        .candidates
+                        .iter()
+                        .any(|candidate| candidate.value == completion.token)
+                {
+                    let index = self
+                        .input
+                        .completion_index
+                        .min(completion.candidates.len() - 1);
+                    let value = completion.candidates[index].value.clone();
+                    self.input.replace_before_cursor(completion.start, &value);
                 }
                 let idle = !self.turn_active;
                 match self.input.submit(idle) {
@@ -1200,14 +1353,14 @@ impl App {
                 return;
             }
             KeyCode::Up | KeyCode::Down => {
-                let completions = self.input.completions(COMMANDS);
-                if !completions.is_empty() {
+                if let Some(completion) = self.current_completion() {
                     let delta = if matches!(key.code, KeyCode::Up) {
                         -1
                     } else {
                         1
                     };
-                    self.input.cycle_completion(delta, completions.len());
+                    self.input
+                        .cycle_completion(delta, completion.candidates.len());
                     return;
                 }
                 if self.input.is_empty() {
@@ -1224,17 +1377,16 @@ impl App {
                 return;
             }
             KeyCode::Tab => {
-                let completions = self.input.completions(COMMANDS);
-                if !completions.is_empty() {
-                    let index = self
-                        .input
-                        .completion_index
-                        .min(completions.len().saturating_sub(1));
-                    let name = completions[index].0;
-                    self.input.accept_completion(name);
-                    return;
+                // A tab character never belongs in a slash command.
+                if !self.tab_complete() && !self.input.text().trim_start().starts_with('/') {
+                    self.input.handle_key(key);
                 }
-                self.input.handle_key(key);
+                return;
+            }
+            KeyCode::BackTab => {
+                if let Some(completion) = self.current_completion() {
+                    self.input.cycle_completion(-1, completion.candidates.len());
+                }
                 return;
             }
             _ => {}
@@ -1420,6 +1572,7 @@ impl App {
             }
             other => self.unknown_command(other),
         }
+        self.refresh_completion_sources(matches!(name, "new" | "resume" | "sessions"));
     }
 
     fn unknown_command(&mut self, name: &str) {
@@ -1450,6 +1603,7 @@ impl App {
             if let Ok(models) = probe_endpoint_models(&core.config.model).await
                 && !models.is_empty()
             {
+                self.completion_sources.models = models.clone();
                 let current = if core.logged_in() {
                     current
                 } else {
@@ -1577,7 +1731,10 @@ impl App {
         }
 
         let models = match probe_endpoint_models(&candidate.model).await {
-            Ok(models) => models,
+            Ok(models) => {
+                self.completion_sources.models = models.clone();
+                models
+            }
             Err(error) => {
                 self.transcript.push_note(
                     "login",
@@ -2004,7 +2161,10 @@ impl App {
                 Err(poison) => poison.into_inner(),
             };
             let result = session
-                .append(EntryKind::User(UserData { content }))
+                .append(EntryKind::User(UserData {
+                    attachments: Vec::new(),
+                    content,
+                }))
                 .map(|entry| entry.id);
             let _ = session.fsync();
             result
@@ -2152,6 +2312,7 @@ impl App {
             }
             if result.is_ok()
                 && let Err(error) = session.append(EntryKind::User(UserData {
+                    attachments: Vec::new(),
                     content: workflow.prompt.clone(),
                 }))
             {
@@ -2165,7 +2326,10 @@ impl App {
                             crate::tools::skill::skill_marker(&skill.name),
                             skill.full_text()
                         );
-                        if let Err(error) = session.append(EntryKind::User(UserData { content })) {
+                        if let Err(error) = session.append(EntryKind::User(UserData {
+                            attachments: Vec::new(),
+                            content,
+                        })) {
                             result = Err(error);
                             break;
                         }
@@ -3011,6 +3175,7 @@ mod tests {
                     footer: footer.clone(),
                     completions: Vec::new(),
                     completion_index: 0,
+                    completion_title: "",
                     modal: None,
                     activity: None,
                     plan: Vec::new(),
@@ -3268,6 +3433,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tab_completes_commands_arguments_and_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("work");
+        std::fs::create_dir_all(cwd.join("src/ui")).unwrap();
+        std::fs::write(cwd.join("src/ui/input.rs"), "").unwrap();
+        std::fs::write(cwd.join("src/main.rs"), "").unwrap();
+        let paths = crate::paths::Paths {
+            config_dir: dir.path().join("config"),
+            data_dir: dir.path().join("data"),
+            cwd: cwd.clone(),
+            project_id: "test".into(),
+            sessions_dir_override: None,
+        };
+        let base = model_endpoint(&["m"]).await;
+        let mut config = Config::builtin();
+        config.model.endpoint = base;
+        config.model.model = "m".into();
+        let runtime = app::create_runtime(config, paths.clone(), RuntimeOptions::default())
+            .await
+            .unwrap();
+        let options = || UiOptions {
+            no_color: true,
+            trust: false,
+            skills: SkillIndex::bundled(),
+        };
+        let mut app = App::new(runtime, options()).unwrap();
+        let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+        let back_tab = KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT);
+
+        // A unique command completes with a separating space.
+        app.input.set_text("/them");
+        app.handle_key(tab).await;
+        assert_eq!(app.input.text(), "/theme ");
+
+        // Arguments complete from the theme list.
+        app.input.set_text("/theme gru");
+        app.handle_key(tab).await;
+        assert_eq!(app.input.text(), "/theme gruvbox-dark ");
+        // No match inside a command: Tab inserts nothing.
+        app.input.set_text("/theme zzz");
+        app.handle_key(tab).await;
+        assert_eq!(app.input.text(), "/theme zzz");
+
+        // Ambiguous commands: Shift+Tab moves the selection back, Tab accepts.
+        app.input.set_text("/tr");
+        app.handle_key(back_tab).await;
+        app.handle_key(tab).await;
+        assert_eq!(app.input.text(), "/trust ");
+
+        // Enter on a partial argument runs the highlighted completion.
+        app.input.set_text("/theme high");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await;
+        assert_eq!(app.theme.name, "high-contrast");
+
+        // Paths: the first Tab extends to the shared prefix, the popup lists
+        // the rest, and a unique file is accepted.
+        app.input.set_text("explain @sr");
+        app.handle_key(tab).await;
+        assert_eq!(app.input.text(), "explain @src/");
+        assert!(app.current_completion().is_none());
+        app.handle_key(tab).await;
+        let completion = app.current_completion().expect("path popup");
+        assert_eq!(completion.candidates[0].value, "src/ui/");
+        app.input.set_text("explain @src/m");
+        app.handle_key(tab).await;
+        assert_eq!(app.input.text(), "explain @src/main.rs ");
+
+        // Plain prose: Tab falls through to the textarea.
+        app.input.set_text("hello");
+        app.handle_key(tab).await;
+        assert!(app.input.text().starts_with("hello"));
+
+        // Prompt history survives a restart for the same project.
+        app.input.set_text("remember me");
+        app.input.submit(true).unwrap();
+        drop(app);
+        let runtime = app::create_runtime(
+            {
+                let mut config = Config::builtin();
+                config.model.endpoint = model_endpoint(&["m"]).await;
+                config.model.model = "m".into();
+                config
+            },
+            paths,
+            RuntimeOptions::default(),
+        )
+        .await
+        .unwrap();
+        let mut app = App::new(runtime, options()).unwrap();
+        assert!(app.input.history_prev());
+        assert_eq!(app.input.text(), "remember me");
+    }
+
+    #[tokio::test]
     async fn new_and_resume_switch_sessions() {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().join("work");
@@ -3319,6 +3579,7 @@ mod tests {
             .lock()
             .unwrap()
             .append(EntryKind::User(UserData {
+                attachments: Vec::new(),
                 content: "first session message".into(),
             }))
             .unwrap();

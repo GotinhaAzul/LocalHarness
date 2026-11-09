@@ -66,7 +66,23 @@ pub async fn run_turn(
         profile: core.config.profile_name().to_string(),
     });
 
-    if let Err(err) = append_user(&core.session, &user_text) {
+    // `@path` mentions attach file snapshots, within a quarter of the
+    // usable prompt so one message cannot crowd out the conversation.
+    let attachment_budget = core.budget.chars_for(core.budget.usable_prompt() / 4);
+    let mentions = super::mentions::resolve(&core.tool_context(), &user_text, attachment_budget);
+    if !mentions.attachments.is_empty() {
+        let names: Vec<&str> = mentions
+            .attachments
+            .iter()
+            .map(|attachment| attachment.path.as_str())
+            .collect();
+        let _ = tx.send(AgentEvent::Notice(format!("attached {}", names.join(", "))));
+    }
+    for skipped in &mentions.skipped {
+        let _ = tx.send(AgentEvent::Notice(format!("not attached: {skipped}")));
+    }
+
+    if let Err(err) = append_user_with(&core.session, &user_text, mentions.attachments) {
         let message = format!("cannot append user message: {err}");
         let _ = tx.send(AgentEvent::Error {
             code: "session_write".into(),
@@ -1491,10 +1507,19 @@ fn fingerprint(name: &str, args: &str, content: &str) -> String {
 }
 
 fn append_user(session: &crate::tools::SessionHandle, text: &str) -> anyhow::Result<()> {
+    append_user_with(session, text, Vec::new())
+}
+
+fn append_user_with(
+    session: &crate::tools::SessionHandle,
+    text: &str,
+    attachments: Vec<crate::session::Attachment>,
+) -> anyhow::Result<()> {
     session
         .lock()
         .expect("session lock")
         .append(EntryKind::User(UserData {
+            attachments,
             content: text.to_string(),
         }))?;
     Ok(())

@@ -422,9 +422,34 @@ fn classify_http(code: u16, body: &str, model: &str) -> Option<ProviderError> {
     Some(ProviderError::new(class, message))
 }
 
+/// Fold the leading run of system messages (base prompt, then a compaction
+/// summary) into one. Several chat templates (Gemma, Mistral, and others
+/// llama.cpp renders with `--jinja`) reject a second system message or demand
+/// strictly alternating roles; one combined system turn is accepted by all of
+/// them and keeps the same prefix for KV-cache reuse.
+fn merge_leading_system(messages: &[ChatMessage]) -> Vec<ChatMessage> {
+    let leading = messages
+        .iter()
+        .take_while(|message| matches!(message, ChatMessage::System { .. }))
+        .count();
+    if leading < 2 {
+        return messages.to_vec();
+    }
+    let combined = messages[..leading]
+        .iter()
+        .filter_map(|message| match message {
+            ChatMessage::System { content } => Some(content.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let mut merged = vec![ChatMessage::System { content: combined }];
+    merged.extend_from_slice(&messages[leading..]);
+    merged
+}
+
 fn build_body(req: &ChatRequest, include_usage: bool) -> Result<Value, ProviderError> {
-    let messages: Vec<Value> = req
-        .messages
+    let messages: Vec<Value> = merge_leading_system(&req.messages)
         .iter()
         .map(|message| match message {
             ChatMessage::System { content } => json!({"role":"system","content":content}),
@@ -671,6 +696,29 @@ mod tests {
         assert!((usage.tokens_per_sec.unwrap() - 52.94).abs() < 0.01);
         // Plain chunks carry nothing.
         assert!(usage_of(r#"{"choices":[]}"#).is_none());
+    }
+
+    #[test]
+    fn leading_system_messages_are_merged_once() {
+        let system = |text: &str| ChatMessage::System {
+            content: text.into(),
+        };
+        let messages = vec![
+            system("base"),
+            system("summary"),
+            ChatMessage::User {
+                content: "hi".into(),
+            },
+            system("state"),
+        ];
+        let merged = merge_leading_system(&messages);
+        assert_eq!(merged.len(), 3);
+        assert!(
+            matches!(&merged[0], ChatMessage::System { content } if content == "base\n\nsummary")
+        );
+        // A later system message is left where the harness put it.
+        assert!(matches!(&merged[2], ChatMessage::System { content } if content == "state"));
+        assert_eq!(merge_leading_system(&messages[2..]).len(), 2);
     }
 
     #[test]

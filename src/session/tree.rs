@@ -324,6 +324,7 @@ mod tests {
             seq,
             parent,
             EntryKind::User(UserData {
+                attachments: Vec::new(),
                 content: text.into(),
             }),
         )

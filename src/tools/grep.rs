@@ -126,6 +126,9 @@ fn run(ctx: &ToolContext, args: &Value) -> Result<ToolResult, ToolResult> {
         .map(|note| format!("{note}\n"))
         .unwrap_or_default();
 
+    let include_hidden = optional_str(args, "glob")
+        .is_some_and(|glob| crate::tools::glob_names_hidden(&glob))
+        || crate::tools::glob_names_hidden(&raw_path_hint(args));
     let matcher = match optional_str(args, "glob") {
         Some(glob) => {
             let compiled = Glob::new(&glob).map_err(|err| {
@@ -166,13 +169,7 @@ fn run(ctx: &ToolContext, args: &Value) -> Result<ToolResult, ToolResult> {
         }
     } else {
         let mut walker = WalkBuilder::new(&root);
-        walker
-            .hidden(true)
-            .parents(true)
-            .git_ignore(true)
-            .git_global(true)
-            .ignore(true)
-            .follow_links(false);
+        crate::tools::configure_walker(&mut walker, include_hidden);
 
         for entry in walker.build() {
             if ctx.is_cancelled() {
@@ -321,6 +318,11 @@ fn truncate_line(line: &str, max: usize) -> String {
     let mut truncated: String = line.chars().take(max).collect();
     truncated.push_str("...");
     truncated
+}
+
+/// The `path` argument, for deciding whether hidden entries were asked for.
+fn raw_path_hint(args: &Value) -> String {
+    optional_str(args, "path").unwrap_or_default()
 }
 
 fn rel_display(cwd: &Path, path: &Path) -> String {

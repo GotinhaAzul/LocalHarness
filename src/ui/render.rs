@@ -1413,8 +1413,10 @@ pub struct Scene<'a> {
     pub input: &'a TextArea<'static>,
     pub debug_lines: Vec<String>,
     pub footer: FooterData,
-    pub completions: Vec<(&'static str, &'static str)>,
+    /// Completion popup rows: label and description.
+    pub completions: Vec<(String, String)>,
     pub completion_index: usize,
+    pub completion_title: &'static str,
     pub modal: Option<&'a ModalData>,
     pub activity: Option<ActivityData>,
     pub plan: Vec<(String, PlanStatus)>,
@@ -1713,20 +1715,41 @@ fn render_completions(frame: &mut Frame, scene: &Scene<'_>, area: Rect, theme: &
     let width = area.width.min(76);
     let popup = Rect::new(area.x, area.bottom().saturating_sub(height), width, height);
     frame.render_widget(Clear, popup);
-    let block = WidgetBlock::default()
+    let title = if scene.completion_title.is_empty() {
+        " commands · tab accept "
+    } else {
+        scene.completion_title
+    };
+    let mut block = WidgetBlock::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(theme.style(Role::Border))
-        .title(Span::styled(
-            " commands · tab accept ",
+        .title(Span::styled(title, theme.style(Role::Muted)));
+    if scene.completions.len() > visible {
+        block = block.title_bottom(Span::styled(
+            format!(
+                " {}/{} ",
+                scene.completion_index + 1,
+                scene.completions.len()
+            ),
             theme.style(Role::Muted),
         ));
+    }
+    // The name column fits the longest visible label, within reason.
+    let label_width = scene
+        .completions
+        .iter()
+        .map(|(label, _)| label.chars().count())
+        .max()
+        .unwrap_or(0)
+        .clamp(10, 32);
+    let description_width = (width as usize).saturating_sub(label_width + 5);
     // Keep the selection in view when the list is longer than the popup.
     let first = scene
         .completion_index
         .saturating_sub(visible.saturating_sub(1));
     let mut lines = Vec::new();
-    for (index, (name, description)) in scene
+    for (index, (label, description)) in scene
         .completions
         .iter()
         .enumerate()
@@ -1735,10 +1758,11 @@ fn render_completions(frame: &mut Frame, scene: &Scene<'_>, area: Rect, theme: &
     {
         let selected = index == scene.completion_index;
         let marker = if selected { "› " } else { "  " };
+        let label = clip_end(label, label_width);
         let mut line = Line::from(vec![
             Span::styled(marker, theme.bold(Role::Accent)),
             Span::styled(
-                format!("/{name:<10}"),
+                format!("{label:<label_width$}"),
                 if selected {
                     theme.bold(Role::Accent)
                 } else {
@@ -1746,10 +1770,7 @@ fn render_completions(frame: &mut Frame, scene: &Scene<'_>, area: Rect, theme: &
                 },
             ),
             Span::styled(
-                format!(
-                    " {}",
-                    clip_end(description, width.saturating_sub(17) as usize)
-                ),
+                format!(" {}", clip_end(description, description_width)),
                 theme.style(Role::Muted),
             ),
         ]);
@@ -2055,6 +2076,7 @@ mod tests {
                     footer: footer.clone(),
                     completions: Vec::new(),
                     completion_index: 0,
+                    completion_title: "",
                     modal: None,
                     activity: None,
                     plan: Vec::new(),
@@ -2093,6 +2115,7 @@ mod tests {
                     footer: FooterData::default(),
                     completions: Vec::new(),
                     completion_index: 0,
+                    completion_title: "",
                     modal: None,
                     activity: Some(ActivityData {
                         spinner: "⠋",

@@ -441,6 +441,30 @@ pub fn optional_bool(args: &Value, key: &str) -> Option<bool> {
     args.get(key).and_then(|v| v.as_bool())
 }
 
+/// True when a glob names a hidden path segment (`.github/**`, `**/.env*`),
+/// so a walker that skips dotfiles by default should include them. `.` and
+/// `..` are navigation, not hidden names.
+pub fn glob_names_hidden(pattern: &str) -> bool {
+    pattern
+        .split('/')
+        .any(|segment| segment.starts_with('.') && segment != "." && segment != "..")
+}
+
+/// Configure a gitignore-aware walker. Hidden entries are skipped unless
+/// `include_hidden`; `.git` internals are always skipped.
+pub fn configure_walker(walker: &mut ignore::WalkBuilder, include_hidden: bool) {
+    walker
+        .hidden(!include_hidden)
+        .parents(true)
+        .git_ignore(true)
+        .git_global(true)
+        .ignore(true)
+        .follow_links(false);
+    if include_hidden {
+        walker.filter_entry(|entry| entry.file_name() != ".git");
+    }
+}
+
 /// Format a path relative to the working directory for display.
 pub fn display_path(cwd: &std::path::Path, path: &std::path::Path) -> String {
     path.strip_prefix(cwd)
@@ -452,6 +476,15 @@ pub fn display_path(cwd: &std::path::Path, path: &std::path::Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hidden_segments_are_detected_in_globs() {
+        assert!(glob_names_hidden(".github/**/*.yml"));
+        assert!(glob_names_hidden("**/.env*"));
+        assert!(!glob_names_hidden("./src/**/*.rs"));
+        assert!(!glob_names_hidden("../**/*.rs"));
+        assert!(!glob_names_hidden("**/*.rs"));
+    }
 
     #[test]
     fn normalize_collapses_dot_and_parent() {
