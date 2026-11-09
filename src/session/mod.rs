@@ -13,8 +13,8 @@ use chrono::Utc;
 
 pub use artifact::{Artifact, ArtifactError, ArtifactSlice, ArtifactStore};
 pub use entry::{
-    AssistantData, CheckoutData, CompactionData, CustomData, Entry, EntryKind, ErrorData,
-    FORMAT_VERSION, SessionData, ToolCall, ToolResultData, UserData,
+    AssistantData, Attachment, CheckoutData, CompactionData, CustomData, Entry, EntryKind,
+    ErrorData, FORMAT_VERSION, SessionData, ToolCall, ToolResultData, UserData,
 };
 pub use store::{SessionStore, StoreError};
 pub use tree::{CheckoutError, SessionTree};
@@ -362,6 +362,7 @@ mod tests {
         let mut session = Session::create(&paths, header(), false).unwrap();
         let entry = session
             .append(EntryKind::User(UserData {
+                attachments: Vec::new(),
                 content: "hello".into(),
             }))
             .unwrap();
@@ -383,6 +384,7 @@ mod tests {
         let mut session = Session::create(&paths, header(), false).unwrap();
         session
             .append(EntryKind::User(UserData {
+                attachments: Vec::new(),
                 content: "one".into(),
             }))
             .unwrap();
@@ -395,6 +397,7 @@ mod tests {
         session.checkout("e1", "fork").unwrap();
         let entry = session
             .append(EntryKind::User(UserData {
+                attachments: Vec::new(),
                 content: "branch".into(),
             }))
             .unwrap();
@@ -418,6 +421,7 @@ mod tests {
         assert!(session.path.is_none());
         session
             .append(EntryKind::User(UserData {
+                attachments: Vec::new(),
                 content: "hi".into(),
             }))
             .unwrap();

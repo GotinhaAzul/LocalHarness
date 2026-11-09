@@ -1,5 +1,8 @@
 //! Multiline input, history, and slash-command completion.
 
+use std::io::Write as _;
+use std::path::PathBuf;
+
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::style::Modifier;
 use ratatui::style::Style;
@@ -8,6 +11,9 @@ use ratatui_textarea::{CursorMove, TextArea, WrapMode};
 
 use crate::ui::theme::{Role, Theme};
 
+/// Prompts kept in memory and on disk.
+const HISTORY_LIMIT: usize = 200;
+
 /// Owned editing state for the prompt.
 pub struct InputState {
     pub textarea: TextArea<'static>,
@@ -15,6 +21,11 @@ pub struct InputState {
     history_index: Option<usize>,
     draft: String,
     pub completion_index: usize,
+    /// Set by Tab to show on-demand (path) completions; cleared on edit.
+    popup_open: bool,
+    /// Per-project file prompts are appended to, so Up recalls them across
+    /// restarts. `None` keeps history in memory only.
+    history_file: Option<PathBuf>,
 }
 
 impl Default for InputState {
@@ -26,7 +37,7 @@ impl Default for InputState {
 impl InputState {
     pub fn new() -> Self {
         let mut textarea = TextArea::new(vec![String::new()]);
-        textarea.set_placeholder_text("type a message, or /help");
+        textarea.set_placeholder_text("type a message, @file to attach, or /help");
         textarea.set_max_histories(200);
         textarea.set_cursor_line_style(Style::default());
         textarea.set_wrap_mode(WrapMode::WordOrGlyph);
@@ -37,6 +48,8 @@ impl InputState {
             history_index: None,
             draft: String::new(),
             completion_index: 0,
+            popup_open: false,
+            history_file: None,
         }
     }
 
@@ -87,9 +100,57 @@ impl InputState {
         }
         if self.history.last().map(String::as_str) != Some(text) {
             self.history.push(text.to_string());
-            if self.history.len() > 200 {
+            if self.history.len() > HISTORY_LIMIT {
                 self.history.remove(0);
             }
+            self.append_history_file(text);
+        }
+    }
+
+    /// Load prompt history from `path` (JSON-lines of strings, newest last)
+    /// and append future prompts to it. A missing or damaged file is not an
+    /// error: history is a convenience.
+    pub fn attach_history_file(&mut self, path: PathBuf) {
+        if let Ok(raw) = std::fs::read_to_string(&path) {
+            let loaded: Vec<String> = raw
+                .lines()
+                .filter_map(|line| serde_json::from_str::<String>(line).ok())
+                .filter(|text| !text.trim().is_empty())
+                .collect();
+            let skip = loaded.len().saturating_sub(HISTORY_LIMIT);
+            let mut history: Vec<String> = loaded.into_iter().skip(skip).collect();
+            history.dedup();
+            history.append(&mut self.history);
+            self.history = history;
+            // Rewrite oversized files so they stay bounded.
+            if skip > HISTORY_LIMIT {
+                let body: String = self
+                    .history
+                    .iter()
+                    .filter_map(|text| serde_json::to_string(text).ok())
+                    .map(|line| line + "\n")
+                    .collect();
+                let _ = std::fs::write(&path, body);
+            }
+        }
+        self.history_file = Some(path);
+    }
+
+    fn append_history_file(&self, text: &str) {
+        let Some(path) = &self.history_file else {
+            return;
+        };
+        let Ok(line) = serde_json::to_string(text) else {
+            return;
+        };
+        use std::os::unix::fs::OpenOptionsExt as _;
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(path)
+        {
+            let _ = writeln!(file, "{line}");
         }
     }
 
@@ -161,26 +222,44 @@ impl InputState {
         self.textarea.redo()
     }
 
-    /// Filtered slash-command completions for the current prompt. Empty unless
-    /// the prompt is a single `/`-prefixed word.
-    pub fn completions(
-        &self,
-        commands: &[(&'static str, &'static str)],
-    ) -> Vec<(&'static str, &'static str)> {
+    /// The prompt text before the cursor, which completion works on.
+    pub fn before_cursor(&self) -> String {
+        let ratatui_textarea::DataCursor(row, col) = self.textarea.cursor();
+        let lines = self.textarea.lines();
+        let mut before = String::new();
+        for line in lines.iter().take(row) {
+            before.push_str(line);
+            before.push('\n');
+        }
+        if let Some(line) = lines.get(row) {
+            before.extend(line.chars().take(col));
+        }
+        before
+    }
+
+    /// Whether the cursor sits at the very end of the prompt.
+    pub fn cursor_at_end(&self) -> bool {
+        self.before_cursor().len() == self.text().len()
+    }
+
+    /// Replace the text between byte `start` and the cursor with
+    /// `insertion`, leaving the cursor just after it. Text after the cursor
+    /// is preserved.
+    pub fn replace_before_cursor(&mut self, start: usize, insertion: &str) {
+        let before = self.before_cursor();
         let text = self.text();
-        let trimmed = text.trim_start();
-        if !trimmed.starts_with('/') || trimmed.contains(char::is_whitespace) {
-            return Vec::new();
-        }
-        let prefix = &trimmed[1..];
-        if commands.iter().any(|(name, _)| *name == prefix) {
-            return Vec::new();
-        }
-        commands
-            .iter()
-            .copied()
-            .filter(|(name, _)| name.starts_with(prefix))
-            .collect()
+        let after = &text[before.len()..];
+        let start = start.min(before.len());
+        let head = format!("{}{insertion}", &before[..start]);
+        self.textarea.clear();
+        self.textarea.insert_str(format!("{head}{after}"));
+        let row = head.matches('\n').count();
+        let col = head.rsplit('\n').next().unwrap_or("").chars().count();
+        self.textarea.move_cursor(CursorMove::Jump(
+            row.min(u16::MAX as usize) as u16,
+            col.min(u16::MAX as usize) as u16,
+        ));
+        self.reset_completion();
     }
 
     pub fn cycle_completion(&mut self, delta: isize, len: usize) {
@@ -193,37 +272,19 @@ impl InputState {
         self.completion_index = next as usize;
     }
 
-    pub fn selected_completion(
-        &self,
-        commands: &[(&'static str, &'static str)],
-    ) -> Option<&'static str> {
-        let matches = self.completions(commands);
-        if matches.is_empty() {
-            return None;
-        }
-        let index = self.completion_index.min(matches.len() - 1);
-        Some(matches[index].0)
+    /// Open the on-demand completion popup (file paths) until the text
+    /// changes.
+    pub fn open_popup(&mut self) {
+        self.popup_open = true;
     }
 
-    /// A partial command name that Enter should complete before running.
-    pub fn partial_command(
-        &self,
-        commands: &[(&'static str, &'static str)],
-    ) -> Option<&'static str> {
-        let text = self.text();
-        let trimmed = text.trim();
-        if !trimmed.starts_with('/') || trimmed.contains(char::is_whitespace) {
-            return None;
-        }
-        self.selected_completion(commands)
-    }
-
-    pub fn accept_completion(&mut self, name: &str) {
-        self.set_text(&format!("/{name}"));
+    pub fn popup_open(&self) -> bool {
+        self.popup_open
     }
 
     pub fn reset_completion(&mut self) {
         self.completion_index = 0;
+        self.popup_open = false;
     }
 
     /// Screen rows the prompt needs at `width` columns with soft wrapping.
@@ -293,13 +354,6 @@ impl InputState {
 mod tests {
     use super::*;
 
-    const COMMANDS: &[(&str, &str)] = &[
-        ("help", "list commands"),
-        ("theme", "change the theme"),
-        ("tree", "browse the session tree"),
-        ("trust", "show trust state"),
-    ];
-
     fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, modifiers)
     }
@@ -342,23 +396,43 @@ mod tests {
     }
 
     #[test]
-    fn slash_completion_filters_with_descriptions() {
+    fn replacing_before_the_cursor_keeps_the_tail() {
         let mut input = InputState::new();
-        input.set_text("/tr");
-        let matches = input.completions(COMMANDS);
-        let names: Vec<&str> = matches.iter().map(|(name, _)| *name).collect();
-        assert_eq!(names, vec!["tree", "trust"]);
-        assert!(
-            matches
-                .iter()
-                .all(|(_, description)| !description.is_empty())
-        );
+        input.set_text("fix @src/ma please");
+        // Put the cursor right after "@src/ma".
+        input.textarea.move_cursor(CursorMove::Jump(0, 11));
+        assert_eq!(input.before_cursor(), "fix @src/ma");
+        assert!(!input.cursor_at_end());
+        input.replace_before_cursor(5, "src/main.rs ");
+        assert_eq!(input.text(), "fix @src/main.rs  please");
+        assert_eq!(input.before_cursor(), "fix @src/main.rs ");
+    }
 
-        input.set_text("/");
-        assert_eq!(input.completions(COMMANDS).len(), COMMANDS.len());
+    #[test]
+    fn history_persists_across_instances() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prompt_history.jsonl");
+        let mut first = InputState::new();
+        first.attach_history_file(path.clone());
+        first.set_text("line one\nline two");
+        first.submit(true).unwrap();
+        first.set_text("second");
+        first.submit(true).unwrap();
 
-        input.set_text("/help");
-        assert!(input.completions(COMMANDS).is_empty());
+        let mut second = InputState::new();
+        second.attach_history_file(path);
+        assert!(second.history_prev());
+        assert_eq!(second.text(), "second");
+        assert!(second.history_prev());
+        assert_eq!(second.text(), "line one\nline two");
+    }
+
+    #[test]
+    fn before_cursor_spans_lines() {
+        let mut input = InputState::new();
+        input.set_text("one\ntwo");
+        assert_eq!(input.before_cursor(), "one\ntwo");
+        assert!(input.cursor_at_end());
     }
 
     #[test]
@@ -374,14 +448,5 @@ mod tests {
         input.insert_text("!");
         assert!(input.text().ends_with("word!"), "{}", input.text());
         assert_eq!(input.visual_rows(40), 4);
-    }
-
-    #[test]
-    fn partial_command_completes_to_a_command_name() {
-        let mut input = InputState::new();
-        input.set_text("/tre");
-        assert_eq!(input.partial_command(COMMANDS), Some("tree"));
-        input.accept_completion("tree");
-        assert_eq!(input.text(), "/tree");
     }
 }

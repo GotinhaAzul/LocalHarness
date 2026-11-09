@@ -1038,6 +1038,49 @@ async fn read_then_edit_records_fs_change() {
 }
 
 #[tokio::test]
+async fn mentioned_files_reach_the_model_and_count_as_read() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.rs"), "fn main() {}\n").unwrap();
+    let harness = harness(
+        dir.path(),
+        vec![
+            // No `read` first: the mention satisfies read-before-edit.
+            tool_script("edit", json!({"path":"a.rs","old":"main","new":"run"})),
+            text_script("done"),
+        ],
+        &["read", "edit"],
+    );
+    let (outcome, events) = run(&harness, "rename main in @a.rs.").await;
+    assert_eq!(outcome.status, TurnStatus::Done);
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("a.rs")).unwrap(),
+        "fn run() {}\n"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::Notice(text) if text == "attached a.rs"))
+    );
+
+    // The model saw the file; the transcript keeps the prompt as typed.
+    let requests = harness.provider.requests.lock().unwrap();
+    let user = requests[0]
+        .messages
+        .iter()
+        .find_map(|message| match message {
+            localharness::provider::ChatMessage::User { content } => Some(content.clone()),
+            _ => None,
+        })
+        .expect("user message");
+    assert!(user.contains("<file path=\"a.rs\">"), "{user}");
+    assert!(user.contains("1  fn main() {}"), "{user}");
+    assert_eq!(
+        user_messages(&harness.session),
+        vec!["rename main in @a.rs."]
+    );
+}
+
+#[tokio::test]
 async fn todo_gate_blocks_the_third_mutation() {
     let dir = tempfile::tempdir().unwrap();
     let harness = harness(

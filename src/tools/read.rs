@@ -58,7 +58,7 @@ impl Tool for ReadTool {
     }
 }
 
-fn run(ctx: &ToolContext, args: &Value) -> Result<ToolResult, ToolResult> {
+pub(crate) fn run(ctx: &ToolContext, args: &Value) -> Result<ToolResult, ToolResult> {
     let raw = required_str(args, "path")?;
     let path = ctx.resolve(&raw)?;
     let display = display_path(&ctx.cwd, &path);

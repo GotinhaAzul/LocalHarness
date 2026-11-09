@@ -235,6 +235,7 @@ mod tests {
             parent: parent.map(str::to_string),
             ts: Utc::now(),
             kind: EntryKind::User(UserData {
+                attachments: Vec::new(),
                 content: content.into(),
             }),
         }

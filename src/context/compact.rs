@@ -378,6 +378,7 @@ mod tests {
         let mut session = session(dir.path());
         session
             .append(EntryKind::User(UserData {
+                attachments: Vec::new(),
                 content: "Fix the parser bug and rerun tests".into(),
             }))
             .unwrap();
@@ -421,6 +422,7 @@ mod tests {
         let mut session = session(dir.path());
         session
             .append(EntryKind::User(UserData {
+                attachments: Vec::new(),
                 content: "x ".repeat(500),
             }))
             .unwrap();

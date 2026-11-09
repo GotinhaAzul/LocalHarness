@@ -603,7 +603,7 @@ all three packs.
 | Core | `patch` | Anchor/range edit with recovery diagnostics |
 | Core | `undo` | Revert the last harness change to a file, one step per call |
 | Core | `bash` | Non-interactive command with timeout |
-| Core | `grep` | Regex search with context, gitignore-aware |
+| Core | `grep` | Regex search with context, gitignore-aware (hidden paths only when named) |
 | Core | `glob` | File discovery |
 | Core | `todo` | Plan and task state, verify-gated |
 | Core | `verify` | Run project verification steps |
@@ -1188,7 +1188,20 @@ cursor = "#c0caf5"
   `/sec`, `/trust`, `/export`, `/clear`, `/debug`. `/login` validates and saves
   the endpoint/model/key; `/model` lists endpoint models and switches the
   session.
-- Slash completion shows a filtered popup with descriptions.
+- Slash completion shows a filtered popup with descriptions. `Tab` completes
+  the token at the cursor (`ui/complete.rs`): command names, command
+  arguments (themes, profiles, skills, workflows, sessions, probed models,
+  `/sec` subcommands), and filesystem paths for `@path`, `./`, `~/`, or
+  `/`-containing tokens. A unique match is accepted; an ambiguous one first
+  extends to the shared prefix, then shows a popup that `Tab` accepts from and
+  `Shift+Tab`/`Up`/`Down` move through. Paths are listed only on `Tab`, never
+  while typing. Prompt history persists per project in
+  `prompt_history.jsonl` beside the sessions (not with `--no-session`).
+- `@path` mentions (`agent/mentions.rs`) attach file snapshots to the user
+  entry (`UserData.attachments`), read through the `read` tool so the jail,
+  caps, and read stamp apply. The model sees them after the prompt; the
+  transcript shows the prompt only. At most eight files, within a quarter of
+  the usable prompt.
 - Paste is bracketed and inserted literally. Large pastes are accepted; the
   model sees them as user content.
 

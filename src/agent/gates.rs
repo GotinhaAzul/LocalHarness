@@ -503,6 +503,7 @@ mod tests {
         let mut session = session(dir.path());
         session
             .append(EntryKind::User(UserData {
+                attachments: Vec::new(),
                 content: "old turn".into(),
             }))
             .unwrap();
@@ -513,6 +514,7 @@ mod tests {
             .unwrap();
         session
             .append(EntryKind::User(UserData {
+                attachments: Vec::new(),
                 content: "new turn".into(),
             }))
             .unwrap();

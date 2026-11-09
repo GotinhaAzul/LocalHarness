@@ -149,10 +149,29 @@ or suffix). `/sessions` lists every session for the project.
 | `Esc` | cancel the current stream |
 | `Ctrl+C` | cancel; again to quit |
 | `Ctrl+D` | quit when the input is empty |
-| `Up`/`Down` | history when input is empty, otherwise cursor |
+| `Up`/`Down` | history when input is empty (kept per project across restarts), otherwise cursor |
 | `PgUp`/`PgDn`, `Home`/`End` | scroll transcript |
 | `Ctrl+R` | toggle reasoning |
-| `/` | slash-command completion |
+| `/` | slash-command completion popup |
+| `Tab` / `Shift+Tab` | complete commands, arguments, and paths; move back through choices |
+
+Tab completes whatever sits at the cursor: command names (`/the` → `/theme `),
+their arguments (themes, profiles, skills, workflows, session ids, models,
+`/sec scope add|remove|clear`), and file paths (`@src/ui/in`, `./`, `~/`, or
+any token with a `/`). One match is accepted, several first extend to their
+shared prefix and then open a popup, and Enter on a partial command or argument
+runs the highlighted choice.
+
+### Mentioning files
+
+Write `@path` in a prompt to attach that file: `fix the panic in
+@src/parser.rs`. The file is read through the same path as the `read` tool
+(path jail, binary and size checks, line numbers) and appended to your message
+for the model, so it starts with the code and may `edit` it without another
+`read`. Up to eight files per prompt, within a quarter of the usable context;
+anything skipped is reported in the footer. A mention that names no file, like
+`@someone`, is left as plain text. The transcript and session keep your prompt
+as typed, with the attached snapshots stored alongside it.
 
 Slash commands: `/help /quit /login /model /profile /theme /tree /fork /new
 /resume /sessions /compact /tools /skill /workflow /sec /trust /export /clear

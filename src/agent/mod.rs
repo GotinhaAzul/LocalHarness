@@ -2,6 +2,7 @@
 
 pub mod gates;
 pub mod limits;
+pub mod mentions;
 pub mod output;
 pub mod prompt;
 pub mod repair;

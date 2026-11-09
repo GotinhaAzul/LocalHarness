@@ -52,7 +52,7 @@ pub fn assemble(
             }
             EntryKind::User(user) => {
                 messages.push(ChatMessage::User {
-                    content: user.content.clone(),
+                    content: user.model_content(),
                 });
             }
             EntryKind::Assistant(assistant) => {
@@ -280,6 +280,7 @@ mod tests {
         let mut session = session(dir.path());
         session
             .append(EntryKind::User(UserData {
+                attachments: Vec::new(),
                 content: "read it".into(),
             }))
             .unwrap();
@@ -316,6 +317,7 @@ mod tests {
         let mut session = session(dir.path());
         session
             .append(EntryKind::User(UserData {
+                attachments: Vec::new(),
                 content: "old".into(),
             }))
             .unwrap();
@@ -329,6 +331,7 @@ mod tests {
             .unwrap();
         session
             .append(EntryKind::User(UserData {
+                attachments: Vec::new(),
                 content: "new".into(),
             }))
             .unwrap();
