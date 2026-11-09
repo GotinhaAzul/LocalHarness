@@ -1,6 +1,6 @@
 name = "general-assistance"
-description = "Read-only assistance: answer questions, orient in a repository, read logs and configuration, and summarize with citations, without changing anything"
+description = "Read-only assistance: answer questions, orient in a repository, and summarize with citations, without changing anything or running shell commands"
 profile = "minimal"
 prompt = "prompts/general-assistance.md"
 skills = []
-tools = ["read", "grep", "glob", "bash", "todo", "recall", "thread", "repo_map", "skill"]
+tools = ["read", "grep", "glob", "todo", "recall", "thread", "repo_map", "skill"]

@@ -2114,6 +2114,9 @@ impl App {
             let base = config.profile().clone();
             let derived_name = format!("workflow-{}", sanitize_name(name));
             let mut derived = base;
+            // A workflow's tool list is an allowlist: drop the base profile's
+            // packs so unlisted tools in those packs are not silently enabled.
+            derived.packs.clear();
             derived.tools = workflow.tools.clone();
             derived.description = workflow
                 .description

@@ -102,7 +102,7 @@ deduplicated and sorted.
 | --- | --- |
 | `api-security` | Authorization-aware API review: surface and defaults, input handling and authorization, bounded PoV verification, scoped fix and regression |
 | `coding` | Changing an existing repository: orient, plan, small edits, narrow verification, diff review, and a short report |
-| `general-assistance` | Read-only assistance: answer questions, orient in a repository, read logs and configuration, and summarize with citations |
+| `general-assistance` | Read-only assistance: answer questions, orient in a repository, and summarize with citations, with no write or shell tools |
 | `native-code-review` | Native C/C++ and kernel memory-safety review: parser surface, length/free triage, bounded sanitizer proof, scoped fix and regression |
 | `security-blue` | Defensive work: evidence-first triage, validated Sigma detections, hardening, secure code review, and supply-chain checks |
 | `security-red` | Authorized offensive testing: scope, reconnaissance into a surface map, hypotheses, bounded proof, evidence-backed findings, and a report |
@@ -114,12 +114,14 @@ names a bug class — so a 27B–35B model does not start with every reference i
 context. `coding` and `general-assistance` ship without a skill and rely on the
 repository's own instructions.
 
-Every workflow carries an explicit tool allowlist. The security workflows
-include `finding`, `verify`, `test`, `review`, `surface`, `evidence`, `bash`,
-and `bg`; their prompts require bounded, non-destructive validation: the
-reproduction is the proof, and destructive or third-party testing stops and
-asks. `general-assistance` has no write, edit, or project-check tools by
-design.
+Every workflow carries an explicit tool allowlist. The list is exact: starting a
+workflow derives a profile that drops the base profile's packs, so a tool not in
+the list stays unavailable even when its pack is part of the base profile. The
+security workflows include `finding`, `verify`, `test`, `review`, `surface`,
+`evidence`, `bash`, and `bg`; their prompts require bounded, non-destructive
+validation: the reproduction is the proof, and destructive or third-party
+testing stops and asks. `general-assistance` has no write, edit, shell, or
+project-check tools by design.
 
 `/workflow <name>` starts a new branch, records a checkout, applies the profile
 (deriving a workflow profile when `tools` is set), appends the workflow prompt as

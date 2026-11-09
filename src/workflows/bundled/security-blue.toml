@@ -3,4 +3,4 @@ description = "Defensive security: evidence-first triage, detection engineering 
 profile = "security"
 prompt = "prompts/security-blue.md"
 skills = []
-tools = ["read", "write", "edit", "patch", "grep", "glob", "bash", "bg", "repo_map", "todo", "verify", "recall", "thread", "test", "review", "detect", "iocs", "evidence", "finding", "skill"]
+tools = ["read", "write", "edit", "patch", "undo", "grep", "glob", "bash", "bg", "repo_map", "todo", "verify", "recall", "thread", "test", "review", "detect", "iocs", "evidence", "finding", "skill"]

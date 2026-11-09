@@ -3,4 +3,4 @@ description = "Authorized offensive testing: scope and rules of engagement, reco
 profile = "security"
 prompt = "prompts/security-red.md"
 skills = []
-tools = ["read", "write", "edit", "patch", "grep", "glob", "bash", "bg", "repo_map", "todo", "verify", "recall", "thread", "test", "review", "surface", "evidence", "attack_path", "finding", "iocs", "skill"]
+tools = ["read", "write", "edit", "patch", "undo", "grep", "glob", "bash", "bg", "repo_map", "todo", "verify", "recall", "thread", "test", "review", "surface", "evidence", "attack_path", "finding", "iocs", "skill"]
