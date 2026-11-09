@@ -66,6 +66,31 @@ pub fn render(engagement: &Engagement) -> String {
             if let Some(remediation) = &finding.remediation {
                 out.push_str(&format!("- Remediation: {remediation}\n"));
             }
+            if let Some(verification) = &finding.verification {
+                let passed = verification
+                    .assertions
+                    .iter()
+                    .filter(|assertion| assertion.passed)
+                    .count();
+                out.push_str(&format!(
+                    "- Verification: {} ({}) · {passed}/{} assertions",
+                    verification.status.as_str(),
+                    verification.verdict.as_str(),
+                    verification.assertions.len()
+                ));
+                if !verification.evidence.is_empty() {
+                    out.push_str(&format!(" · evidence {}", verification.evidence.join(", ")));
+                }
+                out.push('\n');
+            } else if !finding.poc_steps.is_empty() {
+                out.push_str(&format!(
+                    "- PoC: {} step(s), not replayed\n",
+                    finding.poc_steps.len()
+                ));
+            }
+            if let Some(confidence) = finding.confidence {
+                out.push_str(&format!("- Confidence: {confidence:.2}\n"));
+            }
             if finding.status == Status::Open {
                 out.push_str("- Status: open\n");
             }

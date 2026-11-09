@@ -261,7 +261,7 @@ fn cancelled_result() -> ToolResult {
     }
 }
 
-fn spawn_reader<R>(reader: Option<R>, captured: Arc<AtomicUsize>) -> JoinHandle<Vec<u8>>
+pub(crate) fn spawn_reader<R>(reader: Option<R>, captured: Arc<AtomicUsize>) -> JoinHandle<Vec<u8>>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
@@ -289,7 +289,7 @@ where
 }
 
 /// Await a reader, but never block on a pipe held open by a stray grandchild.
-async fn collect(mut handle: JoinHandle<Vec<u8>>) -> Vec<u8> {
+pub(crate) async fn collect(mut handle: JoinHandle<Vec<u8>>) -> Vec<u8> {
     tokio::select! {
         result = &mut handle => result.unwrap_or_default(),
         _ = tokio::time::sleep(TERM_GRACE) => {
@@ -328,7 +328,7 @@ fn render_preview(stdout: &[u8], stderr: &[u8]) -> String {
 }
 
 /// Take at most `max` bytes without splitting a UTF-8 code point.
-fn take_bytes(text: &str, max: usize) -> (String, bool) {
+pub(crate) fn take_bytes(text: &str, max: usize) -> (String, bool) {
     if text.len() <= max {
         return (text.to_string(), false);
     }

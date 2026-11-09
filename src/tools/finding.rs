@@ -4,16 +4,25 @@ use std::io::Write as _;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::sync::MutexGuard;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::Utc;
 use serde_json::{Value, json};
 
+use crate::security::evidence::NewEvidence;
 use crate::security::findings::{MAX_EVIDENCE_CHARS, clip};
+use crate::security::verify::{
+    MinimizeOptions, PocStep, ReplayOptions, VerifyStatus, execute_steps, minimize_steps,
+    validate_steps,
+};
 use crate::security::{
     EvidenceRef, FindingPatch, NewFinding, SecurityState, Severity, Status, render_report,
 };
-use crate::tools::{Tool, ToolContext, ToolPack, ToolResult, display_path, optional_str};
+use crate::tools::{
+    Tool, ToolContext, ToolPack, ToolResult, display_path, optional_bool, optional_str,
+    optional_u64,
+};
 
 /// Cap on the report Markdown echoed back in the tool result.
 const REPORT_CHARS: usize = 18_000;
@@ -105,6 +114,8 @@ impl FindingTool {
             remediation: non_empty(args, "remediation"),
             session_id,
             entry_id,
+            poc_steps: parse_steps(args)?.unwrap_or_default(),
+            confidence: parse_confidence(args)?,
         };
         let finding = engagement
             .add(new)
@@ -162,10 +173,18 @@ impl FindingTool {
             patch.remediation = Some(remediation);
             changed.push("remediation");
         }
+        if let Some(steps) = parse_steps(args)? {
+            patch.poc_steps = Some(steps);
+            changed.push("poc_steps");
+        }
+        if let Some(confidence) = parse_confidence(args)? {
+            patch.confidence = Some(confidence);
+            changed.push("confidence");
+        }
 
         if changed.is_empty() {
             return Err(arg_err(
-                "nothing to update; pass at least one of title, severity, status, target, evidence, impact, or remediation",
+                "nothing to update; pass at least one of title, severity, status, target, evidence, impact, remediation, poc_steps, or confidence",
             ));
         }
 
@@ -191,6 +210,233 @@ impl FindingTool {
             finding.title
         ))
         .with_details(json!({"finding": to_json(&finding), "changed": changed})))
+    }
+
+    async fn verify(ctx: &ToolContext, args: &Value) -> Result<ToolResult, ToolResult> {
+        let id = required(args, "id")?;
+        if let Some(runner) = optional_str(args, "runner")
+            && runner != "local"
+        {
+            return Err(arg_err(
+                "only runner=local is implemented; container and QEMU replay are not part of this build",
+            ));
+        }
+        let steps_arg = parse_steps(args)?;
+        let minimize = optional_bool(args, "minimize").unwrap_or(false);
+        let max_oracle_calls = optional_u64(args, "max_oracle_calls")
+            .unwrap_or(20)
+            .clamp(1, 50) as usize;
+        let timeout = Duration::from_secs(
+            optional_u64(args, "timeout_secs")
+                .unwrap_or(30)
+                .clamp(1, 300),
+        );
+        let session_id = ctx.session.lock().ok().map(|session| session.id.clone());
+
+        let (target, mut steps, engagement_dir, engagement_name, scope) = {
+            let mut state = lock_security(ctx)?;
+            let engagement_name = state.engagement_name.clone();
+            let scope = state.scope.clone();
+            let engagement = state
+                .ensure_engagement(&ctx.paths)
+                .map_err(|err| security_io(&ctx.paths, err))?;
+            if let Some(steps) = steps_arg {
+                engagement
+                    .update(
+                        &id,
+                        FindingPatch {
+                            poc_steps: Some(steps),
+                            ..FindingPatch::default()
+                        },
+                    )
+                    .map_err(|msg| ToolResult::err("FINDING_ARGS", msg))?;
+            }
+            let finding = engagement
+                .get(&id)
+                .ok_or_else(|| not_found(&id, &engagement_name))?
+                .clone();
+            (
+                finding.target,
+                finding.poc_steps,
+                engagement.dir.clone(),
+                engagement_name,
+                scope,
+            )
+        };
+        if steps.is_empty() {
+            return Err(arg_err(format!(
+                "finding {engagement_name}/{id} has no poc_steps; pass poc_steps with shell/http actions and at least one expect assertion"
+            )));
+        }
+        validate_steps(&steps).map_err(arg_err)?;
+
+        let base = engagement_dir
+            .join("poc")
+            .join(format!("{id}-{}", Utc::now().format("%Y%m%dT%H%M%S%3fZ")));
+        std::fs::create_dir_all(&base).map_err(|err| {
+            ToolResult::err(
+                "POC_RUN",
+                format!("cannot create PoC run directory {}: {err}", base.display()),
+            )
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700));
+        }
+
+        let original_len = steps.len();
+        let mut outcome = execute_steps(
+            &steps,
+            &ReplayOptions {
+                run_dir: base.join("run"),
+                scope: scope.clone(),
+                timeout,
+                cancel: ctx.cancel.clone(),
+                target: target.clone(),
+            },
+        )
+        .await;
+        outcome.verification.finding_id = id.clone();
+
+        let mut minimization = None;
+        if minimize && outcome.verification.status == VerifyStatus::Reproduced && steps.len() > 1 {
+            let (minimized, calls, one_minimal) = minimize_steps(
+                &steps,
+                &MinimizeOptions {
+                    base_dir: base.join("minimize"),
+                    scope: scope.clone(),
+                    timeout,
+                    cancel: ctx.cancel.clone(),
+                    target: target.clone(),
+                    max_oracle_calls,
+                },
+            )
+            .await;
+            if minimized.len() < steps.len() {
+                let final_outcome = execute_steps(
+                    &minimized,
+                    &ReplayOptions {
+                        run_dir: base.join("final"),
+                        scope: scope.clone(),
+                        timeout,
+                        cancel: ctx.cancel.clone(),
+                        target: target.clone(),
+                    },
+                )
+                .await;
+                if final_outcome.verification.status == VerifyStatus::Reproduced {
+                    steps = minimized;
+                    outcome = final_outcome;
+                    outcome.verification.finding_id = id.clone();
+                    minimization = Some((original_len, steps.len(), calls, one_minimal));
+                } else {
+                    minimization = Some((original_len, original_len, calls, one_minimal));
+                }
+            } else {
+                minimization = Some((original_len, original_len, calls, one_minimal));
+            }
+        }
+
+        let records = std::mem::take(&mut outcome.records);
+        let mut verification = outcome.verification;
+        let mut evidence_ids = Vec::new();
+        let mut evidence_error = None;
+        let finding = {
+            let mut state = lock_security(ctx)?;
+            let engagement = state
+                .ensure_engagement(&ctx.paths)
+                .map_err(|err| security_io(&ctx.paths, err))?;
+            for record in &records {
+                let new = NewEvidence {
+                    tool: "poc".into(),
+                    session: session_id.clone(),
+                    entry: None,
+                    target: record.target.clone(),
+                    command: record.command.clone(),
+                    started: record.started,
+                    finished: record.finished,
+                    duration_ms: record.duration_ms,
+                    exit_code: record.exit_code.map(i64::from),
+                    timed_out: record.timed_out,
+                    cancelled: record.cancelled,
+                    is_error: record.is_error,
+                    output: record.output.clone(),
+                    summary: Some(record.summary.clone()),
+                };
+                match engagement.evidence.add(new) {
+                    Ok(evidence) => evidence_ids.push(evidence.id),
+                    Err(err) => {
+                        evidence_error = Some(err.to_string());
+                        break;
+                    }
+                }
+            }
+            verification.evidence = evidence_ids.clone();
+            if let Some(error) = &evidence_error {
+                verification
+                    .summary
+                    .push_str(&format!("; evidence write stopped: {error}"));
+            }
+            engagement
+                .record_verification(&id, verification.clone())
+                .map_err(|msg| ToolResult::err("FINDING_ARGS", msg))?
+        };
+
+        let _ = std::fs::remove_dir_all(&base);
+
+        let passed = verification
+            .assertions
+            .iter()
+            .filter(|assertion| assertion.passed)
+            .count();
+        let mut content = format!(
+            "verify {id}: {} ({}) · {}/{} assertions · {} command(s)\n",
+            verification.status.as_str(),
+            verification.verdict.as_str(),
+            passed,
+            verification.assertions.len(),
+            verification.commands.len()
+        );
+        content.push_str(&format!("{}: {}\n", finding.title, finding.target));
+        if let Some((before, after, calls, one_minimal)) = minimization {
+            content.push_str(&format!(
+                "minimize: {before} -> {after} steps, {calls} oracle run(s){}\n",
+                if one_minimal {
+                    ", 1-minimal"
+                } else {
+                    ", budget hit"
+                }
+            ));
+        }
+        if !evidence_ids.is_empty() {
+            content.push_str(&format!("evidence: {}\n", evidence_ids.join(", ")));
+        }
+        content.push_str(&verification.summary);
+        content.push('\n');
+        match verification.status {
+            VerifyStatus::Reproduced => content.push_str(
+                "next: `finding report` includes the verification; after a scoped fix and a passing replay, set status=fixed.",
+            ),
+            VerifyStatus::NotReproduced => content.push_str(
+                "finding kept and status unchanged: a failed replay is not proof the bug is absent. Inspect the assertions and evidence, then adapt the PoC or target.",
+            ),
+            VerifyStatus::Error | VerifyStatus::Skipped => content.push_str(
+                "inconclusive: the verifier did not decide the finding and it is kept. Fix the scope or runner problem and retry.",
+            ),
+        }
+
+        Ok(ToolResult::ok(content).with_details(json!({
+            "finding": to_json(&finding),
+            "verification": verification,
+            "evidence": evidence_ids,
+            "minimize": minimization.map(|(before, after, calls, one_minimal)| json!({
+                "before": before,
+                "after": after,
+                "oracle_calls": calls,
+                "one_minimal": one_minimal,
+            })),
+        })))
     }
 
     fn list(ctx: &ToolContext) -> Result<ToolResult, ToolResult> {
@@ -349,6 +595,35 @@ fn non_empty(args: &Value, key: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+fn parse_confidence(args: &Value) -> Result<Option<f64>, ToolResult> {
+    let Some(value) = args.get("confidence") else {
+        return Ok(None);
+    };
+    let Some(value) = value.as_f64() else {
+        return Err(arg_err("confidence must be a number between 0 and 1"));
+    };
+    if !(0.0..=1.0).contains(&value) || !value.is_finite() {
+        return Err(arg_err("confidence must be a number between 0 and 1"));
+    }
+    Ok(Some(value))
+}
+
+fn parse_steps(args: &Value) -> Result<Option<Vec<PocStep>>, ToolResult> {
+    let Some(value) = args.get("poc_steps") else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let steps: Vec<PocStep> = serde_json::from_value(value.clone()).map_err(|err| {
+        arg_err(format!(
+            "invalid poc_steps: {err}; each step needs id and action, for example {{\"id\":\"probe\",\"action\":{{\"type\":\"shell\",\"cmd\":\"true\"}},\"expect\":{{\"type\":\"exit-zero\"}}}}"
+        ))
+    })?;
+    validate_steps(&steps).map_err(arg_err)?;
+    Ok(Some(steps))
+}
+
 fn explicit_ref(args: &Value) -> Option<EvidenceRef> {
     let evidence = optional_str(args, "evidence_id");
     let session = optional_str(args, "session");
@@ -423,6 +698,108 @@ fn to_json(finding: &crate::security::Finding) -> Value {
     serde_json::to_value(finding).unwrap_or(Value::Null)
 }
 
+fn poc_action_schema() -> Value {
+    json!({
+        "oneOf": [
+            {
+                "type": "object",
+                "properties": {
+                    "type": {"const": "shell"},
+                    "cmd": {"type": "string", "description": "Run with bash -c in the isolated PoC run directory."},
+                    "cwd": {"type": "string", "description": "Optional relative subdirectory."}
+                },
+                "required": ["type", "cmd"],
+                "additionalProperties": false
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "type": {"const": "http"},
+                    "method": {"type": "string", "enum": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]},
+                    "url": {"type": "string", "description": "http(s) URL; the host must be in engagement scope."},
+                    "headers": {"type": "object", "additionalProperties": {"type": "string"}},
+                    "body": {"type": "string"}
+                },
+                "required": ["type", "method", "url"],
+                "additionalProperties": false
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "type": {"const": "note"},
+                    "text": {"type": "string"}
+                },
+                "required": ["type", "text"],
+                "additionalProperties": false
+            }
+        ]
+    })
+}
+
+fn poc_expect_schema() -> Value {
+    json!({
+        "oneOf": [
+            {
+                "type": "object",
+                "properties": {"type": {"const": "exit-zero"}},
+                "required": ["type"],
+                "additionalProperties": false
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "type": {"const": "http-status"},
+                    "status": {"oneOf": [{"type": "integer"}, {"type": "array", "items": {"type": "integer"}}]}
+                },
+                "required": ["type", "status"],
+                "additionalProperties": false
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "type": {"const": "body-contains"},
+                    "text": {"type": "string"}
+                },
+                "required": ["type", "text"],
+                "additionalProperties": false
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "type": {"const": "body-matches"},
+                    "pattern": {"type": "string"}
+                },
+                "required": ["type", "pattern"],
+                "additionalProperties": false
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "type": {"const": "file-exists"},
+                    "path": {"type": "string", "description": "Relative path inside the PoC run directory."}
+                },
+                "required": ["type", "path"],
+                "additionalProperties": false
+            }
+        ]
+    })
+}
+
+fn poc_step_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "id": {"type": "string", "description": "1-64 chars of letters, digits, '_' or '-'"},
+            "kind": {"type": "string", "enum": ["setup", "auth", "prerequisite", "exploit", "verify"]},
+            "summary": {"type": "string"},
+            "action": poc_action_schema(),
+            "expect": poc_expect_schema()
+        },
+        "required": ["id", "action"],
+        "additionalProperties": false
+    })
+}
+
 #[async_trait]
 impl Tool for FindingTool {
     fn name(&self) -> &'static str {
@@ -430,14 +807,14 @@ impl Tool for FindingTool {
     }
 
     fn description(&self) -> &'static str {
-        "Engagement findings ledger: add, update, list, report."
+        "Engagement findings ledger: add, update, list, report, verify. `verify` replays a finding's poc_steps and records a deterministic verdict."
     }
 
     fn schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "action": {"type": "string", "enum": ["add", "update", "list", "report"]},
+                "action": {"type": "string", "enum": ["add", "update", "list", "report", "verify"]},
                 "id": {"type": "string", "description": "finding id from `list`, e.g. f1"},
                 "title": {"type": "string", "description": "add: one-line summary of the issue."},
                 "severity": {"type": "string", "enum": ["critical", "high", "medium", "low", "info"]},
@@ -449,7 +826,18 @@ impl Tool for FindingTool {
                 "remediation": {"type": "string", "description": "How to fix it."},
                 "session": {"type": "string", "description": "session id for the evidence ref"},
                 "entry": {"type": "string", "description": "session entry id for the evidence ref"},
-                "artifact": {"type": "string", "description": "artifact id holding the evidence"}
+                "artifact": {"type": "string", "description": "artifact id holding the evidence"},
+                "confidence": {"type": "number", "minimum": 0, "maximum": 1, "description": "Model confidence; raised to 0.6 when poc_steps exist and 0.8 when a verifiable assertion exists."},
+                "poc_steps": {
+                    "type": "array",
+                    "maxItems": 50,
+                    "description": "Deterministic reproduction steps. Add at least one expect assertion.",
+                    "items": poc_step_schema()
+                },
+                "minimize": {"type": "boolean", "description": "verify: reduce a reproducing step graph to a 1-minimal subset."},
+                "max_oracle_calls": {"type": "integer", "minimum": 1, "maximum": 50, "description": "verify: minimization replay budget (default 20)."},
+                "timeout_secs": {"type": "integer", "minimum": 1, "maximum": 300, "description": "verify: per-step timeout (default 30)."},
+                "runner": {"type": "string", "enum": ["local"], "description": "verify: only the local runner is implemented."}
             },
             "required": ["action"],
             "additionalProperties": false
@@ -469,7 +857,7 @@ impl Tool for FindingTool {
             Some(action) => action,
             None => {
                 return arg_err(
-                    "missing \"action\"; pass {\"action\":\"add\"|\"update\"|\"list\"|\"report\"}",
+                    "missing \"action\"; pass {\"action\":\"add\"|\"update\"|\"list\"|\"report\"|\"verify\"}",
                 );
             }
         };
@@ -478,8 +866,9 @@ impl Tool for FindingTool {
             "update" => Self::update(ctx, &args),
             "list" => Self::list(ctx),
             "report" => Self::report(ctx),
+            "verify" => Self::verify(ctx, &args).await,
             other => Err(arg_err(format!(
-                "unknown action {other:?}; use add, update, list, or report"
+                "unknown action {other:?}; use add, update, list, report, or verify"
             ))),
         };
         match outcome {
@@ -761,5 +1150,198 @@ mod tests {
         let reported = FindingTool.call(&ctx, json!({"action": "report"})).await;
         assert!(!reported.is_error);
         assert!(reported.content.contains("no findings recorded"));
+    }
+
+    #[tokio::test]
+    async fn verify_replays_shell_steps_and_records_confidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(dir.path());
+        let tool = FindingTool;
+        let added = tool
+            .call(
+                &ctx,
+                json!({
+                    "action": "add",
+                    "title": "marker injection",
+                    "severity": "high",
+                    "target": "local fixture",
+                    "evidence": "the probe prints the canary",
+                    "poc_steps": [{
+                        "id": "probe",
+                        "kind": "verify",
+                        "action": {"type": "shell", "cmd": "printf 'ZERO-INJ-OK'"},
+                        "expect": {"type": "body-contains", "text": "ZERO-INJ-OK"}
+                    }]
+                }),
+            )
+            .await;
+        assert!(!added.is_error, "{}", added.content);
+
+        let verified = tool
+            .call(&ctx, json!({"action": "verify", "id": "f1"}))
+            .await;
+        assert!(!verified.is_error, "{}", verified.content);
+        assert!(
+            verified.content.contains("reproduced"),
+            "{}",
+            verified.content
+        );
+        let details = verified.details.as_ref().expect("details");
+        assert_eq!(details["verification"]["status"], "reproduced");
+        assert_eq!(details["verification"]["verdict"], "confirmed");
+        assert_eq!(details["evidence"].as_array().unwrap().len(), 1);
+
+        let state = ctx.security.lock().unwrap();
+        let finding = &state.engagement.as_ref().unwrap().findings[0];
+        assert_eq!(
+            finding.verification.as_ref().unwrap().status,
+            VerifyStatus::Reproduced
+        );
+        assert_eq!(finding.verification.as_ref().unwrap().evidence, vec!["e1"]);
+        assert!(finding.confidence.unwrap() >= 0.8);
+        assert_eq!(finding.status, Status::Open);
+    }
+
+    #[tokio::test]
+    async fn verify_without_steps_is_prescriptive() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(dir.path());
+        let tool = FindingTool;
+        tool.call(
+            &ctx,
+            json!({
+                "action": "add",
+                "title": "prose only",
+                "severity": "low",
+                "target": "local",
+                "evidence": "an observation"
+            }),
+        )
+        .await;
+        let verified = tool
+            .call(&ctx, json!({"action": "verify", "id": "f1"}))
+            .await;
+        assert!(verified.is_error);
+        assert!(
+            verified.content.contains("no poc_steps"),
+            "{}",
+            verified.content
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_replay_rejects_without_closing_the_finding() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(dir.path());
+        let tool = FindingTool;
+        tool.call(
+            &ctx,
+            json!({
+                "action": "add",
+                "title": "flaky proof",
+                "severity": "medium",
+                "target": "local",
+                "evidence": "exit 1",
+                "poc_steps": [{
+                    "id": "probe",
+                    "action": {"type": "shell", "cmd": "exit 1"},
+                    "expect": {"type": "exit-zero"}
+                }]
+            }),
+        )
+        .await;
+        let verified = tool
+            .call(&ctx, json!({"action": "verify", "id": "f1"}))
+            .await;
+        assert!(!verified.is_error, "{}", verified.content);
+        assert!(
+            verified.content.contains("not_reproduced"),
+            "{}",
+            verified.content
+        );
+        let state = ctx.security.lock().unwrap();
+        let finding = &state.engagement.as_ref().unwrap().findings[0];
+        assert_eq!(finding.status, Status::Open);
+        assert_eq!(
+            finding.verification.as_ref().unwrap().verdict,
+            crate::security::verify::VerifyVerdict::Rejected
+        );
+    }
+
+    #[tokio::test]
+    async fn http_replay_rejects_an_unscoped_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(dir.path());
+        let tool = FindingTool;
+        tool.call(
+            &ctx,
+            json!({
+                "action": "add",
+                "title": "unscoped http",
+                "severity": "low",
+                "target": "http://127.0.0.1:1/",
+                "evidence": "request",
+                "poc_steps": [{
+                    "id": "http",
+                    "action": {"type": "http", "method": "GET", "url": "http://127.0.0.1:1/"},
+                    "expect": {"type": "http-status", "status": 200}
+                }]
+            }),
+        )
+        .await;
+        let verified = tool
+            .call(&ctx, json!({"action": "verify", "id": "f1"}))
+            .await;
+        assert!(!verified.is_error, "{}", verified.content);
+        assert!(
+            verified.content.contains("inconclusive"),
+            "{}",
+            verified.content
+        );
+        assert!(
+            verified.content.contains("not in the engagement scope"),
+            "{}",
+            verified.content
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_minimizes_a_reproducing_step_graph() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(dir.path());
+        let tool = FindingTool;
+        tool.call(
+            &ctx,
+            json!({
+                "action": "add",
+                "title": "minimize me",
+                "severity": "medium",
+                "target": "local",
+                "evidence": "three steps",
+                "poc_steps": [
+                    {"id": "setup", "action": {"type": "shell", "cmd": "printf setup"}, "expect": {"type": "exit-zero"}},
+                    {"id": "probe", "action": {"type": "shell", "cmd": "printf 'ZERO-INJ-OK'"}, "expect": {"type": "body-contains", "text": "ZERO-INJ-OK"}},
+                    {"id": "noise", "action": {"type": "shell", "cmd": "true"}, "expect": {"type": "exit-zero"}}
+                ]
+            }),
+        )
+        .await;
+        let verified = tool
+            .call(
+                &ctx,
+                json!({"action": "verify", "id": "f1", "minimize": true, "max_oracle_calls": 20}),
+            )
+            .await;
+        assert!(!verified.is_error, "{}", verified.content);
+        assert!(
+            verified.content.contains("minimize:"),
+            "{}",
+            verified.content
+        );
+        let details = verified.details.as_ref().expect("details");
+        assert!(
+            details["minimize"]["after"].as_u64().unwrap()
+                < details["minimize"]["before"].as_u64().unwrap()
+        );
     }
 }

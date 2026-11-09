@@ -17,6 +17,7 @@ pub mod session;
 pub mod skills;
 pub mod tools;
 pub mod ui;
+pub mod workflows;
 
 pub use agent::{Core, run_turn};
 pub use config::Config;

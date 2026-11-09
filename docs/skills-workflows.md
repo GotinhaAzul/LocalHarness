@@ -47,8 +47,24 @@ every reference to the conversation at once.
 References are the other `.md` and `.txt` files in the skill directory (up to
 three levels deep, symlinks ignored), named by relative path, e.g.
 `references/rollback.md`. The model can ask for `references/rollback.md`,
-`rollback.md`, or `rollback`. Bundled `security-red` and `security-blue` embed
-theirs in the binary.
+`rollback.md`, or `rollback`. Bundled `security-red`, `security-blue`, and
+`security-methods` embed theirs in the binary.
+
+`security-methods` is the class-specific method library. It has exactly six
+references, chosen by bug class:
+
+| Reference | Classes |
+| --- | --- |
+| `native-memory` | C/C++, kernel, binary parser memory safety |
+| `web-injection` | Command injection, SQLi (including identifier injection), path traversal, crypto misuse, races |
+| `auth-and-access` | JWT, AD/Entra attack paths, broken-assumption mining |
+| `ssrf-and-request-smuggling` | SSRF guard bypass, HTTP request smuggling |
+| `deserialization-and-prototype-pollution` | Deserialization chains, prototype pollution, HTTP/spec differentials |
+| `llm-application-security` | Prompt injection, RAG poisoning, excessive agency, insecure output handling |
+
+It does not grant scope: authorization comes from `security-red` and the `/sec`
+scope gate, and a finding is confirmed only by a reproduced
+`finding {"action":"verify"}` result.
 
 Skills are data: they cannot grant security scope, load tools, or bypass a
 guard. Project skills load only in trusted sessions, for the tool and for
@@ -71,6 +87,27 @@ Paths:
 
 - Global: `~/.config/localharness/workflows/<name>.toml`
 - Project: `.harness/workflows/<name>.toml` (requires trust)
+- Bundled: compiled into the binary
+
+Resolution order is global, then trusted project, then bundled. A global file
+shadows a project file of the same name; a project file shadows the bundled
+workflow. Project files still require a trusted session — an untrusted project
+workflow produces the trust error instead of silently falling back to a bundled
+workflow. `/workflow` with no argument lists every name from all three sources,
+deduplicated and sorted.
+
+## Bundled workflows
+
+| Name | Purpose |
+| --- | --- |
+| `api-security` | Authorization-aware API review: surface and defaults, input handling and authorization, bounded PoV verification, scoped fix and regression |
+| `native-code-review` | Native C/C++ and kernel memory-safety review: parser surface, length/free triage, bounded sanitizer proof, scoped fix and regression |
+
+Both use the `security` profile, load `security-red` and `security-methods`, and
+carry an explicit tool allowlist including `finding`, `verify`, `test`,
+`review`, `surface`, `evidence`, `bash`, and `bg`. Their prompts require
+bounded, non-destructive validation: the reproduction is the proof, and
+destructive or third-party testing stops and asks.
 
 `/workflow <name>` starts a new branch, records a checkout, applies the profile
 (deriving a workflow profile when `tools` is set), appends the workflow prompt as
@@ -81,3 +118,23 @@ gates still apply.
 The prompt path is resolved relative to the workflow file. Missing prompts,
 unknown profiles, and untrusted project workflows produce prescriptive errors
 and leave the session unchanged.
+
+## Installable copies
+
+Every bundled workflow also ships as a valid on-disk copy under
+`src/workflows/bundled/`:
+
+```text
+src/workflows/bundled/api-security.toml
+src/workflows/bundled/native-code-review.toml
+src/workflows/bundled/prompts/api-security.md
+src/workflows/bundled/prompts/native-code-review.md
+```
+
+The TOML files are ordinary installable workflows: `prompt` is a path relative
+to the TOML, and copying the TOML plus its prompt directory into
+`~/.config/localharness/workflows/` (or `.harness/workflows/`) installs it.
+Editing the installed copy does not change the compiled-in workflow unless you
+rebuild with an updated source file. Workflow tests check that every TOML
+parses, every prompt exists and is nonempty, and every skill and tool name
+resolves in the crate registries.

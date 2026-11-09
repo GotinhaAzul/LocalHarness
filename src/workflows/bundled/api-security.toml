@@ -1,0 +1,6 @@
+name = "api-security"
+description = "Authorization-aware API security review: surface, defaults, input handling, bounded PoV verification, and scoped fix"
+profile = "security"
+prompt = "prompts/api-security.md"
+skills = ["security-red", "security-methods"]
+tools = ["read", "write", "edit", "grep", "glob", "bash", "bg", "finding", "iocs", "verify", "test", "review", "surface", "evidence"]

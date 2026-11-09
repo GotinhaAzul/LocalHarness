@@ -590,6 +590,9 @@ mod tests {
             updated: Utc::now(),
             session_id: None,
             entry_id: None,
+            poc_steps: Vec::new(),
+            verification: None,
+            confidence: None,
         }
     }
 

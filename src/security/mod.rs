@@ -10,6 +10,7 @@ pub mod graph;
 pub mod report;
 pub mod scope;
 pub mod surface;
+pub mod verify;
 
 use std::path::{Path, PathBuf};
 

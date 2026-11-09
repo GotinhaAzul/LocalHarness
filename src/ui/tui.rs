@@ -41,6 +41,7 @@ use crate::ui::widgets::{
     FooterData, HeaderData, ModalData, ModelsModal, SessionItem, SessionsModal, ToolItem,
     ToolsModal, clip_end,
 };
+use crate::workflows::{self, WorkflowSpec};
 
 /// Slash commands with one-line descriptions for the completion popup.
 pub const COMMANDS: &[(&str, &str)] = &[
@@ -2041,8 +2042,14 @@ impl App {
             .project_dir()
             .join("workflows")
             .join(format!("{name}.toml"));
-        let path = if global.is_file() {
-            global
+        let workflow: WorkflowSpec = if global.is_file() {
+            match load_workflow_file(&global) {
+                Ok(workflow) => workflow,
+                Err(message) => {
+                    self.set_notice(message, Role::Error);
+                    return;
+                }
+            }
         } else if project.is_file() {
             if !trust {
                 self.set_notice(
@@ -2051,7 +2058,15 @@ impl App {
                 );
                 return;
             }
-            project
+            match load_workflow_file(&project) {
+                Ok(workflow) => workflow,
+                Err(message) => {
+                    self.set_notice(message, Role::Error);
+                    return;
+                }
+            }
+        } else if let Some(bundled) = workflows::get(name) {
+            bundled.clone()
         } else {
             let names = available_workflows(&paths, trust);
             self.set_notice(
@@ -2066,53 +2081,6 @@ impl App {
                 Role::Error,
             );
             return;
-        };
-        let raw = match std::fs::read_to_string(&path) {
-            Ok(raw) => raw,
-            Err(error) => {
-                self.set_notice(
-                    format!("cannot read {}: {error}", path.display()),
-                    Role::Error,
-                );
-                return;
-            }
-        };
-        let workflow: WorkflowFile = match toml::from_str(&raw) {
-            Ok(workflow) => workflow,
-            Err(error) => {
-                self.set_notice(
-                    format!("invalid workflow {}: {error}", path.display()),
-                    Role::Error,
-                );
-                return;
-            }
-        };
-        let Some(prompt_ref) = workflow.prompt.as_deref() else {
-            self.set_notice(
-                format!("workflow {} has no prompt file", path.display()),
-                Role::Error,
-            );
-            return;
-        };
-        let prompt_path = if Path::new(prompt_ref).is_absolute() {
-            PathBuf::from(prompt_ref)
-        } else {
-            path.parent()
-                .unwrap_or_else(|| Path::new("."))
-                .join(prompt_ref)
-        };
-        let prompt = match std::fs::read_to_string(&prompt_path) {
-            Ok(prompt) => prompt,
-            Err(error) => {
-                self.set_notice(
-                    format!(
-                        "cannot read workflow prompt {}: {error}",
-                        prompt_path.display()
-                    ),
-                    Role::Error,
-                );
-                return;
-            }
         };
         let skills = SkillIndex::load(&paths, trust);
         for skill in &workflow.skills {
@@ -2147,7 +2115,10 @@ impl App {
             let derived_name = format!("workflow-{}", sanitize_name(name));
             let mut derived = base;
             derived.tools = workflow.tools.clone();
-            derived.description = workflow.description.clone().or(workflow.name.clone());
+            derived.description = workflow
+                .description
+                .clone()
+                .or_else(|| Some(workflow.name.clone()));
             config.profiles.insert(derived_name.clone(), derived);
             config.profile_name = derived_name;
         }
@@ -2177,7 +2148,9 @@ impl App {
                 }
             }
             if result.is_ok()
-                && let Err(error) = session.append(EntryKind::User(UserData { content: prompt }))
+                && let Err(error) = session.append(EntryKind::User(UserData {
+                    content: workflow.prompt.clone(),
+                }))
             {
                 result = Err(error);
             }
@@ -2812,6 +2785,44 @@ fn available_theme_names(paths: &crate::paths::Paths) -> Vec<String> {
     names
 }
 
+/// Load an installable workflow TOML and its prompt, resolved relative to the
+/// file. Errors are the prescriptive messages `/workflow` has always shown.
+fn load_workflow_file(path: &Path) -> std::result::Result<WorkflowSpec, String> {
+    let raw = std::fs::read_to_string(path)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    let workflow: WorkflowFile = toml::from_str(&raw)
+        .map_err(|error| format!("invalid workflow {}: {error}", path.display()))?;
+    let Some(prompt_ref) = workflow.prompt.as_deref() else {
+        return Err(format!("workflow {} has no prompt file", path.display()));
+    };
+    let prompt_path = if Path::new(prompt_ref).is_absolute() {
+        PathBuf::from(prompt_ref)
+    } else {
+        path.parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(prompt_ref)
+    };
+    let prompt = std::fs::read_to_string(&prompt_path).map_err(|error| {
+        format!(
+            "cannot read workflow prompt {}: {error}",
+            prompt_path.display()
+        )
+    })?;
+    let name = workflow.name.unwrap_or_else(|| {
+        path.file_stem()
+            .map(|stem| stem.to_string_lossy().to_string())
+            .unwrap_or_else(|| "workflow".to_string())
+    });
+    Ok(WorkflowSpec {
+        name,
+        description: workflow.description,
+        profile: workflow.profile,
+        prompt,
+        skills: workflow.skills,
+        tools: workflow.tools,
+    })
+}
+
 fn available_workflows(paths: &crate::paths::Paths, trust: bool) -> Vec<String> {
     let mut names = Vec::new();
     let mut scan = |dir: &Path| {
@@ -2830,6 +2841,11 @@ fn available_workflows(paths: &crate::paths::Paths, trust: bool) -> Vec<String> 
     scan(&paths.workflows_dir());
     if trust {
         scan(&paths.project_dir().join("workflows"));
+    }
+    for name in workflows::names() {
+        if !names.iter().any(|existing| existing == name) {
+            names.push(name.to_string());
+        }
     }
     names.sort();
     names
@@ -2924,6 +2940,20 @@ mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
     use ratatui_textarea::TextArea;
+
+    #[test]
+    fn bundled_workflows_are_discoverable() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut paths = crate::paths::Paths::discover(dir.path()).unwrap();
+        paths.config_dir = dir.path().join("config");
+        let names = available_workflows(&paths, false);
+        for expected in ["api-security", "native-code-review"] {
+            assert!(
+                names.iter().any(|name| name == expected),
+                "missing {expected}: {names:?}"
+            );
+        }
+    }
 
     fn header(model: &str, session: &str) -> HeaderData {
         HeaderData {

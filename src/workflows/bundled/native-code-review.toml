@@ -1,0 +1,6 @@
+name = "native-code-review"
+description = "Ongoing review of native C/C++ and kernel code for memory-safety bugs, with bounded sanitizer PoCs and scoped fixes"
+profile = "security"
+prompt = "prompts/native-code-review.md"
+skills = ["security-red", "security-methods"]
+tools = ["read", "write", "edit", "grep", "glob", "bash", "bg", "finding", "iocs", "verify", "test", "review", "surface", "evidence"]

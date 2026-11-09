@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 use super::evidence::EvidenceLedger;
 use super::surface::SurfaceMap;
+use super::verify::{PocStep, Verification, compute_confidence};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -136,6 +137,12 @@ pub struct Finding {
     pub session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub entry_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub poc_steps: Vec<PocStep>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification: Option<Verification>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -149,6 +156,8 @@ pub struct NewFinding {
     pub remediation: Option<String>,
     pub session_id: Option<String>,
     pub entry_id: Option<String>,
+    pub poc_steps: Vec<PocStep>,
+    pub confidence: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -160,6 +169,8 @@ pub struct FindingPatch {
     pub evidence: Option<String>,
     pub impact: Option<String>,
     pub remediation: Option<String>,
+    pub poc_steps: Option<Vec<PocStep>>,
+    pub confidence: Option<f64>,
 }
 
 #[derive(Debug)]
@@ -250,6 +261,9 @@ impl Engagement {
             updated: now,
             session_id: new.session_id,
             entry_id: new.entry_id,
+            confidence: compute_confidence(new.confidence, &new.poc_steps),
+            poc_steps: new.poc_steps,
+            verification: None,
         };
         self.next_id += 1;
         self.append(&finding)?;
@@ -286,6 +300,13 @@ impl Engagement {
         if let Some(remediation) = patch.remediation {
             finding.remediation = Some(clip(&remediation, MAX_TEXT_CHARS));
         }
+        if let Some(steps) = patch.poc_steps {
+            finding.poc_steps = steps;
+        }
+        if let Some(confidence) = patch.confidence {
+            finding.confidence = Some(confidence);
+        }
+        finding.confidence = compute_confidence(finding.confidence, &finding.poc_steps);
         finding.updated = Utc::now();
         self.append(&finding)?;
         self.findings[index] = finding.clone();
@@ -294,6 +315,25 @@ impl Engagement {
 
     pub fn get(&self, id: &str) -> Option<&Finding> {
         self.findings.iter().find(|f| f.id == id)
+    }
+
+    /// Persist a replay verdict. Verification never changes the lifecycle
+    /// status; `not_reproduced` is not an automatic false positive.
+    pub fn record_verification(
+        &mut self,
+        id: &str,
+        verification: Verification,
+    ) -> Result<Finding, String> {
+        let Some(index) = self.findings.iter().position(|f| f.id == id) else {
+            return Err(format!("no finding {id:?}; `finding list` shows ids"));
+        };
+        let mut finding = self.findings[index].clone();
+        finding.verification = Some(verification);
+        finding.confidence = compute_confidence(finding.confidence, &finding.poc_steps);
+        finding.updated = Utc::now();
+        self.append(&finding)?;
+        self.findings[index] = finding.clone();
+        Ok(finding)
     }
 
     pub fn counts(&self) -> (usize, usize, usize) {
@@ -407,5 +447,66 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut engagement = Engagement::open(&paths(dir.path()), "eng").unwrap();
         assert!(engagement.update("f99", FindingPatch::default()).is_err());
+    }
+
+    #[test]
+    fn verification_and_confidence_round_trip() {
+        use crate::security::verify::{
+            PocAction, PocExpect, PocStep, PocStepKind, Verification, VerifyStatus, VerifyVerdict,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths(dir.path());
+        let mut engagement = Engagement::open(&paths, "eng").unwrap();
+        let finding = engagement
+            .add(NewFinding {
+                title: "proof".into(),
+                severity: Severity::High,
+                target: "local".into(),
+                poc_steps: vec![PocStep {
+                    id: "probe".into(),
+                    kind: PocStepKind::Verify,
+                    summary: "canary".into(),
+                    action: PocAction::Shell {
+                        cmd: "printf ok".into(),
+                        cwd: None,
+                    },
+                    expect: Some(PocExpect::ExitZero),
+                }],
+                confidence: Some(0.2),
+                ..NewFinding::default()
+            })
+            .unwrap();
+        assert_eq!(finding.confidence, Some(0.8));
+
+        let now = Utc::now();
+        engagement
+            .record_verification(
+                "f1",
+                Verification {
+                    status: VerifyStatus::Reproduced,
+                    verdict: VerifyVerdict::Confirmed,
+                    finding_id: "f1".into(),
+                    started: now,
+                    finished: now,
+                    duration_ms: 1,
+                    commands: Vec::new(),
+                    assertions: Vec::new(),
+                    evidence: vec!["e1".into()],
+                    summary: "reproduced".into(),
+                    error: None,
+                },
+            )
+            .unwrap();
+
+        let reopened = Engagement::open(&paths, "eng").unwrap();
+        let finding = reopened.get("f1").unwrap();
+        assert_eq!(finding.confidence, Some(0.8));
+        assert_eq!(
+            finding.verification.as_ref().unwrap().status,
+            VerifyStatus::Reproduced
+        );
+        assert_eq!(finding.verification.as_ref().unwrap().evidence, vec!["e1"]);
+        assert_eq!(finding.poc_steps.len(), 1);
     }
 }

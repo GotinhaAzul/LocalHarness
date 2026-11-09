@@ -618,7 +618,7 @@ all three packs.
 | Security | `evidence` | List, show, verify the evidence chain |
 | Security | `detect` | Validate/run Sigma-subset rules, map hits to findings |
 | Security | `attack_path` | Ranked graph paths, choke points, node detail |
-| Security | `finding` | Engagement findings ledger and report |
+| Security | `finding` | Engagement findings ledger, report, and PoC replay |
 | Security | `iocs` | Extract and defang indicators |
 
 Tool descriptions stay under roughly 200 characters. Schemas are flat objects
@@ -689,12 +689,25 @@ code and, where useful, the exact call shape.
   added lines for secrets, debug statements, TODOs, lockfiles, config files,
   deletion-heavy changes, binary files, and source changes without tests. The
   diff is capped and truncation names the follow-up call.
-- `finding` supports `add`, `update`, `list`, `report`. Severities: critical,
-  high, medium, low, info. Statuses: open, fixed, accepted, false-positive.
-  `add` requires title, severity, target, and evidence. Evidence can reference
-  a session entry, an artifact, inline text, or an engagement evidence id.
-  `add` auto-links the last tool's evidence entry when one exists. Caps: 50
-  findings, 2000 chars of evidence, 1000 chars of impact/remediation.
+- `finding` supports `add`, `update`, `list`, `report`, `verify`. Severities:
+  critical, high, medium, low, info. Statuses: open, fixed, accepted,
+  false-positive. `add` requires title, severity, target, and evidence.
+  Evidence can reference a session entry, an artifact, inline text, or an
+  engagement evidence id. `add` auto-links the last tool's evidence entry when
+  one exists. `add`, `update`, and `verify` accept `poc_steps` and a model
+  `confidence`; the stored confidence is raised to the evidence floor (0.6
+  with steps, 0.8 with a verifiable assertion). Caps: 50 findings, 2000 chars
+  of evidence, 1000 chars of impact/remediation.
+- `finding verify` replays a step graph locally. Actions are `shell` (`bash -c`
+  in an isolated run directory), `http` (redirects disabled; host must be in
+  engagement scope), and `note`. Assertions are `exit-zero`, `http-status`,
+  `body-contains`, `body-matches`, and `file-exists`. A run is `reproduced`
+  only when every assertion passes. `not_reproduced` is a rejection but does not
+  change the finding status; `error` and `skipped` are inconclusive and never
+  suppress. Steps run with a cleared environment, a per-step timeout, a
+  process-group kill, and one evidence entry per executed step. `minimize:true`
+  applies ddmin over steps, bounded by `max_oracle_calls`; exploit/verify steps
+  and steps with a non-`exit-zero` assertion are anchors and are kept.
 - `evidence` lists, shows, and verifies engagement evidence entries. Each entry
   stores tool, target, command, start/finish time, duration, exit code, error
   flags, artifact path, byte count, and SHA-256. Verification recomputes the
@@ -735,7 +748,7 @@ code and, where useful, the exact call shape.
 | post-edit diagnostics | 8 entries, 1200 chars |
 | `test` | 600 s maximum, 2500-char result |
 | `review` | 400 diff lines default, 12 findings |
-| `finding` | 50 per engagement, 2000-char evidence |
+| `finding` | 50 per engagement, 2000-char evidence, 50 PoC steps |
 | `evidence` | 20,000 entries, 4 MiB per artifact |
 | `surface` | 10,000 assets |
 | `detect` | 300 rule files, 500 files / 250k lines per run, 500 hits |
@@ -934,7 +947,14 @@ Security is a first-class pack and a first-class posture.
 
 - Findings live in `engagements/<name>/findings.jsonl`. A finding records id,
   title, severity, status, target, evidence, impact, remediation, created/updated
-  time, session id, entry id, and an optional evidence reference.
+  time, session id, entry id, an optional evidence reference, optional
+  `poc_steps`, the latest `verification`, and a confidence value.
+- `finding verify` runs the step graph in `engagements/<name>/poc/` and stores a
+  `Verification`: status (`reproduced`, `not_reproduced`, `error`, `skipped`),
+  verdict (`confirmed`, `rejected`, `inconclusive`), per-command argv/exit/
+  duration/excerpts, assertions, and evidence ids. The run directory is removed
+  after the evidence entries are written. Verification never changes lifecycle
+  status; a rejected replay is not an automatic false positive.
 - `/sec report` writes Markdown grouped by severity, with evidence, impact, and
   remediation. `/sec` shows scope, finding counts, evidence count, and surface
   size. Engagement directories are `0700`; files are `0600`.

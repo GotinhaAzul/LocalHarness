@@ -327,6 +327,35 @@ const BLUE_REFERENCES: &[(&str, &str)] = &[
         include_str!("bundled/security-blue-references/hardening.md"),
     ),
 ];
+const METHODS_SKILL: &str = include_str!("bundled/security-methods.md");
+const METHODS_REFERENCES: &[(&str, &str)] = &[
+    (
+        "references/native-memory.md",
+        include_str!("bundled/security-methods-references/native-memory.md"),
+    ),
+    (
+        "references/web-injection.md",
+        include_str!("bundled/security-methods-references/web-injection.md"),
+    ),
+    (
+        "references/auth-and-access.md",
+        include_str!("bundled/security-methods-references/auth-and-access.md"),
+    ),
+    (
+        "references/ssrf-and-request-smuggling.md",
+        include_str!("bundled/security-methods-references/ssrf-and-request-smuggling.md"),
+    ),
+    (
+        "references/deserialization-and-prototype-pollution.md",
+        include_str!(
+            "bundled/security-methods-references/deserialization-and-prototype-pollution.md"
+        ),
+    ),
+    (
+        "references/llm-application-security.md",
+        include_str!("bundled/security-methods-references/llm-application-security.md"),
+    ),
+];
 
 fn bundled_skill(main: &str, references: &[(&str, &'static str)], name: &str) -> Skill {
     let (meta, body) = split_frontmatter(main);
@@ -353,6 +382,7 @@ pub fn bundled() -> SkillIndex {
         skills: vec![
             bundled_skill(RED_SKILL, RED_REFERENCES, "security-red"),
             bundled_skill(BLUE_SKILL, BLUE_REFERENCES, "security-blue"),
+            bundled_skill(METHODS_SKILL, METHODS_REFERENCES, "security-methods"),
         ],
     }
 }
@@ -402,6 +432,51 @@ mod tests {
                     "{} names {} but does not embed it",
                     skill.name,
                     found.as_str()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn security_methods_skill_is_bundled_with_reference_documents() {
+        let index = bundled();
+        let skill = index.get("security-methods").expect("bundled skill");
+        assert!(skill.bundled);
+        assert_eq!(skill.references.len(), 6);
+        for needle in [
+            "native-memory",
+            "web-injection",
+            "auth-and-access",
+            "ssrf-and-request-smuggling",
+            "deserialization-and-prototype-pollution",
+            "llm-application-security",
+        ] {
+            let reference = skill
+                .reference(needle)
+                .unwrap_or_else(|| panic!("missing reference {needle}"));
+            let text = reference.text().expect("embedded reference text");
+            assert!(text.len() > 500, "reference {needle} is too thin");
+        }
+        assert!(skill.body.contains("security-red"));
+        assert!(skill.body.contains("poc_steps"));
+        assert!(skill.body.contains("finding verify"));
+        assert!(skill.full_text().contains("MIT OR Apache-2.0"));
+        let banned = [
+            "save_finding",
+            "verify_finding",
+            "variant_hunt",
+            "generate_fix",
+            "load_skill",
+            "list_skills",
+        ];
+        for name in banned {
+            assert!(!skill.body.contains(name), "body still names {name}");
+            for reference in &skill.references {
+                let text = reference.text().unwrap();
+                assert!(
+                    !text.contains(name),
+                    "{} still names {name}",
+                    reference.path
                 );
             }
         }

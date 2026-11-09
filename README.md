@@ -43,7 +43,8 @@ measures progress, and stops loops; the model does the work.
 - **Code-aware tools.** Language-server diagnostics after edits, a cached repo
   map, test/verify loops, and undo that refuses to clobber your own work.
 - **Security engagements.** Evidence capture, attack-surface inventory, Sigma
-  detection, findings, and an attack-path graph, scoped to an authorized target.
+  detection, findings with deterministic PoC replay, and an attack-path graph,
+  scoped to an authorized target.
 - **One binary.** `lh` is a single static Rust binary with a TUI and a JSONL
   headless mode. Nothing to install at runtime.
 
@@ -186,6 +187,13 @@ nmap/HTTP/TLS output into one inventory; `detect` validates and runs a Sigma
 subset against local logs; `attack_path` queries the graph derived from the
 surface, findings, and evidence. `finding add` auto-links the last tool's
 evidence entry, or accepts `evidence_id` explicitly.
+
+A finding can carry `poc_steps` — bounded shell or HTTP actions with
+assertions. `finding verify` replays them locally, records one evidence entry
+per step, and stores a verdict: `reproduced`/`confirmed`,
+`not_reproduced`/`rejected`, or `error|skipped`/`inconclusive`. Only a
+reproduced run confirms; a failed replay never auto-marks the finding as a
+false positive. `minimize:true` reduces a reproducing step graph with ddmin.
 
 Tool results are capped and archived; `recall` reads a range of an artifact.
 Guards enforce read-before-edit, scope, loop detection, budgets, stall

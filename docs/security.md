@@ -50,6 +50,71 @@ false-positive. Caps: 50 findings, 2000 characters of evidence, 1000 of
 impact/remediation. `add` auto-attaches the last tool result and its engagement
 evidence entry when none is given; `evidence_id:"e3"` links a specific entry.
 
+## PoC verification
+
+A finding can carry a deterministic proof-of-concept step graph. `finding
+verify` replays it locally and records a verdict; a finding is `confirmed` only
+when every declared assertion passes against a reproduced run.
+
+```text
+finding {
+  action:"add",
+  title:"Reflected marker at /search",
+  severity:"high",
+  target:"https://app.test/search",
+  evidence:"q=ZERO-INJ-OK is reflected unencoded",
+  poc_steps:[
+    {"id":"probe","kind":"verify",
+     "action":{"type":"http","method":"GET","url":"https://app.test/search?q=ZERO-INJ-OK"},
+     "expect":{"type":"body-contains","text":"ZERO-INJ-OK"}}
+  ]
+}
+finding {action:"verify", id:"f1"}
+finding {action:"verify", id:"f1", minimize:true, max_oracle_calls:20}
+```
+
+Step actions:
+
+| Action | Fields | Runs |
+|---|---|---|
+| `shell` | `cmd`, optional relative `cwd` | `bash -c` in an isolated run directory |
+| `http` | `method`, `url`, optional `headers`, `body` | one request, redirects disabled |
+| `note` | `text` | nothing; informational only |
+
+Assertions (`expect`): `exit-zero`, `http-status` (number or array),
+`body-contains`, `body-matches` (regex), `file-exists` (relative path inside the
+run directory). At least one step must carry an assertion, or `verify` refuses
+to run.
+
+Verdicts:
+
+| Status | Verdict | Meaning |
+|---|---|---|
+| `reproduced` | `confirmed` | every assertion passed |
+| `not_reproduced` | `rejected` | the run completed but an assertion failed |
+| `error` | `inconclusive` | the runner, scope, or a command failed |
+| `skipped` | `inconclusive` | no assertion was declared |
+
+`not_reproduced` does not change the finding's status and is not an automatic
+false positive. `error` and `skipped` never suppress a finding; only an explicit
+`finding update status=false-positive` does. Confidence is the model's reported
+value raised to `0.6` when `poc_steps` exist and `0.8` when a verifiable
+assertion exists.
+
+Shell steps run in a temporary directory under the engagement with a cleared
+environment (only `PATH`, `HOME`, `TMPDIR`, locale, and shell identity are
+inherited), a per-step timeout, and a process-group kill on timeout or cancel.
+HTTP steps require the URL host to be in engagement scope; out-of-scope targets
+are refused before a request is sent. Each executed step appends an engagement
+evidence entry with the command, timing, exit status, output, and SHA-256.
+Minimization (`minimize:true`) removes steps while the graph still reproduces,
+bounded by `max_oracle_calls` (default 20, maximum 50). Exploit/verify steps and
+steps with a non-`exit-zero` assertion are anchors and are never removed;
+minimization trims setup and noise steps around them.
+
+Only the `local` runner is implemented. Container and QEMU replay are not part
+of this build.
+
 ## Evidence chain
 
 When an engagement is active, every `bash`, `bg`, and external tool run appends

@@ -191,6 +191,8 @@ impl DetectTool {
                     remediation: None,
                     session_id: session_id.clone(),
                     entry_id: None,
+                    poc_steps: Vec::new(),
+                    confidence: None,
                 };
                 match engagement.add(new) {
                     Ok(finding) => created.push(finding.id),
