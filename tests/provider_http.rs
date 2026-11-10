@@ -108,6 +108,7 @@ fn request() -> ChatRequest {
             parameters: serde_json::json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}),
         }],
         tool_choice: Some("auto".into()),
+        parallel_tool_calls: None,
         temperature: 0.2,
         top_p: 0.95,
         max_tokens: 128,

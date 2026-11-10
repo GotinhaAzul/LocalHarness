@@ -292,6 +292,8 @@ async fn run_loop(
     let gate_tools = gates::GateTools::from_names(core.tools.iter().map(|tool| tool.name()));
     let read_available = core.tools.iter().any(|tool| tool.name() == "read");
     let mut pending_compaction = false;
+    let mut invalid_tool_calls = 0u32;
+    let mut one_call_reminded = false;
 
     loop {
         if cancel.is_cancelled() {
@@ -467,7 +469,12 @@ async fn run_loop(
             model: core.provider.model().to_string(),
             messages: assembled.messages.clone(),
             tools: core.tool_specs.clone(),
-            tool_choice: Some("auto".into()),
+            tool_choice: core
+                .model_profile
+                .tool_choice
+                .clone()
+                .or(Some("auto".into())),
+            parallel_tool_calls: core.model_profile.parallel_tool_calls,
             temperature: core.config.model.temperature,
             top_p: core.config.model.top_p,
             max_tokens: core.config.model.max_output_tokens,
@@ -746,6 +753,26 @@ async fn run_loop(
         )
         .await;
         let _ = tx.send(AgentEvent::State(AgentState::PostTool));
+
+        invalid_tool_calls += batch.invalid_calls;
+        if invalid_tool_calls >= 3 {
+            let message = "three tool calls were rejected by the one_call rule in this turn; stopping instead of looping. Start a new turn and send exactly one tool call per message.";
+            append_error(&core.session, "tool_call_invalid", message, true);
+            let _ = tx.send(AgentEvent::Error {
+                code: "tool_call_invalid".into(),
+                message: message.into(),
+                recoverable: true,
+            });
+            return TurnOutcome::error("tool_call_invalid", message);
+        }
+        if invalid_tool_calls >= 2 && !one_call_reminded {
+            one_call_reminded = true;
+            let reminder = "[localharness] one_call: one JSON object, one tool per assistant message. Extra calls were rejected and did not run; send a single tool call now.";
+            if let Err(err) = append_user(&core.session, reminder) {
+                return TurnOutcome::error("session_write", err.to_string());
+            }
+            let _ = tx.send(AgentEvent::Notice(reminder.into()));
+        }
 
         if let Some((code, message)) = batch.guard {
             append_error(&core.session, &code, &message, true);
@@ -1413,6 +1440,8 @@ struct BatchOutcome {
     guard: Option<(String, String)>,
     end_turn: bool,
     thread_split: Option<ThreadSplit>,
+    /// Calls rejected by the active profile's one-call rule.
+    invalid_calls: u32,
 }
 
 struct ThreadSplit {
@@ -1440,10 +1469,28 @@ async fn execute_batch(
     let mut batch_chars = 0usize;
     let mut end_turn = false;
     let mut thread_split: Option<ThreadSplit> = None;
+    let mut invalid_calls = 0u32;
 
     let ctx = core.tool_context_with(cancel.clone());
     let active: Vec<&str> = core.tools.iter().map(|tool| tool.name()).collect();
     for (position, original) in calls.iter().enumerate() {
+        if core.model_profile.one_call && position > 0 {
+            invalid_calls += 1;
+            append_tool_result(
+                &core.session,
+                original,
+                &ToolResult::err(
+                    "tool_call_invalid",
+                    format!(
+                        "one_call is active for this profile: send exactly one tool call per assistant message, not {}. This call did not run; retry {} alone in the next message.",
+                        calls.len(),
+                        original.name
+                    ),
+                ),
+                None,
+            );
+            continue;
+        }
         if cancel.is_cancelled() {
             cancelled = true;
             for remaining in &calls[position..] {
@@ -1826,6 +1873,7 @@ async fn execute_batch(
         guard,
         end_turn,
         thread_split,
+        invalid_calls,
     }
 }
 

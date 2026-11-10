@@ -75,6 +75,8 @@ pub struct ChatRequest {
     pub messages: Vec<ChatMessage>,
     pub tools: Vec<ToolSpec>,
     pub tool_choice: Option<String>,
+    /// Server-side hint; dispatch still enforces a profile's one-call rule.
+    pub parallel_tool_calls: Option<bool>,
     pub temperature: f32,
     pub top_p: f32,
     pub max_tokens: u32,
