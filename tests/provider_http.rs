@@ -178,6 +178,96 @@ async fn streams_text_reasoning_tool_calls_and_usage() {
     assert_eq!(sent["messages"][0]["role"], "user");
 }
 
+fn tool_deltas(
+    events: Vec<Result<StreamEvent, localharness::provider::ProviderError>>,
+) -> Vec<(usize, Option<String>, Option<String>, String)> {
+    events
+        .into_iter()
+        .filter_map(|event| match event.expect("stream item") {
+            StreamEvent::ToolCallDelta {
+                index,
+                id,
+                name,
+                arguments,
+            } => Some((index, id, name, arguments.unwrap_or_default())),
+            _ => None,
+        })
+        .collect()
+}
+
+async fn tool_stream(body: &str) -> Vec<(usize, Option<String>, Option<String>, String)> {
+    let (base, state) = spawn().await;
+    state.script.lock().unwrap().push_back(Script {
+        status: 200,
+        body: body.into(),
+        chunked: true,
+    });
+    let events = collect_stream(&provider(&base), request(), CancellationToken::new()).await;
+    tool_deltas(events)
+}
+
+#[tokio::test]
+async fn indexless_calls_in_separate_chunks_stay_separate() {
+    let calls = tool_stream(concat!(
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"call_a\",\"function\":{\"name\":\"read\",\"arguments\":\"{}\"}}]}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"call_b\",\"function\":{\"name\":\"write\",\"arguments\":\"{}\"}}]}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: [DONE]\n\n",
+    ))
+    .await;
+    assert_eq!(calls.len(), 2, "{calls:?}");
+    assert_eq!(calls[0].0, 0);
+    assert_eq!(calls[1].0, 1);
+    assert_eq!(calls[0].2.as_deref(), Some("read"));
+    assert_eq!(calls[1].2.as_deref(), Some("write"));
+}
+
+#[tokio::test]
+async fn indexless_id_name_chunk_then_arguments_stay_one_call() {
+    let calls = tool_stream(concat!(
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"call_a\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"pa\"}}]}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"th\\\":\\\"a.rs\\\"}\"}}]}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: [DONE]\n\n",
+    ))
+    .await;
+    assert_eq!(calls.len(), 2, "{calls:?}");
+    assert!(calls.iter().all(|call| call.0 == 0));
+    assert_eq!(calls[0].2.as_deref(), Some("read"));
+    let args: String = calls.iter().map(|call| call.3.as_str()).collect();
+    assert_eq!(args, "{\"path\":\"a.rs\"}");
+}
+
+#[tokio::test]
+async fn indexless_different_ids_open_new_calls() {
+    let calls = tool_stream(concat!(
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"call_a\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"a.rs\\\"}\"}}]}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"call_b\",\"function\":{\"name\":\"write\",\"arguments\":\"{\\\"path\\\":\\\"b.rs\\\"}\"}}]}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: [DONE]\n\n",
+    ))
+    .await;
+    assert_eq!(calls.len(), 2, "{calls:?}");
+    assert_ne!(calls[0].0, calls[1].0);
+    assert_eq!(calls[0].1.as_deref(), Some("call_a"));
+    assert_eq!(calls[1].1.as_deref(), Some("call_b"));
+}
+
+#[tokio::test]
+async fn a_duplicate_engine_id_with_a_new_name_does_not_merge_calls() {
+    let calls = tool_stream(concat!(
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"call_1\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"a.rs\\\"}\"}}]}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"call_1\",\"function\":{\"name\":\"write\",\"arguments\":\"{\\\"path\\\":\\\"b.rs\\\"}\"}}]}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: [DONE]\n\n",
+    ))
+    .await;
+    assert_eq!(calls.len(), 2, "{calls:?}");
+    assert_ne!(calls[0].0, calls[1].0);
+    assert_eq!(calls[0].2.as_deref(), Some("read"));
+    assert_eq!(calls[1].2.as_deref(), Some("write"));
+}
+
 #[tokio::test]
 async fn retries_without_stream_options_when_rejected() {
     let (base, state) = spawn().await;

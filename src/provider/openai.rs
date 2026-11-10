@@ -126,6 +126,7 @@ impl OpenAiCompatProvider {
         }
 
         let mut parser = SseParser::new();
+        let mut tool_index = ToolCallIndexer::default();
         let mut stream = response.bytes_stream();
         let total_deadline = Instant::now() + self.timeouts.total;
         let mut idle_until = next_idle(Instant::now(), self.timeouts.first_token, total_deadline);
@@ -194,7 +195,9 @@ impl OpenAiCompatProvider {
                         break;
                     }
                     SseFrame::Data(data) => {
-                        if let Err(event) = self.handle_data(&data, req, tx, yielded) {
+                        if let Err(event) =
+                            self.handle_data(&data, req, tx, yielded, &mut tool_index)
+                        {
                             return Attempt::Failed(event);
                         }
                     }
@@ -209,7 +212,7 @@ impl OpenAiCompatProvider {
             match frame {
                 SseFrame::Done => {}
                 SseFrame::Data(data) => {
-                    if let Err(event) = self.handle_data(&data, req, tx, yielded) {
+                    if let Err(event) = self.handle_data(&data, req, tx, yielded, &mut tool_index) {
                         return Attempt::Failed(event);
                     }
                 }
@@ -224,6 +227,7 @@ impl OpenAiCompatProvider {
         req: &ChatRequest,
         tx: &UnboundedSender<StreamItem>,
         yielded: &mut bool,
+        tool_index: &mut ToolCallIndexer,
     ) -> Result<(), ProviderError> {
         let trimmed = data.trim();
         if trimmed.is_empty() {
@@ -269,10 +273,8 @@ impl OpenAiCompatProvider {
                 *yielded = true;
                 let _ = tx.send(Ok(StreamEvent::Delta(content)));
             }
-            for (fallback_index, call) in
-                delta.tool_calls.unwrap_or_default().into_iter().enumerate()
-            {
-                let index = call.index.unwrap_or(fallback_index);
+            for call in delta.tool_calls.unwrap_or_default() {
+                let index = tool_index.assign(&call);
                 let (name, arguments) = match call.function {
                     Some(function) => (function.name, function.arguments),
                     None => (None, None),
@@ -674,6 +676,147 @@ struct FunctionDelta {
     name: Option<String>,
     #[serde(default)]
     arguments: Option<String>,
+}
+
+/// Stateful assignment of stream-local tool-call indices.
+///
+/// OpenAI-compatible engines disagree about `index`: SGLang and vLLM send it,
+/// Ollama's compatibility route and some gateways omit it entirely. A missing
+/// index used to fall back to the position inside the current chunk, so two
+/// calls arriving in separate chunks both became index 0 and were merged into
+/// one call with a spliced name and arguments. Keep the open call instead and
+/// only reuse it for argument-only fragments; a new id or a new name opens a
+/// new internal index.
+#[derive(Debug, Default)]
+struct ToolCallIndexer {
+    next: usize,
+    open: Option<OpenToolCall>,
+    explicit: std::collections::HashMap<usize, OpenToolCall>,
+    used: std::collections::HashSet<usize>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct OpenToolCall {
+    index: usize,
+    id: Option<String>,
+    name: Option<String>,
+}
+
+impl ToolCallIndexer {
+    fn assign(&mut self, call: &ToolCallDelta) -> usize {
+        let id = call
+            .id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty());
+        let name = call
+            .function
+            .as_ref()
+            .and_then(|function| function.name.as_deref())
+            .map(str::trim)
+            .filter(|name| !name.is_empty());
+        match call.index {
+            Some(index) => self.assign_explicit(index, id, name),
+            None => self.assign_implicit(id, name),
+        }
+    }
+
+    /// An engine-supplied index is authoritative unless a *different*
+    /// non-empty id appears on it: some engines reuse one index for several
+    /// calls, and merging those would pair a result with the wrong call.
+    fn assign_explicit(
+        &mut self,
+        engine_index: usize,
+        id: Option<&str>,
+        name: Option<&str>,
+    ) -> usize {
+        if let Some(existing) = self.explicit.get(&engine_index) {
+            let id_conflict = matches!(
+                (existing.id.as_deref(), id),
+                (Some(existing), Some(incoming)) if existing != incoming
+            );
+            if !id_conflict {
+                let index = existing.index;
+                if let Some(entry) = self.explicit.get_mut(&engine_index) {
+                    if entry.id.is_none() {
+                        entry.id = id.map(str::to_string);
+                    }
+                    if entry.name.is_none() {
+                        entry.name = name.map(str::to_string);
+                    }
+                    self.open = Some(entry.clone());
+                }
+                return index;
+            }
+        }
+        let index = if self.used.contains(&engine_index) {
+            self.allocate_index()
+        } else {
+            self.used.insert(engine_index);
+            self.next = self.next.max(engine_index + 1);
+            engine_index
+        };
+        self.explicit.insert(
+            engine_index,
+            OpenToolCall {
+                index,
+                id: id.map(str::to_string),
+                name: name.map(str::to_string),
+            },
+        );
+        self.open = self.explicit.get(&engine_index).cloned();
+        index
+    }
+
+    fn assign_implicit(&mut self, id: Option<&str>, name: Option<&str>) -> usize {
+        let reuse = match &self.open {
+            None => false,
+            Some(open) => match (id, name) {
+                (Some(id), Some(name)) => {
+                    open.id.as_deref() == Some(id)
+                        && (open.name.as_deref().is_none_or(str::is_empty)
+                            || open.name.as_deref() == Some(name))
+                }
+                (Some(id), None) => open.id.as_deref() == Some(id),
+                // A name opens a new call, except for the common split where
+                // an id-bearing chunk arrived before its function name.
+                (None, Some(_)) => {
+                    open.id.is_some() && open.name.as_deref().is_none_or(str::is_empty)
+                }
+                // Arguments-only fragments continue the open call.
+                (None, None) => true,
+            },
+        };
+        if reuse {
+            let index = self.open.as_ref().expect("open call").index;
+            if let Some(open) = self.open.as_mut() {
+                if open.id.is_none() {
+                    open.id = id.map(str::to_string);
+                }
+                if open.name.is_none() {
+                    open.name = name.map(str::to_string);
+                }
+            }
+            return index;
+        }
+        let index = self.allocate_index();
+        self.open = Some(OpenToolCall {
+            index,
+            id: id.map(str::to_string),
+            name: name.map(str::to_string),
+        });
+        index
+    }
+
+    fn allocate_index(&mut self) -> usize {
+        while self.used.contains(&self.next) {
+            self.next += 1;
+        }
+        let index = self.next;
+        self.used.insert(index);
+        self.next = index + 1;
+        index
+    }
 }
 
 #[derive(Debug, Deserialize)]
