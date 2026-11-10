@@ -1,9 +1,49 @@
 //! Deterministic compaction: built from session entries, never the model.
 
+use crate::context::budget::TokenBudget;
 use crate::session::{Entry, EntryKind, Session};
 
+/// Upper bound for a summary, kept for large windows.
 pub const COMPACTION_BUDGET_CHARS: usize = 4500;
+/// Floor so a tiny window still gets a usable summary.
+pub const COMPACTION_BUDGET_MIN_CHARS: usize = 1200;
+/// A summary may never take more than this share of the usable prompt.
+pub const COMPACTION_MAX_PERCENT: usize = 40;
 pub const LAST_INSTRUCTION_CHARS: usize = 600;
+
+/// Window-derived summary limits: a third of the usable prompt characters,
+/// clamped, plus the hard 40% ceiling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SummaryBudget {
+    pub target_chars: usize,
+    pub max_chars: usize,
+}
+
+pub fn summary_budget(budget: &TokenBudget) -> SummaryBudget {
+    let usable_chars = budget.chars_for(budget.usable_prompt());
+    SummaryBudget {
+        target_chars: (usable_chars / 3)
+            .clamp(COMPACTION_BUDGET_MIN_CHARS, COMPACTION_BUDGET_CHARS),
+        max_chars: (usable_chars * COMPACTION_MAX_PERCENT / 100).max(1),
+    }
+}
+
+impl From<usize> for SummaryBudget {
+    /// A fixed character budget with no hard ceiling, for callers that already
+    /// computed their own limit.
+    fn from(target_chars: usize) -> Self {
+        Self {
+            target_chars,
+            max_chars: usize::MAX,
+        }
+    }
+}
+
+impl From<&TokenBudget> for SummaryBudget {
+    fn from(budget: &TokenBudget) -> Self {
+        summary_budget(budget)
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct FindingSummary {
@@ -33,8 +73,9 @@ struct ThreadInfo {
 pub fn build_summary(
     session: &Session,
     findings: Option<&FindingSummary>,
-    budget_chars: usize,
+    budget: impl Into<SummaryBudget>,
 ) -> CompactionSummary {
+    let budget = budget.into();
     let branch = session.branch_entries();
     let thread = thread_info(session, &branch);
     let changed = changed_files(&branch);
@@ -66,17 +107,21 @@ pub fn build_summary(
         last_instruction = clip(&last_instruction, LAST_INSTRUCTION_CHARS);
     }
 
-    let compose =
-        |actions_kept: bool, facts_kept: bool, list_limit: usize, instruction_chars: usize| {
-            let mut out = String::new();
-            out.push_str("[localharness] deterministic compaction\n\n");
-            out.push_str(&format!("## Active thread T1 - {title}\n"));
-            if !objective.is_empty() {
-                out.push_str(&format!("objective: {objective}\n"));
-            }
-            if !thread.constraints.is_empty() {
-                out.push_str(&format!("constraints: {}\n", thread.constraints.join("; ")));
-            }
+    let compose = |actions_kept: bool,
+                   facts_kept: bool,
+                   list_limit: usize,
+                   instruction_chars: usize,
+                   minimal: bool| {
+        let mut out = String::new();
+        out.push_str("[localharness] deterministic compaction\n\n");
+        out.push_str(&format!("## Active thread T1 - {title}\n"));
+        if !objective.is_empty() {
+            out.push_str(&format!("objective: {objective}\n"));
+        }
+        if !minimal && !thread.constraints.is_empty() {
+            out.push_str(&format!("constraints: {}\n", thread.constraints.join("; ")));
+        }
+        if !minimal {
             let files: Vec<&str> = changed
                 .iter()
                 .map(|s| s.as_str())
@@ -94,68 +139,81 @@ pub fn build_summary(
                     join_limited_str(&thread.done, list_limit)
                 ));
             }
-            if !thread.open.is_empty() {
+        }
+        if !thread.open.is_empty() {
+            out.push_str(&format!(
+                "open: {}\n",
+                join_limited_str(&thread.open, list_limit)
+            ));
+        }
+        if !minimal && facts_kept && !thread.facts.is_empty() {
+            out.push_str(&format!(
+                "facts: {}\n",
+                join_limited_str(&thread.facts, list_limit)
+            ));
+        }
+        if !minimal && !changed.is_empty() {
+            out.push_str("\n## Repo\n");
+            out.push_str(&format!("changed: {}\n", join_limited_str(&changed, 12)));
+            if let Some((passed, ago)) = &verify {
                 out.push_str(&format!(
-                    "open: {}\n",
-                    join_limited_str(&thread.open, list_limit)
+                    "verify: {} ({} entries ago)\n",
+                    if *passed { "passed" } else { "failed" },
+                    ago
                 ));
             }
-            if facts_kept && !thread.facts.is_empty() {
-                out.push_str(&format!(
-                    "facts: {}\n",
-                    join_limited_str(&thread.facts, list_limit)
-                ));
-            }
-            if !changed.is_empty() {
-                out.push_str("\n## Repo\n");
-                out.push_str(&format!("changed: {}\n", join_limited_str(&changed, 12)));
-                if let Some((passed, ago)) = &verify {
-                    out.push_str(&format!(
-                        "verify: {} ({} entries ago)\n",
-                        if *passed { "passed" } else { "failed" },
-                        ago
-                    ));
-                }
-            }
-            if let Some(findings) = findings
-                && findings.open > 0
-            {
-                out.push_str("\n## Findings\n");
-                out.push_str(&format!(
-                    "{} open ({} high, {} medium)",
-                    findings.open, findings.high, findings.other
-                ));
+        }
+        if !minimal
+            && let Some(findings) = findings
+            && findings.open > 0
+        {
+            out.push_str("\n## Findings\n");
+            out.push_str(&format!(
+                "{} open ({} high, {} medium)",
+                findings.open, findings.high, findings.other
+            ));
+            out.push('\n');
+        }
+        if !last_instruction.is_empty() {
+            out.push_str("\n## Last instruction (verbatim)\n");
+            let text = clip(&last_instruction, instruction_chars);
+            out.push_str(&text);
+            out.push('\n');
+        }
+        if !minimal && actions_kept && !actions.is_empty() {
+            out.push_str("\n## Last actions\n");
+            for action in actions.iter().take(5) {
+                out.push_str(action);
                 out.push('\n');
             }
-            if !last_instruction.is_empty() {
-                out.push_str("\n## Last instruction (verbatim)\n");
-                let text = clip(&last_instruction, instruction_chars);
-                out.push_str(&text);
-                out.push('\n');
-            }
-            if actions_kept && !actions.is_empty() {
-                out.push_str("\n## Last actions\n");
-                for action in actions.iter().take(5) {
-                    out.push_str(action);
-                    out.push('\n');
-                }
-            }
-            out.truncate(out.trim_end().len());
-            out
-        };
+        }
+        out.truncate(out.trim_end().len());
+        out
+    };
 
-    let mut summary = compose(true, true, usize::MAX, LAST_INSTRUCTION_CHARS);
-    if summary.chars().count() > budget_chars {
-        summary = compose(false, true, usize::MAX, LAST_INSTRUCTION_CHARS);
+    let mut summary = compose(true, true, usize::MAX, LAST_INSTRUCTION_CHARS, false);
+    if summary.chars().count() > budget.target_chars {
+        summary = compose(false, true, usize::MAX, LAST_INSTRUCTION_CHARS, false);
     }
-    if summary.chars().count() > budget_chars {
-        summary = compose(false, false, usize::MAX, LAST_INSTRUCTION_CHARS);
+    if summary.chars().count() > budget.target_chars {
+        summary = compose(false, false, usize::MAX, LAST_INSTRUCTION_CHARS, false);
     }
-    if summary.chars().count() > budget_chars {
-        summary = compose(false, false, 3, LAST_INSTRUCTION_CHARS);
+    if summary.chars().count() > budget.target_chars {
+        summary = compose(false, false, 3, LAST_INSTRUCTION_CHARS, false);
     }
-    if summary.chars().count() > budget_chars {
-        summary = compose(false, false, 3, 300);
+    if summary.chars().count() > budget.target_chars {
+        summary = compose(false, false, 3, 300, false);
+    }
+    // The hard postcondition: never let the summary take more than 40% of the
+    // usable prompt. Keep only the objective, open tasks, and last instruction.
+    if summary.chars().count() > budget.max_chars {
+        summary = compose(false, false, 3, 300, true);
+    }
+    if summary.chars().count() > budget.max_chars {
+        summary = compose(false, false, 1, 120, true);
+    }
+    if summary.chars().count() > budget.max_chars {
+        summary = clip(&summary, budget.max_chars);
     }
 
     CompactionSummary {
@@ -408,7 +466,11 @@ mod tests {
                 CustomData::new("fs-change").with("path", "src/parser.rs"),
             ))
             .unwrap();
-        let summary = build_summary(&session, None, COMPACTION_BUDGET_CHARS);
+        let summary = build_summary(
+            &session,
+            None,
+            summary_budget(&TokenBudget::new(32_768, 4096)),
+        );
         assert!(summary.summary.contains("## Active thread T1"));
         assert!(summary.summary.contains("objective: Fix the parser bug"));
         assert!(summary.summary.contains("src/parser.rs"));
@@ -427,9 +489,99 @@ mod tests {
                 content: "x ".repeat(500),
             }))
             .unwrap();
-        let summary = build_summary(&session, None, 300);
+        let summary = build_summary(
+            &session,
+            None,
+            SummaryBudget {
+                target_chars: 300,
+                max_chars: usize::MAX,
+            },
+        );
         assert!(!summary.summary.contains("## Last actions"));
         assert!(summary.summary.contains("## Active thread T1"));
         assert!(summary.summary.contains("objective:"));
+    }
+
+    #[test]
+    fn small_window_summary_is_capped_at_forty_percent() {
+        let budget = TokenBudget::new(4096, 1024);
+        let limits = summary_budget(&budget);
+        let usable_chars = budget.chars_for(budget.usable_prompt());
+        assert_eq!(
+            limits.max_chars,
+            usable_chars * COMPACTION_MAX_PERCENT / 100
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = session(dir.path());
+        let constraints: Vec<String> = (0..12)
+            .map(|index| format!("constraint {index} {}", "c".repeat(300)))
+            .collect();
+        let facts: Vec<String> = (0..8)
+            .map(|index| format!("fact {index} {}", "f".repeat(300)))
+            .collect();
+        session
+            .append(EntryKind::Custom(
+                CustomData::new("thread-state")
+                    .with("title", "small window")
+                    .with("objective", "finish the slice")
+                    .with("constraints", json!(constraints))
+                    .with("facts", json!(facts))
+                    .with("open", "keep the objective and open tasks".repeat(4)),
+            ))
+            .unwrap();
+        session
+            .append(EntryKind::Custom(
+                CustomData::new("fs-change").with("path", "src/parser.rs"),
+            ))
+            .unwrap();
+        session
+            .append(EntryKind::User(UserData {
+                attachments: Vec::new(),
+                content: "x ".repeat(4000),
+            }))
+            .unwrap();
+
+        let findings = FindingSummary {
+            open: 3,
+            high: 1,
+            other: 2,
+        };
+        let summary = build_summary(&session, Some(&findings), limits);
+        assert!(
+            summary.summary.chars().count() <= limits.max_chars,
+            "{} chars > {} cap",
+            summary.summary.chars().count(),
+            limits.max_chars
+        );
+        assert!(summary.summary.contains("objective: finish the slice"));
+        assert!(summary.summary.contains("open:"));
+        assert!(!summary.summary.contains("## Repo"));
+        assert!(!summary.summary.contains("## Findings"));
+        assert!(!summary.summary.contains("## Last actions"));
+    }
+
+    #[test]
+    fn large_window_keeps_the_fixed_summary_budget() {
+        let limits = summary_budget(&TokenBudget::new(32_768, 4096));
+        assert_eq!(limits.target_chars, COMPACTION_BUDGET_CHARS);
+        assert!(limits.max_chars > limits.target_chars);
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = session(dir.path());
+        session
+            .append(EntryKind::User(UserData {
+                attachments: Vec::new(),
+                content: "Fix the parser bug and rerun tests".into(),
+            }))
+            .unwrap();
+        session
+            .append(EntryKind::Custom(
+                CustomData::new("fs-change").with("path", "src/parser.rs"),
+            ))
+            .unwrap();
+        let fixed = build_summary(&session, None, COMPACTION_BUDGET_CHARS);
+        let windowed = build_summary(&session, None, limits);
+        assert_eq!(fixed.summary, windowed.summary);
     }
 }

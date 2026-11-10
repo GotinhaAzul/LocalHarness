@@ -1,8 +1,11 @@
 //! Token accounting, calibration, and the compaction threshold.
 
-use crate::provider::ChatMessage;
+use crate::provider::{ChatMessage, ToolSpec, tools_json};
 
 pub const DEFAULT_CHARS_PER_TOKEN: f64 = 3.5;
+/// JSON keys, quotes, and type names tokenize denser than prose. Tool schemas
+/// stay on this ratio even after the prose calibration moves.
+pub const JSON_CHARS_PER_TOKEN: f64 = 2.6;
 pub const SAFETY_MARGIN_MIN: u32 = 512;
 /// Real text, code, and JSON all tokenize well under this many characters per
 /// token. A measurement above it means the server dropped part of the prompt.
@@ -50,6 +53,44 @@ impl StaticPrompt {
             return 100.0;
         }
         (self.total as f32 / usable as f32) * 100.0
+    }
+}
+
+/// Fixed cost of the request's `tools` array, computed once when `Core` is
+/// built. `tokens` is the engine's `/tokenize` count when available, otherwise
+/// the JSON-density estimate.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ToolSpecCost {
+    pub chars: usize,
+    pub tokens: u32,
+}
+
+impl ToolSpecCost {
+    /// Price the serialized tools array once, with the JSON ratio. An empty
+    /// array is not sent, so it costs nothing.
+    pub fn from_json(json: &str, budget: &TokenBudget) -> Self {
+        if json.is_empty() {
+            return Self::default();
+        }
+        Self {
+            chars: json.len(),
+            tokens: budget.estimate_json_char_len(json.len()),
+        }
+    }
+
+    /// Replace the estimate with an exact `/tokenize` count.
+    pub fn with_tokens(mut self, tokens: u32) -> Self {
+        self.tokens = tokens;
+        self
+    }
+
+    /// Serialize and price a tool list. Used by tests and callers that do not
+    /// already hold the request JSON.
+    pub fn estimate(tool_specs: &[ToolSpec], budget: &TokenBudget) -> Self {
+        if tool_specs.is_empty() {
+            return Self::default();
+        }
+        Self::from_json(&tools_json(tool_specs), budget)
     }
 }
 
@@ -129,6 +170,12 @@ impl TokenBudget {
 
     pub fn estimate_char_len(&self, chars: usize) -> u32 {
         ((chars as f64) / self.chars_per_token).ceil() as u32
+    }
+
+    /// JSON estimate for tool schemas, pinned to [`JSON_CHARS_PER_TOKEN`] so
+    /// prose calibration cannot move it.
+    pub fn estimate_json_char_len(&self, chars: usize) -> u32 {
+        ((chars as f64) / JSON_CHARS_PER_TOKEN).ceil() as u32
     }
 
     /// Correct `chars_per_token` from a measured prompt size. Keeps a slow
@@ -228,5 +275,49 @@ mod tests {
         assert!(prompt.percent_of(2560) > 100.0);
         let prompt = StaticPrompt::new(2000, 300, 100);
         assert_eq!(prompt.largest(), ("system prompt", 2000));
+    }
+
+    #[test]
+    fn json_density_is_pinned_and_separate_from_prose() {
+        assert!((JSON_CHARS_PER_TOKEN - 2.6).abs() < f64::EPSILON);
+        let budget = TokenBudget::new(32768, 4096);
+        assert_eq!(budget.estimate_json_char_len(2_600), 1_000);
+        // JSON is priced denser than prose at the same character count.
+        assert!(
+            budget.estimate_json_char_len(3_500) > budget.estimate_char_len(3_500),
+            "JSON must not use the prose ratio"
+        );
+        // A prose calibration does not move the JSON estimate.
+        let mut calibrated = budget.clone();
+        calibrated.calibrate(20_000, 4_000);
+        assert!(calibrated.chars_per_token > DEFAULT_CHARS_PER_TOKEN);
+        assert_eq!(
+            calibrated.estimate_json_char_len(2_600),
+            budget.estimate_json_char_len(2_600)
+        );
+    }
+
+    #[test]
+    fn tool_spec_cost_is_fixed_after_the_first_serialization() {
+        let budget = TokenBudget::new(32768, 4096);
+        let specs = vec![ToolSpec {
+            name: "read".into(),
+            description: "Read a file".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"]
+            }),
+        }];
+        let cost = ToolSpecCost::estimate(&specs, &budget);
+        assert!(cost.chars > 0);
+        assert_eq!(cost.tokens, budget.estimate_json_char_len(cost.chars));
+        let measured = cost.with_tokens(42);
+        assert_eq!(measured.tokens, 42);
+        assert_eq!(measured.chars, cost.chars);
+        assert_eq!(
+            ToolSpecCost::from_json("", &budget),
+            ToolSpecCost::default()
+        );
     }
 }
