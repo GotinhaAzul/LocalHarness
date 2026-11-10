@@ -295,6 +295,7 @@ async fn run_doctor(config: &Config, paths: &Paths, json: bool, fix: bool) -> Re
     let probe_path = paths.data_dir.join("tool-probe-cache.json");
     let probe_key = crate::provider::probe::tool_probe_key(&provider, manifest.build.as_deref());
     if let Some(cached) = crate::provider::probe::load_tool_probe(&probe_path, &probe_key) {
+        manifest.tool_dialect = cached.mode.clone();
         manifest.tool_probe = Some(cached);
     }
     if json {

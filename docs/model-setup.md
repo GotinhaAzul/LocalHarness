@@ -224,11 +224,13 @@ retried on the next start because server flags change. `lh doctor` only reads
 the cached result and never sends a chat completion itself.
 
 Anything other than `native_ok` switches the effective mode to `repair` and
-records a warning. A server that rejects tool definitions (`rejected_400`) also
-stops receiving them, so the next request is not rejected the same way. The
-chosen mode appears as `tool_probe` in `lh doctor`, as a `tool-probe` custom
-entry in the session, and as `tools:native`/`tools:repair` in the TUI header.
-Set `LH_SKIP_TOOL_PROBE=1` to skip the probe (diagnostics and scripted tests).
+records a warning; the system prompt then names the `<tool_call>` JSON block
+the repair layer executes. A server that rejects tool definitions
+(`rejected_400`) also stops receiving them, so the next request is not rejected
+the same way. The chosen mode appears as `tool_probe` in `lh doctor`, as a
+`tool-probe` custom entry in the session, and as `tools:native`/`tools:repair`
+in the TUI header. Set `LH_SKIP_TOOL_PROBE=1` to skip the probe (diagnostics and
+scripted tests).
 
 ### Manifest fields
 

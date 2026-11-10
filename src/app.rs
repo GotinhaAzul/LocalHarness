@@ -40,6 +40,13 @@ const START_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const START_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const START_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 
+/// Explicit wire format used when the conformance probe did not find native
+/// tool calls. `recover_output` already recognizes `<tool_call>` blocks.
+const REPAIR_PROTOCOL: &str = "\n\n## Tool calls\n\
+This server does not return structured tool calls. When you need a tool, write exactly one call as:\n\
+<tool_call>{\"name\":\"tool_name\",\"arguments\":{...}}</tool_call>\n\
+Use a bare block, not a fenced code block. Give the final answer in prose when no tool is needed.";
+
 /// Run the configured startup command once when the endpoint is unreachable,
 /// then wait for it to come up. Empty `model.start_command` disables this.
 async fn ensure_endpoint(
@@ -331,6 +338,12 @@ pub async fn create_runtime(
         .brief(&paths.cwd, crate::tools::repo_map::BRIEF_BUDGET);
     let system_prompt =
         prompt::build_system_prompt(&config, &paths, &skills, &tools, Some(&repo_brief));
+    // A server without native tool calls still lists the tools in the system
+    // prompt; name the exact wire format the repair layer can execute.
+    let mut system_prompt = system_prompt;
+    if profile.tool_mode == crate::config::ToolMode::Repair {
+        system_prompt.push_str(REPAIR_PROTOCOL);
+    }
     let mut budget = TokenBudget::new(context_window, config.model.max_output_tokens);
     let sampled = tokio::time::timeout(
         Duration::from_secs(2),
@@ -488,7 +501,7 @@ pub async fn rebuild_core(old: &Arc<Core>, mut config: Config) -> Result<Arc<Cor
     let repo_brief = registry
         .repo()
         .brief(&old.paths.cwd, crate::tools::repo_map::BRIEF_BUDGET);
-    let system_prompt =
+    let mut system_prompt =
         prompt::build_system_prompt(&config, &old.paths, &skills, &tools, Some(&repo_brief));
     let (_, mut model_profile) = config.model_profile();
     // Same target: keep the conformance result unless it never ran. A model
@@ -506,6 +519,9 @@ pub async fn rebuild_core(old: &Arc<Core>, mut config: Config) -> Result<Arc<Cor
     };
     if let Some(probe) = &tool_probe {
         apply_tool_probe(probe, &mut model_profile, &mut tool_specs);
+    }
+    if model_profile.tool_mode == crate::config::ToolMode::Repair {
+        system_prompt.push_str(REPAIR_PROTOCOL);
     }
     let mut budget = TokenBudget::new(context_window, config.model.max_output_tokens);
     if same_target {
@@ -1002,6 +1018,13 @@ mod tests {
         assert!(
             runtime.core.tool_specs.is_empty(),
             "a 400 must stop sending tool definitions"
+        );
+        assert!(
+            runtime
+                .core
+                .system_prompt
+                .contains("<tool_call>{\"name\":\"tool_name\""),
+            "the repair protocol must name the wire format"
         );
         let session = runtime.session.lock().unwrap();
         let recorded = session
