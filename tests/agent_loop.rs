@@ -581,35 +581,33 @@ async fn output_limit_cut_tool_call_does_not_run() {
     let dir = tempfile::tempdir().unwrap();
     let harness = harness(
         dir.path(),
-        vec![
-            Script::Events(vec![
-                StreamEvent::ToolCallDelta {
-                    index: 0,
-                    id: Some("call_1".into()),
-                    name: Some("write".into()),
-                    arguments: Some("{\"path\":\"big.rs\",\"content\":\"fn a() {}\\nfn b".into()),
-                },
-                StreamEvent::Finish("length".into()),
-            ]),
-            text_script("I will write it in parts."),
-        ],
+        vec![Script::Events(vec![
+            StreamEvent::ToolCallDelta {
+                index: 0,
+                id: Some("call_1".into()),
+                name: Some("write".into()),
+                arguments: Some("{\"path\":\"big.rs\",\"content\":\"fn a() {}\\nfn b".into()),
+            },
+            StreamEvent::Finish("length".into()),
+        ])],
         &["write"],
     );
     let (outcome, events) = run(&harness, "write big.rs").await;
-    assert_eq!(outcome.status, TurnStatus::Done);
+    assert_eq!(outcome.status, TurnStatus::Error);
+    let (code, message) = outcome.error.expect("typed truncation error");
+    assert_eq!(code, "tool_call_truncated");
+    assert!(message.contains("incomplete"), "{message}");
     assert!(!dir.path().join("big.rs").exists());
     assert!(tool_results(&harness.session).is_empty());
-    let nudges = user_messages(&harness.session);
-    assert!(
-        nudges
-            .iter()
-            .any(|m| m.contains("while writing the write call")),
-        "{nudges:?}"
+    assert_eq!(
+        harness.provider.requests.lock().unwrap().len(),
+        1,
+        "a truncated call must not be retried or dispatched"
     );
     assert!(
         events
             .iter()
-            .any(|e| matches!(e, AgentEvent::Notice(n) if n.contains("max_output_tokens")))
+            .any(|e| matches!(e, AgentEvent::Error { code, .. } if code == "tool_call_truncated"))
     );
 }
 
@@ -770,6 +768,14 @@ async fn cache_and_timing_reports_are_stored_with_the_reply() {
         last.perf_line().contains("cache 90%"),
         "{}",
         last.perf_line()
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::Usage(_)))
+            .count(),
+        1,
+        "usage must be reported once, not per chunk and once at the end"
     );
 }
 

@@ -244,7 +244,7 @@ impl OpenAiCompatProvider {
         })?;
 
         if let Some(err) = chunk.error {
-            let message = err.message.unwrap_or_else(|| "provider error".into());
+            let message = err.into_message();
             let class = if is_context_error(&message) {
                 ErrorClass::ContextTooSmall
             } else {
@@ -819,10 +819,43 @@ impl ToolCallIndexer {
     }
 }
 
+/// An in-stream error. Engines send either `{"error":{"message":"..."}}` or
+/// `{"error":"..."}`; both must abort the turn with the server's message
+/// instead of becoming an empty answer.
 #[derive(Debug, Deserialize)]
-struct ApiError {
-    #[serde(default)]
-    message: Option<String>,
+#[serde(untagged)]
+enum ApiError {
+    Object {
+        #[serde(default)]
+        message: Option<String>,
+        #[serde(default)]
+        r#type: Option<String>,
+        #[serde(default)]
+        code: Option<Value>,
+    },
+    Text(String),
+}
+
+impl ApiError {
+    fn into_message(self) -> String {
+        match self {
+            ApiError::Text(message) => message,
+            ApiError::Object {
+                message,
+                r#type,
+                code,
+            } => message
+                .or_else(|| {
+                    code.as_ref().and_then(|code| match code {
+                        Value::String(text) => Some(text.clone()),
+                        Value::Number(number) => Some(number.to_string()),
+                        _ => None,
+                    })
+                })
+                .or(r#type)
+                .unwrap_or_else(|| "provider error".into()),
+        }
+    }
 }
 
 fn reasoning_text(delta: &Delta, configured: Option<&str>) -> Option<String> {

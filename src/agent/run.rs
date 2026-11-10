@@ -1043,18 +1043,11 @@ fn recover_output(
         .content
         .as_deref()
         .is_none_or(|c| c.trim().is_empty());
+    // A model that hit its output limit mid-call delivered invalid JSON; the
+    // call is dropped, never dispatched.
     if assistant.stop_reason.as_deref() == Some("length") {
-        let cut = calls.iter().find(|call| {
-            matches!(&call.arguments, Value::String(raw) if serde_json::from_str::<Value>(raw).is_err())
-        });
         let limit = format!(" ({} tokens)", core.config.model.max_output_tokens);
-        if let Some(call) = cut {
-            out.nudge = Some(format!(
-                "[localharness] output limit: your response hit the output token limit{limit} while writing the {} call, so the call was cut off and nothing ran. Send a smaller call: write a short file and grow it with edit, or split the content across several calls.",
-                call.name
-            ));
-            assistant.tool_calls = None;
-        } else if calls.is_empty() {
+        if calls.is_empty() {
             out.nudge = Some(if content_empty {
                 "[localharness] output limit: you used the whole output budget thinking. Stop deliberating and act now: make one tool call or give a concise answer.".to_string()
             } else {
@@ -1201,6 +1194,32 @@ impl StreamAccum {
         }
     }
 
+    /// Reject a call whose arguments did not close because the output limit cut
+    /// the stream. A truncated call must never reach the batch: partial JSON
+    /// used to become a string value and then ran with corrupted arguments.
+    /// Other invalid JSON is left for the repair layer, which can fix common
+    /// model mistakes.
+    fn validate_calls(&self) -> Result<(), ProviderError> {
+        if self.degenerate || self.finish.as_deref() != Some("length") {
+            return Ok(());
+        }
+        for call in self.calls.values() {
+            if call.name.trim().is_empty() || call.arguments.trim().is_empty() {
+                continue;
+            }
+            if serde_json::from_str::<Value>(&call.arguments).is_err() {
+                return Err(ProviderError::new(
+                    ErrorClass::ToolCallTruncated,
+                    format!(
+                        "the model hit the output token limit while writing the {:?} tool call; its arguments are incomplete and nothing was executed. Raise [model] max_output_tokens or split the call into smaller steps.",
+                        call.name
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Emit anything the think splitter held back, and move reasoning that a
     /// template left as `...</think>` without an opening tag.
     fn settle_reasoning(&mut self, tx: &UnboundedSender<AgentEvent>) {
@@ -1315,6 +1334,10 @@ async fn stream_assistant(
     if let Some(usage) = &accum.usage {
         let _ = tx.send(AgentEvent::Usage(usage.clone()));
     }
+    if let Err(err) = accum.validate_calls() {
+        *partial = accum.partial();
+        return Err(err);
+    }
     if let Some(err) = failure {
         *partial = accum.partial();
         return Err(err);
@@ -1381,6 +1404,9 @@ fn handle_stream_item(
                 budget.calibrate(char_count, usage.prompt_tokens);
                 budget.observe_usage(usage.prompt_tokens, estimated_tokens);
             }
+            // Merge every report; the single `AgentEvent::Usage` is emitted
+            // after the stream closes, so a server that repeats usage on each
+            // chunk does not produce duplicate UI events.
             let merged = match accum.usage.as_mut() {
                 Some(existing) => {
                     existing.merge(&usage);
@@ -1388,7 +1414,6 @@ fn handle_stream_item(
                 }
                 None => usage,
             };
-            let _ = tx.send(AgentEvent::Usage(merged.clone()));
             accum.usage = Some(merged);
             None
         }
@@ -2363,6 +2388,29 @@ mod tests {
         again.calls.entry(0).or_default().name = "read".into();
         let second = again.finalize().tool_calls.unwrap();
         assert_ne!(calls[0].id, second[0].id);
+    }
+
+    #[test]
+    fn a_length_cut_invalid_call_is_rejected_before_dispatch() {
+        let mut accum = StreamAccum::new();
+        accum.finish = Some("length".into());
+        let call = accum.calls.entry(0).or_default();
+        call.name = "write".into();
+        call.arguments = "{\"path\":\"big.rs\",\"content\":\"fn a".into();
+        let err = accum.validate_calls().expect_err("truncated call");
+        assert_eq!(err.class, ErrorClass::ToolCallTruncated);
+        assert!(err.message.contains("incomplete"), "{}", err.message);
+        assert!(err.message.contains("max_output_tokens"), "{}", err.message);
+    }
+
+    #[test]
+    fn a_complete_call_is_not_rejected_at_the_output_limit() {
+        let mut accum = StreamAccum::new();
+        accum.finish = Some("length".into());
+        let call = accum.calls.entry(0).or_default();
+        call.name = "read".into();
+        call.arguments = "{\"path\":\"a.rs\"}".into();
+        assert!(accum.validate_calls().is_ok());
     }
 
     #[test]

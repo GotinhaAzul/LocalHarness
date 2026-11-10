@@ -202,6 +202,9 @@ pub enum ErrorClass {
     Server,
     Cancelled,
     Parse,
+    /// The output limit cut a streamed tool call before its JSON closed. The
+    /// call is dropped, never dispatched with partial arguments.
+    ToolCallTruncated,
 }
 
 impl ErrorClass {
@@ -215,6 +218,7 @@ impl ErrorClass {
             ErrorClass::Server => "server",
             ErrorClass::Cancelled => "cancelled",
             ErrorClass::Parse => "parse",
+            ErrorClass::ToolCallTruncated => "tool_call_truncated",
         }
     }
 }

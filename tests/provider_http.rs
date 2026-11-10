@@ -269,6 +269,28 @@ async fn a_duplicate_engine_id_with_a_new_name_does_not_merge_calls() {
 }
 
 #[tokio::test]
+async fn in_stream_error_aborts_with_the_server_message() {
+    let (base, state) = spawn().await;
+    state.script.lock().unwrap().push_back(Script {
+        status: 200,
+        body: concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"par\"}}]}\n\n",
+            "data: {\"error\":{\"message\":\"CUDA out of memory\",\"type\":\"server_error\"}}\n\n",
+            "data: [DONE]\n\n",
+        )
+        .into(),
+        chunked: true,
+    });
+    let events = collect_stream(&provider(&base), request(), CancellationToken::new()).await;
+    let error = events
+        .into_iter()
+        .find_map(|event| event.err())
+        .expect("stream error");
+    assert_eq!(error.class, ErrorClass::BadRequest);
+    assert_eq!(error.message, "CUDA out of memory");
+}
+
+#[tokio::test]
 async fn retries_without_stream_options_when_rejected() {
     let (base, state) = spawn().await;
     {
