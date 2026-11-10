@@ -26,8 +26,58 @@ netexec, bloodhound, certipy, rubeus, chisel, ligolo, pangolin). Targets are
 extracted best-effort from the command; `--help` and `--version` are allowed.
 
 **The gate is a speed bump, not a sandbox.** Unlisted tools, scripts, and
-obfuscation can bypass it. The rules of engagement are the real control. If you
-need isolation, run the harness in a container.
+obfuscation can bypass it. The rules of engagement are the real control. For
+process-level isolation use `--sandbox`; for VM-grade isolation, run the
+harness itself in a container.
+
+## Sandbox
+
+`--sandbox` puts `bash` and `bg` behind an OS-level boundary. The primary
+backend is [bubblewrap](https://github.com/containers/bubblewrap): each command
+runs in fresh user, mount, PID, IPC, UTS, cgroup, and network namespaces with a
+read-only root and a dropped capability set. A classic-BPF seccomp filter
+returns `EPERM` for mount, namespace, module, keyring, BPF, perf, tracing,
+`process_vm_*`, and related syscalls.
+
+Modes:
+
+- `read-only`: the filesystem is read-only except the command's private
+  `/tmp`.
+- `workspace-write`: the workspace is writable; everything else is read-only.
+  An existing `.git` inside the workspace is mounted read-only.
+
+`--sandbox` without a mode selects `workspace-write`.
+
+What bubblewrap enforces:
+
+- `$HOME` is set to `/nonexistent` and hidden behind an empty tmpfs on
+  `/home`. Reads such as `cat ~/.ssh/id_ed25519` fail, and writes to `$HOME`
+  fail.
+- `/tmp` is a private tmpfs, not the host's `/tmp`.
+- No network: the network namespace is empty, so TCP, UDP, DNS, and raw
+  sockets fail.
+- The environment is cleared. Only `PATH`, `LANG`, `LC_ALL`, `LC_CTYPE`,
+  `TERM`, `TZ`, `USER`, `LOGNAME`, and `SHELL` are passed through, plus
+  `HOME=/nonexistent` and `TMPDIR=/tmp`. API keys, SSH agent sockets,
+  GPG/DBus variables, and `XDG_*` are dropped.
+- The sandbox fails closed. If no backend is available at startup, `lh`
+  refuses to run with the sandbox enabled. If a command cannot be wrapped, the
+  tool returns `SANDBOX_UNAVAILABLE` and nothing runs unsandboxed.
+  `--no-sandbox` is the only way to opt out.
+
+When bubblewrap is not installed, the harness falls back to
+[Landlock](https://docs.kernel.org/userspace-api/landlock.html). The ruleset
+grants read/execute on `/`, writes under `TMPDIR`, and (in `workspace-write`)
+writes under the workspace, and it denies TCP bind/connect. Landlock is
+additive: it cannot hide `$HOME`, cannot make `.git` read-only, cannot restrict
+UDP, and writes the host's real `TMPDIR` rather than a private tmpfs. It also
+requires Landlock ABI 4 or newer for the network deny; older kernels fail
+closed instead of running with an open network. Prefer bubblewrap when you
+need those guarantees. The bubblewrap executable can be overridden with
+`LH_BWRAP` (useful for tests and non-standard installs).
+
+`--path-jail` is a separate file-tool boundary; it does not change how `bash`
+runs.
 
 ## Findings
 
@@ -236,5 +286,8 @@ in the system prompt. This reduces, but does not eliminate, prompt injection.
   from errors.
 - Artifact retention defaults to 30 days (`--keep-artifacts`,
   `--clean-artifacts`).
-- `--path-jail` restricts file tools to the working directory. It does not
-  restrict `bash`.
+- `--sandbox` restricts `bash` and `bg` at the OS level: bubblewrap namespaces
+  with a read-only root, private `/tmp`, hidden `$HOME`, no network, and a
+  read-only `.git` in `workspace-write` mode; the Landlock fallback has fewer
+  guarantees. It fails closed, and `--no-sandbox` is the explicit opt-out.
+  `--path-jail` restricts only the file tools.

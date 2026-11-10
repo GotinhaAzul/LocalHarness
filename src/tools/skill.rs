@@ -191,6 +191,7 @@ mod tests {
                 model: "m".into(),
                 profile: "full".into(),
                 app: "test".into(),
+                context: None,
             },
             true,
         )
@@ -210,6 +211,7 @@ mod tests {
             security: Default::default(),
             paths,
             lsp: Default::default(),
+            sandbox: None,
         }
     }
 

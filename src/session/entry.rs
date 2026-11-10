@@ -108,13 +108,33 @@ pub enum EntryKind {
     Error(ErrorData),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SessionData {
     pub cwd: String,
     pub endpoint: String,
     pub model: String,
     pub profile: String,
     pub app: String,
+    /// Context window resolution at session start: trained maximum, server
+    /// allocation, per-slot budget, and the effective minimum. Absent in
+    /// session files written before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<SessionContextWindow>,
+}
+
+/// The four context-window numbers recorded in a session header.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionContextWindow {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trained: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allocated: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub per_slot: Option<u32>,
+    pub effective: u32,
+    /// Where each value came from, keyed `trained`, `allocated`, `per_slot`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sources: Option<std::collections::BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -273,5 +293,101 @@ mod tests {
             EntryKind::Custom(c) => assert_eq!(c.payload["path"], "src/lib.rs"),
             _ => panic!("wrong type"),
         }
+    }
+
+    fn session_entry(context: Option<SessionContextWindow>) -> Entry {
+        Entry {
+            v: FORMAT_VERSION,
+            seq: 0,
+            id: "s1".into(),
+            parent: None,
+            ts: Utc::now(),
+            kind: EntryKind::Session(SessionData {
+                cwd: "/tmp".into(),
+                endpoint: "http://127.0.0.1:8080".into(),
+                model: "qwen3".into(),
+                profile: "full".into(),
+                app: "test".into(),
+                context,
+            }),
+        }
+    }
+
+    #[test]
+    fn old_session_header_without_context_still_loads() {
+        let json = serde_json::json!({
+            "cwd": "/tmp",
+            "endpoint": "http://127.0.0.1:8080",
+            "model": "qwen3",
+            "profile": "full",
+            "app": "0.1.0"
+        });
+        let data: SessionData = serde_json::from_value(json).unwrap();
+        assert!(data.context.is_none());
+        assert_eq!(data.model, "qwen3");
+    }
+
+    #[test]
+    fn session_context_roundtrips_all_four_values() {
+        let mut sources = std::collections::BTreeMap::new();
+        sources.insert(
+            "trained".to_string(),
+            "/v1/models meta.n_ctx_train".to_string(),
+        );
+        sources.insert(
+            "per_slot".to_string(),
+            "llama.cpp /props n_ctx (per slot)".to_string(),
+        );
+        let entry = session_entry(Some(SessionContextWindow {
+            trained: Some(131_072),
+            allocated: Some(8192),
+            per_slot: Some(4096),
+            effective: 4096,
+            sources: Some(sources),
+        }));
+        let json = serde_json::to_value(&entry).unwrap();
+        assert_eq!(json["data"]["context"]["trained"], 131_072);
+        assert_eq!(json["data"]["context"]["allocated"], 8192);
+        assert_eq!(json["data"]["context"]["per_slot"], 4096);
+        assert_eq!(json["data"]["context"]["effective"], 4096);
+        assert_eq!(
+            json["data"]["context"]["sources"]["per_slot"],
+            "llama.cpp /props n_ctx (per slot)"
+        );
+        let back: Entry = serde_json::from_value(json).unwrap();
+        match back.kind {
+            EntryKind::Session(data) => {
+                assert_eq!(
+                    data.context,
+                    Some(SessionContextWindow {
+                        trained: Some(131_072),
+                        allocated: Some(8192),
+                        per_slot: Some(4096),
+                        effective: 4096,
+                        sources: Some(
+                            [
+                                (
+                                    "per_slot".to_string(),
+                                    "llama.cpp /props n_ctx (per slot)".to_string()
+                                ),
+                                (
+                                    "trained".to_string(),
+                                    "/v1/models meta.n_ctx_train".to_string()
+                                ),
+                            ]
+                            .into_iter()
+                            .collect()
+                        ),
+                    })
+                );
+            }
+            _ => panic!("wrong type"),
+        }
+    }
+
+    #[test]
+    fn new_session_header_omits_absent_context() {
+        let json = serde_json::to_value(session_entry(None)).unwrap();
+        assert!(json["data"].get("context").is_none());
     }
 }

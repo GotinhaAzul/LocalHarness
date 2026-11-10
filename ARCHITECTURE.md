@@ -72,8 +72,9 @@ work.
 - codemode, tool search, deferred tool loading.
 - Windows support.
 - Pi extension or session compatibility.
-- A VM/container sandbox. The harness runs as the user; isolation is the
-  user's responsibility and is documented separately.
+- A VM or container runtime. `--sandbox` provides OS-level isolation for
+  `bash` and `bg` (bubblewrap, with a Landlock fallback); stronger isolation
+  remains the user's responsibility and is documented separately.
 - Lua, Rhai, WASM, or any runtime scripting for loop hooks.
 - Model training or fine-tuning.
 
@@ -121,7 +122,11 @@ Probes improve accuracy but are never required.
 A missing endpoint or model never blocks the TUI. Startup probes with a short
 timeout; if no model resolves, the core is built in a logged-out state, the
 session records a warning, and `/login` later validates and applies the
-connection. Headless `--print` rejects the logged-out state.
+connection. Headless `--print` rejects the logged-out state. When a model is
+already selected, `[model] start_command` runs in the background: the TUI opens
+first and a turn waits on a startup gate for the endpoint, so a slow `ssh` or a
+failed command cannot hold the launch. A command that exits non-zero is
+reported at once instead of waiting out the 30-second retry window.
 
 Fallbacks: `context_window` from config (default 32768), and a calibrated
 characters-per-token ratio. Calibration is corrected from `usage.prompt_tokens`
@@ -279,9 +284,10 @@ observable.
 
 | Guard | Behavior |
 |---|---|
-| Read-before-edit | `edit`/`write` on an existing file require a prior `read` with a matching stat stamp (`mtime`, size). A changed file requires a re-read. Creation is allowed. A successful `edit`/`patch`/`write` re-stamps only the file it wrote, so consecutive edits need no re-read while any outside change still does. |
+| Read-before-edit | `edit`/`patch` on an existing file require a prior `read` with a matching stat stamp (`mtime`, size). `write` also requires full-line coverage of the existing file, or an explicit `overwrite: true`; a result capped by the result or batch limit marks coverage incomplete. A changed file requires a re-read. Creation is allowed. A successful `edit`/`patch`/`write` re-stamps only the file it wrote, so consecutive edits need no re-read while any outside change still does. |
 | Scope gate | Security-sensitive commands are checked against the user-set engagement scope. No scope blocks with `SEC_SCOPE` and the `/sec scope add` call. Best-effort, not a sandbox. |
-| Loop guard | Signature is tool name plus canonical arguments. Same call three times in 24 calls, or a 2-4 call cycle three times, blocks the call and ends the turn with a recovery instruction. No automatic session replacement in v1. |
+| Sandbox | When `--sandbox` is set, `bash` and `bg` run in a bubblewrap namespace (or the Landlock fallback): read-only root, hidden `$HOME`, private `/tmp`, no network, and `.git` read-only in `workspace-write`. Startup fails closed when no backend exists; a per-command wrap failure returns `SANDBOX_UNAVAILABLE`. Commands never fall back to an unsandboxed run. |
+| Loop guard | Signature is tool name plus canonical arguments. Four identical calls in a row, or an exact 2-4 call cycle repeated four times, blocks the call and ends the turn with a recovery instruction. A file change or a passing verification clears the history, so long multi-step work does not trip it. No automatic session replacement in v1. |
 | Interactive command guard | Blocks `vim`, `less`, `top`, `htop`, `watch`, `nano`, `ssh` without a command, and similar TTY-only invocations. |
 | Budget | Caps tool calls, model calls, and wall clock. At 80% of the cap, inject a wrap-up instruction. |
 | Stall | Twelve consecutive calls with no new result fingerprint, no file change, and no successful verify. Ends the turn with the last known state. |
@@ -929,7 +935,8 @@ Security is a first-class pack and a first-class posture.
   or denial-of-service tooling.
 - The scope gate is a speed bump, not a sandbox. Target extraction is
   best-effort; unlisted tools and obfuscation can bypass it. The rules of
-  engagement remain the real control.
+  engagement remain the real control. `--sandbox` (8.12) is the process
+  boundary for `bash` and `bg`.
 
 ### 8.3 Scope gate
 
@@ -1047,8 +1054,11 @@ input characters. Missing input and unreadable files return prescriptive errors.
   error messages.
 - Artifact retention defaults to 30 days; `--keep-artifacts` and
   `--clean-artifacts` control it.
-- `--path-jail` restricts file tools to the working directory. It does not
-  restrict `bash`; the docs say so and point to containerization.
+- `--sandbox` restricts `bash` and `bg` at the OS level. Bubblewrap gives each
+  command a read-only root, hidden `$HOME`, private `/tmp`, no network, and a
+  read-only `.git` in `workspace-write`; the Landlock fallback has fewer
+  guarantees. It fails closed; `--no-sandbox` is the explicit opt-out.
+  `--path-jail` restricts only the file tools.
 
 ### 8.11 Supply chain
 
@@ -1058,6 +1068,36 @@ input characters. Missing input and unreadable files return prescriptive errors.
 - No install-time scripts in the Rust binary. Packaging instructions do not
   pipe remote scripts into a shell.
 - The external tool protocol does not auto-install anything.
+
+### 8.12 Sandbox
+
+- `Config` carries a runtime-only `SandboxMode` (`off`, `read-only`,
+  `workspace-write`) and a `sandbox_explicit` flag. `--sandbox[=MODE]` selects
+  a mode; `--no-sandbox` maps to `off`. Neither value is read from TOML.
+- `src/sandbox.rs` owns the engine. `Sandbox::new` resolves the workspace and
+  picks a backend: bubblewrap when `bwrap` (or `LH_BWRAP`) is executable,
+  otherwise Landlock. If neither is usable the constructor returns a
+  fail-closed error, and `detect` exposes the same check to the CLI.
+- Bubblewrap wraps `bash -lc` with `--unshare-all`, `--cap-drop ALL`, a
+  read-only `/`, private tmpfs mounts for `/tmp`, `/home`, and `/root`, the
+  workspace re-bound read-only or writable, `.git` re-bound read-only in
+  `workspace-write`, `--clearenv` plus an allowlisted environment,
+  `HOME=/nonexistent`, `TMPDIR=/tmp`, and a classic-BPF seccomp filter passed
+  through `--seccomp`. The filter returns `EPERM` for mount, namespace, module,
+  keyring, BPF, perf, ptrace, and `process_vm_*` syscalls.
+- The Landlock fallback builds a ruleset with read/execute on `/`, write rights
+  under the workspace (`workspace-write`) and `TMPDIR`, and TCP bind/connect
+  handled with no allow rule. It is applied in `pre_exec` under
+  `no_new_privs`. ABI 4 or newer is required for the network deny; older
+  kernels fail closed. Landlock cannot hide `$HOME`, cannot protect `.git`, and
+  does not cover UDP or the host `TMPDIR` being a real directory.
+- `shell_command(command, cwd, sandbox)` in `src/tools/bash.rs` is the single
+  command builder for `bash` and `bg`. A wrap failure returns
+  `SANDBOX_UNAVAILABLE`; there is no unsandboxed fallback. Process-group and
+  timeout behavior is unchanged because `wrap` sets `process_group(0)`.
+- The workspace is canonicalized at construction, and a tool `cwd` outside it
+  is rejected. A workspace equal to `/` is rejected in `workspace-write`
+  because re-binding it would expose the whole filesystem.
 
 ---
 
@@ -1609,8 +1649,10 @@ These do not block implementation; defaults are specified.
   graph or side-by-side diff of branches is not required.
 - **Packaging.** Static musl, AUR, Nix, and a shell installer are release
   tasks, not architecture.
-- **macOS.** The code avoids Linux-only APIs except process groups and git; a
-  best-effort build is acceptable after Linux is stable.
+- **macOS.** The code avoids Linux-only APIs except process groups, git, and
+  the `--sandbox` backends; on non-Linux hosts the sandbox reports that no
+  backend is available and `--no-sandbox` is required. A best-effort build is
+  acceptable after Linux is stable.
 - **Multiple live sessions.** One active session per process in v1. Tabs or
   multiple windows are later.
 - **Redaction.** Session logs are plaintext and documented. Automatic secret

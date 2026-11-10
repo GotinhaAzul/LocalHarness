@@ -10,7 +10,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 
 use crate::context::compact::{COMPACTION_BUDGET_CHARS, FindingSummary, build_summary};
-use crate::context::{self, BATCH_CAP_CHARS, TokenBudget, cap_result};
+use crate::context::{self, BATCH_CAP_CHARS, StaticPrompt, TokenBudget, cap_result};
 use crate::provider::{ChatMessage, ChatRequest, ErrorClass, ProviderError, StreamEvent, Usage};
 use crate::session::{
     AssistantData, CompactionData, CustomData, EntryKind, ToolCall, ToolResultData, UserData,
@@ -27,6 +27,9 @@ pub enum TurnStatus {
     Cancelled,
     Budget,
     Stalled,
+    /// The server dropped part of the prompt or the rendered prompt cannot
+    /// fit the effective window. The turn ended without replayable output.
+    ContextTruncated,
     Error,
     Blocked,
 }
@@ -51,6 +54,25 @@ impl TurnOutcome {
             error: Some((code.to_string(), message.into())),
         }
     }
+
+    /// A turn that never started because the budget cannot fit. The headless
+    /// exit code is 2, like other budget stops, but the error code is exact.
+    fn budget(code: &str, message: impl Into<String>) -> Self {
+        Self {
+            status: TurnStatus::Budget,
+            error: Some((code.to_string(), message.into())),
+        }
+    }
+}
+
+/// Budget and static prompt for one turn. Resolved after endpoint bring-up so
+/// a deferred `model.start_command` cannot leave the turn on a stale window.
+struct TurnContext {
+    budget: TokenBudget,
+    static_prompt: StaticPrompt,
+    tokenize: bool,
+    /// A window or Ollama-default warning discovered by the refresh.
+    notice: Option<String>,
 }
 
 /// Run one turn to settlement. Appends everything to the session branch;
@@ -61,14 +83,60 @@ pub async fn run_turn(
     tx: UnboundedSender<AgentEvent>,
     cancel: CancellationToken,
 ) -> TurnOutcome {
+    // A background `model.start_command` may still be bringing the endpoint
+    // up. Wait for it instead of racing the first request; cancellation wins.
+    let startup_pending = core.startup.as_ref().is_some_and(|gate| gate.pending());
+    if let Some(gate) = &core.startup {
+        if gate.pending() {
+            let _ = tx.send(AgentEvent::Notice(
+                "waiting for the model endpoint (model.start_command)".into(),
+            ));
+        }
+        if gate.ready(&cancel).await.is_none() {
+            let outcome = TurnOutcome::ok(TurnStatus::Cancelled);
+            let _ = tx.send(AgentEvent::State(AgentState::Cancelled));
+            let _ = tx.send(AgentEvent::TurnDone(outcome.clone()));
+            return outcome;
+        }
+    }
+
     let _ = tx.send(AgentEvent::TurnStarted {
         model: core.provider.model().to_string(),
         profile: core.config.profile_name().to_string(),
     });
 
+    // Resolve the window and tokenizer after bring-up. A deferred startup
+    // probe runs before the server exists, so the build-time values can be
+    // fallbacks; this refresh is what keeps the first turn from budgeting
+    // against the wrong window.
+    let turn = prepare_turn_context(&core, startup_pending).await;
+
+    if let Some(message) = static_prompt_warning(&turn.static_prompt, &turn.budget) {
+        let _ = tx.send(AgentEvent::Notice(message));
+    }
+    if let Some(notice) = &turn.notice {
+        let _ = tx.send(AgentEvent::Notice(notice.clone()));
+    } else if let Some(notice) = &core.window_notice {
+        let tx = tx.clone();
+        core.window_notice_sent.call_once(|| {
+            let _ = tx.send(AgentEvent::Notice(notice.clone()));
+        });
+    }
+    if let Some((code, message)) = static_prompt_failure(&turn.static_prompt, &turn.budget) {
+        let _ = tx.send(AgentEvent::Error {
+            code: code.clone(),
+            message: message.clone(),
+            recoverable: false,
+        });
+        let outcome = TurnOutcome::budget(&code, message);
+        let _ = tx.send(AgentEvent::State(AgentState::Error));
+        let _ = tx.send(AgentEvent::TurnDone(outcome.clone()));
+        return outcome;
+    }
+
     // `@path` mentions attach file snapshots, within a quarter of the
     // usable prompt so one message cannot crowd out the conversation.
-    let attachment_budget = core.budget.chars_for(core.budget.usable_prompt() / 4);
+    let attachment_budget = turn.budget.chars_for(turn.budget.usable_prompt() / 4);
     let mentions = super::mentions::resolve(&core.tool_context(), &user_text, attachment_budget);
     if !mentions.attachments.is_empty() {
         let names: Vec<&str> = mentions
@@ -93,7 +161,7 @@ pub async fn run_turn(
     }
 
     let turn_start = core.session.lock().expect("session lock").active_leaf_id();
-    let outcome = run_loop(&core, &tx, &cancel, turn_start).await;
+    let outcome = run_loop(&core, &tx, &cancel, turn_start, turn).await;
     if let Ok(mut session) = core.session.lock()
         && let Err(err) = session.fsync()
     {
@@ -102,11 +170,89 @@ pub async fn run_turn(
     let _ = tx.send(AgentEvent::State(match outcome.status {
         TurnStatus::Done => AgentState::Done,
         TurnStatus::Cancelled => AgentState::Cancelled,
-        TurnStatus::Error => AgentState::Error,
+        TurnStatus::Error | TurnStatus::ContextTruncated => AgentState::Error,
         _ => AgentState::Done,
     }));
     let _ = tx.send(AgentEvent::TurnDone(outcome.clone()));
     outcome
+}
+
+/// The configured window, if the model profile or `[model]` pins one.
+fn configured_window(core: &Core) -> Option<u32> {
+    let (_, profile) = core.config.model_profile();
+    profile.context_window.or(core.config.model.context_window)
+}
+
+/// Resolve the budget and static prompt for this turn. When endpoint bring-up
+/// was deferred or the window is still a guess, probe now, after the server is
+/// up, and re-measure the static prompt with the calibrated tokenizer ratio.
+async fn prepare_turn_context(core: &Core, startup_pending: bool) -> TurnContext {
+    let mut budget = core.budget.clone();
+    let (effective, source) = core.effective_window();
+    if effective > 0 && effective != budget.context_window {
+        budget = budget.resized_to(effective, core.config.model.max_output_tokens);
+    }
+    let known_window = core
+        .server_window
+        .load(std::sync::atomic::Ordering::Relaxed);
+    if known_window > 0 && known_window < budget.context_window {
+        budget = budget.shrunk_to(known_window);
+    }
+    let refresh = startup_pending || !source.is_reliable();
+    let mut static_prompt = core.static_prompt;
+    let mut tokenize = core.tokenize;
+    let mut notice = None;
+    if refresh {
+        let configured = configured_window(core);
+        let truth = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            crate::provider::probe::probe_context_truth(core.provider.as_ref()),
+        )
+        .await
+        .ok()
+        .flatten()
+        .filter(|truth| truth.is_known());
+        if let Some(truth) = truth {
+            let window = configured
+                .map(|configured| configured.min(truth.effective))
+                .unwrap_or(truth.effective);
+            if window > 0 {
+                budget = budget.resized_to(window, core.config.model.max_output_tokens);
+                core.remember_window(window);
+                if core.window_notice.is_none() {
+                    notice = crate::app::window_notice(Some(&truth), configured);
+                }
+            }
+        }
+        let sampled = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            crate::provider::probe::token_count(core.provider.as_ref(), &core.system_prompt),
+        )
+        .await
+        .ok()
+        .flatten();
+        if let Some(tokens) = sampled {
+            tokenize = true;
+            if tokens > 0 {
+                budget.calibrate(
+                    core.system_prompt.chars().count(),
+                    tokens.min(u32::MAX as usize) as u32,
+                );
+            }
+        }
+        static_prompt = crate::app::measure_static_prompt(
+            &budget,
+            &core.system_prompt,
+            &core.tool_specs,
+            Some(core.repo_brief.as_str()),
+        );
+    }
+    TurnContext {
+        budget,
+        static_prompt,
+        tokenize,
+        notice,
+    }
 }
 
 async fn run_loop(
@@ -114,9 +260,10 @@ async fn run_loop(
     tx: &UnboundedSender<AgentEvent>,
     cancel: &CancellationToken,
     turn_start: Option<String>,
+    turn: TurnContext,
 ) -> TurnOutcome {
     let mut progress = RunProgress::new(core.limits.clone());
-    let mut budget = core.budget.clone();
+    let mut budget = turn.budget;
     let detected = core
         .detected_window
         .load(std::sync::atomic::Ordering::Relaxed);
@@ -130,6 +277,15 @@ async fn run_loop(
         .load(std::sync::atomic::Ordering::Relaxed);
     if known_window > 0 && known_window < budget.context_window {
         budget = budget.shrunk_to(known_window);
+    }
+    if let Some((code, message)) = static_prompt_failure(&turn.static_prompt, &budget) {
+        append_error(&core.session, &code, &message, false);
+        let _ = tx.send(AgentEvent::Error {
+            code: code.clone(),
+            message: message.clone(),
+            recoverable: false,
+        });
+        return TurnOutcome::budget(&code, message);
     }
     let mut loop_guard = LoopGuard::new();
     let verify_configured = !core.config.verify.steps.is_empty();
@@ -199,11 +355,17 @@ async fn run_loop(
             findings.as_ref(),
             budget.percent(assembled.estimated_tokens),
         );
-        if assembled
-            .messages
+        // A compaction on the branch means the state block must be attached.
+        // Detect it from the session, not from the assembled system text:
+        // after system merging the summary lives inside messages[0].
+        let had_compaction = core
+            .session
+            .lock()
+            .expect("session lock")
+            .branch_entries()
             .iter()
-            .any(|m| matches!(m, ChatMessage::System { content } if content.starts_with("[localharness] deterministic compaction")))
-        {
+            .any(|entry| matches!(entry.kind, EntryKind::Compaction(_)));
+        if had_compaction {
             assembled = context::assemble(
                 &core.system_prompt,
                 &core.session.lock().expect("session lock"),
@@ -248,6 +410,56 @@ async fn run_loop(
                         recoverable: true,
                     });
                 }
+            }
+        }
+
+        // When the engine exposes /tokenize, measure the rendered prompt
+        // exactly before sending. The estimate is only a calibration guard;
+        // this is the hard gate that keeps a fitting request from being cut.
+        if turn.tokenize && budget.exceeds_compaction_threshold(assembled.estimated_tokens) {
+            let text = tokenize_text(&assembled.messages, &core.tool_specs);
+            let exact = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                crate::provider::probe::token_count(core.provider.as_ref(), &text),
+            )
+            .await
+            .ok()
+            .flatten()
+            .map(|tokens| tokens.min(u32::MAX as usize) as u32);
+            if let Some(exact) = exact
+                && exact > budget.usable_prompt()
+            {
+                if !progress.presend_compaction_used {
+                    progress.presend_compaction_used = true;
+                    pending_compaction = true;
+                    let _ = tx.send(AgentEvent::Notice(format!(
+                        "the exact tokenizer count is {exact} tokens, but only {} fit the {} token window; compacting before sending.",
+                        budget.usable_prompt(),
+                        budget.context_window
+                    )));
+                    continue;
+                }
+                let suggested = budget.context_window.max(8192);
+                let message = format!(
+                    "the rendered prompt is {exact} tokens after compaction, but only {} fit the effective {} token window. The request was not sent. Raise the engine context (llama.cpp --ctx-size {suggested}; Ollama OLLAMA_CONTEXT_LENGTH={suggested}; vLLM --max-model-len {suggested}), lower [model] max_output_tokens, or run /new.",
+                    budget.usable_prompt(),
+                    budget.context_window
+                );
+                append_custom(
+                    &core.session,
+                    "context-truncated",
+                    json!({
+                        "signal": "exact tokenizer count exceeds the effective window",
+                        "estimated_tokens": exact,
+                        "context_window": budget.context_window,
+                    }),
+                );
+                append_error(&core.session, "context_truncated", &message, false);
+                let _ = tx.send(AgentEvent::Guard {
+                    code: "context_truncated".into(),
+                    message,
+                });
+                return TurnOutcome::ok(TurnStatus::ContextTruncated);
             }
         }
 
@@ -368,23 +580,40 @@ async fn run_loop(
             }
         }
 
-        if let Some(limit) = budget.truncated_at.take()
-            && limit < budget.context_window
+        if let Some(signal) = detect_truncation(&mut budget, &assistant, assembled.estimated_tokens)
         {
-            core.server_window
-                .store(limit, std::sync::atomic::Ordering::Relaxed);
-            budget = budget.shrunk_to(limit);
-            let _ = tx.send(AgentEvent::Notice(format!(
-                "the server silently truncated the prompt to about {limit} tokens, cutting the system prompt and tools. Raise its context size (Ollama: OLLAMA_CONTEXT_LENGTH=32768 or `PARAMETER num_ctx 32768`; llama.cpp: -c 32768). Working within {limit} tokens until then."
-            )));
-            context_window_event(tx, &budget, &assistant);
-            if !progress.truncation_retry_used {
-                // That reply was written without the system prompt; drop it
-                // and retry once the context fits the real window.
-                progress.truncation_retry_used = true;
-                pending_compaction = true;
-                continue;
+            // A reply written against a prompt the server cut is not
+            // trustworthy: do not append it, and do not continue this branch
+            // silently.
+            if let Some(limit) = signal.limit
+                && limit < budget.context_window
+            {
+                core.server_window
+                    .store(limit, std::sync::atomic::Ordering::Relaxed);
+                core.remember_window(limit);
+                budget = budget.shrunk_to(limit);
             }
+            let message = signal.message(&budget, assembled.estimated_tokens);
+            append_custom(
+                &core.session,
+                "context-truncated",
+                json!({
+                    "signal": signal.source,
+                    "prompt_tokens": signal.prompt_tokens,
+                    "estimated_tokens": assembled.estimated_tokens,
+                    "context_window": budget.context_window,
+                    "limit": signal.limit,
+                }),
+            );
+            append_error(&core.session, "context_truncated", &message, false);
+            let _ = tx.send(AgentEvent::Guard {
+                code: "context_truncated".into(),
+                message: message.clone(),
+            });
+            let _ = tx.send(AgentEvent::Notice(
+                "the turn ended because the prompt was truncated. Run /compact to rebuild a fitting summary, or /new to start a fresh branch; do not continue this one.".into(),
+            ));
+            return TurnOutcome::ok(TurnStatus::ContextTruncated);
         }
         let mut assistant = assistant;
         let recovery = recover_output(core, &mut assistant, &mut progress);
@@ -600,6 +829,142 @@ fn context_window_event(
             window: budget.context_window,
         });
     }
+}
+
+/// Refuse a turn whose fixed prompt cannot fit the effective window. The
+/// message names the three components and the exact server flag to raise.
+fn static_prompt_failure(
+    static_prompt: &StaticPrompt,
+    budget: &TokenBudget,
+) -> Option<(String, String)> {
+    let static_prompt = *static_prompt;
+    let usable = budget.usable_prompt();
+    if static_prompt.total <= usable {
+        return None;
+    }
+    let (largest_name, largest) = static_prompt.largest();
+    let message = format!(
+        "the static prompt cannot fit the model window: system prompt ~{} tokens + tool schemas ~{} + repository brief ~{} = {} tokens, but only {} of the {} token window are usable for input ({} reserved for output, {} safety margin). The request would be cut before your first message. Largest contributor: {} ({} tokens). Use the minimal profile, raise the engine context (llama.cpp --ctx-size {}; Ollama OLLAMA_CONTEXT_LENGTH={}; vLLM --max-model-len {}), or lower [model] max_output_tokens.",
+        static_prompt.system,
+        static_prompt.tools,
+        static_prompt.repo,
+        static_prompt.total,
+        usable,
+        budget.context_window,
+        budget.max_output_tokens,
+        budget.safety_margin,
+        largest_name,
+        largest,
+        budget.context_window.max(8192),
+        budget.context_window.max(8192),
+        budget.context_window.max(8192),
+    );
+    Some(("budget_static".to_string(), message))
+}
+
+/// Warn once per turn when the static prompt consumes more than half of the
+/// usable prompt. Not a failure: a 32k window is unchanged.
+fn static_prompt_warning(static_prompt: &StaticPrompt, budget: &TokenBudget) -> Option<String> {
+    let static_prompt = *static_prompt;
+    let usable = budget.usable_prompt();
+    if static_prompt.total <= usable || u64::from(static_prompt.total) * 2 <= u64::from(usable) {
+        return None;
+    }
+    let (largest_name, largest) = static_prompt.largest();
+    Some(format!(
+        "static prompt uses {:.0}% of the usable prompt ({} of {} tokens: system ~{}, tools ~{}, repo brief ~{}; largest: {} at {}). A small window leaves little room for the conversation; raise the engine context or use a smaller profile.",
+        static_prompt.percent_of(usable),
+        static_prompt.total,
+        usable,
+        static_prompt.system,
+        static_prompt.tools,
+        static_prompt.repo,
+        largest_name,
+        largest,
+    ))
+}
+
+struct TruncationSignal {
+    source: String,
+    limit: Option<u32>,
+    prompt_tokens: Option<u32>,
+}
+
+impl TruncationSignal {
+    fn message(&self, budget: &TokenBudget, estimated_tokens: u32) -> String {
+        let mut out = format!(
+            "the server truncated the prompt ({}): the harness estimated {} tokens, the server counted {}; effective window {} tokens.",
+            self.source,
+            estimated_tokens,
+            self.prompt_tokens
+                .map(|tokens| tokens.to_string())
+                .unwrap_or_else(|| "an unknown number".into()),
+            budget.context_window,
+        );
+        if let Some(limit) = self.limit {
+            out.push_str(&format!(
+                " The server appears to accept about {limit} prompt tokens."
+            ));
+        }
+        let suggested = budget.context_window.max(8192);
+        out.push_str(&format!(
+            " The reply was discarded and the turn stopped; do not continue this branch. Raise the engine context (llama.cpp --ctx-size {suggested}; Ollama OLLAMA_CONTEXT_LENGTH={suggested}; vLLM --max-model-len {suggested}), then run /compact or /new."
+        ));
+        out
+    }
+}
+
+/// A turn-ending truncation signal: the engine's own flag, a context shift,
+/// the usage-ratio heuristic, or a prompt-token shortfall larger than the
+/// safety margin. Returns `None` when the prompt was served whole.
+fn detect_truncation(
+    budget: &mut TokenBudget,
+    assistant: &AssistantData,
+    estimated_tokens: u32,
+) -> Option<TruncationSignal> {
+    if let Some(limit) = budget.truncated_at.take() {
+        return Some(TruncationSignal {
+            source: "usage ratio: the server counted far fewer tokens than the text contains"
+                .into(),
+            limit: Some(limit),
+            prompt_tokens: assistant.usage.as_ref().map(|usage| usage.prompt_tokens),
+        });
+    }
+    let usage = assistant.usage.as_ref()?;
+    if usage.truncated == Some(true) {
+        return Some(TruncationSignal {
+            source: "the engine reported truncated=true".into(),
+            limit: Some(usage.prompt_tokens).filter(|tokens| *tokens > 0),
+            prompt_tokens: Some(usage.prompt_tokens),
+        });
+    }
+    if usage.context_shift.unwrap_or(0) > 0 {
+        return Some(TruncationSignal {
+            source: format!(
+                "the engine reported {} context-shift event(s)",
+                usage.context_shift.unwrap_or(0)
+            ),
+            limit: None,
+            prompt_tokens: Some(usage.prompt_tokens),
+        });
+    }
+    if usage.prompt_tokens > 0 && estimated_tokens >= 2_048 {
+        let shortfall = estimated_tokens.saturating_sub(usage.prompt_tokens);
+        // A small tokenizer disagreement is normal; a shortfall larger than
+        // the safety margin, and at least a quarter of the prompt, means the
+        // server dropped messages or tools.
+        if shortfall > budget.safety_margin && usage.prompt_tokens < estimated_tokens * 3 / 4 {
+            return Some(TruncationSignal {
+                source: format!(
+                    "prompt-token shortfall: estimated {estimated_tokens}, server counted {}",
+                    usage.prompt_tokens
+                ),
+                limit: None,
+                prompt_tokens: Some(usage.prompt_tokens),
+            });
+        }
+    }
+    None
 }
 
 /// A call id unique within the session, for servers that omit ids and for
@@ -1305,6 +1670,16 @@ async fn execute_batch(
                     capped.content = capped.content.chars().take(200).collect::<String>();
                 }
             }
+            capped.truncated = true;
+        }
+        // A read whose result was capped did not show the model the whole
+        // file. Record that so `write` requires an explicit overwrite.
+        if call.name == "read"
+            && capped.truncated
+            && let Some(path) = &args_path
+            && let Ok(resolved) = ctx.resolve(path)
+        {
+            crate::tools::write::lock_reads(&ctx).mark_result_truncated(&resolved);
         }
         batch_chars += capped.content.chars().count();
         let tool_result = ToolResult {
@@ -1405,6 +1780,11 @@ async fn execute_batch(
 
         let fingerprint = fingerprint(&call.name, &raw, &tool_result.content);
         progress.record_tool_result(&fingerprint, changed, verified_ok);
+        if changed || verified_ok {
+            // A file change or a passing verification is real progress; the
+            // loop guard must not count calls from before it.
+            loop_guard.record_progress();
+        }
         let _ = tx.send(AgentEvent::ToolFinished {
             call_id: call.id.clone(),
             name: call.name.clone(),
@@ -1546,6 +1926,50 @@ fn append_custom(session: &crate::tools::SessionHandle, kind: &str, payload: Val
         }
         let _ = session.append(EntryKind::Custom(data));
     }
+}
+
+/// Render the prompt the way the model sees it closely enough for
+/// `/tokenize`: role-tagged message text plus tool names, descriptions, and
+/// schemas. The chat template adds a small constant overhead, so a count at
+/// or below the usable prompt is safe; the server's own error remains the
+/// final backstop.
+fn tokenize_text(messages: &[ChatMessage], tools: &[crate::provider::ToolSpec]) -> String {
+    let mut out = String::new();
+    for message in messages {
+        out.push_str(message.role());
+        out.push_str(": ");
+        match message {
+            ChatMessage::System { content } | ChatMessage::User { content } => {
+                out.push_str(content);
+            }
+            ChatMessage::Assistant {
+                content,
+                tool_calls,
+            } => {
+                if let Some(content) = content {
+                    out.push_str(content);
+                }
+                for call in tool_calls {
+                    out.push_str(&format!(
+                        "\n{} {}",
+                        call.name,
+                        serde_json::to_string(&call.arguments).unwrap_or_default()
+                    ));
+                }
+            }
+            ChatMessage::Tool { content, .. } => out.push_str(content),
+        }
+        out.push('\n');
+    }
+    for tool in tools {
+        out.push_str(&tool.name);
+        out.push(' ');
+        out.push_str(&tool.description);
+        out.push(' ');
+        out.push_str(&serde_json::to_string(&tool.parameters).unwrap_or_else(|_| "{}".to_string()));
+        out.push('\n');
+    }
+    out
 }
 
 fn account_tools(
@@ -1752,6 +2176,165 @@ fn compact_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
+
+    use async_trait::async_trait;
+    use tokio::sync::mpsc::UnboundedSender;
+
+    use crate::agent::{RunLimits, WindowSource};
+    use crate::config::{BudgetConfig, ModelProfile};
+    use crate::context::budget::DEFAULT_CHARS_PER_TOKEN;
+    use crate::paths::Paths;
+    use crate::provider::{ChatRequest, Provider, StreamItem};
+    use crate::security::SecurityState;
+    use crate::session::{Session, SessionData};
+    use crate::tools::{BgRegistry, ReadTracker, ToolRegistry};
+
+    struct ProbeProvider {
+        endpoint: String,
+        client: reqwest::Client,
+    }
+
+    #[async_trait]
+    impl Provider for ProbeProvider {
+        async fn chat_stream(
+            &self,
+            _req: ChatRequest,
+            _tx: UnboundedSender<StreamItem>,
+            _cancel: CancellationToken,
+        ) {
+        }
+
+        fn endpoint(&self) -> &str {
+            &self.endpoint
+        }
+
+        fn model(&self) -> &str {
+            "m"
+        }
+
+        fn client(&self) -> Option<&reqwest::Client> {
+            Some(&self.client)
+        }
+    }
+
+    async fn probe_server() -> String {
+        use axum::routing::{get, post};
+        let models = || async { axum::Json(json!({"data": [{"id": "m", "max_model_len": 4096}]})) };
+        let tokenize = || async { axum::Json(json!({"tokens": vec![0u32; 100]})) };
+        let app = axum::Router::new()
+            .route("/v1/models", get(models))
+            .route("/tokenize", post(tokenize));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{address}")
+    }
+
+    fn probe_core(dir: &std::path::Path, endpoint: String) -> Core {
+        let mut paths = Paths::discover(dir).unwrap();
+        paths.data_dir = dir.join("data");
+        paths.config_dir = dir.join("config");
+        let session = Session::create(
+            &paths,
+            SessionData {
+                cwd: dir.display().to_string(),
+                endpoint: endpoint.clone(),
+                model: "m".into(),
+                profile: "test".into(),
+                app: "test".into(),
+                context: None,
+            },
+            true,
+        )
+        .unwrap();
+        let artifacts = session.artifacts.clone();
+        let session = Arc::new(Mutex::new(session));
+        let mut config = crate::config::Config::builtin();
+        config.model.endpoint = endpoint.clone();
+        config.model.model = "m".into();
+        config.model.context_window = Some(32_768);
+        config.model.max_output_tokens = 1024;
+        config.profile_name = "minimal".into();
+        let registry = ToolRegistry::builtin();
+        let tools = registry.select(config.profile(), &[]).unwrap();
+        let tool_specs = ToolRegistry::specs(&tools);
+        let system_prompt = "s".repeat(1000);
+        let budget = TokenBudget::new(32_768, 1024);
+        let static_prompt =
+            crate::app::measure_static_prompt(&budget, &system_prompt, &tool_specs, Some(""));
+        Core {
+            config,
+            paths: paths.clone(),
+            provider: Arc::new(ProbeProvider {
+                endpoint,
+                client: reqwest::Client::new(),
+            }),
+            registry,
+            tools,
+            tool_specs,
+            session,
+            artifacts,
+            reads: Arc::new(Mutex::new(ReadTracker::default())),
+            bg: Arc::new(Mutex::new(BgRegistry::new())),
+            security: Arc::new(Mutex::new(SecurityState::default())),
+            sandbox: None,
+            budget,
+            static_prompt,
+            tokenize: false,
+            limits: RunLimits::from(&BudgetConfig::default()),
+            system_prompt,
+            repo_brief: String::new(),
+            model_profile: ModelProfile::default(),
+            cancel: CancellationToken::new(),
+            tool_timeout: std::time::Duration::from_secs(10),
+            path_jail: false,
+            server_window: Default::default(),
+            window_source: WindowSource::Default,
+            window_truth: None,
+            window_notice: None,
+            window_notice_sent: std::sync::Once::new(),
+            detected_window: Default::default(),
+            window_cache: Default::default(),
+            startup: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn deferred_startup_refreshes_window_tokenizer_and_static_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let endpoint = probe_server().await;
+        let core = probe_core(dir.path(), endpoint);
+        assert_eq!(core.budget.context_window, 32_768);
+        assert!(!core.tokenize);
+        assert_eq!(core.budget.chars_per_token, DEFAULT_CHARS_PER_TOKEN);
+
+        let turn = prepare_turn_context(&core, true).await;
+        assert_eq!(turn.budget.context_window, 4096);
+        assert!(turn.tokenize);
+        assert!(
+            turn.budget.chars_per_token > DEFAULT_CHARS_PER_TOKEN,
+            "tokenizer calibration did not run"
+        );
+        assert_eq!(
+            core.detected_window
+                .load(std::sync::atomic::Ordering::Relaxed),
+            4096
+        );
+        // The static prompt must be re-measured with the calibrated ratio.
+        assert_eq!(
+            turn.static_prompt,
+            crate::app::measure_static_prompt(
+                &turn.budget,
+                &core.system_prompt,
+                &core.tool_specs,
+                Some(core.repo_brief.as_str())
+            )
+        );
+        assert_ne!(turn.static_prompt, core.static_prompt);
+    }
 
     #[test]
     fn merge_fragment_handles_repeats() {
@@ -1786,5 +2369,52 @@ mod tests {
     fn arguments_raw_roundtrips_objects_and_strings() {
         assert_eq!(arguments_raw(&json!({"a":1})), "{\"a\":1}");
         assert_eq!(arguments_raw(&json!("{}")), "{}");
+    }
+
+    #[test]
+    fn truncation_is_detected_from_engine_flag_and_shortfall() {
+        let mut budget = TokenBudget::new(8192, 1024);
+        let assistant = AssistantData {
+            usage: Some(Usage {
+                prompt_tokens: 100,
+                truncated: Some(true),
+                ..Usage::default()
+            }),
+            ..AssistantData::default()
+        };
+        let signal = detect_truncation(&mut budget, &assistant, 4000).expect("engine flag");
+        assert!(signal.source.contains("truncated=true"));
+
+        let mut budget = TokenBudget::new(8192, 1024);
+        let assistant = AssistantData {
+            usage: Some(Usage {
+                prompt_tokens: 1000,
+                ..Usage::default()
+            }),
+            ..AssistantData::default()
+        };
+        let signal = detect_truncation(&mut budget, &assistant, 6000).expect("shortfall");
+        assert!(signal.source.contains("shortfall"));
+
+        // A small tokenizer disagreement is not truncation.
+        let mut budget = TokenBudget::new(8192, 1024);
+        let assistant = AssistantData {
+            usage: Some(Usage {
+                prompt_tokens: 3900,
+                ..Usage::default()
+            }),
+            ..AssistantData::default()
+        };
+        assert!(detect_truncation(&mut budget, &assistant, 4000).is_none());
+    }
+
+    #[test]
+    fn usage_ratio_truncation_signal_is_taken_once() {
+        let mut budget = TokenBudget::new(8192, 1024);
+        budget.truncated_at = Some(2048);
+        let assistant = AssistantData::default();
+        assert!(detect_truncation(&mut budget, &assistant, 4000).is_some());
+        assert!(budget.truncated_at.is_none());
+        assert!(detect_truncation(&mut budget, &assistant, 4000).is_none());
     }
 }

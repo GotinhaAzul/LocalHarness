@@ -10,6 +10,49 @@ const TRUNCATION_CHARS_PER_TOKEN: f64 = 6.0;
 /// Below this size a prompt is too small to judge.
 const TRUNCATION_MIN_CHARS: usize = 12_000;
 
+/// Token estimate for the part of the prompt that exists before the user
+/// types anything: system prompt, tool schemas, and repository brief.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StaticPrompt {
+    pub system: u32,
+    pub tools: u32,
+    pub repo: u32,
+    pub total: u32,
+}
+
+impl StaticPrompt {
+    pub fn new(system: u32, tools: u32, repo: u32) -> Self {
+        Self {
+            system,
+            tools,
+            repo,
+            total: system.saturating_add(tools).saturating_add(repo),
+        }
+    }
+
+    /// The largest component and its name, for a refusal message.
+    pub fn largest(&self) -> (&'static str, u32) {
+        let mut name = "system prompt";
+        let mut value = self.system;
+        if self.tools > value {
+            name = "tool schemas";
+            value = self.tools;
+        }
+        if self.repo > value {
+            name = "repository brief";
+            value = self.repo;
+        }
+        (name, value)
+    }
+
+    pub fn percent_of(&self, usable: u32) -> f32 {
+        if usable == 0 {
+            return 100.0;
+        }
+        (self.total as f32 / usable as f32) * 100.0
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TokenBudget {
     pub context_window: u32,
@@ -175,5 +218,15 @@ mod tests {
         assert_eq!(budget.compaction_threshold(), 6790);
         assert!(!budget.exceeds_compaction_threshold(6789));
         assert!(budget.exceeds_compaction_threshold(6790));
+    }
+
+    #[test]
+    fn static_prompt_names_its_largest_component() {
+        let prompt = StaticPrompt::new(900, 2500, 400);
+        assert_eq!(prompt.total, 3800);
+        assert_eq!(prompt.largest(), ("tool schemas", 2500));
+        assert!(prompt.percent_of(2560) > 100.0);
+        let prompt = StaticPrompt::new(2000, 300, 100);
+        assert_eq!(prompt.largest(), ("system prompt", 2000));
     }
 }

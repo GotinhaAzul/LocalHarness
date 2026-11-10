@@ -1,6 +1,10 @@
 [advisories]
 version = 2
 yanked = "warn"
+# serde_yaml is deprecated and pulls unsafe-libyaml, which has no safe
+# upgrade. The advisory is unmaintained-only, not a vulnerability; replace
+# serde_yaml before lifting this ignore.
+ignore = ["RUSTSEC-2024-0449"]
 
 [licenses]
 version = 2
@@ -8,8 +12,8 @@ allow = [
     "MIT",
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
-    "BSD-2-Clause",
     "BSD-3-Clause",
+    "CDLA-Permissive-2.0",
     "ISC",
     "Unicode-3.0",
     "Zlib",

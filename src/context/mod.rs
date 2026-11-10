@@ -12,7 +12,7 @@ use crate::session::{AssistantData, Entry, EntryKind, Session, ToolResultData};
 pub use archive::{
     BATCH_CAP_CHARS, CappedContent, RECALL_CAP_CHARS, RESULT_CAP_CHARS, cap_batch, cap_result,
 };
-pub use budget::TokenBudget;
+pub use budget::{StaticPrompt, TokenBudget};
 pub use compact::{CompactionSummary, FindingSummary, build_summary};
 
 #[derive(Debug, Clone)]
@@ -22,9 +22,10 @@ pub struct AssembledContext {
     pub char_count: usize,
 }
 
-/// Build provider messages for the active branch. The latest compaction
-/// becomes a system message; custom, checkout, error, and header entries are
-/// not sent.
+/// Build provider messages for the active branch. Every system message (base
+/// prompt, compaction summaries, state block) is folded into one leading
+/// system turn: strict chat templates reject a system message after a
+/// non-system one. Custom, checkout, error, and header entries are not sent.
 pub fn assemble(
     base_system: &str,
     session: &Session,
@@ -73,6 +74,10 @@ pub fn assemble(
         });
     }
 
+    // Folding keeps the logical order (base, summaries in path order, state)
+    // while guaranteeing at most one system message, at the front.
+    let messages = fold_system_messages(messages);
+
     let char_count = messages.iter().map(|m| m.char_len()).sum();
     let estimated_tokens = budget.estimate_messages(&messages);
     AssembledContext {
@@ -80,6 +85,26 @@ pub fn assemble(
         estimated_tokens,
         char_count,
     }
+}
+
+/// Move every system message's content into one leading system turn, keeping
+/// each part's relative order. Strict chat templates (llama.cpp `--jinja`
+/// among them) reject a system message after a user or assistant turn.
+fn fold_system_messages(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
+    let mut system = Vec::new();
+    let mut rest = Vec::with_capacity(messages.len());
+    for message in messages {
+        match message {
+            ChatMessage::System { content } => system.push(content),
+            other => rest.push(other),
+        }
+    }
+    let mut folded = Vec::with_capacity(rest.len() + 1);
+    folded.push(ChatMessage::System {
+        content: system.join("\n\n"),
+    });
+    folded.extend(rest);
+    folded
 }
 
 /// Tool results by call id, in path order. Built once per assembly: scanning
@@ -228,6 +253,7 @@ mod tests {
                 model: "m".into(),
                 profile: "full".into(),
                 app: "test".into(),
+                context: None,
             },
             true,
         )
@@ -307,12 +333,26 @@ mod tests {
         let budget = TokenBudget::new(32768, 4096);
         let assembled = assemble("system", &session, None, &budget);
         assert_eq!(assembled.messages.len(), 4); // system, user, assistant, tool
+        assert_leading_system(&assembled.messages, "system");
         assert_eq!(assembled.messages[3].role(), "tool");
         assert!(assembled.estimated_tokens > 0);
     }
 
+    fn assert_leading_system(messages: &[ChatMessage], expected: &str) {
+        assert!(matches!(
+            &messages[0],
+            ChatMessage::System { content } if content == expected
+        ));
+        assert!(
+            messages[1..]
+                .iter()
+                .all(|message| !matches!(message, ChatMessage::System { .. })),
+            "no system message may follow a non-system message"
+        );
+    }
+
     #[test]
-    fn compaction_becomes_system_message_and_state_block_follows() {
+    fn compaction_is_folded_into_the_leading_system_message() {
         let dir = tempfile::tempdir().unwrap();
         let mut session = session(dir.path());
         session
@@ -337,13 +377,78 @@ mod tests {
             .unwrap();
         let budget = TokenBudget::new(32768, 4096);
         let assembled = assemble("system", &session, Some("STATE"), &budget);
+        assert_leading_system(
+            &assembled.messages,
+            "system\n\n[localharness] summary\n\nSTATE",
+        );
+        assert_eq!(assembled.messages.len(), 2); // system, user
         assert!(matches!(
             &assembled.messages[1],
-            ChatMessage::System { content } if content == "[localharness] summary"
+            ChatMessage::User { content } if content == "new"
         ));
-        assert!(matches!(
-            &assembled.messages.last().unwrap(),
-            ChatMessage::System { content } if content == "STATE"
-        ));
+    }
+
+    #[test]
+    fn compacted_tool_turns_keep_the_system_message_leading() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = session(dir.path());
+        session
+            .append(EntryKind::User(UserData {
+                attachments: Vec::new(),
+                content: "old".into(),
+            }))
+            .unwrap();
+        session
+            .append(EntryKind::Compaction(CompactionData {
+                summary: "[localharness] summary".into(),
+                tokens_before: 100,
+                reason: "auto".into(),
+                thread_id: None,
+            }))
+            .unwrap();
+        session
+            .append(EntryKind::User(UserData {
+                attachments: Vec::new(),
+                content: "new".into(),
+            }))
+            .unwrap();
+        session
+            .append(EntryKind::Assistant(AssistantData {
+                content: Some("working".into()),
+                tool_calls: Some(vec![crate::session::ToolCall {
+                    id: "call_1".into(),
+                    name: "read".into(),
+                    arguments: json!({"path":"a.rs"}),
+                }]),
+                ..AssistantData::default()
+            }))
+            .unwrap();
+        session
+            .append(EntryKind::ToolResult(ToolResultData {
+                call_id: "call_1".into(),
+                content: "file body".into(),
+                is_error: false,
+                details: None,
+                artifact: None,
+            }))
+            .unwrap();
+        session
+            .append(EntryKind::User(UserData {
+                attachments: Vec::new(),
+                content: "next".into(),
+            }))
+            .unwrap();
+        let budget = TokenBudget::new(32768, 4096);
+        let assembled = assemble("system", &session, Some("STATE"), &budget);
+        assert_leading_system(
+            &assembled.messages,
+            "system\n\n[localharness] summary\n\nSTATE",
+        );
+        let roles: Vec<&str> = assembled
+            .messages
+            .iter()
+            .map(|message| message.role())
+            .collect();
+        assert_eq!(roles, vec!["system", "user", "assistant", "tool", "user"]);
     }
 }

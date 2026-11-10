@@ -249,7 +249,9 @@ impl OpenAiCompatProvider {
             return Err(ProviderError::new(class, self.scrub(message)));
         }
 
-        if let Some(usage) = usage_from(chunk.usage, chunk.timings) {
+        let truncated = chunk.truncated;
+        let context_shift = chunk.context_shift;
+        if let Some(usage) = usage_from(chunk.usage, chunk.timings, truncated, context_shift) {
             let _ = tx.send(Ok(StreamEvent::Usage(usage)));
         }
 
@@ -422,20 +424,24 @@ fn classify_http(code: u16, body: &str, model: &str) -> Option<ProviderError> {
     Some(ProviderError::new(class, message))
 }
 
-/// Fold the leading run of system messages (base prompt, then a compaction
-/// summary) into one. Several chat templates (Gemma, Mistral, and others
-/// llama.cpp renders with `--jinja`) reject a second system message or demand
-/// strictly alternating roles; one combined system turn is accepted by all of
-/// them and keeps the same prefix for KV-cache reuse.
+/// Fold every system message (base prompt, compaction summaries, state block)
+/// into one leading system turn, preserving the relative order of their
+/// content. Several chat templates (Gemma, Mistral, and others llama.cpp
+/// renders with `--jinja`) reject a system message after a non-system turn or
+/// demand strictly alternating roles; one combined system turn is accepted by
+/// all of them and keeps the same prefix for KV-cache reuse.
 fn merge_leading_system(messages: &[ChatMessage]) -> Vec<ChatMessage> {
-    let leading = messages
+    let system_count = messages
         .iter()
-        .take_while(|message| matches!(message, ChatMessage::System { .. }))
+        .filter(|message| matches!(message, ChatMessage::System { .. }))
         .count();
-    if leading < 2 {
+    if system_count == 0 {
         return messages.to_vec();
     }
-    let combined = messages[..leading]
+    if system_count == 1 && matches!(messages.first(), Some(ChatMessage::System { .. })) {
+        return messages.to_vec();
+    }
+    let combined = messages
         .iter()
         .filter_map(|message| match message {
             ChatMessage::System { content } => Some(content.as_str()),
@@ -443,13 +449,27 @@ fn merge_leading_system(messages: &[ChatMessage]) -> Vec<ChatMessage> {
         })
         .collect::<Vec<_>>()
         .join("\n\n");
-    let mut merged = vec![ChatMessage::System { content: combined }];
-    merged.extend_from_slice(&messages[leading..]);
+    let mut merged = Vec::with_capacity(messages.len() - system_count + 1);
+    merged.push(ChatMessage::System { content: combined });
+    merged.extend(
+        messages
+            .iter()
+            .filter(|message| !matches!(message, ChatMessage::System { .. }))
+            .cloned(),
+    );
     merged
 }
 
 fn build_body(req: &ChatRequest, include_usage: bool) -> Result<Value, ProviderError> {
-    let messages: Vec<Value> = merge_leading_system(&req.messages)
+    let normalized = merge_leading_system(&req.messages);
+    debug_assert!(
+        normalized
+            .iter()
+            .skip(1)
+            .all(|message| !matches!(message, ChatMessage::System { .. })),
+        "system messages must lead the message list; strict chat templates reject trailing system turns"
+    );
+    let messages: Vec<Value> = normalized
         .iter()
         .map(|message| match message {
             ChatMessage::System { content } => json!({"role":"system","content":content}),
@@ -543,6 +563,12 @@ struct Chunk {
     /// llama.cpp's per-request timings, sent on the final chunk.
     #[serde(default)]
     timings: Option<Timings>,
+    /// llama.cpp native route reports whether the prompt was cut.
+    #[serde(default)]
+    truncated: Option<bool>,
+    /// KoboldCpp / context-shift engines report discarded context here.
+    #[serde(default)]
+    context_shift: Option<u32>,
     #[serde(default)]
     error: Option<ApiError>,
 }
@@ -573,11 +599,19 @@ struct Timings {
     prompt_ms: Option<f64>,
     #[serde(default)]
     predicted_per_second: Option<f64>,
+    /// Number of context-shift events, when the engine reports one.
+    #[serde(default)]
+    n_shift: Option<u32>,
 }
 
 /// Normalize the usage and timing shapes engines send into one `Usage`.
-fn usage_from(usage: Option<WireUsage>, timings: Option<Timings>) -> Option<Usage> {
-    if usage.is_none() && timings.is_none() {
+fn usage_from(
+    usage: Option<WireUsage>,
+    timings: Option<Timings>,
+    truncated: Option<bool>,
+    context_shift: Option<u32>,
+) -> Option<Usage> {
+    if usage.is_none() && timings.is_none() && truncated.is_none() && context_shift.is_none() {
         return None;
     }
     let wire = usage.unwrap_or_default();
@@ -599,6 +633,8 @@ fn usage_from(usage: Option<WireUsage>, timings: Option<Timings>) -> Option<Usag
             .predicted_per_second
             .filter(|rate| rate.is_finite() && *rate > 0.0)
             .map(|rate| rate as f32),
+        truncated,
+        context_shift: context_shift.or(timings.n_shift),
     })
 }
 
@@ -673,7 +709,31 @@ mod tests {
 
     fn usage_of(chunk: &str) -> Option<Usage> {
         let chunk: Chunk = serde_json::from_str(chunk).unwrap();
-        usage_from(chunk.usage, chunk.timings)
+        usage_from(
+            chunk.usage,
+            chunk.timings,
+            chunk.truncated,
+            chunk.context_shift,
+        )
+    }
+
+    #[test]
+    fn engine_truncation_signals_reach_usage() {
+        let usage = usage_of(
+            r#"{"choices":[],"truncated":true,"usage":{"prompt_tokens":2048,"completion_tokens":1,"total_tokens":2049}}"#,
+        )
+        .unwrap();
+        assert_eq!(usage.truncated, Some(true));
+        let usage = usage_of(
+            r#"{"choices":[],"timings":{"n_shift":3},"usage":{"prompt_tokens":2048,"completion_tokens":1,"total_tokens":2049}}"#,
+        )
+        .unwrap();
+        assert_eq!(usage.context_shift, Some(3));
+        let usage = usage_of(
+            r#"{"choices":[],"context_shift":2,"usage":{"prompt_tokens":10,"completion_tokens":1,"total_tokens":11}}"#,
+        )
+        .unwrap();
+        assert_eq!(usage.context_shift, Some(2));
     }
 
     #[test]
@@ -712,13 +772,58 @@ mod tests {
             system("state"),
         ];
         let merged = merge_leading_system(&messages);
-        assert_eq!(merged.len(), 3);
+        assert_eq!(merged.len(), 2);
         assert!(
-            matches!(&merged[0], ChatMessage::System { content } if content == "base\n\nsummary")
+            matches!(&merged[0], ChatMessage::System { content } if content == "base\n\nsummary\n\nstate")
         );
-        // A later system message is left where the harness put it.
-        assert!(matches!(&merged[2], ChatMessage::System { content } if content == "state"));
-        assert_eq!(merge_leading_system(&messages[2..]).len(), 2);
+        assert!(matches!(&merged[1], ChatMessage::User { content } if content == "hi"));
+        // A system message that follows a non-system one is moved to the front.
+        let merged = merge_leading_system(&messages[2..]);
+        assert_eq!(merged.len(), 2);
+        assert!(matches!(&merged[0], ChatMessage::System { content } if content == "state"));
+        assert!(matches!(&merged[1], ChatMessage::User { content } if content == "hi"));
+    }
+
+    #[test]
+    fn body_has_no_system_message_after_the_first() {
+        let req = ChatRequest {
+            model: "m".into(),
+            messages: vec![
+                ChatMessage::User {
+                    content: "hi".into(),
+                },
+                ChatMessage::System {
+                    content: "summary".into(),
+                },
+                ChatMessage::Assistant {
+                    content: Some("ok".into()),
+                    tool_calls: vec![],
+                },
+                ChatMessage::System {
+                    content: "state".into(),
+                },
+            ],
+            tools: vec![],
+            tool_choice: None,
+            temperature: 0.2,
+            top_p: 0.95,
+            max_tokens: 128,
+            stop: vec![],
+            extra_body: None,
+            include_usage: false,
+            reasoning_field: None,
+        };
+        let body = build_body(&req, false).unwrap();
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[0]["content"], "summary\n\nstate");
+        assert!(
+            messages[1..]
+                .iter()
+                .all(|message| message["role"] != "system")
+        );
+        assert_eq!(messages[1]["role"], "user");
+        assert_eq!(messages[2]["role"], "assistant");
     }
 
     #[test]

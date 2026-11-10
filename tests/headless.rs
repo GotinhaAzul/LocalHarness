@@ -15,15 +15,47 @@ use futures_util::stream;
 #[derive(Clone, Default)]
 struct Fake {
     requests: std::sync::Arc<AtomicUsize>,
+    /// Force an implausibly small prompt count to exercise truncation.
+    truncate_usage: bool,
 }
 
-async fn chat(State(fake): State<Fake>) -> Response {
+async fn chat(State(fake): State<Fake>, body: String) -> Response {
     fake.requests.fetch_add(1, Ordering::SeqCst);
-    let frames = concat!(
-        "data: {\"choices\":[{\"delta\":{\"content\":\"Hello from fake\"}}]}\n\n",
-        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
-        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":3,\"total_tokens\":15}}\n\n",
-        "data: [DONE]\n\n",
+    let prompt_tokens = if fake.truncate_usage {
+        12
+    } else {
+        // A plausible count for the prompt the harness actually sent, so the
+        // shortfall detector sees normal usage.
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+        let chars: usize = value["messages"]
+            .as_array()
+            .map(|messages| {
+                messages
+                    .iter()
+                    .map(|message| {
+                        message["content"].as_str().map(str::len).unwrap_or(0)
+                            + message["tool_calls"].as_array().map_or(0, |calls| {
+                                calls
+                                    .iter()
+                                    .map(|call| call.to_string().len())
+                                    .sum::<usize>()
+                            })
+                    })
+                    .sum()
+            })
+            .unwrap_or(0)
+            + value["tools"].to_string().len();
+        (chars / 4).max(1)
+    };
+    let frames = format!(
+        concat!(
+            "data: {{\"choices\":[{{\"delta\":{{\"content\":\"Hello from fake\"}}}}]}}\n\n",
+            "data: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\n",
+            "data: {{\"choices\":[],\"usage\":{{\"prompt_tokens\":{},\"completion_tokens\":3,\"total_tokens\":{}}}}}\n\n",
+            "data: [DONE]\n\n",
+        ),
+        prompt_tokens,
+        prompt_tokens + 3
     );
     let chunks: Vec<Result<Bytes, Infallible>> = frames
         .as_bytes()
@@ -54,10 +86,134 @@ async fn models() -> Response {
 }
 
 async fn spawn() -> (String, Fake) {
-    let fake = Fake::default();
+    spawn_with(false).await
+}
+
+/// A fake that reports an implausibly small prompt count, as an engine does
+/// when it silently drops history.
+async fn spawn_truncating() -> (String, Fake) {
+    spawn_with(true).await
+}
+
+async fn spawn_with(truncate_usage: bool) -> (String, Fake) {
+    let fake = Fake {
+        truncate_usage,
+        ..Fake::default()
+    };
     let app = Router::new()
         .route("/v1/chat/completions", post(chat))
         .route("/v1/models", axum::routing::get(models))
+        .with_state(fake.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (format!("http://{address}"), fake)
+}
+
+#[derive(Clone, Default)]
+struct TokenizerFake {
+    requests: std::sync::Arc<AtomicUsize>,
+    tokens: usize,
+}
+
+async fn tokenize_handler(State(fake): State<TokenizerFake>) -> Response {
+    let body = serde_json::json!({"tokens": vec![0u32; fake.tokens]}).to_string();
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        )
+        .body(Body::from(body))
+        .unwrap()
+}
+
+async fn tokenizer_chat(State(fake): State<TokenizerFake>) -> Response {
+    fake.requests.fetch_add(1, Ordering::SeqCst);
+    let frames = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"should not run\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream"),
+        )
+        .body(Body::from(frames))
+        .unwrap()
+}
+
+/// A server with `/tokenize`, used to prove the exact pre-send check.
+async fn spawn_tokenizer(tokens: usize) -> (String, TokenizerFake) {
+    let fake = TokenizerFake {
+        tokens,
+        ..TokenizerFake::default()
+    };
+    let app = Router::new()
+        .route("/v1/chat/completions", post(tokenizer_chat))
+        .route("/v1/models", axum::routing::get(models))
+        .route("/tokenize", post(tokenize_handler))
+        .with_state(fake.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (format!("http://{address}"), fake)
+}
+
+#[derive(Clone, Default)]
+struct SizedFake {
+    requests: std::sync::Arc<AtomicUsize>,
+    window: u64,
+}
+
+async fn sized_models(State(fake): State<SizedFake>) -> Response {
+    let body = serde_json::json!({
+        "object": "list",
+        "data": [{"id": "test-model", "object": "model", "max_model_len": fake.window}],
+    })
+    .to_string();
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        )
+        .body(Body::from(body))
+        .unwrap()
+}
+
+async fn sized_chat(State(fake): State<SizedFake>) -> Response {
+    fake.requests.fetch_add(1, Ordering::SeqCst);
+    let frames = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":4000,\"completion_tokens\":1,\"total_tokens\":4001}}\n\n",
+        "data: [DONE]\n\n",
+    );
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream"),
+        )
+        .body(Body::from(frames))
+        .unwrap()
+}
+
+async fn spawn_sized(window: u64) -> (String, SizedFake) {
+    let fake = SizedFake {
+        window,
+        ..SizedFake::default()
+    };
+    let app = Router::new()
+        .route("/v1/chat/completions", post(sized_chat))
+        .route("/v1/models", axum::routing::get(sized_models))
         .with_state(fake.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -200,6 +356,149 @@ async fn print_requires_a_model() {
         stderr.contains("no model") && stderr.contains("/login"),
         "stderr: {stderr}"
     );
+}
+
+#[tokio::test]
+async fn print_refuses_when_the_static_prompt_cannot_fit() {
+    let (base, fake) = spawn().await;
+    let env = env();
+    std::fs::create_dir_all(&env.config_dir).unwrap();
+    std::fs::write(
+        env.config_dir.join("config.toml"),
+        "[model]\ncontext_window = 4096\nmax_output_tokens = 1024\n",
+    )
+    .unwrap();
+
+    let output = run_lh(&env, &base, &["--print", "hi", "--profile", "full"]).await;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "stdout: {}\nstderr: {stderr}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(stderr.contains("budget_static"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("tool schemas") || stderr.contains("system prompt"),
+        "stderr: {stderr}"
+    );
+    // The request never reached the model.
+    assert_eq!(fake.requests.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn print_stops_a_truncated_turn_without_replaying_the_reply() {
+    let (base, fake) = spawn_truncating().await;
+    let env = env();
+    // A large project instruction block pushes the prompt past the shortfall
+    // threshold; the fake server then claims only 12 prompt tokens.
+    std::fs::write(
+        env.cwd.join("AGENTS.md"),
+        "project conventions\n".repeat(700),
+    )
+    .unwrap();
+
+    let output = run_lh(&env, &base, &["--print", "hi", "--json"]).await;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "stderr: {stderr}");
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.contains("\"code\":\"context_truncated\"")),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.contains("\"status\":\"ContextTruncated\"")),
+        "stdout: {stdout}"
+    );
+    // The turn stopped instead of retrying on the corrupted branch.
+    assert_eq!(fake.requests.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn print_starts_with_minimal_on_a_small_window() {
+    let (base, _fake) = spawn().await;
+    let env = env();
+    std::fs::create_dir_all(&env.config_dir).unwrap();
+    std::fs::write(
+        env.config_dir.join("config.toml"),
+        "[model]\ncontext_window = 4096\nmax_output_tokens = 1024\n",
+    )
+    .unwrap();
+
+    let output = run_lh(&env, &base, &["--print", "hi", "--profile", "minimal"]).await;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
+    assert!(stdout.contains("Hello from fake"), "stdout: {stdout}");
+}
+
+#[tokio::test]
+async fn print_refuses_a_prompt_the_tokenizer_says_is_too_large() {
+    let (base, fake) = spawn_tokenizer(5_000).await;
+    let env = env();
+    std::fs::create_dir_all(&env.config_dir).unwrap();
+    std::fs::write(
+        env.config_dir.join("config.toml"),
+        "[model]\ncontext_window = 4096\nmax_output_tokens = 1024\n",
+    )
+    .unwrap();
+
+    let output = run_lh(&env, &base, &["--print", "hi", "--profile", "minimal"]).await;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "stderr: {stderr}");
+    assert!(stderr.contains("context_truncated"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("tokenizer") || stderr.contains("rendered prompt"),
+        "stderr: {stderr}"
+    );
+    assert_eq!(fake.requests.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn print_warns_and_clamps_a_profile_above_the_server_window() {
+    let (base, _fake) = spawn_sized(4096).await;
+    let env = env();
+    std::fs::create_dir_all(&env.config_dir).unwrap();
+    std::fs::write(
+        env.config_dir.join("config.toml"),
+        "[model]\ncontext_window = 32768\nmax_output_tokens = 1024\n",
+    )
+    .unwrap();
+
+    let output = run_lh(&env, &base, &["--print", "hi", "--profile", "minimal"]).await;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
+    assert!(
+        stderr.contains("clamped to 4096"),
+        "missing clamp warning: {stderr}"
+    );
+    assert!(
+        stderr.contains("--max-model-len") || stderr.contains("--ctx-size"),
+        "missing exact fix: {stderr}"
+    );
+}
+
+#[tokio::test]
+async fn doctor_reports_generic_and_failed_probes() {
+    let (base, _fake) = spawn().await;
+    let env = env();
+    let output = run_lh(&env, &base, &["doctor", "--json"]).await;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("stable JSON");
+    assert_eq!(value["engine"], "generic");
+    assert!(
+        value["probes_failed"]
+            .as_array()
+            .is_some_and(|probes| !probes.is_empty()),
+        "failed probes must be listed: {stdout}"
+    );
+    assert_eq!(value["model"], "test-model");
 }
 
 #[derive(Clone, Default)]

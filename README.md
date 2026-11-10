@@ -115,8 +115,8 @@ thinking/reasoning handling, and troubleshooting.
 
 The harness does not launch servers on its own. If an endpoint is down and you
 want it started automatically, set the optional `[model] start_command`; it runs
-once at startup, only when the endpoint is unreachable. See
-[docs/configuration.md](docs/configuration.md).
+once at startup, only when the endpoint is unreachable, without holding the TUI
+closed. See [docs/configuration.md](docs/configuration.md).
 
 ## Headless
 
@@ -223,15 +223,23 @@ detection, todo planning, and verification. Every error names the next action.
 Security work is for authorized labs, CTFs, and engagements only. Scope is set
 by the user with `/sec scope add|remove|clear`; there is no model tool for it.
 The scope gate blocks a known set of active-testing tools when no scope is set
-or when an extracted target is outside it. It is a speed bump, not a sandbox.
+or when an extracted target is outside it. It is a speed bump; `--sandbox` is
+the process boundary.
 
 - No telemetry, analytics, or phone-home.
 - Localhost endpoint by default.
 - Project `.harness/` config, skills, workflows, and tools are ignored unless
   `--trust` is passed.
 - Session logs and artifacts are plaintext; `--no-session` disables both.
-- `--path-jail` restricts file tools to the working directory. It does not
-  restrict `bash`; use a container for isolation.
+- `--sandbox` runs `bash` and `bg` inside an OS sandbox, using bubblewrap when
+  installed and Landlock otherwise. Modes are `read-only` and
+  `workspace-write`; `--sandbox` alone selects `workspace-write`. The sandbox
+  hides `$HOME`, gives each command a private `/tmp`, closes the network, and
+  keeps `.git` read-only. It fails closed: if no backend is available, shell
+  commands do not run.
+- `--no-sandbox` disables the sandbox and restores plain shell access.
+- `--path-jail` restricts file tools to the working directory. It is separate
+  from `--sandbox` and does not change how `bash` runs.
 
 Read [docs/security.md](docs/security.md) before using it on client work.
 

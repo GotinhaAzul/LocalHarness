@@ -10,7 +10,7 @@ use nix::sys::signal::Signal;
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
-use crate::tools::bash::{kill_group, shell_command, terminate_group};
+use crate::tools::bash::{kill_group, sandbox_error, shell_command, terminate_group};
 use crate::tools::{
     Tool, ToolContext, ToolPack, ToolResult, object_schema, optional_str, optional_u64,
     required_str,
@@ -181,16 +181,22 @@ impl BgTool {
             Err(err) => return log_error(err),
         };
 
-        let mut cmd = shell_command(&command, &ctx.cwd);
+        let mut cmd = match shell_command(&command, &ctx.cwd, ctx.sandbox.as_deref()) {
+            Ok(cmd) => cmd,
+            Err(message) => return sandbox_error(&message),
+        };
         cmd.kill_on_drop(true);
         let mut child = match cmd.spawn() {
             Ok(child) => child,
             Err(err) => {
+                let hint = if ctx.sandbox.is_some() {
+                    "the sandbox backend failed to start the command; fix the backend or rerun with --no-sandbox"
+                } else {
+                    "check that bash is installed"
+                };
                 return ToolResult::err(
                     "SPAWN_FAILED",
-                    format!(
-                        "could not start bash: {err}; check that bash is installed, then retry"
-                    ),
+                    format!("could not start bash: {err}; {hint}, then retry"),
                 );
             }
         };

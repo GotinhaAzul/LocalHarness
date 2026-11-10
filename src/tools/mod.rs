@@ -115,6 +115,8 @@ pub struct ToolContext {
     pub paths: Paths,
     /// Shared language-server clients used by `lsp` and post-edit diagnostics.
     pub lsp: Arc<lsp::LspService>,
+    /// OS sandbox for `bash` and `bg`. `None` means unsandboxed.
+    pub sandbox: Option<Arc<crate::sandbox::Sandbox>>,
 }
 
 impl ToolContext {
@@ -184,10 +186,51 @@ pub fn normalize(path: &std::path::Path) -> PathBuf {
     out
 }
 
-/// Stat stamps captured by `read`, checked by `edit`/`write` guards.
+/// An inclusive 1-based line span.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LineRange {
+    pub start: usize,
+    pub end: usize,
+}
+
+/// What one path's last read actually delivered. `write` replaces whole files,
+/// so it needs to know every line was seen, not merely that the file was read.
+#[derive(Debug, Clone, Default)]
+pub struct ReadCoverage {
+    pub stamp: Option<FileStamp>,
+    pub total_lines: usize,
+    pub seen: Vec<LineRange>,
+    /// A read result was shortened by the harness result cap, so some lines
+    /// never reached the model even though the read covered them.
+    pub result_truncated: bool,
+}
+
+impl ReadCoverage {
+    /// True when `1..=total_lines` is entirely inside `seen`. A zero-line file
+    /// is trivially covered.
+    fn covers_all(&self) -> bool {
+        if self.total_lines == 0 {
+            return true;
+        }
+        let mut next = 1;
+        for range in &self.seen {
+            if range.start > next {
+                return false;
+            }
+            next = next.max(range.end.saturating_add(1));
+            if next > self.total_lines {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// Stat stamps and line coverage captured by `read`, checked by the
+/// `edit`/`write` guards.
 #[derive(Debug, Default, Clone)]
 pub struct ReadTracker {
-    stamps: HashMap<PathBuf, FileStamp>,
+    entries: HashMap<PathBuf, ReadCoverage>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,8 +251,78 @@ impl FileStamp {
 }
 
 impl ReadTracker {
-    pub fn record(&mut self, path: &std::path::Path, stamp: FileStamp) {
-        self.stamps.insert(path.to_path_buf(), stamp);
+    /// A fresh entry for `stamp`; coverage from an older snapshot is dropped.
+    fn entry(
+        &mut self,
+        path: &std::path::Path,
+        stamp: FileStamp,
+        total_lines: usize,
+    ) -> &mut ReadCoverage {
+        let entry = self.entries.entry(path.to_path_buf()).or_default();
+        if entry.stamp != Some(stamp) {
+            entry.seen.clear();
+            entry.result_truncated = false;
+        }
+        entry.stamp = Some(stamp);
+        entry.total_lines = total_lines;
+        entry
+    }
+
+    /// Record that `start..=end` (1-based inclusive) was delivered to the model.
+    pub fn record_range(
+        &mut self,
+        path: &std::path::Path,
+        stamp: FileStamp,
+        total_lines: usize,
+        start: usize,
+        end: usize,
+    ) {
+        let entry = self.entry(path, stamp, total_lines);
+        // Only a read that redelivers the whole file clears an earlier
+        // truncation; the result cap may set it again after this call.
+        if start == 1 && end >= total_lines {
+            entry.result_truncated = false;
+        }
+        if start == 0 || end < start || start > total_lines {
+            return;
+        }
+        let range = LineRange {
+            start,
+            end: end.min(total_lines),
+        };
+        push_range(&mut entry.seen, range);
+    }
+
+    /// Record a read that returned no lines: an empty file, or `start` past
+    /// EOF. Prior coverage for the same snapshot is retained.
+    pub fn record_empty(&mut self, path: &std::path::Path, stamp: FileStamp, total_lines: usize) {
+        let entry = self.entry(path, stamp, total_lines);
+        // An empty file is fully known. A past-EOF read delivers nothing, so
+        // it cannot clear an earlier truncation.
+        if total_lines == 0 {
+            entry.result_truncated = false;
+        }
+    }
+
+    /// Record that the harness result cap shortened a read of `path`, so its
+    /// content never fully reached the model.
+    pub fn mark_result_truncated(&mut self, path: &std::path::Path) {
+        if let Some(entry) = self.entries.get_mut(path) {
+            entry.result_truncated = true;
+        }
+    }
+
+    /// Record a full read, or content the harness itself just wrote.
+    pub fn record_full(&mut self, path: &std::path::Path, stamp: FileStamp, total_lines: usize) {
+        let entry = self.entry(path, stamp, total_lines);
+        entry.result_truncated = false;
+        entry.seen.clear();
+        if total_lines > 0 {
+            entry.seen.push(LineRange {
+                start: 1,
+                end: total_lines,
+            });
+        }
     }
 
     pub fn stamp_for(path: &std::path::Path) -> Option<FileStamp> {
@@ -220,16 +333,80 @@ impl ReadTracker {
         })
     }
 
+    /// The last read's coverage for `path`, if any.
+    pub fn coverage(&self, path: &std::path::Path) -> Option<&ReadCoverage> {
+        self.entries.get(path)
+    }
+
+    /// The stamp exists and still matches the file on disk.
     pub fn is_current(&self, path: &std::path::Path) -> bool {
-        match (self.stamps.get(path), Self::stamp_for(path)) {
-            (Some(known), Some(actual)) => *known == actual,
+        let known = self.entries.get(path).and_then(|entry| entry.stamp);
+        match (known, Self::stamp_for(path)) {
+            (Some(known), Some(actual)) => known == actual,
             _ => false,
         }
     }
 
-    pub fn clear(&mut self) {
-        self.stamps.clear();
+    /// `write` may replace the file: the snapshot is current and every line
+    /// was both seen and delivered whole.
+    pub fn is_fully_read(&self, path: &std::path::Path) -> bool {
+        let Some(entry) = self.entries.get(path) else {
+            return false;
+        };
+        !entry.result_truncated
+            && entry.covers_all()
+            && match (entry.stamp, Self::stamp_for(path)) {
+                (Some(known), Some(actual)) => known == actual,
+                _ => false,
+            }
     }
+
+    /// Line spans inside `1..=total_lines` that no read delivered, merged.
+    pub fn unseen_ranges(&self, path: &std::path::Path) -> Vec<LineRange> {
+        let Some(entry) = self.entries.get(path) else {
+            return Vec::new();
+        };
+        let mut unseen = Vec::new();
+        let mut next = 1;
+        for range in &entry.seen {
+            if range.start > next {
+                unseen.push(LineRange {
+                    start: next,
+                    end: range.start - 1,
+                });
+            }
+            next = next.max(range.end.saturating_add(1));
+        }
+        if next <= entry.total_lines {
+            unseen.push(LineRange {
+                start: next,
+                end: entry.total_lines,
+            });
+        }
+        unseen
+    }
+
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+}
+
+/// Insert `range` into sorted, non-overlapping `seen`, merging overlaps and
+/// adjacency.
+fn push_range(seen: &mut Vec<LineRange>, range: LineRange) {
+    seen.push(range);
+    seen.sort_by_key(|range| range.start);
+    let mut merged: Vec<LineRange> = Vec::with_capacity(seen.len());
+    for range in seen.drain(..) {
+        if let Some(last) = merged.last_mut()
+            && range.start <= last.end.saturating_add(1)
+        {
+            last.end = last.end.max(range.end);
+            continue;
+        }
+        merged.push(range);
+    }
+    *seen = merged;
 }
 
 #[async_trait]
@@ -476,6 +653,75 @@ pub fn display_path(cwd: &std::path::Path, path: &std::path::Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn line_ranges_merge_and_leave_gaps() {
+        let mut seen = Vec::new();
+        push_range(&mut seen, LineRange { start: 1, end: 150 });
+        push_range(
+            &mut seen,
+            LineRange {
+                start: 300,
+                end: 400,
+            },
+        );
+        push_range(
+            &mut seen,
+            LineRange {
+                start: 151,
+                end: 250,
+            },
+        );
+        push_range(
+            &mut seen,
+            LineRange {
+                start: 251,
+                end: 299,
+            },
+        );
+        assert_eq!(seen, vec![LineRange { start: 1, end: 400 }]);
+    }
+
+    #[test]
+    fn coverage_reports_unseen_ranges_and_truncation() {
+        let mut tracker = ReadTracker::default();
+        let stamp = FileStamp {
+            mtime: std::time::SystemTime::UNIX_EPOCH,
+            len: 0,
+        };
+        let path = std::path::Path::new("/localharness/coverage-test");
+        tracker.record_range(path, stamp, 400, 1, 150);
+        tracker.record_range(path, stamp, 400, 300, 400);
+        assert_eq!(
+            tracker.unseen_ranges(path),
+            vec![LineRange {
+                start: 151,
+                end: 299
+            }]
+        );
+        assert_eq!(
+            tracker.coverage(path).unwrap().seen,
+            vec![
+                LineRange { start: 1, end: 150 },
+                LineRange {
+                    start: 300,
+                    end: 400
+                }
+            ]
+        );
+        assert!(!tracker.is_fully_read(path), "the file does not exist");
+
+        tracker.mark_result_truncated(path);
+        assert!(tracker.coverage(path).unwrap().result_truncated);
+        tracker.record_range(path, stamp, 400, 151, 299);
+        assert!(tracker.unseen_ranges(path).is_empty());
+        assert!(
+            tracker.coverage(path).unwrap().result_truncated,
+            "a partial read cannot clear an earlier truncation"
+        );
+        tracker.record_range(path, stamp, 400, 1, 400);
+        assert!(!tracker.coverage(path).unwrap().result_truncated);
+    }
 
     #[test]
     fn hidden_segments_are_detected_in_globs() {

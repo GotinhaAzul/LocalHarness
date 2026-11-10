@@ -94,8 +94,13 @@ models and switches the current session without rewriting the config. Headless `
 error until a model is selected.
 
 `start_command` is optional. When set, it runs through `sh -c` once at startup
-if `GET /v1/models` fails, and the harness waits up to 30 seconds for the
-endpoint to answer. It is not run when the endpoint is already reachable, and it
+if `GET /v1/models` fails. With a model already configured it runs in the
+background: the TUI opens immediately, and the first turn waits for the endpoint
+instead of racing it. With no model configured the harness waits for the command
+before probing so a single exposed model can still be auto-selected. After a
+successful command the harness waits up to 30 seconds for the endpoint to
+answer; a command that exits non-zero is reported at once without waiting out
+the retry window. It is not run when the endpoint is already reachable, and it
 is not retried during the session. The command runs as the invoking user.
 
 ## Verify steps
@@ -130,10 +135,15 @@ Steps run sequentially without a shell and stop at the first failure.
 | `LH_CONFIG_DIR`, `LH_DATA_DIR` | Override roots |
 | `NO_COLOR` | Disable color |
 | `LH_DEBUG_CONTENT` | Allow content in debug logs (warns) |
+| `LH_BWRAP` | Override the bubblewrap executable used by `--sandbox` |
 
 ## Flags
 
 `--print`, `--json`, `--endpoint`, `--model`, `--model-profile`, `--profile`,
 `--theme`, `--api-key`, `--trust`, `--no-session`, `--continue`, `--resume`,
-`--path-jail`, `--engagement`, `--no-color`, `--keep-artifacts`,
-`--clean-artifacts`, `--debug`.
+`--path-jail`, `--sandbox [read-only|workspace-write]`, `--no-sandbox`,
+`--engagement`, `--no-color`, `--keep-artifacts`, `--clean-artifacts`,
+`--debug`.
+
+`lh doctor [--json] [--fix]` prints the engine capability manifest without
+sending a chat completion. See [model-setup.md](model-setup.md).

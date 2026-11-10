@@ -366,6 +366,7 @@ mod tests {
                 model: "m".into(),
                 profile: "full".into(),
                 app: "test".into(),
+                context: None,
             },
             true,
         )

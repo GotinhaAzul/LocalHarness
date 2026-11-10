@@ -731,6 +731,7 @@ mod tests {
             model: "test".to_string(),
             profile: "full".to_string(),
             app: "test".to_string(),
+            context: None,
         };
         let session = Session::create(&paths, header, true).unwrap();
         let artifacts = session.artifacts.clone();
@@ -748,6 +749,7 @@ mod tests {
             security: Arc::new(Mutex::new(security)),
             paths,
             lsp: Arc::new(crate::tools::lsp::LspService::new()),
+            sandbox: None,
         }
     }
 

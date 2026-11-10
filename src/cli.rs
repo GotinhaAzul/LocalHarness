@@ -22,6 +22,9 @@ use crate::ui::{self, UiOptions};
     about = "Local-first agent harness for coding and security work"
 )]
 pub struct Cli {
+    #[command(subcommand)]
+    pub command: Option<Command>,
+
     /// Run one turn without the TUI and stream the answer to stdout.
     #[arg(long, short = 'p', value_name = "PROMPT")]
     pub print: Option<String>,
@@ -31,35 +34,35 @@ pub struct Cli {
     pub json: bool,
 
     /// Endpoint base URL, for example http://127.0.0.1:8080.
-    #[arg(long, value_name = "URL")]
+    #[arg(long, global = true, value_name = "URL")]
     pub endpoint: Option<String>,
 
     /// Model id; auto-selected when the endpoint exposes exactly one model.
-    #[arg(long, value_name = "MODEL")]
+    #[arg(long, global = true, value_name = "MODEL")]
     pub model: Option<String>,
 
     /// Model profile name from config, or "auto".
-    #[arg(long = "model-profile", value_name = "NAME")]
+    #[arg(long = "model-profile", global = true, value_name = "NAME")]
     pub model_profile: Option<String>,
 
     /// Tool profile (full, coding, security, minimal, or a custom profile).
-    #[arg(long, value_name = "NAME")]
+    #[arg(long, global = true, value_name = "NAME")]
     pub profile: Option<String>,
 
     /// Theme name.
-    #[arg(long, value_name = "NAME")]
+    #[arg(long, global = true, value_name = "NAME")]
     pub theme: Option<String>,
 
     /// Bearer token for the endpoint.
-    #[arg(long, value_name = "KEY")]
+    #[arg(long, global = true, value_name = "KEY")]
     pub api_key: Option<String>,
 
     /// Trust project-local .harness config, profiles, skills, workflows, and tools.
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub trust: bool,
 
     /// Do not write a session or artifacts.
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub no_session: bool,
 
     /// Resume the most recent session for this project.
@@ -71,15 +74,15 @@ pub struct Cli {
     pub resume: Option<String>,
 
     /// Restrict file tools to the working directory (bash is not restricted).
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub path_jail: bool,
 
     /// Engagement name for scope and findings.
-    #[arg(long, value_name = "NAME")]
+    #[arg(long, global = true, value_name = "NAME")]
     pub engagement: Option<String>,
 
     /// Disable color output.
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub no_color: bool,
 
     /// Keep artifacts and skip retention cleanup.
@@ -91,8 +94,32 @@ pub struct Cli {
     pub clean_artifacts: bool,
 
     /// Enable debug-level diagnostic logs.
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub debug: bool,
+
+    /// Run bash and bg inside an OS sandbox. PROFILE is read-only or
+    /// workspace-write (default when the flag is present). Fails closed when
+    /// no sandbox backend is available.
+    #[arg(long, global = true, value_name = "PROFILE", num_args = 0..=1, default_missing_value = "workspace-write")]
+    pub sandbox: Option<String>,
+
+    /// Explicitly run bash and bg without a sandbox. Required to restore the
+    /// pre-sandbox behavior; recorded in the session.
+    #[arg(long, global = true, conflicts_with = "sandbox")]
+    pub no_sandbox: bool,
+}
+
+#[derive(Debug, clap::Subcommand)]
+pub enum Command {
+    /// Print the engine capability manifest and profile mismatches.
+    Doctor {
+        /// Emit one stable JSON object.
+        #[arg(long)]
+        json: bool,
+        /// Print the exact server command or config change for each mismatch.
+        #[arg(long)]
+        fix: bool,
+    },
 }
 
 pub async fn run(cli: Cli) -> Result<i32> {
@@ -140,6 +167,16 @@ pub async fn run(cli: Cli) -> Result<i32> {
     if let Some(theme) = cli.theme {
         config.ui.theme = theme;
     }
+    if let Some(profile) = &cli.sandbox {
+        config.sandbox = crate::config::SandboxMode::parse(profile).ok_or_else(|| {
+            anyhow::anyhow!("unknown sandbox profile {profile:?}; use read-only or workspace-write")
+        })?;
+        config.sandbox_explicit = true;
+    }
+    if cli.no_sandbox {
+        config.sandbox = crate::config::SandboxMode::Off;
+        config.sandbox_explicit = true;
+    }
     config.trust = trust;
     config.session.no_session |= cli.no_session;
     if cli.keep_artifacts {
@@ -156,6 +193,10 @@ pub async fn run(cli: Cli) -> Result<i32> {
         init_logging(&paths, true);
     } else {
         init_logging(&paths, false);
+    }
+
+    if let Some(Command::Doctor { json, fix }) = &cli.command {
+        return run_doctor(&config, &paths, *json, *fix).await;
     }
 
     let resume = match (&cli.resume, cli.continue_last) {
@@ -226,6 +267,45 @@ pub async fn run(cli: Cli) -> Result<i32> {
     }
 }
 
+/// `lh doctor`: fingerprint the engine and print a capability manifest. Only
+/// metadata probes are used; no chat completion and no model load.
+async fn run_doctor(config: &Config, paths: &Paths, json: bool, fix: bool) -> Result<i32> {
+    let mut model = config.model.model.trim().to_string();
+    let probe_provider = crate::provider::OpenAiCompatProvider::new(&config.model, model.clone())?;
+    if model.is_empty() {
+        // Auto-select only when the endpoint names exactly one model; a
+        // doctor run must not load or choose anything.
+        if let Ok(models) = crate::provider::probe::list_models(&probe_provider).await
+            && models.len() == 1
+        {
+            model = models[0].clone();
+        }
+    }
+    let provider = crate::provider::OpenAiCompatProvider::new(&config.model, model)?;
+    let (_, profile) = config.model_profile();
+    let configured = profile
+        .context_window
+        .or(config.model.context_window)
+        .unwrap_or(0);
+    let manifest = crate::doctor::DoctorManifest::probe(&provider, configured).await;
+    if json {
+        println!("{}", manifest.to_json_pretty());
+    } else {
+        print!("{}", manifest.to_text());
+    }
+    if fix && !json {
+        for line in &manifest.fixes {
+            println!("fix: {line}");
+        }
+    }
+    let key = crate::doctor::cache_key(&provider, &manifest);
+    let path = paths.data_dir.join("doctor-cache.json");
+    if let Err(error) = crate::doctor::store_cached(&path, &key, &manifest) {
+        tracing::warn!(%error, "cannot write the doctor cache");
+    }
+    Ok(0)
+}
+
 async fn run_headless(runtime: crate::app::Runtime, prompt: String, json: bool) -> Result<i32> {
     let cancel = CancellationToken::new();
     let (tx, mut rx) = mpsc::unbounded_channel();
@@ -266,7 +346,7 @@ async fn run_headless(runtime: crate::app::Runtime, prompt: String, json: bool) 
     Ok(match status {
         TurnStatus::Done => 0,
         TurnStatus::Cancelled => 130,
-        TurnStatus::Budget | TurnStatus::Stalled => 2,
+        TurnStatus::Budget | TurnStatus::Stalled | TurnStatus::ContextTruncated => 2,
         TurnStatus::Error | TurnStatus::Blocked => 1,
     })
 }
