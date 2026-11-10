@@ -17,6 +17,7 @@ use crate::session::{
 };
 use crate::tools::{ToolResult, display_path};
 
+use super::calls::CallLedger;
 use super::gates::{self, LoopDecision, LoopGuard, SettleDecision};
 use super::limits::{RunProgress, StopReason};
 use super::{AgentEvent, AgentState, Core};
@@ -292,6 +293,7 @@ async fn run_loop(
     let gate_tools = gates::GateTools::from_names(core.tools.iter().map(|tool| tool.name()));
     let read_available = core.tools.iter().any(|tool| tool.name() == "read");
     let mut pending_compaction = false;
+    let mut call_ledger = CallLedger::from_session(&core.session.lock().expect("session lock"));
 
     loop {
         if cancel.is_cancelled() {
@@ -413,6 +415,22 @@ async fn run_loop(
             }
         }
 
+        // Every call must have exactly one result before history is replayed.
+        // A missing or duplicate pair would silently attach another call's
+        // output; fail the turn before the request is sent instead.
+        let pairs = context::validate_tool_pairs(&core.session.lock().expect("session lock"));
+        if let Err(err) = pairs {
+            let code = err.code().to_string();
+            let message = err.message;
+            append_error(&core.session, &code, &message, false);
+            let _ = tx.send(AgentEvent::Error {
+                code: code.clone(),
+                message: message.clone(),
+                recoverable: false,
+            });
+            return TurnOutcome::error(&code, message);
+        }
+
         // When the engine exposes /tokenize, measure the rendered prompt
         // exactly before sending. The estimate is only a calibration guard;
         // this is the hard gate that keeps a fitting request from being cut.
@@ -498,6 +516,7 @@ async fn run_loop(
             assembled.estimated_tokens,
             assembled.char_count,
             &mut partial,
+            &mut call_ledger,
         )
         .await;
 
@@ -616,7 +635,7 @@ async fn run_loop(
             return TurnOutcome::ok(TurnStatus::ContextTruncated);
         }
         let mut assistant = assistant;
-        let recovery = recover_output(core, &mut assistant, &mut progress);
+        let recovery = recover_output(core, &mut assistant, &mut progress, &mut call_ledger);
         if let Some(notice) = recovery.notice {
             let _ = tx.send(AgentEvent::Notice(notice));
         }
@@ -967,13 +986,6 @@ fn detect_truncation(
     None
 }
 
-/// A call id unique within the session, for servers that omit ids and for
-/// calls recovered from text. Per-message counters (`call_1`) repeat across
-/// messages and break result matching in replayed history.
-fn fresh_call_id(index: usize) -> String {
-    format!("call_{:x}_{}", Utc::now().timestamp_micros(), index + 1)
-}
-
 /// `stop_reason` recorded when the repetition guard cut the stream.
 const REPETITION_STOP: &str = "repetition";
 /// Nudges for broken output (loops, cut-offs, empty replies) per turn.
@@ -994,6 +1006,7 @@ fn recover_output(
     core: &Core,
     assistant: &mut AssistantData,
     progress: &mut RunProgress,
+    ledger: &mut CallLedger,
 ) -> OutputRecovery {
     let mut out = OutputRecovery::default();
     if assistant.stop_reason.as_deref() == Some(REPETITION_STOP) {
@@ -1018,9 +1031,8 @@ fn recover_output(
             let calls: Vec<ToolCall> = found
                 .calls
                 .into_iter()
-                .enumerate()
-                .map(|(index, call)| ToolCall {
-                    id: fresh_call_id(index),
+                .map(|call| ToolCall {
+                    id: ledger.next_id(),
                     name: call.name,
                     arguments: call.arguments,
                 })
@@ -1241,14 +1253,15 @@ impl StreamAccum {
         }
     }
 
-    fn finalize(self) -> AssistantData {
+    fn finalize(self, ledger: &mut CallLedger) -> AssistantData {
         let mut calls = Vec::new();
-        for (index, mut call) in self.calls {
-            if call.id.trim().is_empty() {
-                call.id = fresh_call_id(index);
-            }
+        for call in self.calls.into_values() {
             if call.name.trim().is_empty() {
                 continue;
+            }
+            let internal_id = ledger.next_id();
+            if !call.id.trim().is_empty() {
+                ledger.map_engine_id(call.id.trim(), &internal_id);
             }
             let arguments = if call.arguments.trim().is_empty() {
                 json!({})
@@ -1257,7 +1270,7 @@ impl StreamAccum {
                     .unwrap_or_else(|_| Value::String(call.arguments.clone()))
             };
             calls.push(ToolCall {
-                id: call.id,
+                id: internal_id,
                 name: call.name,
                 arguments,
             });
@@ -1294,6 +1307,7 @@ async fn stream_assistant(
     estimated_tokens: u32,
     char_count: usize,
     partial: &mut Option<AssistantData>,
+    ledger: &mut CallLedger,
 ) -> Result<AssistantData, ProviderError> {
     if cancel.is_cancelled() {
         return Err(ProviderError::new(
@@ -1349,7 +1363,7 @@ async fn stream_assistant(
             "generation cancelled",
         ));
     }
-    Ok(accum.finalize())
+    Ok(accum.finalize(ledger))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2377,16 +2391,17 @@ mod tests {
         let call = accum.calls.entry(0).or_default();
         call.name = "read".into();
         call.arguments = "{not json".into();
-        let assistant = accum.finalize();
+        let mut ledger = CallLedger::default();
+        let assistant = accum.finalize(&mut ledger);
         let calls = assistant.tool_calls.unwrap();
-        assert!(calls[0].id.starts_with("call_"), "{}", calls[0].id);
+        assert_eq!(calls[0].id, "call_0001");
         assert!(matches!(&calls[0].arguments, Value::String(_)));
         // Ids must not repeat across messages, or replayed history pairs a
         // call with another call's result.
-        std::thread::sleep(std::time::Duration::from_millis(1));
         let mut again = StreamAccum::new();
         again.calls.entry(0).or_default().name = "read".into();
-        let second = again.finalize().tool_calls.unwrap();
+        let second = again.finalize(&mut ledger).tool_calls.unwrap();
+        assert_eq!(second[0].id, "call_0002");
         assert_ne!(calls[0].id, second[0].id);
     }
 

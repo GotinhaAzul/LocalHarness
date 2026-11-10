@@ -1,5 +1,6 @@
 //! Agent loop: context assembly, model streaming, tool batch execution, gates.
 
+pub mod calls;
 pub mod gates;
 pub mod limits;
 pub mod mentions;

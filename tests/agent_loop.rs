@@ -465,6 +465,100 @@ fn finish_script(deltas: &[&str], finish: &str) -> Script {
 }
 
 #[tokio::test]
+async fn duplicate_engine_ids_get_distinct_internal_ids_and_results() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.rs"), "a\n").unwrap();
+    std::fs::write(dir.path().join("b.rs"), "b\n").unwrap();
+    let harness = harness(
+        dir.path(),
+        vec![
+            Script::Events(vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call_1".into()),
+                    name: Some("read".into()),
+                    arguments: Some("{\"path\":\"a.rs\"}".into()),
+                },
+                StreamEvent::ToolCallDelta {
+                    index: 1,
+                    id: Some("call_1".into()),
+                    name: Some("read".into()),
+                    arguments: Some("{\"path\":\"b.rs\"}".into()),
+                },
+                StreamEvent::Finish("tool_calls".into()),
+            ]),
+            text_script("done"),
+        ],
+        &["read"],
+    );
+    let (outcome, _) = run(&harness, "read both").await;
+    assert_eq!(outcome.status, TurnStatus::Done);
+    let call_ids: Vec<String> = assistants(&harness.session)
+        .into_iter()
+        .flat_map(|assistant| assistant.tool_calls.unwrap_or_default())
+        .map(|call| call.id)
+        .collect();
+    assert_eq!(call_ids, ["call_0001", "call_0002"]);
+    assert_eq!(tool_results(&harness.session).len(), 2);
+}
+
+#[tokio::test]
+async fn internal_call_ids_increase_across_turns() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.rs"), "a\n").unwrap();
+    let harness = harness(
+        dir.path(),
+        vec![
+            tool_script("read", json!({"path":"a.rs"})),
+            text_script("one"),
+            tool_script("read", json!({"path":"a.rs"})),
+            text_script("two"),
+        ],
+        &["read"],
+    );
+    run(&harness, "first").await;
+    run(&harness, "second").await;
+    let call_ids: Vec<String> = assistants(&harness.session)
+        .into_iter()
+        .flat_map(|assistant| assistant.tool_calls.unwrap_or_default())
+        .map(|call| call.id)
+        .collect();
+    assert_eq!(call_ids, ["call_0001", "call_0002"]);
+}
+
+#[tokio::test]
+async fn a_missing_tool_result_fails_before_the_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness(dir.path(), vec![text_script("unused")], &["read"]);
+    harness
+        .session
+        .lock()
+        .unwrap()
+        .append(EntryKind::Assistant(localharness::session::AssistantData {
+            tool_calls: Some(vec![localharness::session::ToolCall {
+                id: "call_0001".into(),
+                name: "read".into(),
+                arguments: json!({"path":"a.rs"}),
+            }]),
+            ..Default::default()
+        }))
+        .unwrap();
+    let (outcome, events) = run(&harness, "continue").await;
+    assert_eq!(outcome.status, TurnStatus::Error);
+    let (code, message) = outcome.error.expect("typed pair error");
+    assert_eq!(code, "tool_result_missing");
+    assert!(message.contains("call_0001"), "{message}");
+    assert_eq!(
+        harness.provider.requests.lock().unwrap().len(),
+        0,
+        "the request must not be sent with an unanswered call"
+    );
+    assert!(events.iter().any(
+        |event| matches!(event, AgentEvent::Error { code, .. } if code == "tool_result_missing")
+    ));
+}
+
+#[tokio::test]
 async fn tool_calls_written_as_text_are_executed() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("a.rs"), "fn main() {}\n").unwrap();

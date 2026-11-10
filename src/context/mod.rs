@@ -139,6 +139,117 @@ impl<'a> ToolResults<'a> {
     }
 }
 
+/// A replayed call/result stream is inconsistent. The turn must not send it:
+/// a mismatch pairs a result with another call's output or drops it entirely.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolPairError {
+    code: &'static str,
+    pub message: String,
+}
+
+impl ToolPairError {
+    fn new(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+
+    pub fn code(&self) -> &'static str {
+        self.code
+    }
+}
+
+impl std::fmt::Display for ToolPairError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ToolPairError {}
+
+/// Assert one result per call and one call per result on the replay path.
+///
+/// Internal ids make this exact: engines may reuse ids or omit them, but the
+/// ledger gives every assistant call one unique id before it is written. A
+/// mismatch is a typed, pre-request failure rather than another call's output
+/// silently appearing in a tool message.
+pub fn validate_tool_pairs(session: &Session) -> Result<(), ToolPairError> {
+    let path = session.context_path();
+    let mut calls: HashMap<&str, (&str, u64)> = HashMap::new();
+    let mut results: HashMap<&str, u64> = HashMap::new();
+    for entry in &path {
+        match &entry.kind {
+            EntryKind::Assistant(assistant) => {
+                for call in assistant.tool_calls.as_deref().unwrap_or_default() {
+                    if call.id.trim().is_empty() {
+                        return Err(ToolPairError::new(
+                            "tool_call_missing_id",
+                            format!(
+                                "the assistant call to {:?} has no id; this session was written by an older harness. Start a new branch with /new.",
+                                call.name
+                            ),
+                        ));
+                    }
+                    if let Some((name, first)) = calls.get(call.id.as_str()) {
+                        return Err(ToolPairError::new(
+                            "tool_call_duplicate",
+                            format!(
+                                "tool call id {:?} is used twice ({:?} and {:?}, entries {} and {}); results cannot be paired. Start a new branch with /new.",
+                                call.id, name, call.name, first, entry.seq
+                            ),
+                        ));
+                    }
+                    calls.insert(call.id.as_str(), (call.name.as_str(), entry.seq));
+                }
+            }
+            EntryKind::ToolResult(result) => {
+                let Some((name, call_seq)) = calls.get(result.call_id.as_str()) else {
+                    return Err(ToolPairError::new(
+                        "tool_result_orphan",
+                        format!(
+                            "a tool result for {:?} has no matching call on this branch (entry {}); replay would attach it to the wrong step. Start a new branch with /new, or /compact to summarize the inconsistent history.",
+                            result.call_id, entry.seq
+                        ),
+                    ));
+                };
+                if entry.seq <= *call_seq {
+                    return Err(ToolPairError::new(
+                        "tool_result_orphan",
+                        format!(
+                            "a tool result for {:?} precedes its call (entries {} and {}); replay would attach it to the wrong step. Start a new branch with /new.",
+                            result.call_id, entry.seq, call_seq
+                        ),
+                    ));
+                }
+                if let Some(first) = results.get(result.call_id.as_str()) {
+                    return Err(ToolPairError::new(
+                        "tool_result_duplicate",
+                        format!(
+                            "tool call {:?} ({:?}) has more than one result (entries {} and {}); exactly one result per call is required. Start a new branch with /new.",
+                            result.call_id, name, first, entry.seq
+                        ),
+                    ));
+                }
+                results.insert(result.call_id.as_str(), entry.seq);
+            }
+            _ => {}
+        }
+    }
+    for (id, (name, seq)) in &calls {
+        if !results.contains_key(id) {
+            return Err(ToolPairError::new(
+                "tool_result_missing",
+                format!(
+                    "tool call {:?} ({:?}, entry {}) has no result on this branch; the request would replay an unanswered call. Start a new branch with /new, or /compact to summarize the inconsistent history.",
+                    id, name, seq
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn push_assistant(
     messages: &mut Vec<ChatMessage>,
     assistant: &AssistantData,
@@ -338,6 +449,65 @@ mod tests {
         assert!(assembled.estimated_tokens > 0);
     }
 
+    #[test]
+    fn pair_validation_requires_one_result_per_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = session(dir.path());
+        session
+            .append(EntryKind::Assistant(AssistantData {
+                tool_calls: Some(vec![crate::session::ToolCall {
+                    id: "call_0001".into(),
+                    name: "read".into(),
+                    arguments: json!({"path":"a.rs"}),
+                }]),
+                ..AssistantData::default()
+            }))
+            .unwrap();
+        let err = validate_tool_pairs(&session).expect_err("missing result");
+        assert_eq!(err.code(), "tool_result_missing");
+        assert!(err.message.contains("call_0001"));
+
+        session
+            .append(EntryKind::ToolResult(ToolResultData {
+                call_id: "call_0001".into(),
+                content: "file body".into(),
+                is_error: false,
+                details: None,
+                artifact: None,
+            }))
+            .unwrap();
+        assert!(validate_tool_pairs(&session).is_ok());
+
+        session
+            .append(EntryKind::ToolResult(ToolResultData {
+                call_id: "call_0001".into(),
+                content: "duplicate".into(),
+                is_error: false,
+                details: None,
+                artifact: None,
+            }))
+            .unwrap();
+        let err = validate_tool_pairs(&session).expect_err("duplicate result");
+        assert_eq!(err.code(), "tool_result_duplicate");
+    }
+
+    #[test]
+    fn pair_validation_rejects_an_orphan_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = session(dir.path());
+        session
+            .append(EntryKind::ToolResult(ToolResultData {
+                call_id: "call_0009".into(),
+                content: "orphan".into(),
+                is_error: false,
+                details: None,
+                artifact: None,
+            }))
+            .unwrap();
+        let err = validate_tool_pairs(&session).expect_err("orphan result");
+        assert_eq!(err.code(), "tool_result_orphan");
+    }
+
     fn assert_leading_system(messages: &[ChatMessage], expected: &str) {
         assert!(matches!(
             &messages[0],
@@ -450,5 +620,9 @@ mod tests {
             .map(|message| message.role())
             .collect();
         assert_eq!(roles, vec!["system", "user", "assistant", "tool", "user"]);
+        assert!(
+            validate_tool_pairs(&session).is_ok(),
+            "a compacted turn must still pair its call and result"
+        );
     }
 }
