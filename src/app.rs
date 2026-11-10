@@ -301,12 +301,6 @@ pub async fn create_runtime(
     let system_prompt =
         prompt::build_system_prompt(&config, &paths, &skills, &tools, Some(&repo_brief));
     let mut budget = TokenBudget::new(context_window, config.model.max_output_tokens);
-    let static_prompt = measure_static_prompt(
-        &budget,
-        &system_prompt,
-        &tool_specs,
-        Some(repo_brief.as_str()),
-    );
     let sampled = tokio::time::timeout(
         Duration::from_secs(2),
         probe::token_count(&probe_provider, &system_prompt),
@@ -323,6 +317,14 @@ pub async fn create_runtime(
             tokens.min(u32::MAX as usize) as u32,
         );
     }
+    // Measure the static prompt with the calibrated ratio, not the initial
+    // 3.5-chars-per-token guess.
+    let static_prompt = measure_static_prompt(
+        &budget,
+        &system_prompt,
+        &tool_specs,
+        Some(repo_brief.as_str()),
+    );
     if static_prompt.total > budget.usable_prompt() {
         session.warnings.push(format!(
             "static prompt is {} tokens but only {} fit the {} token window; turns will be refused until the profile or context is reduced",
@@ -395,6 +397,7 @@ pub async fn create_runtime(
         tokenize,
         limits,
         system_prompt,
+        repo_brief,
         model_profile: profile,
         cancel: CancellationToken::new(),
         tool_timeout: Duration::from_secs(660),
@@ -460,20 +463,28 @@ pub async fn rebuild_core(old: &Arc<Core>, mut config: Config) -> Result<Arc<Cor
         // The tokenizer calibration only holds for the same model.
         budget.chars_per_token = old.budget.chars_per_token;
     }
+    let sampled = tokio::time::timeout(
+        Duration::from_secs(2),
+        probe::token_count(provider.as_ref(), &system_prompt),
+    )
+    .await
+    .ok()
+    .flatten();
+    let tokenize = sampled.is_some();
+    if let Some(tokens) = sampled
+        && tokens > 0
+    {
+        budget.calibrate(
+            system_prompt.chars().count(),
+            tokens.min(u32::MAX as usize) as u32,
+        );
+    }
     let static_prompt = measure_static_prompt(
         &budget,
         &system_prompt,
         &tool_specs,
         Some(repo_brief.as_str()),
     );
-    let tokenize = tokio::time::timeout(
-        Duration::from_secs(2),
-        probe::token_count(provider.as_ref(), &system_prompt),
-    )
-    .await
-    .ok()
-    .flatten()
-    .is_some();
     let limits = RunLimits::from(&config.budgets);
     Ok(Arc::new(Core {
         config,
@@ -493,6 +504,7 @@ pub async fn rebuild_core(old: &Arc<Core>, mut config: Config) -> Result<Arc<Cor
         tokenize,
         limits,
         system_prompt,
+        repo_brief,
         model_profile,
         cancel: old.cancel.clone(),
         tool_timeout: old.tool_timeout,
@@ -516,7 +528,10 @@ pub async fn rebuild_core(old: &Arc<Core>, mut config: Config) -> Result<Arc<Cor
 
 /// Warning to show once before the first turn: a clamped profile or an
 /// Ollama server still at its small default context.
-fn window_notice(truth: Option<&probe::WindowTruth>, configured: Option<u32>) -> Option<String> {
+pub(crate) fn window_notice(
+    truth: Option<&probe::WindowTruth>,
+    configured: Option<u32>,
+) -> Option<String> {
     let truth = truth.filter(|truth| truth.is_known())?;
     if let Some(configured) = configured
         && configured > truth.effective
@@ -558,7 +573,7 @@ fn session_context(truth: Option<&probe::WindowTruth>) -> Option<SessionContextW
 /// Static prompt cost at build time. The repository brief is part of the
 /// system prompt, so it is measured once and subtracted from the system
 /// total; the message can then name the three contributors separately.
-fn measure_static_prompt(
+pub(crate) fn measure_static_prompt(
     budget: &TokenBudget,
     system_prompt: &str,
     tool_specs: &[crate::provider::ToolSpec],

@@ -10,7 +10,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 
 use crate::context::compact::{COMPACTION_BUDGET_CHARS, FindingSummary, build_summary};
-use crate::context::{self, BATCH_CAP_CHARS, TokenBudget, cap_result};
+use crate::context::{self, BATCH_CAP_CHARS, StaticPrompt, TokenBudget, cap_result};
 use crate::provider::{ChatMessage, ChatRequest, ErrorClass, ProviderError, StreamEvent, Usage};
 use crate::session::{
     AssistantData, CompactionData, CustomData, EntryKind, ToolCall, ToolResultData, UserData,
@@ -65,6 +65,16 @@ impl TurnOutcome {
     }
 }
 
+/// Budget and static prompt for one turn. Resolved after endpoint bring-up so
+/// a deferred `model.start_command` cannot leave the turn on a stale window.
+struct TurnContext {
+    budget: TokenBudget,
+    static_prompt: StaticPrompt,
+    tokenize: bool,
+    /// A window or Ollama-default warning discovered by the refresh.
+    notice: Option<String>,
+}
+
 /// Run one turn to settlement. Appends everything to the session branch;
 /// streams UI events.
 pub async fn run_turn(
@@ -75,6 +85,7 @@ pub async fn run_turn(
 ) -> TurnOutcome {
     // A background `model.start_command` may still be bringing the endpoint
     // up. Wait for it instead of racing the first request; cancellation wins.
+    let startup_pending = core.startup.as_ref().is_some_and(|gate| gate.pending());
     if let Some(gate) = &core.startup {
         if gate.pending() {
             let _ = tx.send(AgentEvent::Notice(
@@ -94,23 +105,24 @@ pub async fn run_turn(
         profile: core.config.profile_name().to_string(),
     });
 
-    let mut static_budget = core.budget.clone();
-    let known_window = core
-        .server_window
-        .load(std::sync::atomic::Ordering::Relaxed);
-    if known_window > 0 && known_window < static_budget.context_window {
-        static_budget = static_budget.shrunk_to(known_window);
-    }
-    if let Some(message) = static_prompt_warning(&core, &static_budget) {
+    // Resolve the window and tokenizer after bring-up. A deferred startup
+    // probe runs before the server exists, so the build-time values can be
+    // fallbacks; this refresh is what keeps the first turn from budgeting
+    // against the wrong window.
+    let turn = prepare_turn_context(&core, startup_pending).await;
+
+    if let Some(message) = static_prompt_warning(&turn.static_prompt, &turn.budget) {
         let _ = tx.send(AgentEvent::Notice(message));
     }
-    if let Some(notice) = &core.window_notice {
+    if let Some(notice) = &turn.notice {
+        let _ = tx.send(AgentEvent::Notice(notice.clone()));
+    } else if let Some(notice) = &core.window_notice {
         let tx = tx.clone();
         core.window_notice_sent.call_once(|| {
             let _ = tx.send(AgentEvent::Notice(notice.clone()));
         });
     }
-    if let Some((code, message)) = static_prompt_failure(&core, &static_budget) {
+    if let Some((code, message)) = static_prompt_failure(&turn.static_prompt, &turn.budget) {
         let _ = tx.send(AgentEvent::Error {
             code: code.clone(),
             message: message.clone(),
@@ -124,7 +136,7 @@ pub async fn run_turn(
 
     // `@path` mentions attach file snapshots, within a quarter of the
     // usable prompt so one message cannot crowd out the conversation.
-    let attachment_budget = core.budget.chars_for(core.budget.usable_prompt() / 4);
+    let attachment_budget = turn.budget.chars_for(turn.budget.usable_prompt() / 4);
     let mentions = super::mentions::resolve(&core.tool_context(), &user_text, attachment_budget);
     if !mentions.attachments.is_empty() {
         let names: Vec<&str> = mentions
@@ -149,7 +161,7 @@ pub async fn run_turn(
     }
 
     let turn_start = core.session.lock().expect("session lock").active_leaf_id();
-    let outcome = run_loop(&core, &tx, &cancel, turn_start).await;
+    let outcome = run_loop(&core, &tx, &cancel, turn_start, turn).await;
     if let Ok(mut session) = core.session.lock()
         && let Err(err) = session.fsync()
     {
@@ -165,14 +177,93 @@ pub async fn run_turn(
     outcome
 }
 
+/// The configured window, if the model profile or `[model]` pins one.
+fn configured_window(core: &Core) -> Option<u32> {
+    let (_, profile) = core.config.model_profile();
+    profile.context_window.or(core.config.model.context_window)
+}
+
+/// Resolve the budget and static prompt for this turn. When endpoint bring-up
+/// was deferred or the window is still a guess, probe now, after the server is
+/// up, and re-measure the static prompt with the calibrated tokenizer ratio.
+async fn prepare_turn_context(core: &Core, startup_pending: bool) -> TurnContext {
+    let mut budget = core.budget.clone();
+    let (effective, source) = core.effective_window();
+    if effective > 0 && effective != budget.context_window {
+        budget = budget.resized_to(effective, core.config.model.max_output_tokens);
+    }
+    let known_window = core
+        .server_window
+        .load(std::sync::atomic::Ordering::Relaxed);
+    if known_window > 0 && known_window < budget.context_window {
+        budget = budget.shrunk_to(known_window);
+    }
+    let refresh = startup_pending || !source.is_reliable();
+    let mut static_prompt = core.static_prompt;
+    let mut tokenize = core.tokenize;
+    let mut notice = None;
+    if refresh {
+        let configured = configured_window(core);
+        let truth = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            crate::provider::probe::probe_context_truth(core.provider.as_ref()),
+        )
+        .await
+        .ok()
+        .flatten()
+        .filter(|truth| truth.is_known());
+        if let Some(truth) = truth {
+            let window = configured
+                .map(|configured| configured.min(truth.effective))
+                .unwrap_or(truth.effective);
+            if window > 0 {
+                budget = budget.resized_to(window, core.config.model.max_output_tokens);
+                core.remember_window(window);
+                if core.window_notice.is_none() {
+                    notice = crate::app::window_notice(Some(&truth), configured);
+                }
+            }
+        }
+        let sampled = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            crate::provider::probe::token_count(core.provider.as_ref(), &core.system_prompt),
+        )
+        .await
+        .ok()
+        .flatten();
+        if let Some(tokens) = sampled {
+            tokenize = true;
+            if tokens > 0 {
+                budget.calibrate(
+                    core.system_prompt.chars().count(),
+                    tokens.min(u32::MAX as usize) as u32,
+                );
+            }
+        }
+        static_prompt = crate::app::measure_static_prompt(
+            &budget,
+            &core.system_prompt,
+            &core.tool_specs,
+            Some(core.repo_brief.as_str()),
+        );
+    }
+    TurnContext {
+        budget,
+        static_prompt,
+        tokenize,
+        notice,
+    }
+}
+
 async fn run_loop(
     core: &std::sync::Arc<Core>,
     tx: &UnboundedSender<AgentEvent>,
     cancel: &CancellationToken,
     turn_start: Option<String>,
+    turn: TurnContext,
 ) -> TurnOutcome {
     let mut progress = RunProgress::new(core.limits.clone());
-    let mut budget = core.budget.clone();
+    let mut budget = turn.budget;
     let detected = core
         .detected_window
         .load(std::sync::atomic::Ordering::Relaxed);
@@ -187,7 +278,7 @@ async fn run_loop(
     if known_window > 0 && known_window < budget.context_window {
         budget = budget.shrunk_to(known_window);
     }
-    if let Some((code, message)) = static_prompt_failure(core, &budget) {
+    if let Some((code, message)) = static_prompt_failure(&turn.static_prompt, &budget) {
         append_error(&core.session, &code, &message, false);
         let _ = tx.send(AgentEvent::Error {
             code: code.clone(),
@@ -325,7 +416,7 @@ async fn run_loop(
         // When the engine exposes /tokenize, measure the rendered prompt
         // exactly before sending. The estimate is only a calibration guard;
         // this is the hard gate that keeps a fitting request from being cut.
-        if core.tokenize && budget.exceeds_compaction_threshold(assembled.estimated_tokens) {
+        if turn.tokenize && budget.exceeds_compaction_threshold(assembled.estimated_tokens) {
             let text = tokenize_text(&assembled.messages, &core.tool_specs);
             let exact = tokio::time::timeout(
                 std::time::Duration::from_secs(2),
@@ -742,8 +833,11 @@ fn context_window_event(
 
 /// Refuse a turn whose fixed prompt cannot fit the effective window. The
 /// message names the three components and the exact server flag to raise.
-fn static_prompt_failure(core: &Core, budget: &TokenBudget) -> Option<(String, String)> {
-    let static_prompt = core.static_prompt;
+fn static_prompt_failure(
+    static_prompt: &StaticPrompt,
+    budget: &TokenBudget,
+) -> Option<(String, String)> {
+    let static_prompt = *static_prompt;
     let usable = budget.usable_prompt();
     if static_prompt.total <= usable {
         return None;
@@ -770,8 +864,8 @@ fn static_prompt_failure(core: &Core, budget: &TokenBudget) -> Option<(String, S
 
 /// Warn once per turn when the static prompt consumes more than half of the
 /// usable prompt. Not a failure: a 32k window is unchanged.
-fn static_prompt_warning(core: &Core, budget: &TokenBudget) -> Option<String> {
-    let static_prompt = core.static_prompt;
+fn static_prompt_warning(static_prompt: &StaticPrompt, budget: &TokenBudget) -> Option<String> {
+    let static_prompt = *static_prompt;
     let usable = budget.usable_prompt();
     if static_prompt.total <= usable || u64::from(static_prompt.total) * 2 <= u64::from(usable) {
         return None;
@@ -2082,6 +2176,165 @@ fn compact_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
+
+    use async_trait::async_trait;
+    use tokio::sync::mpsc::UnboundedSender;
+
+    use crate::agent::{RunLimits, WindowSource};
+    use crate::config::{BudgetConfig, ModelProfile};
+    use crate::context::budget::DEFAULT_CHARS_PER_TOKEN;
+    use crate::paths::Paths;
+    use crate::provider::{ChatRequest, Provider, StreamItem};
+    use crate::security::SecurityState;
+    use crate::session::{Session, SessionData};
+    use crate::tools::{BgRegistry, ReadTracker, ToolRegistry};
+
+    struct ProbeProvider {
+        endpoint: String,
+        client: reqwest::Client,
+    }
+
+    #[async_trait]
+    impl Provider for ProbeProvider {
+        async fn chat_stream(
+            &self,
+            _req: ChatRequest,
+            _tx: UnboundedSender<StreamItem>,
+            _cancel: CancellationToken,
+        ) {
+        }
+
+        fn endpoint(&self) -> &str {
+            &self.endpoint
+        }
+
+        fn model(&self) -> &str {
+            "m"
+        }
+
+        fn client(&self) -> Option<&reqwest::Client> {
+            Some(&self.client)
+        }
+    }
+
+    async fn probe_server() -> String {
+        use axum::routing::{get, post};
+        let models = || async { axum::Json(json!({"data": [{"id": "m", "max_model_len": 4096}]})) };
+        let tokenize = || async { axum::Json(json!({"tokens": vec![0u32; 100]})) };
+        let app = axum::Router::new()
+            .route("/v1/models", get(models))
+            .route("/tokenize", post(tokenize));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{address}")
+    }
+
+    fn probe_core(dir: &std::path::Path, endpoint: String) -> Core {
+        let mut paths = Paths::discover(dir).unwrap();
+        paths.data_dir = dir.join("data");
+        paths.config_dir = dir.join("config");
+        let session = Session::create(
+            &paths,
+            SessionData {
+                cwd: dir.display().to_string(),
+                endpoint: endpoint.clone(),
+                model: "m".into(),
+                profile: "test".into(),
+                app: "test".into(),
+                context: None,
+            },
+            true,
+        )
+        .unwrap();
+        let artifacts = session.artifacts.clone();
+        let session = Arc::new(Mutex::new(session));
+        let mut config = crate::config::Config::builtin();
+        config.model.endpoint = endpoint.clone();
+        config.model.model = "m".into();
+        config.model.context_window = Some(32_768);
+        config.model.max_output_tokens = 1024;
+        config.profile_name = "minimal".into();
+        let registry = ToolRegistry::builtin();
+        let tools = registry.select(config.profile(), &[]).unwrap();
+        let tool_specs = ToolRegistry::specs(&tools);
+        let system_prompt = "s".repeat(1000);
+        let budget = TokenBudget::new(32_768, 1024);
+        let static_prompt =
+            crate::app::measure_static_prompt(&budget, &system_prompt, &tool_specs, Some(""));
+        Core {
+            config,
+            paths: paths.clone(),
+            provider: Arc::new(ProbeProvider {
+                endpoint,
+                client: reqwest::Client::new(),
+            }),
+            registry,
+            tools,
+            tool_specs,
+            session,
+            artifacts,
+            reads: Arc::new(Mutex::new(ReadTracker::default())),
+            bg: Arc::new(Mutex::new(BgRegistry::new())),
+            security: Arc::new(Mutex::new(SecurityState::default())),
+            sandbox: None,
+            budget,
+            static_prompt,
+            tokenize: false,
+            limits: RunLimits::from(&BudgetConfig::default()),
+            system_prompt,
+            repo_brief: String::new(),
+            model_profile: ModelProfile::default(),
+            cancel: CancellationToken::new(),
+            tool_timeout: std::time::Duration::from_secs(10),
+            path_jail: false,
+            server_window: Default::default(),
+            window_source: WindowSource::Default,
+            window_truth: None,
+            window_notice: None,
+            window_notice_sent: std::sync::Once::new(),
+            detected_window: Default::default(),
+            window_cache: Default::default(),
+            startup: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn deferred_startup_refreshes_window_tokenizer_and_static_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let endpoint = probe_server().await;
+        let core = probe_core(dir.path(), endpoint);
+        assert_eq!(core.budget.context_window, 32_768);
+        assert!(!core.tokenize);
+        assert_eq!(core.budget.chars_per_token, DEFAULT_CHARS_PER_TOKEN);
+
+        let turn = prepare_turn_context(&core, true).await;
+        assert_eq!(turn.budget.context_window, 4096);
+        assert!(turn.tokenize);
+        assert!(
+            turn.budget.chars_per_token > DEFAULT_CHARS_PER_TOKEN,
+            "tokenizer calibration did not run"
+        );
+        assert_eq!(
+            core.detected_window
+                .load(std::sync::atomic::Ordering::Relaxed),
+            4096
+        );
+        // The static prompt must be re-measured with the calibrated ratio.
+        assert_eq!(
+            turn.static_prompt,
+            crate::app::measure_static_prompt(
+                &turn.budget,
+                &core.system_prompt,
+                &core.tool_specs,
+                Some(core.repo_brief.as_str())
+            )
+        );
+        assert_ne!(turn.static_prompt, core.static_prompt);
+    }
 
     #[test]
     fn merge_fragment_handles_repeats() {

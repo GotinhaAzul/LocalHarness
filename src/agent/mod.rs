@@ -52,6 +52,9 @@ pub struct Core {
     pub tokenize: bool,
     pub limits: RunLimits,
     pub system_prompt: String,
+    /// Repository brief included in `system_prompt`, kept separately so the
+    /// static prompt can be re-measured after tokenizer calibration.
+    pub repo_brief: String,
     pub model_profile: ModelProfile,
     pub cancel: CancellationToken,
     pub tool_timeout: Duration,

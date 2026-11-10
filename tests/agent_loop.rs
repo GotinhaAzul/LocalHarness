@@ -191,6 +191,7 @@ fn harness_config(dir: &std::path::Path, scripts: Vec<Script>, config: Config) -
         security: Arc::new(Mutex::new(SecurityState::default())),
         sandbox: None,
         system_prompt: "system".into(),
+        repo_brief: String::new(),
         model_profile: localharness::config::ModelProfile::default(),
         cancel: CancellationToken::new(),
         tool_timeout: std::time::Duration::from_secs(10),
