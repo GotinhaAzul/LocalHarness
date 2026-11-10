@@ -1,7 +1,5 @@
 <p align="center">
-  <a href="https://github.com/GotinhaAzul/LocalHarness">
-    <img src="docs/assets/terminal.svg" alt="LocalHarness TUI: reading a file, reproducing a failing test, editing, and passing verification" width="960">
-  </a>
+  <img src="docs/assets/demo.gif" alt="LocalHarness TUI: a failing test, the model reading the file, editing it, and the verify gate passing" width="960">
 </p>
 
 <h1 align="center">LocalHarness</h1>
