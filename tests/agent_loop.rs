@@ -193,6 +193,7 @@ fn harness_config(dir: &std::path::Path, scripts: Vec<Script>, config: Config) -
         system_prompt: "system".into(),
         repo_brief: String::new(),
         model_profile: localharness::config::ModelProfile::default(),
+        tool_probe: None,
         cancel: CancellationToken::new(),
         tool_timeout: std::time::Duration::from_secs(10),
         path_jail: false,

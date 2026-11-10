@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::provider::probe::{self, LlamaProps, OllamaModel, WindowTruth};
+use crate::provider::probe::{self, LlamaProps, OllamaModel, ToolProbe, WindowTruth};
 use crate::provider::{Provider, endpoint_urls};
 
 /// Timeout for one metadata probe. Long enough for a local engine to answer,
@@ -32,6 +32,11 @@ pub struct DoctorManifest {
     /// `native`, `repair`, `none`, or `unknown`.
     pub tool_dialect: String,
     pub tool_parser: Option<String>,
+    /// Last forced-tool conformance probe for this model/build. `null` when
+    /// the TUI/headless runtime has not run one or `lh doctor` has no cached
+    /// result. `lh doctor` itself never sends a chat completion.
+    #[serde(default)]
+    pub tool_probe: Option<ToolProbe>,
     pub reasoning_field: Option<String>,
     /// `json_schema`, `grammar`, `none`, or `unknown`.
     pub structured_output: String,
@@ -232,7 +237,7 @@ impl DoctorManifest {
                     if props
                         .chat_template
                         .as_deref()
-                        .is_some_and(template_supports_tools)
+                        .is_some_and(probe::template_supports_tools)
                     {
                         tool_dialect = "native".into();
                     }
@@ -335,6 +340,7 @@ impl DoctorManifest {
             context,
             tool_dialect,
             tool_parser,
+            tool_probe: None,
             reasoning_field,
             structured_output,
             cache_mode,
@@ -388,6 +394,16 @@ impl DoctorManifest {
             out.push_str(&format!(" (parser: {parser})"));
         }
         out.push('\n');
+        match &self.tool_probe {
+            Some(probe) => out.push_str(&format!(
+                "tool probe: {} · mode {} · model {} · checked {}\n",
+                probe.outcome.code(),
+                probe.mode,
+                probe.model,
+                probe.checked
+            )),
+            None => out.push_str("tool probe: not run (no cached conformance result)\n"),
+        }
         out.push_str(&format!(
             "reasoning field: {}\n",
             self.reasoning_field.as_deref().unwrap_or("unknown")
@@ -593,11 +609,6 @@ fn lmstudio_signature(value: &serde_json::Value, model: &str) -> bool {
     })
 }
 
-fn template_supports_tools(template: &str) -> bool {
-    let template = template.to_ascii_lowercase();
-    template.contains("tool") || template.contains("function")
-}
-
 fn positive(value: &serde_json::Value) -> Option<u32> {
     value
         .as_u64()
@@ -653,6 +664,7 @@ mod tests {
             context: sample_context(),
             tool_dialect: "native".into(),
             tool_parser: None,
+            tool_probe: None,
             reasoning_field: None,
             structured_output: "unknown".into(),
             cache_mode: None,
@@ -670,6 +682,25 @@ mod tests {
     }
 
     #[test]
+    fn text_manifest_surfaces_the_tool_probe() {
+        let mut manifest = sample_manifest();
+        assert!(manifest.to_text().contains("tool probe: not run"));
+        manifest.tool_probe = Some(ToolProbe {
+            outcome: probe::ToolProbeOutcome::ProseFallback,
+            model: "qwen3".into(),
+            build: Some("b6040".into()),
+            mode: "repair".into(),
+            message: "the model answered in prose".into(),
+            checked: "2026-01-01T00:00:00Z".into(),
+        });
+        let text = manifest.to_text();
+        assert!(
+            text.contains("tool probe: prose_fallback · mode repair"),
+            "{text}"
+        );
+    }
+
+    #[test]
     fn json_manifest_has_every_documented_field() {
         let value: serde_json::Value =
             serde_json::from_str(&sample_manifest().to_json_pretty()).unwrap();
@@ -680,6 +711,7 @@ mod tests {
             "context",
             "tool_dialect",
             "tool_parser",
+            "tool_probe",
             "reasoning_field",
             "structured_output",
             "cache_mode",

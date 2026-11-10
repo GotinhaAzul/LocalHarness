@@ -157,6 +157,7 @@ Steps run sequentially without a shell and stop at the first failure.
 | `LH_NO_SESSION` | Disable persistence |
 | `LH_TRUST` | Trust project config |
 | `LH_CONFIG_DIR`, `LH_DATA_DIR` | Override roots |
+| `LH_SKIP_TOOL_PROBE` | Skip the one-shot tool-call conformance probe |
 | `NO_COLOR` | Disable color |
 | `LH_DEBUG_CONTENT` | Allow content in debug logs (warns) |
 | `LH_BWRAP` | Override the bubblewrap executable used by `--sandbox` |

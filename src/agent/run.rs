@@ -104,6 +104,7 @@ pub async fn run_turn(
     let _ = tx.send(AgentEvent::TurnStarted {
         model: core.provider.model().to_string(),
         profile: core.config.profile_name().to_string(),
+        tool_mode: core.tool_mode_label().unwrap_or_default(),
     });
 
     // Resolve the window and tokenizer after bring-up. A deferred startup
@@ -2327,6 +2328,7 @@ mod tests {
             system_prompt,
             repo_brief: String::new(),
             model_profile: ModelProfile::default(),
+            tool_probe: None,
             cancel: CancellationToken::new(),
             tool_timeout: std::time::Duration::from_secs(10),
             path_jail: false,

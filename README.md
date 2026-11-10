@@ -246,6 +246,7 @@ Global config: `~/.config/localharness/config.toml`. A trusted project `.harness
 | `LH_THEME` | Theme name |
 | `LH_NO_SESSION`, `LH_TRUST` | Disable persistence; trust project config |
 | `LH_CONFIG_DIR`, `LH_DATA_DIR` | Override config and data roots |
+| `LH_SKIP_TOOL_PROBE` | Skip the one-shot tool-call conformance probe |
 
 `model_profile = "auto"` matches by model-name prefix; the `default` model profile is the fallback. `[model] context_window` is used only when the model profile does not set one. See [docs/configuration.md](docs/configuration.md) for every key and [docs/model-setup.md](docs/model-setup.md) for engine-specific tuning.
 

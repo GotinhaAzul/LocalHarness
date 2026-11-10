@@ -357,6 +357,7 @@ impl App {
             git: GitStatus::none(),
             profile: config.profile_name().to_string(),
             model: runtime.core.provider.model().to_string(),
+            tool_mode: runtime.core.tool_mode_label().unwrap_or_default(),
             logged_in: runtime.core.logged_in(),
             used,
             window,
@@ -649,6 +650,7 @@ impl App {
         self.header.model = runtime.core.provider.model().to_string();
         self.header.logged_in = runtime.core.logged_in();
         self.header.profile = self.config.profile_name().to_string();
+        self.header.tool_mode = runtime.core.tool_mode_label().unwrap_or_default();
         self.header.trust = self.config.trust || self.options.trust;
         self.window = runtime.core.effective_window().0;
         self.header.window = self.window;
@@ -1075,10 +1077,15 @@ impl App {
 
     fn handle_agent_event(&mut self, event: AgentEvent) {
         match event {
-            AgentEvent::TurnStarted { model, profile } => {
+            AgentEvent::TurnStarted {
+                model,
+                profile,
+                tool_mode,
+            } => {
                 self.header.logged_in = !model.trim().is_empty();
                 self.header.model = model;
                 self.header.profile = profile;
+                self.header.tool_mode = tool_mode;
                 self.turn_state = Some(AgentState::AssembleContext);
             }
             AgentEvent::State(state) => {
@@ -1916,6 +1923,7 @@ impl App {
         self.header.model = core.provider.model().to_string();
         self.header.logged_in = core.logged_in();
         self.header.profile = self.config.profile_name().to_string();
+        self.header.tool_mode = core.tool_mode_label().unwrap_or_default();
         self.header.trust = self.config.trust || self.options.trust;
         self.window = core.effective_window().0;
         self.header.window = self.window;
@@ -2609,6 +2617,7 @@ impl App {
             SkillIndex::load(&paths, true).advertised_for(&crate::tools::active_packs(&core.tools));
         self.header.trust = true;
         self.header.profile = self.config.profile_name().to_string();
+        self.header.tool_mode = core.tool_mode_label().unwrap_or_default();
         self.window = core.effective_window().0;
         self.header.window = self.window;
         self.used_tokens = estimate_used(&core);
@@ -3170,6 +3179,7 @@ mod tests {
             git: GitStatus::none(),
             profile: "full".into(),
             model: model.into(),
+            tool_mode: String::new(),
             logged_in: true,
             used: 12400,
             window: 64000,

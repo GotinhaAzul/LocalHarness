@@ -57,6 +57,9 @@ pub struct Core {
     /// static prompt can be re-measured after tokenizer calibration.
     pub repo_brief: String,
     pub model_profile: ModelProfile,
+    /// Last forced-tool conformance result for this model/build. `None` when
+    /// the probe could not run (server down or a deferred start).
+    pub tool_probe: Option<crate::provider::probe::ToolProbe>,
     pub cancel: CancellationToken,
     pub tool_timeout: Duration,
     pub path_jail: bool,
@@ -173,6 +176,19 @@ impl Core {
         !self.provider.model().trim().is_empty()
     }
 
+    /// Effective tool mode for the header: the conformance probe wins over
+    /// the configured profile; `auto` without a probe is not advertised.
+    pub fn tool_mode_label(&self) -> Option<String> {
+        if let Some(probe) = &self.tool_probe {
+            return Some(format!("tools:{}", probe.mode));
+        }
+        match self.model_profile.tool_mode {
+            crate::config::ToolMode::Native => Some("tools:native".into()),
+            crate::config::ToolMode::Repair => Some("tools:repair".into()),
+            crate::config::ToolMode::Auto => None,
+        }
+    }
+
     /// The window in force and where it came from, including a window
     /// detected from the server after this core was built.
     pub fn effective_window(&self) -> (u32, WindowSource) {
@@ -251,6 +267,8 @@ pub enum AgentEvent {
     TurnStarted {
         model: String,
         profile: String,
+        /// Effective tool mode (`native`/`repair`), when known.
+        tool_mode: String,
     },
     State(AgentState),
     TextDelta(String),

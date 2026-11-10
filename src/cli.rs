@@ -289,6 +289,14 @@ async fn run_doctor(config: &Config, paths: &Paths, json: bool, fix: bool) -> Re
         .or(config.model.context_window)
         .unwrap_or(0);
     let manifest = crate::doctor::DoctorManifest::probe(&provider, configured).await;
+    let mut manifest = manifest;
+    // `lh doctor` never sends a chat completion. Show the last conformance
+    // result the runtime stored for this model/build, if any.
+    let probe_path = paths.data_dir.join("tool-probe-cache.json");
+    let probe_key = crate::provider::probe::tool_probe_key(&provider, manifest.build.as_deref());
+    if let Some(cached) = crate::provider::probe::load_tool_probe(&probe_path, &probe_key) {
+        manifest.tool_probe = Some(cached);
+    }
     if json {
         println!("{}", manifest.to_json_pretty());
     } else {
@@ -356,8 +364,12 @@ async fn run_headless(runtime: crate::app::Runtime, prompt: String, json: bool) 
 fn render_event(event: AgentEvent, json: bool) -> Result<Option<TurnStatus>> {
     if json {
         let value = match &event {
-            AgentEvent::TurnStarted { model, profile } => {
-                json!({"type":"started","model":model,"profile":profile})
+            AgentEvent::TurnStarted {
+                model,
+                profile,
+                tool_mode,
+            } => {
+                json!({"type":"started","model":model,"profile":profile,"tool_mode":tool_mode})
             }
             AgentEvent::State(state) => json!({"type":"state","state":format!("{state:?}")}),
             AgentEvent::TextDelta(text) => json!({"type":"text","text":text}),
