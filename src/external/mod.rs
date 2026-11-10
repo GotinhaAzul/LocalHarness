@@ -744,6 +744,7 @@ mod tests {
             trust: true,
             verify: VerifyConfig::default(),
             profile: "full".to_string(),
+            packs: Vec::new(),
             reads: Arc::new(Mutex::new(ReadTracker::default())),
             bg: Arc::new(Mutex::new(BgRegistry::new())),
             security: Arc::new(Mutex::new(security)),

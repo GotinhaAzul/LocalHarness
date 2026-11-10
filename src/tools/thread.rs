@@ -606,6 +606,7 @@ mod tests {
             trust: true,
             verify: VerifyConfig::default(),
             profile: "test".into(),
+            packs: Vec::new(),
             reads: Arc::new(Mutex::new(ReadTracker::default())),
             bg: Arc::new(Mutex::new(BgRegistry::new())),
             security: Arc::new(Mutex::new(SecurityState::default())),

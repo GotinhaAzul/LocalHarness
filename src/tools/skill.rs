@@ -153,7 +153,7 @@ impl Tool for SkillTool {
             .map(|name| name.trim().trim_start_matches('/').to_string())
             .filter(|name| !name.is_empty());
         let Some(name) = name else {
-            return list(&index);
+            return list(&index.advertised_for(&ctx.packs));
         };
         let Some(skill) = index.get(&name) else {
             return unknown(&index, &name);
@@ -206,6 +206,7 @@ mod tests {
             trust,
             verify: Default::default(),
             profile: "full".into(),
+            packs: vec!["core".into(), "coding".into(), "security".into()],
             reads: Default::default(),
             bg: Arc::new(Mutex::new(crate::tools::BgRegistry::new())),
             security: Default::default(),

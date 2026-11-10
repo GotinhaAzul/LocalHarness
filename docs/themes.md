@@ -1,8 +1,9 @@
 # Themes
 
-Themes are TOML files with semantic tokens. Bundled: `omarchy`,
-`catppuccin-mocha`, `gruvbox-dark`, `high-contrast`, `light`. User themes live
-in `~/.config/localharness/themes/<name>.toml`.
+Themes are TOML files with semantic tokens. Bundled: `default`,
+`catppuccin-mocha`, `gruvbox-dark`, `high-contrast`, `light`. `omarchy` is
+accepted as an alias for `default`, so older configs keep working. User themes
+live in `~/.config/localharness/themes/<name>.toml`.
 
 ```toml
 name = "mine"

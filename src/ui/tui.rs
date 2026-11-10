@@ -468,6 +468,7 @@ impl App {
             .map(|(name, data)| (name.clone(), data.description.clone().unwrap_or_default()))
             .collect();
         sources.skills = SkillIndex::load(&paths, trust)
+            .advertised_for(&crate::tools::active_packs(&runtime.core.tools))
             .names()
             .into_iter()
             .map(str::to_string)
@@ -2166,8 +2167,9 @@ impl App {
             return;
         };
         let skills = SkillIndex::load(&runtime.core.paths, self.config.trust);
+        let advertised = skills.advertised_for(&crate::tools::active_packs(&runtime.core.tools));
         if name.is_empty() {
-            let names: Vec<&str> = skills.names();
+            let names: Vec<&str> = advertised.names();
             self.transcript
                 .push_note("skills", format!("available: {}", names.join(", ")), false);
             return;
@@ -2176,7 +2178,7 @@ impl App {
             self.set_notice(
                 format!(
                     "unknown skill {name:?}; available: {}",
-                    skills.names().join(", ")
+                    advertised.names().join(", ")
                 ),
                 Role::Error,
             );
@@ -2603,7 +2605,8 @@ impl App {
         }
         self.config = core.config.clone();
         self.options.trust = true;
-        self.options.skills = SkillIndex::load(&paths, true);
+        self.options.skills =
+            SkillIndex::load(&paths, true).advertised_for(&crate::tools::active_packs(&core.tools));
         self.header.trust = true;
         self.header.profile = self.config.profile_name().to_string();
         self.window = core.effective_window().0;
@@ -3240,7 +3243,7 @@ mod tests {
             120,
             40,
             header("qwen3.5-35b-a3b", "abcdef12"),
-            Theme::bundled("omarchy"),
+            Theme::bundled("default"),
         );
         let text = buffer_text(&terminal);
         assert!(text.contains("/tmp/project"), "cwd missing:\n{text}");
@@ -3256,7 +3259,7 @@ mod tests {
             60,
             20,
             header("qwen3.5-35b-a3b", "abcdef123456"),
-            Theme::bundled("omarchy"),
+            Theme::bundled("default"),
         );
         let text = buffer_text(&terminal);
         assert!(text.contains("/tmp/project"), "cwd missing:\n{text}");
@@ -3279,7 +3282,7 @@ mod tests {
             120,
             20,
             header("model", "session"),
-            Theme::bundled("omarchy"),
+            Theme::bundled("default"),
         );
         let after = draw_scene(120, 20, header("model", "session"), Theme::bundled("light"));
         // The info bar is the second-to-last row; column 1 starts the cwd.
@@ -3298,7 +3301,7 @@ mod tests {
     fn header_shows_not_logged_in_without_a_model() {
         let mut header = header("", "session");
         header.logged_in = false;
-        let terminal = draw_scene(120, 20, header, Theme::bundled("omarchy"));
+        let terminal = draw_scene(120, 20, header, Theme::bundled("default"));
         let text = buffer_text(&terminal);
         assert!(text.contains("not logged in"), "header:\n{text}");
     }

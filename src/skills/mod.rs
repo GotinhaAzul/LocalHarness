@@ -54,6 +54,8 @@ pub struct Skill {
     pub references: Vec<SkillReference>,
     pub source: Option<PathBuf>,
     pub bundled: bool,
+    /// Tool packs that advertise this skill. Empty means every profile.
+    pub packs: Vec<String>,
 }
 
 impl Skill {
@@ -144,6 +146,26 @@ impl SkillIndex {
             .iter()
             .map(|skill| skill.name.as_str())
             .collect()
+    }
+
+    /// Skills visible to the active tool packs. A skill with no pack
+    /// restriction is always visible; a pack-specific skill stays loadable by
+    /// name, it just stops cluttering the index when its pack is off.
+    pub fn advertised_for(&self, packs: &[String]) -> SkillIndex {
+        SkillIndex {
+            skills: self
+                .skills
+                .iter()
+                .filter(|skill| {
+                    skill.packs.is_empty()
+                        || skill
+                            .packs
+                            .iter()
+                            .any(|pack| packs.iter().any(|active| active == pack))
+                })
+                .cloned()
+                .collect(),
+        }
     }
 
     /// Compact index injected into the system prompt.
@@ -242,6 +264,7 @@ pub fn load_skill_file(path: &Path, bundled: bool) -> Option<Skill> {
         references: Vec::new(),
         source: Some(path.to_path_buf()),
         bundled,
+        packs: Vec::new(),
     })
 }
 
@@ -357,7 +380,12 @@ const METHODS_REFERENCES: &[(&str, &str)] = &[
     ),
 ];
 
-fn bundled_skill(main: &str, references: &[(&str, &'static str)], name: &str) -> Skill {
+fn bundled_skill(
+    main: &str,
+    references: &[(&str, &'static str)],
+    name: &str,
+    packs: &[&str],
+) -> Skill {
     let (meta, body) = split_frontmatter(main);
     Skill {
         name: meta.get("name").cloned().unwrap_or_else(|| name.into()),
@@ -373,6 +401,7 @@ fn bundled_skill(main: &str, references: &[(&str, &'static str)], name: &str) ->
             .collect(),
         source: None,
         bundled: true,
+        packs: packs.iter().map(|pack| (*pack).to_string()).collect(),
     }
 }
 
@@ -380,9 +409,14 @@ fn bundled_skill(main: &str, references: &[(&str, &'static str)], name: &str) ->
 pub fn bundled() -> SkillIndex {
     SkillIndex {
         skills: vec![
-            bundled_skill(RED_SKILL, RED_REFERENCES, "security-red"),
-            bundled_skill(BLUE_SKILL, BLUE_REFERENCES, "security-blue"),
-            bundled_skill(METHODS_SKILL, METHODS_REFERENCES, "security-methods"),
+            bundled_skill(RED_SKILL, RED_REFERENCES, "security-red", &["security"]),
+            bundled_skill(BLUE_SKILL, BLUE_REFERENCES, "security-blue", &["security"]),
+            bundled_skill(
+                METHODS_SKILL,
+                METHODS_REFERENCES,
+                "security-methods",
+                &["security"],
+            ),
         ],
     }
 }
@@ -420,6 +454,21 @@ mod tests {
         assert!(listed.contains("- references/recon.md"));
         assert!(listed.len() < red.body.len() + 1000);
         assert!(red.reference("recon").unwrap().text().unwrap().len() > 500);
+    }
+
+    #[test]
+    fn security_skills_follow_the_active_packs() {
+        let all = bundled();
+        let coding = all.advertised_for(&["core".into(), "coding".into()]);
+        assert!(coding.get("security-red").is_none());
+        assert!(coding.get("security-blue").is_none());
+        // Filtering only affects the index; an explicit load still resolves.
+        assert!(all.get("security-red").is_some());
+
+        let full = all.advertised_for(&["core".into(), "coding".into(), "security".into()]);
+        assert!(full.get("security-red").is_some());
+        assert!(full.get("security-blue").is_some());
+        assert!(full.get("security-methods").is_some());
     }
 
     #[test]

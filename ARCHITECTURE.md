@@ -598,8 +598,8 @@ deletes entries.
 
 ### 6.1 Built-in tool surface
 
-Twenty-three tools. Static per model call. The default `full` profile includes
-all three packs.
+Twenty-three tools. Static per model call. The default `coding` profile includes
+core and coding; `full` adds the security pack.
 
 | Pack | Tool | Purpose |
 |---|---|---|
@@ -782,7 +782,9 @@ packs = ["core", "security"]
 tools = ["read", "bash", "verify"]
 ```
 
-- `full` is the default. Coding and security are equal, not primary/plugin.
+- `coding` is the default; `full` adds security. Coding and security are equal
+  capabilities, not primary/plugin: the default keeps shell/file use broad while
+  security tooling, posture, and skills stay opt-in.
 - A profile may list packs, explicit tools, or both. Explicit tools are added
   to the pack result.
 - External tools are attached to a profile or workflow. They never auto-join
@@ -1135,7 +1137,7 @@ input characters. Missing input and unreadable files return prescriptive errors.
 Semantic tokens, TOML, user-overridable:
 
 ```toml
-name = "omarchy"
+name = "default"
 
 [colors]
 bg = "#1b1b1f"
@@ -1164,8 +1166,8 @@ selection = "#283457"
 cursor = "#c0caf5"
 ```
 
-- Bundled themes: `omarchy`, `catppuccin-mocha`, `gruvbox-dark`,
-  `high-contrast`, `light`.
+- Bundled themes: `default`, `catppuccin-mocha`, `gruvbox-dark`,
+  `high-contrast`, `light`. `omarchy` is an alias for `default`.
 - Color values: `#rgb`, `#rrggbb`, ANSI names (`red`, `bright_blue`, ...),
   `indexed:0..255`, and `default`.
 - `color_mode = "auto" | "truecolor" | "256" | "16"`. Auto detects
@@ -1305,6 +1307,8 @@ Environment variables: `LH_ENDPOINT`, `LH_MODEL`, `LH_API_KEY`, `LH_PROFILE`,
 ### 10.3 Example config
 
 ```toml
+default_profile = "coding"      # overridden by --profile / LH_PROFILE
+
 [model]
 endpoint = "http://127.0.0.1:8080"
 model = ""                      # auto-select if /v1/models has one entry
@@ -1318,7 +1322,7 @@ connect_timeout_secs = 5
 first_token_timeout_secs = 120
 
 [ui]
-theme = "omarchy"
+theme = "default"
 color_mode = "auto"
 show_reasoning = false
 show_token_counts = true
@@ -1334,6 +1338,15 @@ max_wall_minutes = 30
 stall_calls = 12
 verify_attempts = 2
 wrap_up_at = 0.8
+
+[prompt]
+identity = ""                  # replaces the built-in one-line identity
+instructions = ""              # appended after the built-in operating rules
+file = ""                      # or a Markdown file
+
+[profile.coding]               # the built-in default
+packs = ["core", "coding"]
+model_profile = "auto"
 
 [profile.full]
 packs = ["core", "coding", "security"]
@@ -1620,7 +1633,7 @@ a new message, and resume the session.
 | Pi relationship | Reference only | No Node/TS runtime; no compatibility burden |
 | Provider | OpenAI-compatible endpoint only | Any local engine works; no server management |
 | Cloud | Not in v1 | Local-first posture; no auth/catalog scope |
-| Packs | Coding and security equal; `full` default | The product is both; profiles narrow |
+| Packs | Coding and security equal; `coding` default, `full` opt-in | General use is coding; security stays one profile away |
 | Tool surface | 23 static built-ins; no tool search | Small-model reliability and debuggability |
 | Extensibility | Profiles, skills, workflows, external tools | Users add tools/workflows, not loop behavior |
 | Scripting | None in v1 | Avoid a second API and loop complexity |

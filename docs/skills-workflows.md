@@ -26,7 +26,9 @@ Locations:
 
 The system prompt carries a compact index of name, description, and when to use
 each skill. Write the `description` and `when` for the model: they are how it
-decides to load the skill.
+decides to load the skill. Bundled security skills are advertised only while
+the `security` pack is active, so the `coding` default stays focused; they are
+still loadable by name and are preloaded by the security workflows.
 
 **The model loads skills itself** with the `skill` tool (core pack, read-only):
 

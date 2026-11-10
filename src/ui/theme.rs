@@ -105,7 +105,7 @@ pub struct Theme {
 impl Theme {
     pub fn names() -> &'static [&'static str] {
         &[
-            "omarchy",
+            "default",
             "catppuccin-mocha",
             "gruvbox-dark",
             "high-contrast",
@@ -113,7 +113,8 @@ impl Theme {
         ]
     }
 
-    /// Load a theme by name: user themes first, then bundled, then omarchy.
+    /// Load a theme by name: user themes first, then bundled, then the
+    /// default palette. `omarchy` is accepted as an alias for `default`.
     pub fn load(name: &str, theme_dir: &Path, color_mode: ColorMode, no_color: bool) -> Theme {
         if name == "light" {
             // "light" can be a bundled name too; user files win.
@@ -140,19 +141,17 @@ impl Theme {
     }
 
     pub fn bundled(name: &str) -> Theme {
-        let colors = match name {
-            "catppuccin-mocha" => catppuccin(),
-            "gruvbox-dark" => gruvbox(),
-            "high-contrast" => high_contrast(),
-            "light" => light(),
-            _ => omarchy(),
+        let (canonical, colors) = match name {
+            "catppuccin-mocha" => ("catppuccin-mocha", catppuccin()),
+            "gruvbox-dark" => ("gruvbox-dark", gruvbox()),
+            "high-contrast" => ("high-contrast", high_contrast()),
+            "light" => ("light", light()),
+            // Compatibility: older configs and scripts used the distro name.
+            "omarchy" | "" => ("default", default_dark()),
+            _ => (name, default_dark()),
         };
         Theme {
-            name: if name.is_empty() {
-                "omarchy".into()
-            } else {
-                name.to_string()
-            },
+            name: canonical.to_string(),
             colors,
             color_mode: ColorMode::Auto,
             no_color: false,
@@ -367,7 +366,7 @@ pub fn parse_theme(raw: &str, color_mode: ColorMode) -> Result<Theme, String> {
     let file: ThemeFile = toml::from_str(raw).map_err(|err| err.to_string())?;
     let mut theme = Theme {
         name: file.name.unwrap_or_else(|| "custom".into()),
-        colors: omarchy(),
+        colors: default_dark(),
         color_mode,
         no_color: false,
     };
@@ -481,7 +480,7 @@ pub fn detect_color_mode() -> ColorMode {
     ColorMode::Ansi16
 }
 
-fn omarchy() -> ThemeColors {
+fn default_dark() -> ThemeColors {
     ThemeColors {
         bg: Color::Rgb(27, 27, 31),
         fg: Color::Rgb(228, 228, 231),
@@ -657,6 +656,15 @@ mod tests {
             let theme = Theme::load(name, Path::new("/nonexistent"), ColorMode::Truecolor, false);
             assert_eq!(&theme.name, name);
         }
+    }
+
+    #[test]
+    fn omarchy_is_an_alias_for_default() {
+        let alias = Theme::bundled("omarchy");
+        let canonical = Theme::bundled("default");
+        assert_eq!(alias.name, "default");
+        assert_eq!(alias.colors.accent, canonical.colors.accent);
+        assert_eq!(Theme::bundled("").name, "default");
     }
 
     #[test]

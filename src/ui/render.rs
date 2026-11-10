@@ -1831,7 +1831,7 @@ mod tests {
 
     #[test]
     fn tool_line_has_glyph_name_summary_duration_preview_and_artifact() {
-        let theme = Theme::bundled("omarchy");
+        let theme = Theme::bundled("default");
         let block = Block::tool(
             Some("call-1".into()),
             "bash",
@@ -1854,7 +1854,7 @@ mod tests {
 
     #[test]
     fn long_tool_output_collapses_until_expanded() {
-        let theme = Theme::bundled("omarchy");
+        let theme = Theme::bundled("default");
         let output: Vec<String> = (1..=10).map(|n| format!("line {n}")).collect();
         let block = Block::tool(
             None,
@@ -1887,7 +1887,7 @@ mod tests {
 
     #[test]
     fn running_and_failed_tools_use_distinct_glyphs() {
-        let theme = Theme::bundled("omarchy");
+        let theme = Theme::bundled("default");
         let running = Block::tool(None, "read", "a.rs", ToolStatus::Running, None, "", None);
         let failed = Block::tool(
             None,
@@ -1906,7 +1906,7 @@ mod tests {
 
     #[test]
     fn diff_fences_use_diff_colors() {
-        let theme = Theme::bundled("omarchy");
+        let theme = Theme::bundled("default");
         let block = Block::assistant(
             "Patch:\n```diff\n--- a/x.rs\n+++ b/x.rs\n@@ -1 +1 @@\n-old\n+new\n```",
             None,
@@ -1934,7 +1934,7 @@ mod tests {
 
     #[test]
     fn reasoning_is_collapsed_by_default_and_expanded_with_ctrl_r() {
-        let theme = Theme::bundled("omarchy");
+        let theme = Theme::bundled("default");
         let block = Block::assistant("answer", Some("secret thought".into()));
         let collapsed = joined(&blocks_to_lines(
             std::slice::from_ref(&block),
@@ -1954,7 +1954,7 @@ mod tests {
 
     #[test]
     fn errors_render_with_a_cross_and_hanging_message() {
-        let theme = Theme::bundled("omarchy");
+        let theme = Theme::bundled("default");
         let block = Block::error("timeout", "the request timed out");
         let lines = blocks_to_lines(&[block], 60, &theme, false);
         let text = joined(&lines);
@@ -1964,7 +1964,7 @@ mod tests {
 
     #[test]
     fn live_user_message_renders_above_the_turns_tools() {
-        let theme = Theme::bundled("omarchy");
+        let theme = Theme::bundled("default");
         let mut transcript = Transcript::new(false);
         transcript.begin_turn("fix the bug");
         transcript.text_delta("Looking.");
@@ -1980,7 +1980,7 @@ mod tests {
 
     #[test]
     fn notes_stay_where_they_were_pushed() {
-        let theme = Theme::bundled("omarchy");
+        let theme = Theme::bundled("default");
         let mut transcript = Transcript::new(false);
         transcript.set_session(vec![Block::user("first")]);
         transcript.push_note("help", "the help text", false);
@@ -1994,7 +1994,7 @@ mod tests {
 
     #[test]
     fn turn_summary_reports_time_tools_failures_and_edits() {
-        let theme = Theme::bundled("omarchy");
+        let theme = Theme::bundled("default");
         let block = Block {
             kind: BlockKind::TurnSummary {
                 seconds: Some(75),
@@ -2013,7 +2013,7 @@ mod tests {
 
     #[test]
     fn plan_folds_finished_steps_when_long() {
-        let theme = Theme::bundled("omarchy");
+        let theme = Theme::bundled("default");
         let mut plan: Vec<(String, PlanStatus)> = (1..=5)
             .map(|n| (format!("done {n}"), PlanStatus::Completed))
             .collect();
@@ -2042,7 +2042,7 @@ mod tests {
 
     #[test]
     fn test_backend_renders_tool_card() {
-        let theme = Theme::bundled("omarchy");
+        let theme = Theme::bundled("default");
         let mut transcript = Transcript::new(false);
         transcript.set_session(vec![Block::tool(
             None,
@@ -2093,7 +2093,7 @@ mod tests {
 
     #[test]
     fn activity_line_and_plan_render_above_the_input() {
-        let theme = Theme::bundled("omarchy");
+        let theme = Theme::bundled("default");
         let mut transcript = Transcript::new(false);
         let input = TextArea::new(vec![String::new()]);
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();

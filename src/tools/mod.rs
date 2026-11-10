@@ -52,6 +52,30 @@ pub enum ToolPack {
     Security,
 }
 
+impl ToolPack {
+    /// Stable name used by profiles, skills, and diagnostics.
+    pub fn label(self) -> &'static str {
+        match self {
+            ToolPack::Core => "core",
+            ToolPack::Coding => "coding",
+            ToolPack::Security => "security",
+        }
+    }
+}
+
+/// Packs represented in a selected tool list. A profile can name packs or
+/// explicit tools, so this is the truthful answer for what is active.
+pub fn active_packs(tools: &[Arc<dyn Tool>]) -> Vec<String> {
+    let mut packs: Vec<String> = Vec::new();
+    for tool in tools {
+        let label = tool.pack().label().to_string();
+        if !packs.contains(&label) {
+            packs.push(label);
+        }
+    }
+    packs
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ToolResult {
     pub content: String,
@@ -109,6 +133,8 @@ pub struct ToolContext {
     pub trust: bool,
     pub verify: VerifyConfig,
     pub profile: String,
+    /// Packs active in this context; used to keep the skill index focused.
+    pub packs: Vec<String>,
     pub reads: Arc<Mutex<ReadTracker>>,
     pub bg: Arc<Mutex<bg::BgRegistry>>,
     pub security: Arc<Mutex<SecurityState>>,

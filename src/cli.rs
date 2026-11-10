@@ -45,7 +45,7 @@ pub struct Cli {
     #[arg(long = "model-profile", global = true, value_name = "NAME")]
     pub model_profile: Option<String>,
 
-    /// Tool profile (full, coding, security, minimal, or a custom profile).
+    /// Tool profile (coding, full, security, minimal, or a custom profile).
     #[arg(long, global = true, value_name = "NAME")]
     pub profile: Option<String>,
 
@@ -259,7 +259,8 @@ pub async fn run(cli: Cli) -> Result<i32> {
             let ui_options = UiOptions {
                 no_color: no_color || config.ui.color_mode == ColorMode::Ansi16,
                 trust,
-                skills: crate::skills::SkillIndex::load(&paths, trust),
+                skills: crate::skills::SkillIndex::load(&paths, trust)
+                    .advertised_for(&crate::tools::active_packs(&runtime.core.tools)),
             };
             ui::run(runtime, ui_options).await?;
             Ok(0)

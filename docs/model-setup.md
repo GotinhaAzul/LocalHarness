@@ -81,17 +81,17 @@ flags to add.
 Enable the local server and load a model. Use its `/v1` base URL if it is not
 `http://127.0.0.1:8080`.
 
-## Tailnet or another machine
+## A tailnet or another machine
 
 Point `[model] endpoint` at the host, with or without the `/v1` suffix:
 
 ```toml
 [model]
-endpoint = "http://desktopserver:8088/v1"
-model = "spark26"       # or "" to auto-select when /v1/models has one entry
+endpoint = "http://model-host:8088/v1"
+model = "my-model"      # or "" to auto-select when /v1/models has one entry
 
-[model_profile.spark]
-match = ["spark"]
+[model_profile.remote]
+match = ["my-model"]
 context_window = 131072
 tool_mode = "native"
 reasoning_field = "reasoning_content"

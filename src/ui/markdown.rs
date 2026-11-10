@@ -948,7 +948,7 @@ mod tests {
     use super::*;
 
     fn theme() -> Theme {
-        Theme::bundled("omarchy")
+        Theme::bundled("default")
     }
 
     fn text_of(lines: &[Line<'_>]) -> String {

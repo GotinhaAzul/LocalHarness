@@ -4,6 +4,10 @@ LocalHarness includes a first-class security pack for authorized testing,
 labs, CTFs, and defensive work. It does not provide exploit payloads,
 persistence, credential dumping, evasion, or denial-of-service tooling.
 
+Security is opt-in: the default `coding` profile has no security tools or
+posture. Use `--profile security` for core plus security, or `--profile full`
+for coding plus security; `/profile` switches during a session.
+
 ## Authorization
 
 Scope is set only by the user:

@@ -23,10 +23,12 @@ defaults. Environment variables fill the gaps.
 ## Example
 
 ```toml
+default_profile = "coding"      # coding | full | security | minimal | custom
+
 [model]
 endpoint = "http://127.0.0.1:8080"
-# The /v1 suffix is optional. Both forms work, including a tailnet host:
-# endpoint = "http://desktopserver:8088/v1"
+# The /v1 suffix is optional. Both forms work, including another machine:
+# endpoint = "http://model-host:8088/v1"
 model = ""                      # auto-select if /v1/models has one entry
 api_key = ""
 start_command = ""              # optional; run once if the endpoint is down
@@ -40,7 +42,7 @@ first_token_timeout_secs = 120
 stream_idle_timeout_secs = 120
 
 [ui]
-theme = "omarchy"
+theme = "default"               # default | catppuccin-mocha | gruvbox-dark | light | high-contrast
 color_mode = "auto"             # auto | truecolor | 256 | 16
 show_reasoning = false
 show_token_counts = true
@@ -58,6 +60,17 @@ max_wall_minutes = 30
 stall_calls = 12
 verify_attempts = 2
 wrap_up_at = 0.8
+
+[prompt]
+identity = ""                   # replaces the built-in one-line identity
+instructions = ""               # extra instructions appended to the prompt
+file = ""                       # or a Markdown file, relative to the config dir
+
+# `coding` is the built-in default. `full` adds the security pack; `security`
+# and `minimal` narrow it further.
+[profile.coding]
+packs = ["core", "coding"]
+model_profile = "auto"
 
 [profile.full]
 packs = ["core", "coding", "security"]
@@ -81,9 +94,20 @@ stop = ["<|im_end|>"]
 extra_body = { chat_template_kwargs = { enable_thinking = true } }
 ```
 
+`default_profile` picks the profile used at startup; `--profile` and
+`LH_PROFILE` still override it. The built-in default is `coding`.
+
 `model_profile = "auto"` matches by model-name prefix declared in `match`; the
-`default` profile is the fallback. `[model] context_window` is used only when
-the model profile does not set one.
+`default` model profile is the fallback. `[model] context_window` is used only
+when the model profile does not set one.
+
+`[prompt] identity` replaces the first line of the system prompt; leave it
+empty to keep the built-in one. `instructions` and `file` are appended after
+the built-in operating rules and are ordinary text, not code. A relative
+`file` resolves against the config directory first, then a trusted `.harness/`
+directory, then the path itself; an untrusted repository cannot shadow it.
+Per-profile `prompt` files still append after that. None of these can change
+the gates, tool selection, scope, or the endpoint; those remain in code.
 
 The TUI does not require `[model]` to be resolved at startup. If the endpoint is
 down or `model` is empty, the harness opens with `not logged in`; `/login`

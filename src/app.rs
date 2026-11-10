@@ -294,7 +294,8 @@ pub async fn create_runtime(
         .select(config.profile(), &external_tools)
         .map_err(anyhow::Error::msg)?;
     let tool_specs = ToolRegistry::specs(&tools);
-    let skills = SkillIndex::load(&paths, config.trust);
+    let skills =
+        SkillIndex::load(&paths, config.trust).advertised_for(&crate::tools::active_packs(&tools));
     let repo_brief = registry
         .repo()
         .brief(&paths.cwd, crate::tools::repo_map::BRIEF_BUDGET);
@@ -451,7 +452,8 @@ pub async fn rebuild_core(old: &Arc<Core>, mut config: Config) -> Result<Arc<Cor
         .select(config.profile(), &external_tools)
         .map_err(anyhow::Error::msg)?;
     let tool_specs = ToolRegistry::specs(&tools);
-    let skills = SkillIndex::load(&old.paths, config.trust);
+    let skills = SkillIndex::load(&old.paths, config.trust)
+        .advertised_for(&crate::tools::active_packs(&tools));
     let repo_brief = registry
         .repo()
         .brief(&old.paths.cwd, crate::tools::repo_map::BRIEF_BUDGET);

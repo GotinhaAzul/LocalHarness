@@ -447,7 +447,15 @@ async fn print_refuses_a_prompt_the_tokenizer_says_is_too_large() {
     )
     .unwrap();
 
-    let output = run_lh(&env, &base, &["--print", "hi", "--profile", "minimal"]).await;
+    // Enough user text to cross the compaction threshold even with the
+    // compact default prompt, so the exact-tokenizer guard is exercised.
+    let prompt = format!("hi {}", "context ".repeat(1500));
+    let output = run_lh(
+        &env,
+        &base,
+        &["--print", prompt.as_str(), "--profile", "minimal"],
+    )
+    .await;
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(2), "stderr: {stderr}");
     assert!(stderr.contains("context_truncated"), "stderr: {stderr}");

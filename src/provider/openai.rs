@@ -915,11 +915,11 @@ mod tests {
     #[test]
     fn endpoint_with_v1_suffix_is_not_doubled() {
         let config = ModelConfig {
-            endpoint: "http://desktopserver:8088/v1/".into(),
+            endpoint: "http://model-host:8088/v1/".into(),
             ..ModelConfig::default()
         };
         let p = OpenAiCompatProvider::new(&config, "spark26").unwrap();
-        assert_eq!(p.url(), "http://desktopserver:8088/v1/chat/completions");
-        assert_eq!(p.base_url(), "http://desktopserver:8088/v1");
+        assert_eq!(p.url(), "http://model-host:8088/v1/chat/completions");
+        assert_eq!(p.base_url(), "http://model-host:8088/v1");
     }
 }

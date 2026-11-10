@@ -21,6 +21,9 @@ pub struct Config {
     pub ui: UiConfig,
     pub session: SessionConfig,
     pub budgets: BudgetConfig,
+    pub prompt: PromptConfig,
+    /// Profile used when neither `--profile` nor `LH_PROFILE` is set.
+    pub default_profile: String,
     #[serde(rename = "profile")]
     pub profiles: BTreeMap<String, ProfileConfig>,
     #[serde(rename = "model_profile")]
@@ -78,8 +81,8 @@ impl SandboxMode {
 }
 
 impl Config {
-    /// Built-in defaults, including the `full` profile and the default model
-    /// profile.
+    /// Built-in defaults, including the `coding` profile and the default
+    /// model profile.
     pub fn builtin() -> Self {
         let mut cfg = Config::default();
         cfg.profiles.insert(
@@ -218,19 +221,22 @@ impl Config {
         Ok(())
     }
 
-    /// The active profile name. `full` unless configured otherwise.
+    /// The active profile name: CLI/`LH_PROFILE`, then `default_profile`, then
+    /// the built-in `coding`.
     pub fn profile_name(&self) -> &str {
-        if self.profile_name.is_empty() {
-            "full"
-        } else {
+        if !self.profile_name.is_empty() {
             &self.profile_name
+        } else if !self.default_profile.is_empty() {
+            &self.default_profile
+        } else {
+            "coding"
         }
     }
 
     pub fn profile(&self) -> &ProfileConfig {
         static FALLBACK: std::sync::LazyLock<ProfileConfig> =
             std::sync::LazyLock::new(|| ProfileConfig {
-                packs: vec!["core".into(), "coding".into(), "security".into()],
+                packs: vec!["core".into(), "coding".into()],
                 tools: vec![],
                 model_profile: Some("auto".into()),
                 prompt: None,
@@ -353,6 +359,37 @@ impl Config {
             .iter()
             .find(|p| p.is_file())
             .and_then(|p| std::fs::read_to_string(p).ok())
+    }
+
+    /// Global prompt customization: inline instructions first, then the
+    /// optional file. Both are plain appended text, never code.
+    pub fn load_custom_prompt(&self, paths: &crate::paths::Paths) -> Option<String> {
+        let mut parts = Vec::new();
+        if !self.prompt.instructions.trim().is_empty() {
+            parts.push(self.prompt.instructions.trim().to_string());
+        }
+        let rel = self.prompt.file.as_path();
+        if !rel.as_os_str().is_empty() {
+            // Config first, then a trusted project, then the raw path. An
+            // untrusted repository cannot shadow the configured prompt file.
+            let mut candidates = vec![paths.config_dir.join(rel)];
+            if self.trust {
+                candidates.push(paths.project_dir().join(rel));
+            }
+            candidates.push(PathBuf::from(rel));
+            if let Some(text) = candidates
+                .iter()
+                .find(|path| path.is_file())
+                .and_then(|path| std::fs::read_to_string(path).ok())
+            {
+                parts.push(text.trim().to_string());
+            }
+        }
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join("\n\n"))
+        }
     }
 }
 
@@ -487,7 +524,7 @@ pub struct UiConfig {
 impl Default for UiConfig {
     fn default() -> Self {
         Self {
-            theme: "omarchy".into(),
+            theme: "default".into(),
             color_mode: ColorMode::Auto,
             show_reasoning: false,
             show_token_counts: true,
@@ -554,6 +591,18 @@ impl Default for BudgetConfig {
             wrap_up_at: 0.8,
         }
     }
+}
+
+/// Global prompt customization. Empty fields keep the built-in text.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PromptConfig {
+    /// Replaces the built-in one-line identity when non-empty.
+    pub identity: String,
+    /// Extra instructions appended after the built-in operating rules.
+    pub instructions: String,
+    /// Extra instructions file, resolved like a profile prompt.
+    pub file: PathBuf,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -684,9 +733,21 @@ mod tests {
     #[test]
     fn defaults_are_sane() {
         let cfg = Config::builtin();
-        assert_eq!(cfg.profile_name(), "full");
+        assert_eq!(cfg.profile_name(), "coding");
         assert_eq!(cfg.context_window(), 32768);
-        assert_eq!(cfg.profile().packs, ["core", "coding", "security"]);
+        assert_eq!(cfg.profile().packs, ["core", "coding"]);
+        assert_eq!(cfg.ui.theme, "default");
+        assert_eq!(cfg.profiles["full"].packs, ["core", "coding", "security"]);
+
+        let mut cfg = Config::builtin();
+        cfg.default_profile = "full".into();
+        assert_eq!(cfg.profile_name(), "full");
+        cfg.profile_name = "minimal".into();
+        assert_eq!(
+            cfg.profile_name(),
+            "minimal",
+            "an explicit selection wins over the config default"
+        );
     }
 
     #[test]
@@ -739,6 +800,49 @@ mod tests {
         assert_eq!(base["a"]["y"].as_integer(), Some(2));
         assert_eq!(base["c"]["q"].as_integer(), Some(4));
         assert_eq!(base["b"]["z"].as_integer(), Some(3));
+    }
+
+    #[test]
+    fn default_profile_loads_from_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "default_profile = \"full\"\n").unwrap();
+        let cfg = Config::load(&path, None).unwrap();
+        assert_eq!(cfg.profile_name(), "full");
+        assert_eq!(cfg.profile().packs, ["core", "coding", "security"]);
+    }
+
+    #[test]
+    fn custom_prompt_combines_inline_text_and_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut paths = crate::paths::Paths::discover(dir.path()).unwrap();
+        paths.config_dir = dir.path().join("config");
+        std::fs::create_dir_all(&paths.config_dir).unwrap();
+        std::fs::write(paths.config_dir.join("prompt.md"), "From the file.\n").unwrap();
+
+        let mut cfg = Config::builtin();
+        cfg.prompt.instructions = "Inline rule.".into();
+        cfg.prompt.file = PathBuf::from("prompt.md");
+        let text = cfg.load_custom_prompt(&paths).unwrap();
+        assert!(text.contains("Inline rule."));
+        assert!(text.contains("From the file."));
+    }
+
+    #[test]
+    fn untrusted_project_cannot_shadow_the_prompt_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(project.join(".harness")).unwrap();
+        std::fs::write(project.join(".harness/prompt.md"), "repo text\n").unwrap();
+        let mut paths = crate::paths::Paths::discover(&project).unwrap();
+        paths.config_dir = dir.path().join("config");
+
+        let mut cfg = Config::builtin();
+        cfg.prompt.file = PathBuf::from("prompt.md");
+        assert!(cfg.load_custom_prompt(&paths).is_none());
+
+        cfg.trust = true;
+        assert_eq!(cfg.load_custom_prompt(&paths).as_deref(), Some("repo text"));
     }
 
     #[test]

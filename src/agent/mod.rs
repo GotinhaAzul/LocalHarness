@@ -226,6 +226,7 @@ impl Core {
             trust: self.config.trust,
             verify: self.config.verify.clone(),
             profile: self.config.profile_name().to_string(),
+            packs: crate::tools::active_packs(&self.tools),
             reads: self.reads.clone(),
             bg: self.bg.clone(),
             security: self.security.clone(),

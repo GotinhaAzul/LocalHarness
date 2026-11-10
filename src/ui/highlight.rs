@@ -670,7 +670,7 @@ mod tests {
     use super::*;
 
     fn theme() -> Theme {
-        Theme::bundled("omarchy")
+        Theme::bundled("default")
     }
 
     fn joined(spans: &[Span<'_>]) -> String {
