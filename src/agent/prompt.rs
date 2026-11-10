@@ -76,15 +76,14 @@ pub fn build_system_prompt(
         );
     }
 
-    out.push_str("## Available tools\n\n");
-    out.push_str(
-        &tools
-            .iter()
-            .map(|tool| format!("- {}: {}", tool.name(), tool.description()))
-            .collect::<Vec<_>>()
-            .join("\n"),
-    );
-    out.push_str("\n\n");
+    // The request carries the full tool catalog in `tools[]` (name,
+    // description, and JSON schema). Repeating the descriptions here doubles
+    // their cost and lets the two copies drift. Keep only a one-line name
+    // index for engines that ignore the tools field.
+    if !tools.is_empty() {
+        out.push_str(&tool_index_line(tools));
+        out.push_str("\n\n");
+    }
 
     let index = skills
         .advertised_for(&crate::tools::active_packs(tools))
@@ -118,6 +117,17 @@ pub fn build_system_prompt(
 
     out.push_str("Work directly. Report what changed, what was verified, and what remains uncertain. Keep final answers concise.\n");
     out
+}
+
+fn tool_index_line(tools: &[Arc<dyn Tool>]) -> String {
+    let names = tools
+        .iter()
+        .map(|tool| tool.name())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "Available tools (names only; descriptions and schemas travel with the request): {names}"
+    )
 }
 
 fn clip(text: &str, max_chars: usize) -> String {
@@ -156,8 +166,43 @@ mod tests {
         assert!(prompt.contains("read a file before edit"));
         assert!(prompt.contains("security-red"));
         assert!(prompt.contains("## Security posture"));
-        assert!(prompt.contains("- read:"));
+        assert!(prompt.contains("Available tools (names only"));
+        assert!(prompt.contains("read"));
         assert!(prompt.contains("Work directly"));
+    }
+
+    #[test]
+    fn full_profile_prompt_drops_tool_descriptions_and_shrinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut paths = Paths::discover(dir.path()).unwrap();
+        paths.data_dir = dir.path().join("data");
+        paths.config_dir = dir.path().join("config");
+        let mut config = Config::builtin();
+        config.profile_name = "full".into();
+        let registry = ToolRegistry::builtin();
+        let tools = registry.select(config.profile(), &[]).unwrap();
+        let prompt = build_system_prompt(&config, &paths, &SkillIndex::bundled(), &tools, None);
+
+        let specs = ToolRegistry::specs(&tools);
+        for spec in &specs {
+            assert!(
+                !prompt.contains(&spec.description),
+                "system prompt repeats the tools[] description for {}",
+                spec.name
+            );
+        }
+
+        // The old inventory was one `- name: description` line per tool.
+        let old_inventory_chars: usize = specs
+            .iter()
+            .map(|spec| format!("- {}: {}\n", spec.name, spec.description).len())
+            .sum();
+        let new_index_chars = tool_index_line(&tools).chars().count();
+        assert!(
+            old_inventory_chars >= new_index_chars + 1_800,
+            "full-profile prompt shrank by only {} chars",
+            old_inventory_chars - new_index_chars
+        );
     }
 
     #[test]

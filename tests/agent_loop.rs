@@ -173,16 +173,22 @@ fn harness_config(dir: &std::path::Path, scripts: Vec<Script>, config: Config) -
         requests: Mutex::new(Vec::new()),
         strict_system: AtomicBool::new(false),
     });
+    let budget = TokenBudget::new(config.context_window(), config.model.max_output_tokens);
+    let tool_specs = ToolRegistry::specs(&selected);
+    let tool_specs_json = localharness::provider::tools_json(&tool_specs);
+    let tool_specs_cost = localharness::context::ToolSpecCost::from_json(&tool_specs_json, &budget);
     let core = Core {
-        budget: TokenBudget::new(config.context_window(), config.model.max_output_tokens),
+        budget,
         static_prompt: localharness::context::StaticPrompt::default(),
+        tool_specs_cost,
         tokenize: false,
         limits: localharness::agent::RunLimits::from(&config.budgets),
         config,
         paths: paths.clone(),
         provider: provider.clone(),
         registry,
-        tool_specs: ToolRegistry::specs(&selected),
+        tool_specs,
+        tool_specs_json,
         tools: selected,
         session: session.clone(),
         artifacts,
@@ -1119,20 +1125,62 @@ async fn model_budget_stops_before_another_call() {
 async fn oversized_context_compacts_before_the_model_call() {
     let dir = tempfile::tempdir().unwrap();
     let mut harness = harness(dir.path(), vec![text_script("after compaction")], &["read"]);
-    // Shrink the budget so the large user prompt crosses 80%.
+    // Shrink the budget so the large user prompt crosses 80% but the
+    // window-derived summary still fits after one compaction.
     let mut core = Arc::try_unwrap(harness.core).unwrap_or_else(|_| panic!("sole owner"));
-    core.budget = TokenBudget::new(1000, 100);
+    core.budget = TokenBudget::new(4096, 1024);
     harness.core = Arc::new(core);
     let (outcome, _) = run(&harness, &"x".repeat(8000)).await;
     assert_eq!(outcome.status, TurnStatus::Done);
     let session = harness.session.lock().unwrap();
-    assert!(
-        session
-            .branch_entries()
-            .iter()
-            .any(|entry| entry.is_compaction()),
-        "expected a compaction entry"
+    let compactions = session
+        .branch_entries()
+        .iter()
+        .filter(|entry| entry.is_compaction())
+        .count();
+    assert_eq!(compactions, 1, "expected exactly one compaction entry");
+}
+
+#[tokio::test]
+async fn repeated_over_threshold_ends_with_budget_context_after_one_compaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut harness = harness(
+        dir.path(),
+        vec![text_script("should not be called")],
+        &["read"],
     );
+    let mut core = Arc::try_unwrap(harness.core).unwrap_or_else(|_| panic!("sole owner"));
+    core.budget = TokenBudget::new(1000, 100);
+    // The fixed system prompt alone stays above the threshold, so one
+    // compaction cannot converge.
+    core.system_prompt = "s".repeat(6000);
+    core.window_source = localharness::agent::WindowSource::Configured;
+    harness.core = Arc::new(core);
+
+    let (outcome, events) = run(&harness, "go").await;
+    assert_eq!(outcome.status, TurnStatus::Budget);
+    let (code, message) = outcome.error.expect("diagnostic");
+    assert_eq!(code, "budget_context");
+    assert!(message.contains("static overhead"), "{message}");
+    assert!(message.contains("system prompt"), "{message}");
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Error { code, .. } if code == "budget_context"
+        )),
+        "missing budget_context event"
+    );
+    let session = harness.session.lock().unwrap();
+    let compactions = session
+        .branch_entries()
+        .iter()
+        .filter(|entry| entry.is_compaction())
+        .count();
+    assert_eq!(compactions, 1, "the loop must not compact twice");
+    assert!(session.branch_entries().iter().any(
+        |entry| matches!(&entry.kind, EntryKind::Error(data) if data.code == "budget_context")
+    ));
+    assert_eq!(harness.provider.requests.lock().unwrap().len(), 0);
 }
 
 #[tokio::test]

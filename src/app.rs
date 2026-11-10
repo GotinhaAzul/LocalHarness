@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agent::{Core, RunLimits, WindowSource, prompt};
 use crate::config::Config;
-use crate::context::{StaticPrompt, TokenBudget};
+use crate::context::{StaticPrompt, TokenBudget, ToolSpecCost};
 use crate::external;
 use crate::paths::Paths;
 use crate::provider::{OpenAiCompatProvider, Provider, probe};
@@ -361,12 +361,22 @@ pub async fn create_runtime(
             tokens.min(u32::MAX as usize) as u32,
         );
     }
+    let tool_specs_json = if tool_specs.is_empty() {
+        String::new()
+    } else {
+        crate::provider::tools_json(&tool_specs)
+    };
+    let mut tool_specs_cost = ToolSpecCost::from_json(&tool_specs_json, &budget);
+    if tokenize && !tool_specs_json.is_empty() {
+        tool_specs_cost =
+            measure_tool_specs(&probe_provider, &tool_specs_json, tool_specs_cost).await;
+    }
     // Measure the static prompt with the calibrated ratio, not the initial
     // 3.5-chars-per-token guess.
     let static_prompt = measure_static_prompt(
         &budget,
         &system_prompt,
-        &tool_specs,
+        tool_specs_cost,
         Some(repo_brief.as_str()),
     );
     if static_prompt.total > budget.usable_prompt() {
@@ -430,6 +440,8 @@ pub async fn create_runtime(
         registry,
         tools,
         tool_specs,
+        tool_specs_json,
+        tool_specs_cost,
         session: session_handle.clone(),
         artifacts,
         reads,
@@ -544,10 +556,20 @@ pub async fn rebuild_core(old: &Arc<Core>, mut config: Config) -> Result<Arc<Cor
             tokens.min(u32::MAX as usize) as u32,
         );
     }
+    let tool_specs_json = if tool_specs.is_empty() {
+        String::new()
+    } else {
+        crate::provider::tools_json(&tool_specs)
+    };
+    let mut tool_specs_cost = ToolSpecCost::from_json(&tool_specs_json, &budget);
+    if tokenize && !tool_specs_json.is_empty() {
+        tool_specs_cost =
+            measure_tool_specs(provider.as_ref(), &tool_specs_json, tool_specs_cost).await;
+    }
     let static_prompt = measure_static_prompt(
         &budget,
         &system_prompt,
-        &tool_specs,
+        tool_specs_cost,
         Some(repo_brief.as_str()),
     );
     let limits = RunLimits::from(&config.budgets);
@@ -558,6 +580,8 @@ pub async fn rebuild_core(old: &Arc<Core>, mut config: Config) -> Result<Arc<Cor
         registry,
         tools,
         tool_specs,
+        tool_specs_json,
+        tool_specs_cost,
         session: old.session.clone(),
         artifacts: old.artifacts.clone(),
         reads: old.reads.clone(),
@@ -636,30 +660,46 @@ fn session_context(truth: Option<&probe::WindowTruth>) -> Option<SessionContextW
     })
 }
 
+/// Exact tool-schema tokens when the engine answers `/tokenize`, otherwise the
+/// fixed JSON-density estimate. Called once when the core is built (and once
+/// after a deferred startup learns the tokenizer).
+pub(crate) async fn measure_tool_specs(
+    provider: &dyn Provider,
+    tool_specs_json: &str,
+    estimated: ToolSpecCost,
+) -> ToolSpecCost {
+    if tool_specs_json.is_empty() {
+        return estimated;
+    }
+    let measured = tokio::time::timeout(
+        Duration::from_secs(2),
+        probe::token_count(provider, tool_specs_json),
+    )
+    .await
+    .ok()
+    .flatten()
+    // A token count above the byte count is impossible for a real tokenizer;
+    // treat it as a broken probe instead of inflating the budget.
+    .filter(|tokens| *tokens > 0 && *tokens <= tool_specs_json.len())
+    .map(|tokens| tokens.min(u32::MAX as usize) as u32);
+    measured.map_or(estimated, |tokens| estimated.with_tokens(tokens))
+}
+
 /// Static prompt cost at build time. The repository brief is part of the
 /// system prompt, so it is measured once and subtracted from the system
-/// total; the message can then name the three contributors separately.
+/// total; the message can then name the three contributors separately. The
+/// tools term is the fixed cost computed from the request's serialized array.
 pub(crate) fn measure_static_prompt(
     budget: &TokenBudget,
     system_prompt: &str,
-    tool_specs: &[crate::provider::ToolSpec],
+    tools: ToolSpecCost,
     repo_brief: Option<&str>,
 ) -> StaticPrompt {
     let repo = repo_brief
         .map(|brief| budget.estimate_text(brief))
         .unwrap_or(0);
     let system = budget.estimate_text(system_prompt).saturating_sub(repo);
-    let tool_chars: usize = tool_specs
-        .iter()
-        .map(|tool| {
-            tool.name.len()
-                + tool.description.len()
-                + serde_json::to_string(&tool.parameters)
-                    .map(|schema| schema.len())
-                    .unwrap_or(0)
-        })
-        .sum();
-    StaticPrompt::new(system, budget.estimate_char_len(tool_chars), repo)
+    StaticPrompt::new(system, tools.tokens, repo)
 }
 
 struct ResolvedWindow {

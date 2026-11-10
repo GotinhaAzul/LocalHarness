@@ -12,7 +12,7 @@ use crate::session::{AssistantData, Entry, EntryKind, Session, ToolResultData};
 pub use archive::{
     BATCH_CAP_CHARS, CappedContent, RECALL_CAP_CHARS, RESULT_CAP_CHARS, cap_batch, cap_result,
 };
-pub use budget::{StaticPrompt, TokenBudget};
+pub use budget::{JSON_CHARS_PER_TOKEN, StaticPrompt, TokenBudget, ToolSpecCost};
 pub use compact::{CompactionSummary, FindingSummary, build_summary};
 
 #[derive(Debug, Clone)]

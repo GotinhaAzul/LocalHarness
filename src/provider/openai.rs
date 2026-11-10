@@ -523,21 +523,7 @@ fn build_body(req: &ChatRequest, include_usage: bool) -> Result<Value, ProviderE
         "max_tokens": req.max_tokens,
     });
     if !req.tools.is_empty() {
-        let tools: Vec<Value> = req
-            .tools
-            .iter()
-            .map(|tool| {
-                json!({
-                    "type": "function",
-                    "function": {
-                        "name": tool.name,
-                        "description": tool.description,
-                        "parameters": tool.parameters,
-                    }
-                })
-            })
-            .collect();
-        body["tools"] = Value::Array(tools);
+        body["tools"] = super::tools_payload(&req.tools);
         body["tool_choice"] = json!(req.tool_choice.as_deref().unwrap_or("auto"));
     }
     if !req.stop.is_empty() {

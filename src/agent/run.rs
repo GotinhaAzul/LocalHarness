@@ -9,8 +9,8 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 
-use crate::context::compact::{COMPACTION_BUDGET_CHARS, FindingSummary, build_summary};
-use crate::context::{self, BATCH_CAP_CHARS, StaticPrompt, TokenBudget, cap_result};
+use crate::context::compact::{FindingSummary, build_summary, summary_budget};
+use crate::context::{self, BATCH_CAP_CHARS, StaticPrompt, TokenBudget, ToolSpecCost, cap_result};
 use crate::provider::{ChatMessage, ChatRequest, ErrorClass, ProviderError, StreamEvent, Usage};
 use crate::session::{
     AssistantData, CompactionData, CustomData, EntryKind, ToolCall, ToolResultData, UserData,
@@ -71,6 +71,7 @@ impl TurnOutcome {
 struct TurnContext {
     budget: TokenBudget,
     static_prompt: StaticPrompt,
+    tool_specs_cost: ToolSpecCost,
     tokenize: bool,
     /// A window or Ollama-default warning discovered by the refresh.
     notice: Option<String>,
@@ -202,6 +203,7 @@ async fn prepare_turn_context(core: &Core, startup_pending: bool) -> TurnContext
     }
     let refresh = startup_pending || !source.is_reliable();
     let mut static_prompt = core.static_prompt;
+    let mut tool_specs_cost = core.tool_specs_cost;
     let mut tokenize = core.tokenize;
     let mut notice = None;
     if refresh {
@@ -241,17 +243,28 @@ async fn prepare_turn_context(core: &Core, startup_pending: bool) -> TurnContext
                     tokens.min(u32::MAX as usize) as u32,
                 );
             }
+            // A deferred startup may have learned `/tokenize` after the core
+            // was built; measure the fixed tool cost once here.
+            if !core.tool_specs_json.is_empty() {
+                tool_specs_cost = crate::app::measure_tool_specs(
+                    core.provider.as_ref(),
+                    &core.tool_specs_json,
+                    tool_specs_cost,
+                )
+                .await;
+            }
         }
         static_prompt = crate::app::measure_static_prompt(
             &budget,
             &core.system_prompt,
-            &core.tool_specs,
+            tool_specs_cost,
             Some(core.repo_brief.as_str()),
         );
     }
     TurnContext {
         budget,
         static_prompt,
+        tool_specs_cost,
         tokenize,
         notice,
     }
@@ -265,7 +278,13 @@ async fn run_loop(
     turn: TurnContext,
 ) -> TurnOutcome {
     let mut progress = RunProgress::new(core.limits.clone());
-    let mut budget = turn.budget;
+    let TurnContext {
+        mut budget,
+        static_prompt,
+        tool_specs_cost,
+        tokenize,
+        notice: _,
+    } = turn;
     let detected = core
         .detected_window
         .load(std::sync::atomic::Ordering::Relaxed);
@@ -280,7 +299,7 @@ async fn run_loop(
     if known_window > 0 && known_window < budget.context_window {
         budget = budget.shrunk_to(known_window);
     }
-    if let Some((code, message)) = static_prompt_failure(&turn.static_prompt, &budget) {
+    if let Some((code, message)) = static_prompt_failure(&static_prompt, &budget) {
         append_error(&core.session, &code, &message, false);
         let _ = tx.send(AgentEvent::Error {
             code: code.clone(),
@@ -295,6 +314,7 @@ async fn run_loop(
     let read_available = core.tools.iter().any(|tool| tool.name() == "read");
     let mut pending_compaction = false;
     let mut call_ledger = CallLedger::from_session(&core.session.lock().expect("session lock"));
+    let mut compacted_this_turn = false;
 
     loop {
         if cancel.is_cancelled() {
@@ -376,11 +396,14 @@ async fn run_loop(
                 &budget,
             );
         }
-        account_tools(core, &budget, &mut assembled);
+        account_tools(tool_specs_cost, &mut assembled);
 
         let force_compact = pending_compaction;
         pending_compaction = false;
         if force_compact || budget.exceeds_compaction_threshold(assembled.estimated_tokens) {
+            if compacted_this_turn {
+                return end_budget_context(core, tx, &budget, &assembled, static_prompt);
+            }
             let _ = tx.send(AgentEvent::State(AgentState::Compact));
             match compact(
                 &core.session,
@@ -390,8 +413,10 @@ async fn run_loop(
                 } else {
                     "auto"
                 },
+                &budget,
             ) {
                 Ok((summary, tokens_before)) => {
+                    compacted_this_turn = true;
                     let _ = tx.send(AgentEvent::Compacted {
                         summary: summary.clone(),
                         tokens_before,
@@ -402,7 +427,21 @@ async fn run_loop(
                         Some(&state),
                         &budget,
                     );
-                    account_tools(core, &budget, &mut assembled);
+                    account_tools(tool_specs_cost, &mut assembled);
+                    // The exact count is the hard gate; check it before
+                    // declaring the compaction unable to converge.
+                    if tokenize
+                        && let Some(exact) = exact_prompt_tokens(core, &assembled).await
+                        && exact > budget.usable_prompt()
+                    {
+                        return end_context_truncated(core, tx, &budget, exact);
+                    }
+                    // One compaction is the whole allowance for a turn. If the
+                    // fixed prompt plus the trimmed summary still cannot fit,
+                    // another pass would only rewrite the same bytes.
+                    if budget.exceeds_compaction_threshold(assembled.estimated_tokens) {
+                        return end_budget_context(core, tx, &budget, &assembled, static_prompt);
+                    }
                 }
                 Err(err) => {
                     let message = format!("compaction failed: {err}");
@@ -435,20 +474,12 @@ async fn run_loop(
         // When the engine exposes /tokenize, measure the rendered prompt
         // exactly before sending. The estimate is only a calibration guard;
         // this is the hard gate that keeps a fitting request from being cut.
-        if turn.tokenize && budget.exceeds_compaction_threshold(assembled.estimated_tokens) {
-            let text = tokenize_text(&assembled.messages, &core.tool_specs);
-            let exact = tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                crate::provider::probe::token_count(core.provider.as_ref(), &text),
-            )
-            .await
-            .ok()
-            .flatten()
-            .map(|tokens| tokens.min(u32::MAX as usize) as u32);
+        if tokenize && budget.exceeds_compaction_threshold(assembled.estimated_tokens) {
+            let exact = exact_prompt_tokens(core, &assembled).await;
             if let Some(exact) = exact
                 && exact > budget.usable_prompt()
             {
-                if !progress.presend_compaction_used {
+                if !progress.presend_compaction_used && !compacted_this_turn {
                     progress.presend_compaction_used = true;
                     pending_compaction = true;
                     let _ = tx.send(AgentEvent::Notice(format!(
@@ -458,27 +489,7 @@ async fn run_loop(
                     )));
                     continue;
                 }
-                let suggested = budget.context_window.max(8192);
-                let message = format!(
-                    "the rendered prompt is {exact} tokens after compaction, but only {} fit the effective {} token window. The request was not sent. Raise the engine context (llama.cpp --ctx-size {suggested}; Ollama OLLAMA_CONTEXT_LENGTH={suggested}; vLLM --max-model-len {suggested}), lower [model] max_output_tokens, or run /new.",
-                    budget.usable_prompt(),
-                    budget.context_window
-                );
-                append_custom(
-                    &core.session,
-                    "context-truncated",
-                    json!({
-                        "signal": "exact tokenizer count exceeds the effective window",
-                        "estimated_tokens": exact,
-                        "context_window": budget.context_window,
-                    }),
-                );
-                append_error(&core.session, "context_truncated", &message, false);
-                let _ = tx.send(AgentEvent::Guard {
-                    code: "context_truncated".into(),
-                    message,
-                });
-                return TurnOutcome::ok(TurnStatus::ContextTruncated);
+                return end_context_truncated(core, tx, &budget, exact);
             }
         }
 
@@ -786,26 +797,39 @@ async fn run_loop(
         }
         if batch.end_turn {
             if let Some(request) = batch.thread_split {
-                let findings = core.findings_summary();
-                match compact_with_reason(&core.session, findings.as_ref(), "thread_split") {
-                    Ok((summary, tokens_before)) => {
-                        let _ = tx.send(AgentEvent::Compacted {
-                            summary,
-                            tokens_before,
-                        });
-                    }
-                    Err(err) => {
-                        let _ = tx.send(AgentEvent::Notice(format!(
-                            "thread compaction failed: {err}"
-                        )));
+                let mut compacted = false;
+                if !compacted_this_turn {
+                    let findings = core.findings_summary();
+                    match compact_with_reason(
+                        &core.session,
+                        findings.as_ref(),
+                        "thread_split",
+                        &budget,
+                    ) {
+                        Ok((summary, tokens_before)) => {
+                            compacted = true;
+                            let _ = tx.send(AgentEvent::Compacted {
+                                summary,
+                                tokens_before,
+                            });
+                        }
+                        Err(err) => {
+                            let _ = tx.send(AgentEvent::Notice(format!(
+                                "thread compaction failed: {err}"
+                            )));
+                        }
                     }
                 }
                 if let Some(kickoff) = request.kickoff {
                     let _ = append_user(&core.session, &kickoff);
                 }
-                let _ = tx.send(AgentEvent::Notice(
-                    "thread split: context compacted; the old branch remains in /tree".into(),
-                ));
+                let _ = tx.send(AgentEvent::Notice(if compacted {
+                    "thread split: context compacted; the old branch remains in /tree".into()
+                } else if compacted_this_turn {
+                    "thread split: context was already compacted this turn; the old branch remains in /tree".into()
+                } else {
+                    "thread split: context compaction failed; the old branch remains in /tree".into()
+                }));
                 return TurnOutcome::ok(TurnStatus::Done);
             }
             return TurnOutcome::ok(TurnStatus::Done);
@@ -880,6 +904,60 @@ fn static_prompt_failure(
         budget.context_window.max(8192),
     );
     Some(("budget_static".to_string(), message))
+}
+
+/// End a turn that cannot converge after its one compaction. The message
+/// names the fixed overhead so the user can shrink the profile or window.
+fn end_budget_context(
+    core: &Core,
+    tx: &UnboundedSender<AgentEvent>,
+    budget: &TokenBudget,
+    assembled: &crate::context::AssembledContext,
+    static_prompt: StaticPrompt,
+) -> TurnOutcome {
+    let static_prompt = if static_prompt.total == 0 {
+        StaticPrompt::new(
+            budget.estimate_text(&core.system_prompt),
+            core.tool_specs_cost.tokens,
+            budget.estimate_text(&core.repo_brief),
+        )
+    } else {
+        static_prompt
+    };
+    let (largest_name, largest) = static_prompt.largest();
+    let suggested = budget.context_window.max(8192);
+    let message = format!(
+        "one compaction did not bring the prompt under the {} token threshold: ~{} tokens remain ({:.0}% of the {} usable prompt). The remaining cost is static overhead: system prompt ~{} tokens, tool schemas ~{} tokens, repository brief ~{} tokens ({} total; largest: {} at {}), plus the compaction summary and state block. Compaction cannot remove it. Raise the engine context (llama.cpp --ctx-size {suggested}; Ollama OLLAMA_CONTEXT_LENGTH={suggested}; vLLM --max-model-len {suggested}), use a smaller profile, lower [model] max_output_tokens, or run /new.",
+        budget.compaction_threshold(),
+        assembled.estimated_tokens,
+        budget.percent(assembled.estimated_tokens),
+        budget.usable_prompt(),
+        static_prompt.system,
+        static_prompt.tools,
+        static_prompt.repo,
+        static_prompt.total,
+        largest_name,
+        largest,
+    );
+    append_custom(
+        &core.session,
+        "budget-context",
+        json!({
+            "estimated_tokens": assembled.estimated_tokens,
+            "threshold": budget.compaction_threshold(),
+            "usable_prompt": budget.usable_prompt(),
+            "static_prompt": static_prompt.total,
+            "largest": largest_name,
+            "largest_tokens": largest,
+        }),
+    );
+    append_error(&core.session, "budget_context", &message, false);
+    let _ = tx.send(AgentEvent::Error {
+        code: "budget_context".into(),
+        message: message.clone(),
+        recoverable: false,
+    });
+    TurnOutcome::budget("budget_context", message)
 }
 
 /// Warn once per turn when the static prompt consumes more than half of the
@@ -1969,12 +2047,58 @@ fn append_custom(session: &crate::tools::SessionHandle, kind: &str, payload: Val
     }
 }
 
+/// Exact rendered-prompt count when `/tokenize` answers.
+async fn exact_prompt_tokens(
+    core: &Core,
+    assembled: &crate::context::AssembledContext,
+) -> Option<u32> {
+    let text = tokenize_text(&assembled.messages, &core.tool_specs_json);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        crate::provider::probe::token_count(core.provider.as_ref(), &text),
+    )
+    .await
+    .ok()
+    .flatten()
+    .map(|tokens| tokens.min(u32::MAX as usize) as u32)
+}
+
+/// Stop a turn whose rendered prompt cannot fit even after compaction.
+fn end_context_truncated(
+    core: &Core,
+    tx: &UnboundedSender<AgentEvent>,
+    budget: &TokenBudget,
+    exact: u32,
+) -> TurnOutcome {
+    let suggested = budget.context_window.max(8192);
+    let message = format!(
+        "the rendered prompt is {exact} tokens after compaction, but only {} fit the effective {} token window. The request was not sent. Raise the engine context (llama.cpp --ctx-size {suggested}; Ollama OLLAMA_CONTEXT_LENGTH={suggested}; vLLM --max-model-len {suggested}), lower [model] max_output_tokens, or run /new.",
+        budget.usable_prompt(),
+        budget.context_window
+    );
+    append_custom(
+        &core.session,
+        "context-truncated",
+        json!({
+            "signal": "exact tokenizer count exceeds the effective window",
+            "estimated_tokens": exact,
+            "context_window": budget.context_window,
+        }),
+    );
+    append_error(&core.session, "context_truncated", &message, false);
+    let _ = tx.send(AgentEvent::Guard {
+        code: "context_truncated".into(),
+        message,
+    });
+    TurnOutcome::ok(TurnStatus::ContextTruncated)
+}
+
 /// Render the prompt the way the model sees it closely enough for
-/// `/tokenize`: role-tagged message text plus tool names, descriptions, and
-/// schemas. The chat template adds a small constant overhead, so a count at
-/// or below the usable prompt is safe; the server's own error remains the
-/// final backstop.
-fn tokenize_text(messages: &[ChatMessage], tools: &[crate::provider::ToolSpec]) -> String {
+/// `/tokenize`: role-tagged message text plus the pre-serialized `tools` array.
+/// The chat template adds a small constant overhead, so a count at or below
+/// the usable prompt is safe; the server's own error remains the final
+/// backstop.
+fn tokenize_text(messages: &[ChatMessage], tools_json: &str) -> String {
     let mut out = String::new();
     for message in messages {
         out.push_str(message.role());
@@ -2002,37 +2126,16 @@ fn tokenize_text(messages: &[ChatMessage], tools: &[crate::provider::ToolSpec]) 
         }
         out.push('\n');
     }
-    for tool in tools {
-        out.push_str(&tool.name);
-        out.push(' ');
-        out.push_str(&tool.description);
-        out.push(' ');
-        out.push_str(&serde_json::to_string(&tool.parameters).unwrap_or_else(|_| "{}".to_string()));
+    if !tools_json.is_empty() {
+        out.push_str(tools_json);
         out.push('\n');
     }
     out
 }
 
-fn account_tools(
-    core: &Core,
-    budget: &TokenBudget,
-    assembled: &mut crate::context::AssembledContext,
-) {
-    let chars: usize = core
-        .tool_specs
-        .iter()
-        .map(|tool| {
-            tool.name.len()
-                + tool.description.len()
-                + serde_json::to_string(&tool.parameters)
-                    .map(|schema| schema.len())
-                    .unwrap_or(0)
-        })
-        .sum();
-    assembled.char_count += chars;
-    assembled.estimated_tokens = assembled
-        .estimated_tokens
-        .saturating_add(budget.estimate_char_len(chars));
+fn account_tools(cost: ToolSpecCost, assembled: &mut crate::context::AssembledContext) {
+    assembled.char_count += cost.chars;
+    assembled.estimated_tokens = assembled.estimated_tokens.saturating_add(cost.tokens);
 }
 
 fn append_error(
@@ -2175,25 +2278,28 @@ fn compact(
     session: &crate::tools::SessionHandle,
     findings: Option<&FindingSummary>,
     reason: &str,
+    budget: &TokenBudget,
 ) -> anyhow::Result<(String, u64)> {
-    compact_session(session, findings, reason)
+    compact_session(session, findings, reason, budget)
 }
 
 fn compact_with_reason(
     session: &crate::tools::SessionHandle,
     findings: Option<&FindingSummary>,
     reason: &str,
+    budget: &TokenBudget,
 ) -> anyhow::Result<(String, u64)> {
-    compact_session(session, findings, reason)
+    compact_session(session, findings, reason, budget)
 }
 
 fn compact_session(
     session: &crate::tools::SessionHandle,
     findings: Option<&FindingSummary>,
     reason: &str,
+    budget: &TokenBudget,
 ) -> anyhow::Result<(String, u64)> {
     let mut session = session.lock().expect("session lock");
-    let summary = build_summary(&session, findings, COMPACTION_BUDGET_CHARS);
+    let summary = build_summary(&session, findings, summary_budget(budget));
     let thread_id = session
         .latest_custom_on_path("thread-state")
         .and_then(|entry| match &entry.kind {
@@ -2304,8 +2410,10 @@ mod tests {
         let tool_specs = ToolRegistry::specs(&tools);
         let system_prompt = "s".repeat(1000);
         let budget = TokenBudget::new(32_768, 1024);
+        let tool_specs_json = crate::provider::tools_json(&tool_specs);
+        let tool_specs_cost = ToolSpecCost::from_json(&tool_specs_json, &budget);
         let static_prompt =
-            crate::app::measure_static_prompt(&budget, &system_prompt, &tool_specs, Some(""));
+            crate::app::measure_static_prompt(&budget, &system_prompt, tool_specs_cost, Some(""));
         Core {
             config,
             paths: paths.clone(),
@@ -2316,6 +2424,8 @@ mod tests {
             registry,
             tools,
             tool_specs,
+            tool_specs_json,
+            tool_specs_cost,
             session,
             artifacts,
             reads: Arc::new(Mutex::new(ReadTracker::default())),
@@ -2356,6 +2466,10 @@ mod tests {
         let turn = prepare_turn_context(&core, true).await;
         assert_eq!(turn.budget.context_window, 4096);
         assert!(turn.tokenize);
+        assert_eq!(
+            turn.tool_specs_cost.tokens, 100,
+            "the deferred refresh must measure the tools array with /tokenize"
+        );
         assert!(
             turn.budget.chars_per_token > DEFAULT_CHARS_PER_TOKEN,
             "tokenizer calibration did not run"
@@ -2371,11 +2485,27 @@ mod tests {
             crate::app::measure_static_prompt(
                 &turn.budget,
                 &core.system_prompt,
-                &core.tool_specs,
+                turn.tool_specs_cost,
                 Some(core.repo_brief.as_str())
             )
         );
         assert_ne!(turn.static_prompt, core.static_prompt);
+    }
+
+    #[test]
+    fn account_tools_adds_the_precomputed_fixed_term() {
+        let mut assembled = crate::context::AssembledContext {
+            messages: Vec::new(),
+            estimated_tokens: 10,
+            char_count: 20,
+        };
+        let cost = ToolSpecCost {
+            chars: 2_600,
+            tokens: 1_000,
+        };
+        account_tools(cost, &mut assembled);
+        assert_eq!(assembled.char_count, 2_620);
+        assert_eq!(assembled.estimated_tokens, 1_010);
     }
 
     #[test]

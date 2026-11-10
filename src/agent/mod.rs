@@ -37,6 +37,11 @@ pub struct Core {
     pub registry: ToolRegistry,
     pub tools: Vec<Arc<dyn Tool>>,
     pub tool_specs: Vec<ToolSpec>,
+    /// Serialized `tools` array, computed once: char/token accounting and the
+    /// exact `/tokenize` check reuse it without re-serializing schemas.
+    pub tool_specs_json: String,
+    /// Fixed token cost of `tool_specs` (exact when `/tokenize` answered).
+    pub tool_specs_cost: crate::context::ToolSpecCost,
     pub session: SessionHandle,
     pub artifacts: Arc<crate::session::ArtifactStore>,
     pub reads: Arc<Mutex<ReadTracker>>,

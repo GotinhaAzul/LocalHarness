@@ -2125,7 +2125,8 @@ impl App {
                 Ok(session) => session,
                 Err(poison) => poison.into_inner(),
             };
-            let summary = context::build_summary(&session, findings.as_ref(), 4500);
+            let budget = context::compact::summary_budget(&runtime.core.budget);
+            let summary = context::build_summary(&session, findings.as_ref(), budget);
             let result = session
                 .append(EntryKind::Compaction(CompactionData {
                     summary: summary.summary.clone(),
