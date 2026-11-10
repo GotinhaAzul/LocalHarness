@@ -1213,7 +1213,8 @@ impl StreamAccum {
     /// Other invalid JSON is left for the repair layer, which can fix common
     /// model mistakes.
     fn validate_calls(&self) -> Result<(), ProviderError> {
-        if self.degenerate || self.finish.as_deref() != Some("length") {
+        let cut_short = matches!(self.finish.as_deref(), Some("length") | Some("max_tokens"));
+        if self.degenerate || !cut_short {
             return Ok(());
         }
         for call in self.calls.values() {
