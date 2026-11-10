@@ -735,7 +735,14 @@ impl ToolCallIndexer {
                 (existing.id.as_deref(), id),
                 (Some(existing), Some(incoming)) if existing != incoming
             );
-            if !id_conflict {
+            // Some engines reuse both one id and one index. A different
+            // function name is a different call; merging would splice the
+            // names and arguments together.
+            let name_conflict = matches!(
+                (existing.name.as_deref(), name),
+                (Some(existing), Some(incoming)) if existing != incoming
+            );
+            if !id_conflict && !name_conflict {
                 let index = existing.index;
                 if let Some(entry) = self.explicit.get_mut(&engine_index) {
                     if entry.id.is_none() {

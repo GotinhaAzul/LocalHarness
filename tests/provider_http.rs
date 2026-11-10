@@ -269,6 +269,63 @@ async fn a_duplicate_engine_id_with_a_new_name_does_not_merge_calls() {
 }
 
 #[tokio::test]
+async fn an_explicit_duplicate_engine_id_with_a_new_name_opens_a_new_call() {
+    let calls = tool_stream(concat!(
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"a.rs\\\"}\"}}]}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"write\",\"arguments\":\"{\\\"path\\\":\\\"b.rs\\\"}\"}}]}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: [DONE]\n\n",
+    ))
+    .await;
+    assert_eq!(calls.len(), 2, "{calls:?}");
+    assert_ne!(calls[0].0, calls[1].0);
+    assert_eq!(calls[0].2.as_deref(), Some("read"));
+    assert_eq!(calls[1].2.as_deref(), Some("write"));
+}
+
+#[tokio::test]
+async fn a_call_split_across_many_chunks_reassembles() {
+    let arguments = r#"{"path":"a.rs","content":"fn main() { println!(\"hi\"); }\n"}"#;
+    let mut body = String::new();
+    for (position, piece) in arguments
+        .as_bytes()
+        .chunks(arguments.len().div_ceil(20))
+        .enumerate()
+    {
+        let chunk = if position == 0 {
+            serde_json::json!({
+                "choices": [{"delta": {"tool_calls": [{
+                    "index": 0,
+                    "id": "call_1",
+                    "function": {"name": "write", "arguments": String::from_utf8_lossy(piece)}
+                }]}}]
+            })
+        } else {
+            serde_json::json!({
+                "choices": [{"delta": {"tool_calls": [{
+                    "index": 0,
+                    "function": {"arguments": String::from_utf8_lossy(piece)}
+                }]}}]
+            })
+        };
+        body.push_str("data: ");
+        body.push_str(&chunk.to_string());
+        body.push_str("\n\n");
+    }
+    body.push_str("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n");
+    body.push_str("data: [DONE]\n\n");
+    let calls = tool_stream(&body).await;
+    assert!(calls.iter().all(|call| call.0 == 0), "{calls:?}");
+    let reassembled: String = calls.iter().map(|call| call.3.as_str()).collect();
+    assert_eq!(reassembled, arguments);
+    assert_eq!(
+        calls.iter().filter(|call| call.2.is_some()).count(),
+        1,
+        "the function name must arrive once"
+    );
+}
+
+#[tokio::test]
 async fn in_stream_error_aborts_with_the_server_message() {
     let (base, state) = spawn().await;
     state.script.lock().unwrap().push_back(Script {
