@@ -11,12 +11,14 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agent::{Core, RunLimits, WindowSource, prompt};
 use crate::config::Config;
-use crate::context::TokenBudget;
+use crate::context::{StaticPrompt, TokenBudget};
 use crate::external;
 use crate::paths::Paths;
 use crate::provider::{OpenAiCompatProvider, Provider, probe};
 use crate::security::SecurityState;
-use crate::session::{APP_VERSION, Session, SessionData};
+use crate::session::{
+    APP_VERSION, CustomData, EntryKind, Session, SessionContextWindow, SessionData,
+};
 use crate::skills::SkillIndex;
 use crate::tools::{BgRegistry, ReadTracker, SessionHandle, SessionHandle as Handle, ToolRegistry};
 
@@ -174,8 +176,11 @@ pub async fn create_runtime(
 
     let (_, profile) = config.model_profile();
     let window_cache: Arc<Mutex<std::collections::HashMap<String, u32>>> = Default::default();
-    let (context_window, window_source) =
-        resolve_window(&config, &probe_provider, None, &window_cache).await;
+    let resolved = resolve_window_truth(&config, &probe_provider, &window_cache).await;
+    let context_window = resolved.window;
+    let window_source = resolved.source;
+    let window_truth = resolved.truth;
+    let configured_window = resolved.configured;
     let provider: Arc<dyn Provider> =
         Arc::new(OpenAiCompatProvider::new(&config.model, model.clone())?);
     warn_if_remote(&config.model.endpoint);
@@ -227,13 +232,57 @@ pub async fn create_runtime(
                 model: model.clone(),
                 profile: config.profile_name().to_string(),
                 app: APP_VERSION.to_string(),
+                context: session_context(window_truth.as_ref()),
             },
             options.no_session,
         )?,
     };
     session.warnings.extend(startup_warnings);
-    for warning in &session.warnings {
-        tracing::warn!("{warning}");
+    let window_notice = window_notice(window_truth.as_ref(), configured_window);
+    if let Some(notice) = &window_notice {
+        session.warnings.push(notice.clone());
+    }
+
+    // Build the OS sandbox before any turn. A requested sandbox that cannot
+    // start is a hard error; it never silently falls back to unsandboxed
+    // execution. `--no-sandbox` is the explicit escape hatch.
+    let sandbox = if config.sandbox == crate::config::SandboxMode::Off {
+        None
+    } else {
+        let sandbox = crate::sandbox::Sandbox::new(config.sandbox, paths.cwd.clone())
+            .map_err(anyhow::Error::msg)?;
+        Some(Arc::new(sandbox))
+    };
+    if config.sandbox_explicit {
+        let backend = sandbox
+            .as_ref()
+            .map(|sandbox| sandbox.label())
+            .unwrap_or("off");
+        if let Err(error) = session.append(EntryKind::Custom(
+            CustomData::new("sandbox")
+                .with("mode", config.sandbox.label())
+                .with("backend", backend),
+        )) {
+            tracing::warn!(%error, "cannot record the sandbox mode in the session");
+        }
+        if config.sandbox == crate::config::SandboxMode::Off {
+            session.warnings.push(
+                "sandbox disabled explicitly with --no-sandbox; bash can read ~/.ssh, write anywhere, and use the network"
+                    .into(),
+            );
+        }
+    }
+    if let Some(context) = session_context(window_truth.as_ref()) {
+        let payload = serde_json::to_value(&context)
+            .ok()
+            .and_then(|value| value.as_object().cloned())
+            .unwrap_or_default();
+        if let Err(error) = session.append(EntryKind::Custom(CustomData {
+            kind: "context-window".into(),
+            payload,
+        })) {
+            tracing::warn!(%error, "cannot record the context window in the session");
+        }
     }
 
     let registry = ToolRegistry::builtin();
@@ -252,6 +301,12 @@ pub async fn create_runtime(
     let system_prompt =
         prompt::build_system_prompt(&config, &paths, &skills, &tools, Some(&repo_brief));
     let mut budget = TokenBudget::new(context_window, config.model.max_output_tokens);
+    let static_prompt = measure_static_prompt(
+        &budget,
+        &system_prompt,
+        &tool_specs,
+        Some(repo_brief.as_str()),
+    );
     let sampled = tokio::time::timeout(
         Duration::from_secs(2),
         probe::token_count(&probe_provider, &system_prompt),
@@ -259,6 +314,7 @@ pub async fn create_runtime(
     .await
     .ok()
     .flatten();
+    let tokenize = sampled.is_some();
     if let Some(tokens) = sampled
         && tokens > 0
     {
@@ -267,7 +323,25 @@ pub async fn create_runtime(
             tokens.min(u32::MAX as usize) as u32,
         );
     }
+    if static_prompt.total > budget.usable_prompt() {
+        session.warnings.push(format!(
+            "static prompt is {} tokens but only {} fit the {} token window; turns will be refused until the profile or context is reduced",
+            static_prompt.total,
+            budget.usable_prompt(),
+            budget.context_window
+        ));
+    } else if u64::from(static_prompt.total) * 2 > u64::from(budget.usable_prompt()) {
+        session.warnings.push(format!(
+            "static prompt uses {:.0}% of the usable prompt ({} of {} tokens)",
+            static_prompt.percent_of(budget.usable_prompt()),
+            static_prompt.total,
+            budget.usable_prompt()
+        ));
+    }
     let limits = RunLimits::from(&config.budgets);
+    for warning in &session.warnings {
+        tracing::warn!("{warning}");
+    }
     let artifacts = session.artifacts.clone();
     let reads = Arc::new(Mutex::new(ReadTracker::default()));
     let bg = Arc::new(Mutex::new(BgRegistry::new()));
@@ -315,7 +389,10 @@ pub async fn create_runtime(
         reads,
         bg,
         security,
+        sandbox: sandbox.clone(),
         budget,
+        static_prompt,
+        tokenize,
         limits,
         system_prompt,
         model_profile: profile,
@@ -324,6 +401,9 @@ pub async fn create_runtime(
         path_jail: options.path_jail,
         server_window: Default::default(),
         window_source,
+        window_truth,
+        window_notice,
+        window_notice_sent: std::sync::Once::new(),
         detected_window: Default::default(),
         window_cache,
         startup,
@@ -349,9 +429,11 @@ pub async fn rebuild_core(old: &Arc<Core>, mut config: Config) -> Result<Arc<Cor
     // limit seen from the server instead of probing again.
     let same_target = old.provider.model() == provider.model()
         && old.config.model.endpoint == config.model.endpoint;
-    let reuse = same_target.then_some((old.budget.context_window, old.window_source));
-    let (context_window, window_source) =
-        resolve_window(&config, provider.as_ref(), reuse, &old.window_cache).await;
+    let resolved = resolve_window_truth(&config, provider.as_ref(), &old.window_cache).await;
+    let context_window = resolved.window;
+    let window_source = resolved.source;
+    let window_truth = resolved.truth;
+    let window_notice = window_notice(window_truth.as_ref(), resolved.configured);
     let (server_window, detected_window) = if same_target {
         (old.server_window.clone(), old.detected_window.clone())
     } else {
@@ -378,6 +460,20 @@ pub async fn rebuild_core(old: &Arc<Core>, mut config: Config) -> Result<Arc<Cor
         // The tokenizer calibration only holds for the same model.
         budget.chars_per_token = old.budget.chars_per_token;
     }
+    let static_prompt = measure_static_prompt(
+        &budget,
+        &system_prompt,
+        &tool_specs,
+        Some(repo_brief.as_str()),
+    );
+    let tokenize = tokio::time::timeout(
+        Duration::from_secs(2),
+        probe::token_count(provider.as_ref(), &system_prompt),
+    )
+    .await
+    .ok()
+    .flatten()
+    .is_some();
     let limits = RunLimits::from(&config.budgets);
     Ok(Arc::new(Core {
         config,
@@ -391,7 +487,10 @@ pub async fn rebuild_core(old: &Arc<Core>, mut config: Config) -> Result<Arc<Cor
         reads: old.reads.clone(),
         bg: old.bg.clone(),
         security: old.security.clone(),
+        sandbox: old.sandbox.clone(),
         budget,
+        static_prompt,
+        tokenize,
         limits,
         system_prompt,
         model_profile,
@@ -400,6 +499,9 @@ pub async fn rebuild_core(old: &Arc<Core>, mut config: Config) -> Result<Arc<Cor
         path_jail: old.path_jail,
         server_window,
         window_source,
+        window_truth,
+        window_notice,
+        window_notice_sent: std::sync::Once::new(),
         detected_window,
         window_cache: old.window_cache.clone(),
         // Endpoint bring-up is not retried on `/model` or `/login`; only a
@@ -412,39 +514,179 @@ pub async fn rebuild_core(old: &Arc<Core>, mut config: Config) -> Result<Arc<Cor
     }))
 }
 
-/// Context window for `provider`'s model: an explicit config or model-profile
-/// value, else a probe of the endpoint, else the default. `reuse` carries a
-/// previous probe for the same endpoint and model.
-async fn resolve_window(
+/// Warning to show once before the first turn: a clamped profile or an
+/// Ollama server still at its small default context.
+fn window_notice(truth: Option<&probe::WindowTruth>, configured: Option<u32>) -> Option<String> {
+    let truth = truth.filter(|truth| truth.is_known())?;
+    if let Some(configured) = configured
+        && configured > truth.effective
+    {
+        return Some(format!(
+            "the model profile asks for {configured} tokens but the server allocated {} ({}); the window is clamped to {}. {}",
+            truth.effective,
+            truth
+                .allocated_source
+                .as_deref()
+                .unwrap_or("no allocated value"),
+            truth.effective,
+            context_fix(truth),
+        ));
+    }
+    if truth.allocated_source.as_deref() == Some("ollama default") {
+        return Some(format!(
+            "Ollama is running at its default context of {} tokens; before the first turn set OLLAMA_CONTEXT_LENGTH=32768 (or add PARAMETER num_ctx 32768 to the Modelfile), then restart Ollama.",
+            truth.effective
+        ));
+    }
+    None
+}
+
+/// Session-header form of a probed window. Absent when nothing was known, so
+/// a guessed default is never recorded as measured.
+fn session_context(truth: Option<&probe::WindowTruth>) -> Option<SessionContextWindow> {
+    let truth = truth.filter(|truth| truth.is_known())?;
+    let sources = truth.source_map();
+    Some(SessionContextWindow {
+        trained: truth.trained,
+        allocated: truth.allocated,
+        per_slot: truth.per_slot,
+        effective: truth.effective,
+        sources: (!sources.is_empty()).then_some(sources),
+    })
+}
+
+/// Static prompt cost at build time. The repository brief is part of the
+/// system prompt, so it is measured once and subtracted from the system
+/// total; the message can then name the three contributors separately.
+fn measure_static_prompt(
+    budget: &TokenBudget,
+    system_prompt: &str,
+    tool_specs: &[crate::provider::ToolSpec],
+    repo_brief: Option<&str>,
+) -> StaticPrompt {
+    let repo = repo_brief
+        .map(|brief| budget.estimate_text(brief))
+        .unwrap_or(0);
+    let system = budget.estimate_text(system_prompt).saturating_sub(repo);
+    let tool_chars: usize = tool_specs
+        .iter()
+        .map(|tool| {
+            tool.name.len()
+                + tool.description.len()
+                + serde_json::to_string(&tool.parameters)
+                    .map(|schema| schema.len())
+                    .unwrap_or(0)
+        })
+        .sum();
+    StaticPrompt::new(system, budget.estimate_char_len(tool_chars), repo)
+}
+
+struct ResolvedWindow {
+    configured: Option<u32>,
+    truth: Option<probe::WindowTruth>,
+    window: u32,
+    source: WindowSource,
+}
+
+/// Resolve the context window from all three advertised values. The effective
+/// value is `min(trained, allocated, per_slot)`; a configured value is clamped
+/// to it rather than sent unchecked. A probe failure keeps the configured
+/// value, then a cached value, then the default.
+async fn resolve_window_truth(
     config: &Config,
     provider: &dyn Provider,
-    reuse: Option<(u32, WindowSource)>,
     cache: &Mutex<std::collections::HashMap<String, u32>>,
-) -> (u32, WindowSource) {
+) -> ResolvedWindow {
     let (_, profile) = config.model_profile();
-    if profile.context_window.is_some() || config.model.context_window.is_some() {
-        return (config.context_window(), WindowSource::Configured);
-    }
-    if let Some((window, source @ WindowSource::Probed(_))) = reuse {
-        return (window, source);
-    }
+    let configured = profile.context_window.or(config.model.context_window);
+    let fallback = || ResolvedWindow {
+        configured,
+        truth: None,
+        window: configured.unwrap_or_else(|| config.context_window()),
+        source: if configured.is_some() {
+            WindowSource::Configured
+        } else {
+            WindowSource::Default
+        },
+    };
     if provider.model().trim().is_empty() {
-        return (config.context_window(), WindowSource::Default);
+        return fallback();
     }
     let key = Core::window_key(&config.model.endpoint, provider.model());
-    if let Some(window) = cache.lock().ok().and_then(|cache| cache.get(&key).copied()) {
-        return (window, WindowSource::Probed(probe::WindowProbe::Remembered));
+    let mut truth =
+        tokio::time::timeout(Duration::from_secs(3), probe::probe_context_truth(provider))
+            .await
+            .ok()
+            .flatten();
+    let mut remembered = false;
+    if truth.as_ref().is_none_or(|truth| !truth.is_known())
+        && let Some(window) = cache.lock().ok().and_then(|cache| cache.get(&key).copied())
+    {
+        truth = Some(probe::WindowTruth::resolve(None, Some(window), None));
+        remembered = true;
     }
-    let probed = tokio::time::timeout(
-        Duration::from_secs(3),
-        probe::probe_context_window(provider),
-    )
-    .await
-    .ok()
-    .flatten();
-    match probed {
-        Some((window, how)) => (window, WindowSource::Probed(how)),
-        None => (config.context_window(), WindowSource::Default),
+    let probed = truth
+        .as_ref()
+        .map(|truth| truth.effective)
+        .filter(|window| *window > 0);
+    if let Some(window) = probed
+        && let Ok(mut cache) = cache.lock()
+    {
+        cache.insert(key, window);
+    }
+    let window = match (configured, probed) {
+        (Some(configured), Some(probed)) => configured.min(probed),
+        (Some(configured), None) => configured,
+        (None, Some(probed)) => probed,
+        (None, None) => config.context_window(),
+    };
+    let source = if remembered {
+        WindowSource::Probed(probe::WindowProbe::Remembered)
+    } else if let Some(truth) = &truth
+        && truth.is_known()
+    {
+        // A trained maximum alone is not what the server allocated.
+        if truth.allocated.is_some() || truth.per_slot.is_some() {
+            WindowSource::Probed(probe::WindowProbe::Served)
+        } else {
+            WindowSource::Probed(probe::WindowProbe::OllamaTrained)
+        }
+    } else if configured.is_some() {
+        WindowSource::Configured
+    } else {
+        WindowSource::Default
+    };
+    ResolvedWindow {
+        configured,
+        truth,
+        window,
+        source,
+    }
+}
+
+/// Exact server-side fix for a too-small context, based on which probe
+/// reported the allocated value.
+fn context_fix(truth: &probe::WindowTruth) -> String {
+    let source = truth.allocated_source.as_deref().unwrap_or("");
+    if source.contains("ollama") {
+        format!(
+            "Set OLLAMA_CONTEXT_LENGTH={} (or add PARAMETER num_ctx {} to the Modelfile), then restart Ollama.",
+            truth.effective.max(32768),
+            truth.effective.max(32768)
+        )
+    } else if source.contains("llama") {
+        format!(
+            "Restart llama.cpp with --ctx-size {} (or -c {}).",
+            truth.effective.max(32768),
+            truth.effective.max(32768)
+        )
+    } else if source.contains("vllm") {
+        format!(
+            "Restart vLLM with --max-model-len {}.",
+            truth.effective.max(32768)
+        )
+    } else {
+        "Raise the server's context size, or lower [model] max_output_tokens.".to_string()
     }
 }
 
@@ -639,6 +881,41 @@ mod tests {
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         drop(listener);
         endpoint
+    }
+
+    #[tokio::test]
+    async fn explicit_no_sandbox_is_recorded_in_the_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(dir.path());
+        let mut config = Config::builtin();
+        config.model.endpoint = unreachable_endpoint();
+        config.model.model = "spark26".into();
+        config.model.context_window = Some(8192);
+        config.sandbox = crate::config::SandboxMode::Off;
+        config.sandbox_explicit = true;
+
+        let runtime = create_runtime(config, paths, RuntimeOptions::default())
+            .await
+            .unwrap();
+        let session = runtime.session.lock().unwrap();
+        let entry = session
+            .latest_custom_on_path("sandbox")
+            .expect("sandbox mode is recorded");
+        match &entry.kind {
+            EntryKind::Custom(custom) => {
+                assert_eq!(custom.payload["mode"], "off");
+                assert_eq!(custom.payload["backend"], "off");
+            }
+            _ => panic!("wrong entry type"),
+        }
+        assert!(
+            session
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("--no-sandbox")),
+            "missing warning: {:?}",
+            session.warnings
+        );
     }
 
     #[tokio::test]

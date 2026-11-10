@@ -135,10 +135,15 @@ Steps run sequentially without a shell and stop at the first failure.
 | `LH_CONFIG_DIR`, `LH_DATA_DIR` | Override roots |
 | `NO_COLOR` | Disable color |
 | `LH_DEBUG_CONTENT` | Allow content in debug logs (warns) |
+| `LH_BWRAP` | Override the bubblewrap executable used by `--sandbox` |
 
 ## Flags
 
 `--print`, `--json`, `--endpoint`, `--model`, `--model-profile`, `--profile`,
 `--theme`, `--api-key`, `--trust`, `--no-session`, `--continue`, `--resume`,
-`--path-jail`, `--engagement`, `--no-color`, `--keep-artifacts`,
-`--clean-artifacts`, `--debug`.
+`--path-jail`, `--sandbox [read-only|workspace-write]`, `--no-sandbox`,
+`--engagement`, `--no-color`, `--keep-artifacts`, `--clean-artifacts`,
+`--debug`.
+
+`lh doctor [--json] [--fix]` prints the engine capability manifest without
+sending a chat completion. See [model-setup.md](model-setup.md).

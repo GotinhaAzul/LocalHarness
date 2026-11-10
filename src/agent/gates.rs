@@ -7,7 +7,10 @@ use crate::tools::ToolResult;
 
 use super::limits::RunProgress;
 
-/// Signature-based loop detection over the last 24 calls.
+/// Signature-based loop detection over recent calls. It only trips on genuine
+/// repetition: four identical calls in a row, or an exact 2-4 call cycle
+/// repeated four times in a row. Legitimate multi-step work (edit A, verify,
+/// edit B, verify, edit A, verify) must not trip it.
 #[derive(Debug)]
 pub struct LoopGuard {
     history: VecDeque<String>,
@@ -34,6 +37,7 @@ impl LoopGuard {
         }
     }
 
+    /// Record the call about to run and decide whether it continues a loop.
     pub fn check_and_record(&mut self, signature: impl Into<String>) -> LoopDecision {
         let signature = signature.into();
         self.history.push_back(signature.clone());
@@ -41,30 +45,29 @@ impl LoopGuard {
             self.history.pop_front();
         }
 
-        let repeated = self
+        let consecutive = self
             .history
             .iter()
             .rev()
-            .take(24)
-            .filter(|s| **s == signature)
+            .take_while(|s| **s == signature)
             .count();
-        if repeated >= 3 {
+        if consecutive >= 4 {
             return LoopDecision::Tripped {
                 reason: format!(
-                    "the same call ({signature}) ran {repeated} times in the last 24 calls. Stop repeating it; change approach or report the blocker."
+                    "the same call ({signature}) ran {consecutive} times in a row. Stop repeating it; change approach or report the blocker."
                 ),
             };
         }
 
         for period in 2..=4 {
-            if self.history.len() < period * 3 {
+            if self.history.len() < period * 4 {
                 continue;
             }
             let window: Vec<&String> = self
                 .history
                 .iter()
                 .rev()
-                .take(period * 3)
+                .take(period * 4)
                 .collect::<Vec<_>>()
                 .into_iter()
                 .rev()
@@ -76,12 +79,19 @@ impl LoopGuard {
             if cycles {
                 return LoopDecision::Tripped {
                     reason: format!(
-                        "a {period}-call cycle repeated three times ({signature}). Stop the cycle and switch to a different strategy."
+                        "a {period}-call cycle repeated four times in a row ({signature}). Stop the cycle and switch to a different strategy."
                     ),
                 };
             }
         }
         LoopDecision::Ok
+    }
+
+    /// Clear the accumulated history. The agent loop calls this after a file
+    /// change or a passing verification, so genuine progress resets the guard
+    /// and a long task's earlier calls cannot count toward a false loop.
+    pub fn record_progress(&mut self) {
+        self.history.clear();
     }
 }
 
@@ -327,34 +337,64 @@ mod tests {
     use crate::session::*;
 
     #[test]
-    fn loop_guard_trips_on_third_repeat() {
+    fn loop_guard_trips_on_fourth_consecutive_repeat() {
         let mut guard = LoopGuard::new();
-        assert_eq!(
-            guard.check_and_record("read:{\"path\":\"a\"}"),
-            LoopDecision::Ok
-        );
-        assert_eq!(
-            guard.check_and_record("read:{\"path\":\"a\"}"),
-            LoopDecision::Ok
-        );
+        let signature = "read:{\"path\":\"a\"}";
+        for _ in 0..3 {
+            assert_eq!(guard.check_and_record(signature), LoopDecision::Ok);
+        }
         assert!(matches!(
-            guard.check_and_record("read:{\"path\":\"a\"}"),
+            guard.check_and_record(signature),
             LoopDecision::Tripped { .. }
         ));
     }
 
     #[test]
-    fn loop_guard_trips_on_two_call_cycle() {
+    fn loop_guard_trips_on_four_repetitions_of_a_two_call_cycle() {
         let mut guard = LoopGuard::new();
-        let mut tripped = false;
-        for _ in 0..3 {
+        for cycle in 1..=4 {
+            let mut tripped = false;
             tripped |= matches!(guard.check_and_record("a"), LoopDecision::Tripped { .. });
             tripped |= matches!(guard.check_and_record("b"), LoopDecision::Tripped { .. });
-            if tripped {
-                break;
+            if cycle < 4 {
+                assert!(!tripped, "cycle {cycle} must not trip the guard");
+            } else {
+                assert!(tripped, "the fourth repetition must trip the guard");
             }
         }
-        assert!(tripped);
+    }
+
+    #[test]
+    fn loop_guard_allows_distinct_edit_verify_work() {
+        let mut guard = LoopGuard::new();
+        for call in [
+            "edit:{\"path\":\"a.rs\",\"old\":\"x\"}",
+            "verify:{}",
+            "edit:{\"path\":\"b.rs\",\"old\":\"y\"}",
+            "verify:{}",
+            "edit:{\"path\":\"a.rs\",\"old\":\"z\"}",
+            "verify:{}",
+            "edit:{\"path\":\"c.rs\",\"old\":\"w\"}",
+            "verify:{}",
+        ] {
+            assert_eq!(guard.check_and_record(call), LoopDecision::Ok);
+        }
+    }
+
+    #[test]
+    fn loop_guard_progress_resets_history() {
+        let mut guard = LoopGuard::new();
+        for _ in 0..3 {
+            assert_eq!(guard.check_and_record("same"), LoopDecision::Ok);
+        }
+        guard.record_progress();
+        for _ in 0..3 {
+            assert_eq!(guard.check_and_record("same"), LoopDecision::Ok);
+        }
+        assert!(matches!(
+            guard.check_and_record("same"),
+            LoopDecision::Tripped { .. }
+        ));
     }
 
     fn limits() -> crate::agent::limits::RunLimits {
@@ -491,6 +531,7 @@ mod tests {
                 model: "m".into(),
                 profile: "full".into(),
                 app: "test".into(),
+                context: None,
             },
             true,
         )

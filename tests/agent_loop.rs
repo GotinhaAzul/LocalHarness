@@ -2,6 +2,7 @@
 //! model. Covers guards, budgets, compaction, and session consistency.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -10,10 +11,10 @@ use localharness::config::{Config, ProfileConfig, VerifyConfig, VerifyStep};
 use localharness::context::TokenBudget;
 use localharness::paths::Paths;
 use localharness::provider::{
-    ChatRequest, ErrorClass, Provider, ProviderError, StreamEvent, StreamItem, Usage,
+    ChatMessage, ChatRequest, ErrorClass, Provider, ProviderError, StreamEvent, StreamItem, Usage,
 };
 use localharness::security::SecurityState;
-use localharness::session::{EntryKind, Session, SessionData};
+use localharness::session::{CompactionData, EntryKind, Session, SessionData};
 use localharness::tools::{BgRegistry, ReadTracker, SessionHandle, ToolRegistry};
 use serde_json::json;
 use tokio::sync::mpsc::UnboundedSender;
@@ -28,6 +29,9 @@ enum Script {
 struct ScriptedProvider {
     scripts: Mutex<VecDeque<Script>>,
     requests: Mutex<Vec<ChatRequest>>,
+    /// Reject any system message after a non-system one, like a strict
+    /// llama.cpp `--jinja` template.
+    strict_system: AtomicBool,
 }
 
 #[async_trait]
@@ -38,6 +42,22 @@ impl Provider for ScriptedProvider {
         tx: UnboundedSender<StreamItem>,
         _cancel: CancellationToken,
     ) {
+        if self.strict_system.load(Ordering::Relaxed) {
+            let mut seen_non_system = false;
+            for message in &req.messages {
+                match message {
+                    ChatMessage::System { .. } if seen_non_system => {
+                        let _ = tx.send(Err(ProviderError::new(
+                            ErrorClass::BadRequest,
+                            "strict template: system message after a non-system message",
+                        )));
+                        return;
+                    }
+                    ChatMessage::System { .. } => {}
+                    _ => seen_non_system = true,
+                }
+            }
+        }
         self.requests.lock().unwrap().push(req);
         let script = self.scripts.lock().unwrap().pop_front();
         match script {
@@ -139,6 +159,7 @@ fn harness_config(dir: &std::path::Path, scripts: Vec<Script>, config: Config) -
             model: "test-model".into(),
             profile: "test".into(),
             app: "test".into(),
+            context: None,
         },
         true,
     )
@@ -150,9 +171,12 @@ fn harness_config(dir: &std::path::Path, scripts: Vec<Script>, config: Config) -
     let provider = Arc::new(ScriptedProvider {
         scripts: Mutex::new(scripts.into()),
         requests: Mutex::new(Vec::new()),
+        strict_system: AtomicBool::new(false),
     });
     let core = Core {
         budget: TokenBudget::new(config.context_window(), config.model.max_output_tokens),
+        static_prompt: localharness::context::StaticPrompt::default(),
+        tokenize: false,
         limits: localharness::agent::RunLimits::from(&config.budgets),
         config,
         paths: paths.clone(),
@@ -165,6 +189,7 @@ fn harness_config(dir: &std::path::Path, scripts: Vec<Script>, config: Config) -
         reads: Arc::new(Mutex::new(ReadTracker::default())),
         bg: Arc::new(Mutex::new(BgRegistry::new())),
         security: Arc::new(Mutex::new(SecurityState::default())),
+        sandbox: None,
         system_prompt: "system".into(),
         model_profile: localharness::config::ModelProfile::default(),
         cancel: CancellationToken::new(),
@@ -172,6 +197,9 @@ fn harness_config(dir: &std::path::Path, scripts: Vec<Script>, config: Config) -
         path_jail: false,
         server_window: Default::default(),
         window_source: localharness::agent::WindowSource::Default,
+        window_truth: None,
+        window_notice: None,
+        window_notice_sent: std::sync::Once::new(),
         detected_window: Default::default(),
         window_cache: Default::default(),
         startup: None,
@@ -613,7 +641,48 @@ async fn cut_off_prose_and_empty_replies_continue() {
 }
 
 #[tokio::test]
-async fn silent_server_truncation_is_detected_and_retried() {
+async fn a_turn_after_compaction_keeps_system_messages_leading() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness(dir.path(), vec![text_script("done")], &["read"]);
+    harness
+        .provider
+        .strict_system
+        .store(true, Ordering::Relaxed);
+    harness
+        .session
+        .lock()
+        .unwrap()
+        .append(EntryKind::Compaction(CompactionData {
+            summary: "the compacted summary".into(),
+            tokens_before: 1000,
+            reason: "test".into(),
+            thread_id: None,
+        }))
+        .unwrap();
+
+    let (outcome, _) = run(&harness, "continue").await;
+    assert_eq!(outcome.status, TurnStatus::Done, "{:?}", outcome.error);
+    let requests = harness.provider.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    let messages = &requests[0].messages;
+    assert!(
+        matches!(&messages[0], ChatMessage::System { content }
+            if content.contains("the compacted summary")
+                && content.contains("[localharness] state")),
+        "leading system: {:?}",
+        messages[0]
+    );
+    assert!(
+        messages
+            .iter()
+            .skip(1)
+            .all(|message| !matches!(message, ChatMessage::System { .. })),
+        "no system message may follow a non-system one"
+    );
+}
+
+#[tokio::test]
+async fn silent_server_truncation_ends_the_turn() {
     let dir = tempfile::tempdir().unwrap();
     let harness = harness(
         dir.path(),
@@ -630,15 +699,16 @@ async fn silent_server_truncation_is_detected_and_retried() {
     );
     let prompt = "Explain this log.\n".repeat(1200);
     let (outcome, events) = run(&harness, &prompt).await;
-    assert_eq!(outcome.status, TurnStatus::Done);
-    assert_eq!(harness.provider.requests.lock().unwrap().len(), 2);
+    assert_eq!(outcome.status, TurnStatus::ContextTruncated);
+    // No retry on the corrupted branch.
+    assert_eq!(harness.provider.requests.lock().unwrap().len(), 1);
     assert!(
         assistants(&harness.session)
             .iter()
-            .all(|a| a.content.as_deref() != Some("I have no tools.")),
-        "the reply written without the system prompt is discarded"
+            .all(|a| a.content.as_deref() != Some("I have no tools.")
+                && a.content.as_deref() != Some("answer")),
+        "a truncated turn must not be replayed as normal history"
     );
-    assert_eq!(last_assistant(&harness.session), "answer");
     assert!(
         harness
             .core
@@ -647,10 +717,15 @@ async fn silent_server_truncation_is_detected_and_retried() {
             > 0,
         "the real window is remembered for later turns"
     );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::Guard { code, message }
+            if code == "context_truncated" && message.contains("OLLAMA_CONTEXT_LENGTH")
+    )));
     assert!(
         events
             .iter()
-            .any(|e| matches!(e, AgentEvent::Notice(n) if n.contains("OLLAMA_CONTEXT_LENGTH")))
+            .any(|e| matches!(e, AgentEvent::Notice(n) if n.contains("/compact")))
     );
 }
 
@@ -884,7 +959,7 @@ async fn unknown_tool_suggests_the_nearest_name() {
 }
 
 #[tokio::test]
-async fn loop_guard_blocks_the_third_identical_call() {
+async fn loop_guard_blocks_the_fourth_identical_call() {
     let dir = tempfile::tempdir().unwrap();
     let harness = harness(
         dir.path(),
@@ -892,7 +967,7 @@ async fn loop_guard_blocks_the_third_identical_call() {
             tool_script("read", json!({"path":"a.rs"})),
             tool_script("read", json!({"path":"a.rs"})),
             tool_script("read", json!({"path":"a.rs"})),
-            text_script("should not run"),
+            tool_script("read", json!({"path":"a.rs"})),
         ],
         &["read"],
     );
@@ -911,9 +986,9 @@ async fn loop_guard_blocks_the_third_identical_call() {
             _ => None,
         })
         .collect();
-    assert_eq!(results.len(), 3);
-    assert!(results[2].contains("loop_guard"), "{results:?}");
-    assert_eq!(harness.provider.requests.lock().unwrap().len(), 3);
+    assert_eq!(results.len(), 4);
+    assert!(results[3].contains("loop_guard"), "{results:?}");
+    assert_eq!(harness.provider.requests.lock().unwrap().len(), 4);
 }
 
 #[tokio::test]

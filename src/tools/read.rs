@@ -123,7 +123,7 @@ pub(crate) fn run(ctx: &ToolContext, args: &Value) -> Result<ToolResult, ToolRes
     let limit = usize::try_from(limit_u64).unwrap_or(MAX_LINES as usize);
 
     if total == 0 {
-        record_stamp(ctx, &path);
+        record_read(ctx, &path, 0, None);
         let text = format!("{display} is empty (0 lines)");
         return Ok(ToolResult::ok(text).with_details(json!({
             "path": display,
@@ -136,7 +136,7 @@ pub(crate) fn run(ctx: &ToolContext, args: &Value) -> Result<ToolResult, ToolRes
 
     let first = start.saturating_sub(1);
     if first >= total {
-        record_stamp(ctx, &path);
+        record_read(ctx, &path, total, None);
         let text = format!("{display} has {total} lines; start={start} is past the end");
         return Ok(ToolResult::ok(text).with_details(json!({
             "path": display,
@@ -170,7 +170,7 @@ pub(crate) fn run(ctx: &ToolContext, args: &Value) -> Result<ToolResult, ToolRes
         ));
     }
 
-    record_stamp(ctx, &path);
+    record_read(ctx, &path, total, Some((start, last)));
     Ok(ToolResult::ok(text).with_details(json!({
         "path": display,
         "start": start,
@@ -180,10 +180,15 @@ pub(crate) fn run(ctx: &ToolContext, args: &Value) -> Result<ToolResult, ToolRes
     })))
 }
 
-fn record_stamp(ctx: &ToolContext, path: &Path) {
+/// Record what this read delivered: `Some((start, end))` for a line range,
+/// `None` for an empty result (empty file or `start` past EOF).
+fn record_read(ctx: &ToolContext, path: &Path, total_lines: usize, range: Option<(usize, usize)>) {
     if let Some(stamp) = FileStamp::stamp_for(path) {
         let mut reads = crate::tools::write::lock_reads(ctx);
-        reads.record(path, stamp);
+        match range {
+            Some((start, end)) => reads.record_range(path, stamp, total_lines, start, end),
+            None => reads.record_empty(path, stamp, total_lines),
+        }
     }
 }
 
@@ -295,5 +300,99 @@ mod tests {
         let _ = ReadTool.call(&ctx, json!({"path": "a.txt"})).await;
         let path = dir.path().canonicalize().unwrap().join("a.txt");
         assert!(crate::tools::write::lock_reads(&ctx).is_current(&path));
+    }
+
+    #[tokio::test]
+    async fn partial_read_records_only_the_seen_lines() {
+        use crate::tools::LineRange;
+
+        let dir = tempfile::tempdir().unwrap();
+        let body: String = (1..=400).map(|n| format!("line{n}\n")).collect();
+        std::fs::write(dir.path().join("a.txt"), body).unwrap();
+        let ctx = test_context(dir.path());
+
+        let result = ReadTool.call(&ctx, json!({"path": "a.txt"})).await;
+        assert!(!result.is_error, "{}", result.content);
+        let path = ctx.resolve("a.txt").unwrap();
+        let reads = crate::tools::write::lock_reads(&ctx);
+        let coverage = reads.coverage(&path).unwrap();
+        assert_eq!(coverage.total_lines, 400);
+        assert_eq!(coverage.seen, vec![LineRange { start: 1, end: 150 }]);
+        assert!(!coverage.result_truncated);
+        assert!(reads.is_current(&path));
+        assert!(!reads.is_fully_read(&path));
+        assert_eq!(
+            reads.unseen_ranges(&path),
+            vec![LineRange {
+                start: 151,
+                end: 400
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn past_eof_read_records_stamp_without_coverage() {
+        use crate::tools::LineRange;
+
+        let dir = tempfile::tempdir().unwrap();
+        let body: String = (1..=10).map(|n| format!("line{n}\n")).collect();
+        std::fs::write(dir.path().join("a.txt"), body).unwrap();
+        let ctx = test_context(dir.path());
+
+        let result = ReadTool
+            .call(&ctx, json!({"path": "a.txt", "start": 999}))
+            .await;
+        assert!(!result.is_error, "{}", result.content);
+        let path = ctx.resolve("a.txt").unwrap();
+        let reads = crate::tools::write::lock_reads(&ctx);
+        let coverage = reads.coverage(&path).unwrap();
+        assert_eq!(coverage.total_lines, 10);
+        assert!(coverage.seen.is_empty());
+        assert!(reads.is_current(&path));
+        assert!(!reads.is_fully_read(&path));
+        assert_eq!(
+            reads.unseen_ranges(&path),
+            vec![LineRange { start: 1, end: 10 }]
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_and_full_reads_are_fully_covered() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("empty.txt"), "").unwrap();
+        let ctx = test_context(dir.path());
+
+        let path = ctx.resolve("empty.txt").unwrap();
+        let _ = ReadTool.call(&ctx, json!({"path": "empty.txt"})).await;
+        assert!(crate::tools::write::lock_reads(&ctx).is_fully_read(&path));
+
+        let body: String = (1..=400).map(|n| format!("line{n}\n")).collect();
+        std::fs::write(dir.path().join("a.txt"), body).unwrap();
+        let path = ctx.resolve("a.txt").unwrap();
+        let _ = ReadTool
+            .call(&ctx, json!({"path": "a.txt", "start": 1, "end": 400}))
+            .await;
+        assert!(crate::tools::write::lock_reads(&ctx).is_fully_read(&path));
+    }
+
+    #[tokio::test]
+    async fn adjacent_reads_merge_into_full_coverage() {
+        let dir = tempfile::tempdir().unwrap();
+        let body: String = (1..=400).map(|n| format!("line{n}\n")).collect();
+        std::fs::write(dir.path().join("a.txt"), body).unwrap();
+        let ctx = test_context(dir.path());
+
+        let path = ctx.resolve("a.txt").unwrap();
+        let first = ReadTool
+            .call(&ctx, json!({"path": "a.txt", "start": 1, "end": 150}))
+            .await;
+        assert!(!first.is_error, "{}", first.content);
+        assert!(!crate::tools::write::lock_reads(&ctx).is_fully_read(&path));
+
+        let rest = ReadTool
+            .call(&ctx, json!({"path": "a.txt", "start": 151, "end": 400}))
+            .await;
+        assert!(!rest.is_error, "{}", rest.content);
+        assert!(crate::tools::write::lock_reads(&ctx).is_fully_read(&path));
     }
 }

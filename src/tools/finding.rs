@@ -902,6 +902,7 @@ mod tests {
             model: "test".into(),
             profile: "test".into(),
             app: "test".into(),
+            context: None,
         };
         let session = Session::create(&paths, header, true).unwrap();
         let artifacts = session.artifacts.clone();
@@ -920,6 +921,7 @@ mod tests {
             security: Arc::new(Mutex::new(security)),
             paths,
             lsp: Arc::new(crate::tools::lsp::LspService::new()),
+            sandbox: None,
         }
     }
 

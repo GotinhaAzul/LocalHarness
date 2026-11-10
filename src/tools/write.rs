@@ -28,7 +28,7 @@ impl Tool for WriteTool {
     }
 
     fn description(&self) -> &'static str {
-        "Create or replace a file atomically. Read an existing file first."
+        "Create or replace a file atomically. Replacing an existing file requires a full read of it, unless overwrite is true."
     }
 
     fn schema(&self) -> Value {
@@ -36,7 +36,8 @@ impl Tool for WriteTool {
             json!({
                 "path": {"type": "string", "description": "File to write, relative to the working directory."},
                 "content": {"type": "string", "description": "Full file content."},
-                "allow_empty": {"type": "boolean", "description": "Permit writing an empty file."}
+                "allow_empty": {"type": "boolean", "description": "Permit writing an empty file."},
+                "overwrite": {"type": "boolean", "description": "Replace a partially-read file anyway; the file must still be unchanged since the last read. Use only when the read intentionally covered part of the file."}
             }),
             &["path", "content"],
         )
@@ -78,6 +79,7 @@ fn run(ctx: &ToolContext, args: &Value) -> Result<ToolResult, ToolResult> {
             )
         })?;
     let allow_empty = optional_bool(args, "allow_empty").unwrap_or(false);
+    let overwrite = optional_bool(args, "overwrite").unwrap_or(false);
 
     if content.is_empty() && !allow_empty {
         return Err(ToolResult::err(
@@ -109,12 +111,22 @@ fn run(ctx: &ToolContext, args: &Value) -> Result<ToolResult, ToolResult> {
                 format!("{display} is a directory; pass a file path"),
             ));
         }
-        if !lock_reads(ctx).is_current(&path) {
-            return Err(ToolResult::err(
-                "READ_FIRST",
-                format!("read {display} first"),
-            ));
-        }
+        let gate = {
+            let reads = lock_reads(ctx);
+            if !reads.is_current(&path) {
+                Err(ToolResult::err(
+                    "READ_FIRST",
+                    format!("read {display} first"),
+                ))
+            } else if !overwrite && !reads.is_fully_read(&path) {
+                let unseen = reads.unseen_ranges(&path);
+                let coverage = reads.coverage(&path);
+                Err(coverage_error(&display, coverage, &unseen))
+            } else {
+                Ok(())
+            }
+        };
+        gate?;
     }
 
     if let Some(parent) = path.parent()
@@ -166,16 +178,69 @@ fn run(ctx: &ToolContext, args: &Value) -> Result<ToolResult, ToolResult> {
     )
 }
 
-/// Borrow the read tracker without panicking on a poisoned lock.
 /// Re-stamp a file the harness itself just wrote. The model authored the new
 /// text and saw the result, so a re-read would only cost a turn; any later
 /// change by something else still breaks the stamp and requires a read.
 pub(crate) fn record_own_write(ctx: &ToolContext, path: &Path) {
     if let Some(stamp) = crate::tools::FileStamp::stamp_for(path) {
-        lock_reads(ctx).record(path, stamp);
+        let total_lines = std::fs::read(path)
+            .map(|bytes| crate::tools::read::line_count(&String::from_utf8_lossy(&bytes)))
+            .unwrap_or(0);
+        lock_reads(ctx).record_full(path, stamp, total_lines);
     }
 }
 
+/// Refuse a whole-file replace when the last read left lines unseen.
+fn coverage_error(
+    display: &str,
+    coverage: Option<&crate::tools::ReadCoverage>,
+    unseen: &[crate::tools::LineRange],
+) -> ToolResult {
+    let escape = "or pass \"overwrite\": true to replace the file anyway.";
+    let Some(coverage) = coverage else {
+        return ToolResult::err(
+            "COVERAGE",
+            format!(
+                "read {display} completely first; writing would replace content you never saw. Read it {escape}"
+            ),
+        );
+    };
+    let total = coverage.total_lines;
+    let message = if unseen.is_empty() {
+        format!(
+            "read {display} but its result was truncated before all {total} lines reached you; writing would replace content you never saw. Read the file in smaller ranges {escape}"
+        )
+    } else if coverage.seen.is_empty() {
+        format!(
+            "read {display} covered none of its {total} lines; writing would delete lines {} you never saw. Read it (start=1) {escape}",
+            describe_ranges(unseen)
+        )
+    } else {
+        format!(
+            "read {display} only covered lines {} of {total}; writing would delete lines {} you never saw. Read the rest (start={}) {escape}",
+            describe_ranges(&coverage.seen),
+            describe_ranges(unseen),
+            unseen[0].start
+        )
+    };
+    ToolResult::err("COVERAGE", message)
+}
+
+fn describe_ranges(ranges: &[crate::tools::LineRange]) -> String {
+    ranges
+        .iter()
+        .map(|range| {
+            if range.start == range.end {
+                range.start.to_string()
+            } else {
+                format!("{}-{}", range.start, range.end)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Borrow the read tracker without panicking on a poisoned lock.
 pub(crate) fn lock_reads(ctx: &ToolContext) -> MutexGuard<'_, ReadTracker> {
     ctx.reads
         .lock()
@@ -252,6 +317,7 @@ pub(crate) fn test_context(dir: &Path) -> ToolContext {
         model: "test".into(),
         profile: "test".into(),
         app: "test".into(),
+        context: None,
     };
     let session = Session::create(&paths, header, true).expect("in-memory session");
     ToolContext {
@@ -268,14 +334,20 @@ pub(crate) fn test_context(dir: &Path) -> ToolContext {
         security: Arc::new(Mutex::new(SecurityState::default())),
         paths,
         lsp: Arc::new(crate::tools::lsp::LspService::new()),
+        sandbox: None,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::edit::EditTool;
     use crate::tools::read::ReadTool;
     use serde_json::json;
+
+    fn numbered(count: usize) -> String {
+        (1..=count).map(|n| format!("line{n}\n")).collect()
+    }
 
     #[tokio::test]
     async fn creates_file_with_details() {
@@ -357,5 +429,182 @@ mod tests {
                 .len(),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn past_eof_read_does_not_authorize_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = numbered(10);
+        std::fs::write(dir.path().join("a.txt"), &original).unwrap();
+        let ctx = test_context(dir.path());
+
+        let read = ReadTool
+            .call(&ctx, json!({"path": "a.txt", "start": 999}))
+            .await;
+        assert!(!read.is_error, "{}", read.content);
+
+        let denied = WriteTool
+            .call(&ctx, json!({"path": "a.txt", "content": "gone\n"}))
+            .await;
+        assert!(denied.is_error, "{}", denied.content);
+        assert!(
+            denied.content.starts_with("[COVERAGE]"),
+            "{}",
+            denied.content
+        );
+        assert!(denied.content.contains("1-10"), "{}", denied.content);
+        assert!(
+            denied.content.contains("\"overwrite\": true"),
+            "{}",
+            denied.content
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            original
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_read_blocks_write_but_not_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), numbered(400)).unwrap();
+        let ctx = test_context(dir.path());
+
+        let read = ReadTool.call(&ctx, json!({"path": "a.txt"})).await;
+        assert!(!read.is_error, "{}", read.content);
+        assert_eq!(read.details.unwrap()["end"].as_u64(), Some(150));
+
+        let denied = WriteTool
+            .call(&ctx, json!({"path": "a.txt", "content": "gone\n"}))
+            .await;
+        assert!(denied.is_error, "{}", denied.content);
+        assert!(
+            denied.content.starts_with("[COVERAGE]"),
+            "{}",
+            denied.content
+        );
+        assert!(denied.content.contains("151-400"), "{}", denied.content);
+        assert!(denied.content.contains("start=151"), "{}", denied.content);
+        assert!(
+            denied.content.contains("\"overwrite\": true"),
+            "{}",
+            denied.content
+        );
+
+        let edited = EditTool
+            .call(
+                &ctx,
+                json!({"path": "a.txt", "old": "line300\n", "new": "line300 edited\n"}),
+            )
+            .await;
+        assert!(!edited.is_error, "{}", edited.content);
+        assert!(
+            std::fs::read_to_string(dir.path().join("a.txt"))
+                .unwrap()
+                .contains("line300 edited")
+        );
+    }
+
+    #[tokio::test]
+    async fn full_read_authorizes_write() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), numbered(400)).unwrap();
+        let ctx = test_context(dir.path());
+
+        let read = ReadTool
+            .call(&ctx, json!({"path": "a.txt", "start": 1, "end": 400}))
+            .await;
+        assert!(!read.is_error, "{}", read.content);
+        assert_eq!(read.details.unwrap()["capped"], false);
+
+        let written = WriteTool
+            .call(&ctx, json!({"path": "a.txt", "content": "replaced\n"}))
+            .await;
+        assert!(!written.is_error, "{}", written.content);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "replaced\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn overwrite_flag_replaces_partially_read_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), numbered(400)).unwrap();
+        let ctx = test_context(dir.path());
+
+        let _ = ReadTool.call(&ctx, json!({"path": "a.txt"})).await;
+        let written = WriteTool
+            .call(
+                &ctx,
+                json!({"path": "a.txt", "content": "replaced\n", "overwrite": true}),
+            )
+            .await;
+        assert!(!written.is_error, "{}", written.content);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "replaced\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn change_after_full_read_still_requires_read_first() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), numbered(400)).unwrap();
+        let ctx = test_context(dir.path());
+
+        let read = ReadTool
+            .call(&ctx, json!({"path": "a.txt", "start": 1, "end": 400}))
+            .await;
+        assert!(!read.is_error, "{}", read.content);
+
+        std::fs::write(dir.path().join("a.txt"), numbered(401)).unwrap();
+        let denied = WriteTool
+            .call(
+                &ctx,
+                json!({"path": "a.txt", "content": "gone\n", "overwrite": true}),
+            )
+            .await;
+        assert!(denied.is_error, "{}", denied.content);
+        assert!(
+            denied.content.starts_with("[READ_FIRST]"),
+            "{}",
+            denied.content
+        );
+    }
+
+    #[tokio::test]
+    async fn truncated_result_blocks_write() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), numbered(400)).unwrap();
+        let ctx = test_context(dir.path());
+
+        let read = ReadTool
+            .call(&ctx, json!({"path": "a.txt", "start": 1, "end": 400}))
+            .await;
+        assert!(!read.is_error, "{}", read.content);
+        let path = ctx.resolve("a.txt").unwrap();
+        assert!(lock_reads(&ctx).is_fully_read(&path));
+
+        lock_reads(&ctx).mark_result_truncated(&path);
+        assert!(lock_reads(&ctx).is_current(&path));
+        assert!(!lock_reads(&ctx).is_fully_read(&path));
+
+        // A later past-EOF read does not redeliver the lost content.
+        let _ = ReadTool
+            .call(&ctx, json!({"path": "a.txt", "start": 999}))
+            .await;
+        assert!(!lock_reads(&ctx).is_fully_read(&path));
+
+        let denied = WriteTool
+            .call(&ctx, json!({"path": "a.txt", "content": "gone\n"}))
+            .await;
+        assert!(denied.is_error, "{}", denied.content);
+        assert!(
+            denied.content.starts_with("[COVERAGE]"),
+            "{}",
+            denied.content
+        );
+        assert!(denied.content.contains("truncated"), "{}", denied.content);
     }
 }

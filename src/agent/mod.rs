@@ -41,7 +41,15 @@ pub struct Core {
     pub reads: Arc<Mutex<ReadTracker>>,
     pub bg: Arc<Mutex<BgRegistry>>,
     pub security: Arc<Mutex<SecurityState>>,
+    /// OS sandbox for `bash` and `bg`, shared with every tool context.
+    pub sandbox: Option<Arc<crate::sandbox::Sandbox>>,
     pub budget: TokenBudget,
+    /// Static prompt cost measured at build time: system prompt, tool
+    /// schemas, and repository brief. Checked before every turn.
+    pub static_prompt: crate::context::StaticPrompt,
+    /// Whether the engine answered `/tokenize`, so the rendered prompt can be
+    /// measured exactly before sending.
+    pub tokenize: bool,
     pub limits: RunLimits,
     pub system_prompt: String,
     pub model_profile: ModelProfile,
@@ -53,6 +61,13 @@ pub struct Core {
     pub server_window: Arc<std::sync::atomic::AtomicU32>,
     /// Where `budget.context_window` came from.
     pub window_source: WindowSource,
+    /// Trained, allocated, per-slot, and effective context values with their
+    /// sources, when the endpoint reported them.
+    pub window_truth: Option<crate::provider::probe::WindowTruth>,
+    /// Warning about the window to show once before the first turn.
+    pub window_notice: Option<String>,
+    /// Ensures `window_notice` is sent only once per core.
+    pub window_notice_sent: std::sync::Once,
     /// Window learned from the server during this core's turns (0 = none),
     /// overriding a guessed `budget.context_window`.
     pub detected_window: Arc<std::sync::atomic::AtomicU32>,
@@ -213,6 +228,7 @@ impl Core {
             security: self.security.clone(),
             paths: self.paths.clone(),
             lsp: self.registry.lsp(),
+            sandbox: self.sandbox.clone(),
         }
     }
 

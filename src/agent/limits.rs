@@ -83,8 +83,8 @@ pub struct RunProgress {
     pub output_recoveries: u32,
     /// Whether the user was told that tool calls are arriving as text.
     pub text_calls_noticed: bool,
-    /// Whether a reply was already discarded for silent server truncation.
-    pub truncation_retry_used: bool,
+    /// Whether the exact tokenizer check already forced a compaction.
+    pub presend_compaction_used: bool,
 }
 
 impl RunProgress {
@@ -104,7 +104,7 @@ impl RunProgress {
             last_stop: None,
             output_recoveries: 0,
             text_calls_noticed: false,
-            truncation_retry_used: false,
+            presend_compaction_used: false,
         }
     }
 

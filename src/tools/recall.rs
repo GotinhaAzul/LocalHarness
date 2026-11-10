@@ -204,6 +204,7 @@ mod tests {
             model: "test".into(),
             profile: "test".into(),
             app: "test".into(),
+            context: None,
         };
         let session = Session::create(&paths, header, true).expect("session");
         let artifacts = Arc::new(ArtifactStore::ephemeral());
@@ -224,6 +225,7 @@ mod tests {
             security: Arc::new(Mutex::new(SecurityState::default())),
             paths,
             lsp: Arc::new(crate::tools::lsp::LspService::new()),
+            sandbox: None,
         };
         (dir, ctx)
     }

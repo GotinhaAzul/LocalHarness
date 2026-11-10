@@ -1048,6 +1048,12 @@ impl App {
                     TurnStatus::Stalled => {
                         self.set_notice("turn stopped: stalled", Role::Warning);
                     }
+                    TurnStatus::ContextTruncated => {
+                        self.set_notice(
+                            "turn stopped: the prompt was truncated; /compact or /new",
+                            Role::Error,
+                        );
+                    }
                     TurnStatus::Blocked => {
                         self.set_notice("turn blocked by a guard", Role::Error);
                     }
@@ -3388,6 +3394,19 @@ mod tests {
         )
         .unwrap();
         assert_eq!(app.header.window, 8192);
+        // The session header records all four context values.
+        let header = app
+            .core()
+            .unwrap()
+            .session
+            .lock()
+            .unwrap()
+            .header()
+            .cloned()
+            .expect("session header");
+        let context = header.context.expect("context recorded");
+        assert_eq!(context.allocated, Some(8192));
+        assert_eq!(context.effective, 8192);
         // The probe result is not written back as if the user configured it.
         assert_eq!(app.config.model.context_window, None);
 
@@ -3396,12 +3415,13 @@ mod tests {
         assert_eq!(app.header.window, 131072);
         assert_eq!(app.core().unwrap().budget.context_window, 131072);
 
-        // An explicit value always wins over the probe.
+        // An explicit value is clamped to what the server allocated.
         let mut pinned = app.config.clone();
         pinned.model.context_window = Some(20_000);
         pinned.model.model = "small".into();
         app.rebuild_core_with(pinned).await.unwrap();
-        assert_eq!(app.header.window, 20_000);
+        assert_eq!(app.header.window, 8192);
+        assert_eq!(app.core().unwrap().budget.context_window, 8192);
     }
 
     fn key(code: KeyCode) -> KeyEvent {

@@ -106,6 +106,13 @@ pub struct Usage {
     /// Generation speed in tokens per second.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tokens_per_sec: Option<f32>,
+    /// Engine-native truncation signal (llama.cpp `truncated`, KoboldCpp
+    /// context shift). When true, the prompt was cut before evaluation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncated: Option<bool>,
+    /// Engine-native count of context-shift events for this request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_shift: Option<u32>,
 }
 
 impl Usage {
@@ -134,6 +141,8 @@ impl Usage {
         self.prompt_ms = other.prompt_ms.or(self.prompt_ms);
         self.first_token_ms = other.first_token_ms.or(self.first_token_ms);
         self.tokens_per_sec = other.tokens_per_sec.or(self.tokens_per_sec);
+        self.truncated = other.truncated.or(self.truncated);
+        self.context_shift = other.context_shift.or(self.context_shift);
     }
 
     /// Share of the prompt reused from the server cache, 0-100.

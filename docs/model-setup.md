@@ -140,8 +140,33 @@ tool_mode = "repair"        # native | repair | auto
 
 ## Context and token accounting
 
+An engine can report three different context sizes, and they are not
+interchangeable:
+
+- **trained** — the model's trained maximum (`n_ctx_train`, LM Studio's
+  `max_context_length`). Usually the largest number.
+- **allocated** — what the server reserved (`--ctx-size`, `num_ctx`,
+  `max_model_len`, `OLLAMA_CONTEXT_LENGTH`).
+- **per-slot** — what one request may use when the server splits the
+  allocation across parallel slots (`--parallel`, llama.cpp `/slots`).
+
+The harness budgets against the smallest reported value:
+`effective = min(trained, allocated, per_slot)`. With `llama-server --parallel
+2 --ctx-size 8192`, `/props` reports 4096 per slot, so the effective window is
+4096, not 8192. With Ollama, the trained maximum can be 131072 while the served
+runner was allocated 4096; the effective window is 4096. When nothing is
+reported the harness falls back to configuration, never to a fabricated value.
+The one exception is Ollama's documented historical default: if Ollama is
+detected with neither a loaded runner context nor a `num_ctx` parameter, the
+harness assumes 4096 and says so (with the `OLLAMA_CONTEXT_LENGTH` fix) instead
+of silently truncating prompts.
+
+The session header records all four values (`trained`, `allocated`, `per_slot`,
+`effective`) and the source of each probe, so a later session can explain why a
+window was chosen. Older session files without that field load unchanged.
+
 ```
-usable_prompt = context_window - max_output_tokens - safety_margin
+usable_prompt = effective_window - max_output_tokens - safety_margin
 ```
 
 The safety margin is 5% of the window, minimum 512 tokens. Compaction starts at
@@ -166,6 +191,91 @@ with every engine. All of it is stored with each reply in the session file. A
 low cache share between compactions means something else is evicting the
 cache: another client on the same llama.cpp slot, or too few `--parallel`
 slots.
+
+## Checking the engine: `lh doctor`
+
+`lh doctor` fingerprints the configured engine from metadata endpoints only.
+It never sends a chat completion and never loads a model. It prints the
+manifest below; `lh doctor --json` prints the same manifest as stable, pretty
+JSON. Fix lines name the exact server flag to change.
+
+Probes are tried in this order and stop at the first match:
+
+1. llama.cpp `GET /props`
+2. Ollama `POST /api/show`
+3. vLLM: `max_model_len` in the selected `/v1/models` entry and `GET /health`
+4. SGLang `GET /server_info`
+5. LM Studio `GET /api/v1/models`
+6. KoboldCpp `GET /api/extra/version`
+7. TabbyAPI `GET /v1/model`
+8. `generic` — conservative defaults, with every failed probe listed
+
+`POST /tokenize` is probed last to record whether exact token counts are
+available. A manifest is cached per `(API base, model, build)` under the data
+directory.
+
+### Manifest fields
+
+| Field | Meaning |
+|---|---|
+| `engine` | `llama.cpp`, `ollama`, `vllm`, `sglang`, `lmstudio`, `koboldcpp`, `tabbyapi`, or `generic`. |
+| `build` | Server build/version string when reported. |
+| `model` | The selected model id. |
+| `context` | `trained`, `allocated`, `per_slot`, `effective`, plus `trained_source`, `allocated_source`, `per_slot_source`. `effective` is zero when nothing was reported. |
+| `tool_dialect` | `native`, `repair`, `none`, or `unknown`, from server metadata (Ollama capabilities, llama.cpp chat template). |
+| `tool_parser` | Parser name the server reports, if any. |
+| `reasoning_field` | Streaming reasoning field the server reports, if any. |
+| `structured_output` | `json_schema`, `grammar`, `none`, or `unknown`; unknown when the server does not report it. |
+| `cache_mode` | Engine cache mode, if reported (for example TabbyAPI's `cache_mode`). |
+| `slots` | Parallel slot count, if reported (llama.cpp `/props`). |
+| `tokenizer_route` | `"/tokenize"` when exact tokenization works, else `null`. |
+| `embeddings` / `rerank` | `true` only when the engine's metadata says so. |
+| `probes_ok` | Metadata probes that answered. |
+| `probes_failed` | Metadata probes that failed or did not identify an engine. |
+| `warnings` | Context mismatch, Ollama default, unknown tool support, unrecognized engine. |
+| `fixes` | Exact commands or config changes; `lh doctor --fix` prints them after the manifest. When the configured window is larger than the server's effective window, the first line names the flag that raises the server limit. |
+
+### `--json` schema
+
+```json
+{
+  "engine": "llama.cpp",
+  "build": "b6040",
+  "model": "qwen3",
+  "context": {
+    "trained": 131072,
+    "allocated": 8192,
+    "per_slot": 4096,
+    "effective": 4096,
+    "trained_source": "/v1/models meta.n_ctx_train",
+    "allocated_source": "llama.cpp /props n_ctx × slots",
+    "per_slot_source": "llama.cpp /props n_ctx (per slot)"
+  },
+  "tool_dialect": "native",
+  "tool_parser": null,
+  "reasoning_field": null,
+  "structured_output": "unknown",
+  "cache_mode": null,
+  "slots": 2,
+  "tokenizer_route": "/tokenize",
+  "embeddings": false,
+  "rerank": false,
+  "probes_ok": ["llama.cpp /props", "POST /tokenize"],
+  "probes_failed": [],
+  "warnings": [
+    "configured context_window 65536 exceeds the server's effective window 4096; prompts will be clamped to the server limit"
+  ],
+  "fixes": [
+    "llama.cpp --ctx-size 65536 (or raise the profile's context_window to the server limit)",
+    "llama.cpp: llama-server -m <model> --jinja --ctx-size 65536 --port 8080"
+  ]
+}
+```
+
+Optional values are `null` rather than omitted, and every field is always
+present, so the JSON can be consumed by scripts. `context.effective == 0` means
+the server reported nothing; the harness falls back to the configured
+`context_window`.
 
 ## Troubleshooting
 

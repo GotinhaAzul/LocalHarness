@@ -33,6 +33,48 @@ pub struct Config {
     pub model_profile_override: Option<String>,
     #[serde(skip)]
     pub trust: bool,
+    /// OS-level sandbox for `bash` and `bg`; runtime only.
+    #[serde(skip)]
+    pub sandbox: SandboxMode,
+    /// True when the user passed `--sandbox` or `--no-sandbox`.
+    #[serde(skip)]
+    pub sandbox_explicit: bool,
+}
+
+/// How strictly `bash` and `bg` are isolated from the host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SandboxMode {
+    /// Run unsandboxed, exactly as before the sandbox existed.
+    #[default]
+    Off,
+    /// The whole filesystem is read-only; only the private temp directory is
+    /// writable.
+    ReadOnly,
+    /// The workspace is writable; everything else stays read-only. An existing
+    /// `.git` inside the workspace is mounted read-only.
+    WorkspaceWrite,
+}
+
+impl SandboxMode {
+    /// Stable name used in diagnostics and the CLI.
+    pub fn label(self) -> &'static str {
+        match self {
+            SandboxMode::Off => "off",
+            SandboxMode::ReadOnly => "read-only",
+            SandboxMode::WorkspaceWrite => "workspace-write",
+        }
+    }
+
+    /// Parse a CLI/config value. Unknown values return `None` so callers can
+    /// report the accepted names.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "off" | "none" => Some(SandboxMode::Off),
+            "read-only" | "readonly" | "ro" => Some(SandboxMode::ReadOnly),
+            "workspace-write" | "workspace" | "write" => Some(SandboxMode::WorkspaceWrite),
+            _ => None,
+        }
+    }
 }
 
 impl Config {

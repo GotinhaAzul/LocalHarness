@@ -12,6 +12,7 @@ use nix::unistd::Pid;
 use serde_json::{Value, json};
 use tokio::task::JoinHandle;
 
+use crate::sandbox::Sandbox;
 use crate::tools::{
     Tool, ToolContext, ToolPack, ToolResult, object_schema, optional_str, optional_u64,
     required_str,
@@ -33,8 +34,17 @@ pub struct BashTool;
 /// Build a non-interactive shell command in its own process group.
 ///
 /// Shared with `bg` so both tools agree on shell semantics and group
-/// ownership: a timeout or stop can signal the whole tree.
-pub(crate) fn shell_command(command: &str, cwd: &Path) -> tokio::process::Command {
+/// ownership: a timeout or stop can signal the whole tree. When `sandbox` is
+/// present the command is wrapped by the OS sandbox; a failure is returned to
+/// the caller and must never fall back to an unsandboxed run.
+pub(crate) fn shell_command(
+    command: &str,
+    cwd: &Path,
+    sandbox: Option<&Sandbox>,
+) -> Result<tokio::process::Command, String> {
+    if let Some(sandbox) = sandbox {
+        return sandbox.wrap(command, cwd);
+    }
     use std::os::unix::process::CommandExt;
     let mut cmd = tokio::process::Command::new("bash");
     cmd.arg("-lc")
@@ -44,7 +54,18 @@ pub(crate) fn shell_command(command: &str, cwd: &Path) -> tokio::process::Comman
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     cmd.as_std_mut().process_group(0);
-    cmd
+    Ok(cmd)
+}
+
+/// Error returned when the sandbox cannot build a command. Fail closed: the
+/// model gets an actionable message instead of an unsandboxed run.
+pub(crate) fn sandbox_error(message: &str) -> ToolResult {
+    let hint = if message.contains("--no-sandbox") {
+        String::new()
+    } else {
+        "\n\nNo command was run. Rerun with --no-sandbox only if unsandboxed shell access is acceptable.".to_string()
+    };
+    ToolResult::err("SANDBOX_UNAVAILABLE", format!("{message}{hint}"))
 }
 
 /// Signal a process group. Guarded so a missing pid can never hit our own
@@ -122,15 +143,23 @@ impl BashTool {
             return cancelled_result();
         }
 
-        let mut cmd = shell_command(&command, &cwd);
+        let mut cmd = match shell_command(&command, &cwd, ctx.sandbox.as_deref()) {
+            Ok(cmd) => cmd,
+            Err(message) => return sandbox_error(&message),
+        };
         cmd.kill_on_drop(true);
         let mut child = match cmd.spawn() {
             Ok(child) => child,
             Err(err) => {
+                let hint = if ctx.sandbox.is_some() {
+                    "the sandbox backend failed to start the command; fix the backend or rerun with --no-sandbox"
+                } else {
+                    "check that bash is installed and the directory exists"
+                };
                 return ToolResult::err(
                     "SPAWN_FAILED",
                     format!(
-                        "could not start bash in {}: {err}; check that bash is installed and the directory exists, then retry with {{'command': '...'}}",
+                        "could not start bash in {}: {err}; {hint}, then retry with {{'command': '...'}}",
                         cwd.display()
                     ),
                 );
@@ -362,6 +391,7 @@ pub(crate) fn test_context(dir: &Path) -> ToolContext {
             model: "test".into(),
             profile: "full".into(),
             app: APP_VERSION.into(),
+            context: None,
         },
         true,
     )
@@ -383,12 +413,97 @@ pub(crate) fn test_context(dir: &Path) -> ToolContext {
         security: Arc::new(Mutex::new(SecurityState::empty())),
         paths,
         lsp: Arc::new(crate::tools::lsp::LspService::new()),
+        sandbox: None,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn sandbox_blocks_home_and_git_writes_and_allows_workspace_writes() {
+        use crate::config::SandboxMode;
+        use crate::sandbox::Sandbox;
+
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(workspace.join(".git")).unwrap();
+        std::fs::write(workspace.join(".git/config"), "[core]\n").unwrap();
+        let sandbox = match Sandbox::new(SandboxMode::WorkspaceWrite, workspace.clone()) {
+            Ok(sandbox) => sandbox,
+            Err(_) => return, // no backend on this host; fail-closed is unit-tested
+        };
+        let mut ctx = test_context(dir.path());
+        ctx.sandbox = Some(Arc::new(sandbox));
+
+        let ssh = BashTool
+            .call(&ctx, json!({"command": "cat ~/.ssh/id_ed25519"}))
+            .await;
+        assert!(ssh.is_error, "home read must fail: {}", ssh.content);
+
+        let inside = BashTool
+            .call(
+                &ctx,
+                json!({"command": "echo ok > inside.txt && cat inside.txt"}),
+            )
+            .await;
+        assert!(!inside.is_error, "{}", inside.content);
+        assert!(workspace.join("inside.txt").is_file());
+
+        let home = BashTool
+            .call(&ctx, json!({"command": "echo no > $HOME/outside.txt"}))
+            .await;
+        assert!(home.is_error, "$HOME write must fail: {}", home.content);
+
+        let git = BashTool
+            .call(&ctx, json!({"command": "echo no > .git/config"}))
+            .await;
+        assert!(git.is_error, ".git write must fail: {}", git.content);
+
+        if std::process::Command::new("curl")
+            .arg("--version")
+            .output()
+            .is_ok()
+        {
+            let net = BashTool
+                .call(
+                    &ctx,
+                    json!({"command": "curl -sS --max-time 2 https://example.com"}),
+                )
+                .await;
+            assert!(net.is_error, "network must be closed: {}", net.content);
+        }
+    }
+
+    #[tokio::test]
+    async fn read_only_sandbox_blocks_workspace_writes() {
+        use crate::config::SandboxMode;
+        use crate::sandbox::Sandbox;
+
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().canonicalize().unwrap();
+        let sandbox = match Sandbox::new(SandboxMode::ReadOnly, workspace.clone()) {
+            Ok(sandbox) => sandbox,
+            Err(_) => return,
+        };
+        let mut ctx = test_context(dir.path());
+        ctx.sandbox = Some(Arc::new(sandbox));
+
+        let denied = BashTool
+            .call(&ctx, json!({"command": "echo no > inside.txt"}))
+            .await;
+        assert!(denied.is_error, "{}", denied.content);
+
+        let temp = BashTool
+            .call(&ctx, json!({"command": "echo ok > /tmp/lh-sandbox-test"}))
+            .await;
+        assert!(
+            !temp.is_error,
+            "private /tmp must be writable: {}",
+            temp.content
+        );
+    }
 
     #[tokio::test]
     async fn timeout_terminates_process_group() {
