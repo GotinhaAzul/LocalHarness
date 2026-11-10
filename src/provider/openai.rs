@@ -525,6 +525,9 @@ fn build_body(req: &ChatRequest, include_usage: bool) -> Result<Value, ProviderE
     if !req.tools.is_empty() {
         body["tools"] = super::tools_payload(&req.tools);
         body["tool_choice"] = json!(req.tool_choice.as_deref().unwrap_or("auto"));
+        if let Some(parallel) = req.parallel_tool_calls {
+            body["parallel_tool_calls"] = json!(parallel);
+        }
     }
     if !req.stop.is_empty() {
         body["stop"] = json!(req.stop);
@@ -974,6 +977,7 @@ mod tests {
             ],
             tools: vec![],
             tool_choice: None,
+            parallel_tool_calls: None,
             temperature: 0.2,
             top_p: 0.95,
             max_tokens: 128,
@@ -1018,6 +1022,7 @@ mod tests {
             ],
             tools: vec![],
             tool_choice: None,
+            parallel_tool_calls: None,
             temperature: 0.2,
             top_p: 0.95,
             max_tokens: 128,

@@ -119,7 +119,7 @@ PASS  cargo  42 passed (3.1 s)
 
 ## 02 · Tools that know the codebase
 
-Twenty-four built-ins in three packs. `coding` (core + coding) is the default; `full` adds the security pack. `security` and `minimal` narrow it further.
+Twenty-four built-ins in three packs. `coding` (core + coding) is the default; `full` adds the security pack. `security` and `minimal` narrow it further; `strict` and `shell` are weak-model presets (see [configuration](docs/configuration.md#weak-model-profiles)).
 
 | Pack | Tools |
 |---|---|
@@ -205,7 +205,7 @@ Read [docs/security.md](docs/security.md) before using it on client work.
 
 Everything at the edge is configurable; the loop itself stays small and auditable.
 
-- **Profiles** select packs and tools. Built-ins are `coding` (default), `full`, `security`, and `minimal`; add your own in `profiles/*.toml` or `.harness/profiles/`.
+- **Profiles** select packs and tools. Built-ins are `coding` (default), `full`, `security`, `minimal`, `strict` (six tools, one call per message for weak models), and experimental `shell` (bash only); add your own in `profiles/*.toml` or `.harness/profiles/`.
 - **Prompt** customization lives in `[prompt]`: replace the one-line identity, append inline instructions, or point at a Markdown file. Per-profile prompts still apply on top.
 - **Skills** are Markdown instructions. The model loads a matching skill with the `skill` tool, or you load one with `/skill <name>`. Bundled security skills advertise only when the security pack is active and remain loadable by name.
 - **Workflows** are playbooks plus a profile and tool allowlist. The bundled set covers coding, review, general assistance, and security.

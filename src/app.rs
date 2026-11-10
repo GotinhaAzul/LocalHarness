@@ -293,6 +293,7 @@ pub async fn create_runtime(
     }
 
     let registry = ToolRegistry::builtin();
+    registry.lsp().set_gate(config.lsp.gate);
     let external_tools = external::load_tools(&paths, config.trust).unwrap_or_else(|err| {
         tracing::warn!(%err, "external tools were not loaded");
         Vec::new()
@@ -300,7 +301,7 @@ pub async fn create_runtime(
     let tools = registry
         .select(config.profile(), &external_tools)
         .map_err(anyhow::Error::msg)?;
-    let mut tool_specs = ToolRegistry::specs(&tools);
+    let mut tool_specs = ToolRegistry::specs_with(&tools, profile.short_tool_schemas());
     // With a background `model.start_command`, the server may not be up yet;
     // probing would stall the TUI for the request timeout. The probe runs on
     // the next rebuild (model switch/profile reload) instead.
@@ -500,14 +501,16 @@ pub async fn rebuild_core(old: &Arc<Core>, mut config: Config) -> Result<Arc<Cor
         Default::default()
     };
     let registry = ToolRegistry::builtin();
+    registry.lsp().set_gate(config.lsp.gate);
     let external_tools = external::load_tools(&old.paths, config.trust).unwrap_or_else(|err| {
         tracing::warn!(%err, "external tools were not loaded");
         Vec::new()
     });
+    let (_, mut model_profile) = config.model_profile();
     let tools = registry
         .select(config.profile(), &external_tools)
         .map_err(anyhow::Error::msg)?;
-    let mut tool_specs = ToolRegistry::specs(&tools);
+    let mut tool_specs = ToolRegistry::specs_with(&tools, model_profile.short_tool_schemas());
     let skills = SkillIndex::load(&old.paths, config.trust)
         .advertised_for(&crate::tools::active_packs(&tools));
     let repo_brief = registry
@@ -515,7 +518,6 @@ pub async fn rebuild_core(old: &Arc<Core>, mut config: Config) -> Result<Arc<Cor
         .brief(&old.paths.cwd, crate::tools::repo_map::BRIEF_BUDGET);
     let mut system_prompt =
         prompt::build_system_prompt(&config, &old.paths, &skills, &tools, Some(&repo_brief));
-    let (_, mut model_profile) = config.model_profile();
     // Same target: keep the conformance result unless it never ran. A model
     // switch probes again so the mode tracks the newly loaded server.
     let tool_probe = if same_target && old.tool_probe.is_some() {
