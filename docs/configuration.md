@@ -94,8 +94,13 @@ models and switches the current session without rewriting the config. Headless `
 error until a model is selected.
 
 `start_command` is optional. When set, it runs through `sh -c` once at startup
-if `GET /v1/models` fails, and the harness waits up to 30 seconds for the
-endpoint to answer. It is not run when the endpoint is already reachable, and it
+if `GET /v1/models` fails. With a model already configured it runs in the
+background: the TUI opens immediately, and the first turn waits for the endpoint
+instead of racing it. With no model configured the harness waits for the command
+before probing so a single exposed model can still be auto-selected. After a
+successful command the harness waits up to 30 seconds for the endpoint to
+answer; a command that exits non-zero is reported at once without waiting out
+the retry window. It is not run when the endpoint is already reachable, and it
 is not retried during the session. The command runs as the invoking user.
 
 ## Verify steps

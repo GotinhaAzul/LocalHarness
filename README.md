@@ -115,8 +115,8 @@ thinking/reasoning handling, and troubleshooting.
 
 The harness does not launch servers on its own. If an endpoint is down and you
 want it started automatically, set the optional `[model] start_command`; it runs
-once at startup, only when the endpoint is unreachable. See
-[docs/configuration.md](docs/configuration.md).
+once at startup, only when the endpoint is unreachable, without holding the TUI
+closed. See [docs/configuration.md](docs/configuration.md).
 
 ## Headless
 

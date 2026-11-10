@@ -307,6 +307,8 @@ struct App {
     quit: bool,
     fatal: Option<String>,
     notice: Option<(String, Role, Instant)>,
+    /// How many session warnings the transcript already shows.
+    warnings_seen: usize,
     token_events: VecDeque<(Instant, u64)>,
     tok_s: f32,
     /// The last model call's usage, with server and harness timings.
@@ -346,6 +348,7 @@ impl App {
             Ok(session) => session.warnings.clone(),
             Err(poison) => poison.into_inner().warnings.clone(),
         };
+        let warnings_seen = warnings.len();
         let used = estimate_used(&runtime.core);
         let window = runtime.core.effective_window().0;
         let trust = config.trust || options.trust;
@@ -383,6 +386,7 @@ impl App {
             quit: false,
             fatal: None,
             notice: None,
+            warnings_seen,
             token_events: VecDeque::new(),
             tok_s: 0.0,
             last_usage: None,
@@ -549,6 +553,27 @@ impl App {
 
     fn set_notice(&mut self, text: impl Into<String>, role: Role) {
         self.notice = Some((text.into(), role, Instant::now()));
+    }
+
+    /// Surface session warnings appended after launch (for example, a failed
+    /// background `model.start_command`).
+    fn sync_session_warnings(&mut self) {
+        let Some(runtime) = &self.runtime else {
+            return;
+        };
+        let warnings = match runtime.session.lock() {
+            Ok(session) => session.warnings.clone(),
+            Err(poison) => poison.into_inner().warnings.clone(),
+        };
+        if warnings.len() <= self.warnings_seen {
+            return;
+        }
+        for warning in &warnings[self.warnings_seen..] {
+            self.transcript
+                .push_note("session warning", warning.clone(), false);
+            self.set_notice(warning.clone(), Role::Warning);
+        }
+        self.warnings_seen = warnings.len();
     }
 
     fn refresh_session_blocks(&mut self) {
@@ -906,6 +931,7 @@ impl App {
 
     fn on_tick(&mut self) {
         self.spinner = (self.spinner + 1) % SPINNER.len();
+        self.sync_session_warnings();
         if let Some((_, _, at)) = &self.notice
             && at.elapsed() > Duration::from_secs(8)
         {

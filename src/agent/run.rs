@@ -61,6 +61,22 @@ pub async fn run_turn(
     tx: UnboundedSender<AgentEvent>,
     cancel: CancellationToken,
 ) -> TurnOutcome {
+    // A background `model.start_command` may still be bringing the endpoint
+    // up. Wait for it instead of racing the first request; cancellation wins.
+    if let Some(gate) = &core.startup {
+        if gate.pending() {
+            let _ = tx.send(AgentEvent::Notice(
+                "waiting for the model endpoint (model.start_command)".into(),
+            ));
+        }
+        if gate.ready(&cancel).await.is_none() {
+            let outcome = TurnOutcome::ok(TurnStatus::Cancelled);
+            let _ = tx.send(AgentEvent::State(AgentState::Cancelled));
+            let _ = tx.send(AgentEvent::TurnDone(outcome.clone()));
+            return outcome;
+        }
+    }
+
     let _ = tx.send(AgentEvent::TurnStarted {
         model: core.provider.model().to_string(),
         profile: core.config.profile_name().to_string(),

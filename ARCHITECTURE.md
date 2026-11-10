@@ -121,7 +121,11 @@ Probes improve accuracy but are never required.
 A missing endpoint or model never blocks the TUI. Startup probes with a short
 timeout; if no model resolves, the core is built in a logged-out state, the
 session records a warning, and `/login` later validates and applies the
-connection. Headless `--print` rejects the logged-out state.
+connection. Headless `--print` rejects the logged-out state. When a model is
+already selected, `[model] start_command` runs in the background: the TUI opens
+first and a turn waits on a startup gate for the endpoint, so a slow `ssh` or a
+failed command cannot hold the launch. A command that exits non-zero is
+reported at once instead of waiting out the 30-second retry window.
 
 Fallbacks: `context_window` from config (default 32768), and a calibrated
 characters-per-token ratio. Calibration is corrected from `usage.prompt_tokens`

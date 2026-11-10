@@ -74,11 +74,17 @@ async fn ensure_endpoint(
         .context("cannot run model.start_command")?;
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     if !output.status.success() {
+        // A failed command did not start the endpoint; waiting out the retry
+        // window only delays the diagnostic by another 30 seconds.
         tracing::warn!(
             status = %output.status,
             stderr = %stderr,
             "model.start_command exited non-zero"
         );
+        if stderr.is_empty() {
+            bail!("model.start_command failed ({})", output.status);
+        }
+        bail!("model.start_command failed ({}): {stderr}", output.status);
     }
     let deadline = tokio::time::Instant::now() + START_COMMAND_TIMEOUT;
     loop {
@@ -123,36 +129,44 @@ pub async fn create_runtime(
     }
 
     let mut model = config.model.model.trim().to_string();
-    let probe_provider = OpenAiCompatProvider::new(&config.model, model.clone())?;
+    let start_command = config.model.start_command.trim().to_string();
+    // With a model already selected, endpoint bring-up runs in the background
+    // so the TUI opens at once; the first turn waits for the gate. With no
+    // model it still runs first: auto-selection needs a reachable endpoint.
+    let deferred_start = !model.is_empty() && !start_command.is_empty();
     let mut startup_warnings = Vec::new();
-    if let Err(error) = ensure_endpoint(&probe_provider, &config.model).await {
-        tracing::warn!(%error, "model endpoint is not available");
-        startup_warnings.push(format!("model endpoint is not available: {error}"));
-    }
-    if model.is_empty() {
-        // The TUI must open without a model so the user can configure one with
-        // /login. Auto-select only when the endpoint is reachable and names one
-        // model; every other outcome becomes a warning, not a startup error.
-        let api = crate::provider::endpoint_urls(&config.model.endpoint).api;
-        let probed =
-            tokio::time::timeout(Duration::from_secs(3), probe::list_models(&probe_provider)).await;
-        match probed {
-            Ok(Ok(models)) => match models.len() {
-                0 => startup_warnings.push(format!(
-                    "not logged in: {api}/models reports no models; load a model, then run /login"
+    if !deferred_start {
+        let probe_provider = OpenAiCompatProvider::new(&config.model, model.clone())?;
+        if let Err(error) = ensure_endpoint(&probe_provider, &config.model).await {
+            tracing::warn!(%error, "model endpoint is not available");
+            startup_warnings.push(format!("model endpoint is not available: {error}"));
+        }
+        if model.is_empty() {
+            // The TUI must open without a model so the user can configure one
+            // with /login. Auto-select only when the endpoint is reachable and
+            // names one model; every other outcome becomes a warning.
+            let api = crate::provider::endpoint_urls(&config.model.endpoint).api;
+            let probed =
+                tokio::time::timeout(Duration::from_secs(3), probe::list_models(&probe_provider))
+                    .await;
+            match probed {
+                Ok(Ok(models)) => match models.len() {
+                    0 => startup_warnings.push(format!(
+                        "not logged in: {api}/models reports no models; load a model, then run /login"
+                    )),
+                    1 => model = models[0].clone(),
+                    _ => startup_warnings.push(format!(
+                        "not logged in: {api}/models exposes multiple models ({}); run /login <endpoint> <model>",
+                        models.join(", ")
+                    )),
+                },
+                Ok(Err(error)) => startup_warnings.push(format!(
+                    "not logged in: no model is set and {api}/models failed: {error}. Start the inference server, then run /login"
                 )),
-                1 => model = models[0].clone(),
-                _ => startup_warnings.push(format!(
-                    "not logged in: {api}/models exposes multiple models ({}); run /login <endpoint> <model>",
-                    models.join(", ")
+                Err(_) => startup_warnings.push(format!(
+                    "not logged in: no model is set and {api}/models did not answer within 3s. Start the inference server, then run /login"
                 )),
-            },
-            Ok(Err(error)) => startup_warnings.push(format!(
-                "not logged in: no model is set and {api}/models failed: {error}. Start the inference server, then run /login"
-            )),
-            Err(_) => startup_warnings.push(format!(
-                "not logged in: no model is set and {api}/models did not answer within 3s. Start the inference server, then run /login"
-            )),
+            }
         }
     }
     config.model.model = model.clone();
@@ -259,6 +273,36 @@ pub async fn create_runtime(
     let bg = Arc::new(Mutex::new(BgRegistry::new()));
     let session_handle: Handle = Arc::new(Mutex::new(session));
 
+    // The gateway may be down. Start it in the background so the TUI does not
+    // wait for the command and its retry window; turns wait on the gate.
+    let startup = if deferred_start {
+        let provider = OpenAiCompatProvider::new(&config.model, model.clone())?;
+        let model_config = config.model.clone();
+        let session = session_handle.clone();
+        let (handle, gate) = crate::agent::StartupGate::channel();
+        tokio::spawn(async move {
+            let result = ensure_endpoint(&provider, &model_config)
+                .await
+                .map_err(|error| format!("{error:#}"));
+            match &result {
+                Ok(()) => tracing::info!("model endpoint is ready"),
+                Err(error) => {
+                    tracing::warn!(%error, "model endpoint is not available");
+                    if let Ok(mut session) = session.lock() {
+                        session
+                            .warnings
+                            .push(format!("model endpoint is not available: {error}"));
+                        let _ = session.fsync();
+                    }
+                }
+            }
+            handle.finish(result);
+        });
+        Some(gate)
+    } else {
+        None
+    };
+
     let core = Core {
         config,
         paths,
@@ -282,6 +326,7 @@ pub async fn create_runtime(
         window_source,
         detected_window: Default::default(),
         window_cache,
+        startup,
     };
 
     Ok(Runtime {
@@ -357,6 +402,13 @@ pub async fn rebuild_core(old: &Arc<Core>, mut config: Config) -> Result<Arc<Cor
         window_source,
         detected_window,
         window_cache: old.window_cache.clone(),
+        // Endpoint bring-up is not retried on `/model` or `/login`; only a
+        // still-running bring-up for the same target carries over.
+        startup: if same_target {
+            old.startup.clone()
+        } else {
+            None
+        },
     }))
 }
 
@@ -579,6 +631,140 @@ mod tests {
                 .any(|warning| warning.contains("not logged in")),
             "missing login warning: {:?}",
             session.warnings
+        );
+    }
+
+    fn unreachable_endpoint() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        endpoint
+    }
+
+    #[tokio::test]
+    async fn failed_start_command_is_reported_without_the_retry_window() {
+        let mut config = Config::builtin();
+        config.model.endpoint = unreachable_endpoint();
+        config.model.model = "spark26".into();
+        config.model.start_command = "exit 7".into();
+        let provider =
+            OpenAiCompatProvider::new(&config.model, config.model.model.clone()).unwrap();
+
+        let started = std::time::Instant::now();
+        let error = ensure_endpoint(&provider, &config.model)
+            .await
+            .expect_err("a failed command must not wait for the endpoint");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "waited out the retry window: {error:#}"
+        );
+        assert!(
+            format!("{error:#}").contains("model.start_command failed"),
+            "{error:#}"
+        );
+    }
+
+    fn test_paths(dir: &std::path::Path) -> Paths {
+        let cwd = dir.join("work");
+        std::fs::create_dir_all(&cwd).unwrap();
+        Paths {
+            config_dir: dir.join("config"),
+            data_dir: dir.join("data"),
+            cwd,
+            project_id: "test".into(),
+            sessions_dir_override: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn start_command_does_not_hold_the_runtime_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(dir.path());
+        let mut config = Config::builtin();
+        config.model.endpoint = unreachable_endpoint();
+        config.model.model = "spark26".into();
+        config.model.start_command = "sleep 30".into();
+        config.model.context_window = Some(131_072);
+
+        let started = std::time::Instant::now();
+        let runtime = create_runtime(
+            config,
+            paths,
+            RuntimeOptions {
+                no_session: true,
+                ..RuntimeOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "create_runtime waited for model.start_command"
+        );
+        let gate = runtime
+            .core
+            .startup
+            .as_ref()
+            .expect("start_command should be backgrounded");
+        assert!(
+            gate.pending(),
+            "start_command finished before the runtime was returned"
+        );
+    }
+
+    #[tokio::test]
+    async fn background_start_failure_becomes_a_session_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(dir.path());
+        let mut config = Config::builtin();
+        config.model.endpoint = unreachable_endpoint();
+        config.model.model = "spark26".into();
+        config.model.start_command = "exit 7".into();
+        config.model.context_window = Some(131_072);
+
+        let runtime = create_runtime(
+            config,
+            paths,
+            RuntimeOptions {
+                no_session: true,
+                ..RuntimeOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        let gate = runtime.core.startup.as_ref().unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            gate.ready(&CancellationToken::new()),
+        )
+        .await
+        .expect("bring-up did not finish")
+        .expect("bring-up was cancelled");
+        assert!(result.is_err());
+        let session = runtime.session.lock().unwrap();
+        assert!(
+            session
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("model.start_command failed")),
+            "missing warning: {:?}",
+            session.warnings
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_gate_releases_waiters_on_result_and_cancel() {
+        let (handle, gate) = crate::agent::StartupGate::channel();
+        assert!(gate.pending());
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        assert!(gate.ready(&cancelled).await.is_none());
+
+        handle.finish(Err("endpoint down".into()));
+        assert!(!gate.pending());
+        assert_eq!(
+            gate.ready(&CancellationToken::new()).await,
+            Some(Err("endpoint down".to_string()))
         );
     }
 }

@@ -174,6 +174,7 @@ fn harness_config(dir: &std::path::Path, scripts: Vec<Script>, config: Config) -
         window_source: localharness::agent::WindowSource::Default,
         detected_window: Default::default(),
         window_cache: Default::default(),
+        startup: None,
     };
     Harness {
         core: Arc::new(core),

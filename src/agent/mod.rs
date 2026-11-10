@@ -11,7 +11,7 @@ pub mod run;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::{mpsc::UnboundedSender, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -59,6 +59,62 @@ pub struct Core {
     /// Windows learned per `endpoint|model`, shared across core rebuilds so
     /// switching models back and forth keeps what was detected.
     pub window_cache: Arc<Mutex<std::collections::HashMap<String, u32>>>,
+    /// Endpoint bring-up (`model.start_command`) still running in the
+    /// background. Turns wait for it so the first request does not race the
+    /// server. `None` when nothing was started or it finished before launch.
+    pub startup: Option<StartupGate>,
+}
+
+/// One-time endpoint bring-up that outlives the launch path. The TUI opens
+/// immediately; a turn waits for the gate instead of failing against a server
+/// that is still starting.
+#[derive(Clone)]
+pub struct StartupGate {
+    state: watch::Receiver<Option<Result<(), String>>>,
+}
+
+impl StartupGate {
+    /// Create the gate and the handle its background task finishes with.
+    pub fn channel() -> (StartupHandle, Self) {
+        let (state, watch) = watch::channel(None);
+        (StartupHandle { state }, Self { state: watch })
+    }
+
+    /// Whether the background task has not reported yet.
+    pub fn pending(&self) -> bool {
+        self.state.borrow().is_none()
+    }
+
+    /// Wait for the background task. `None` means `cancel` fired first. A
+    /// dropped task (panic or shutdown) counts as finished.
+    pub async fn ready(&self, cancel: &CancellationToken) -> Option<Result<(), String>> {
+        let mut state = self.state.clone();
+        let waited = async {
+            loop {
+                if let Some(result) = state.borrow().clone() {
+                    return result;
+                }
+                if state.changed().await.is_err() {
+                    return Ok(());
+                }
+            }
+        };
+        tokio::select! {
+            _ = cancel.cancelled() => None,
+            result = waited => Some(result),
+        }
+    }
+}
+
+/// Sends the outcome of the background bring-up exactly once.
+pub struct StartupHandle {
+    state: watch::Sender<Option<Result<(), String>>>,
+}
+
+impl StartupHandle {
+    pub fn finish(self, result: Result<(), String>) {
+        let _ = self.state.send(Some(result));
+    }
 }
 
 /// Origin of the context window, shown in the UI so a fallback guess is never
