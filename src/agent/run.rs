@@ -2298,6 +2298,7 @@ mod tests {
             window_notice_sent: std::sync::Once::new(),
             detected_window: Default::default(),
             window_cache: Default::default(),
+            mcp: Default::default(),
             startup: None,
         }
     }

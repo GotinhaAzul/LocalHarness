@@ -286,13 +286,9 @@ pub async fn create_runtime(
     }
 
     let registry = ToolRegistry::builtin();
-    let external_tools = external::load_tools(&paths, config.trust).unwrap_or_else(|err| {
-        tracing::warn!(%err, "external tools were not loaded");
-        Vec::new()
-    });
-    let tools = registry
-        .select(config.profile(), &external_tools)
-        .map_err(anyhow::Error::msg)?;
+    let mcp = Arc::new(crate::mcp::McpManager::new());
+    let (tools, mcp_warnings) = select_tools(&registry, &config, &paths, &mcp).await?;
+    session.warnings.extend(mcp_warnings);
     let tool_specs = ToolRegistry::specs(&tools);
     let skills =
         SkillIndex::load(&paths, config.trust).advertised_for(&crate::tools::active_packs(&tools));
@@ -411,12 +407,89 @@ pub async fn create_runtime(
         detected_window: Default::default(),
         window_cache,
         startup,
+        mcp,
     };
 
     Ok(Runtime {
         core: Arc::new(core),
         session: session_handle,
     })
+}
+
+/// Built-in packs, explicit profile tools, external tools, and MCP tools for
+/// the active profile. MCP problems are returned as warnings; only an unknown
+/// tool or server name in the profile is an error.
+pub async fn select_tools(
+    registry: &ToolRegistry,
+    config: &Config,
+    paths: &Paths,
+    mcp: &crate::mcp::McpManager,
+) -> Result<(Vec<Arc<dyn crate::tools::Tool>>, Vec<String>)> {
+    let mut pool = external::load_tools(paths, config.trust).unwrap_or_else(|err| {
+        tracing::warn!(%err, "external tools were not loaded");
+        Vec::new()
+    });
+    let mut reserved = registry.names();
+    reserved.extend(pool.iter().map(|tool| tool.name()));
+    let resolution = mcp.resolve(config, &paths.cwd, &reserved).await;
+    let mut warnings = resolution.warnings.clone();
+    pool.extend(resolution.all().cloned());
+
+    // `mcp:<server>` entries and tools of servers that failed to start are
+    // handled here; everything else goes through the normal selection.
+    let mut profile = config.profile().clone();
+    let mut server_refs = Vec::new();
+    profile.tools.retain(|entry| {
+        if let Some(server) = entry.strip_prefix("mcp:") {
+            server_refs.push(server.to_string());
+            return false;
+        }
+        let from_mcp = config
+            .mcp
+            .keys()
+            .any(|server| entry.starts_with(&format!("{server}{}", crate::mcp::SEPARATOR)));
+        if from_mcp && !pool.iter().any(|tool| tool.name() == entry) {
+            warnings.push(format!(
+                "profile tool `{entry}` is not available: its MCP server did not provide it"
+            ));
+            return false;
+        }
+        true
+    });
+    let mut tools = registry
+        .select(&profile, &pool)
+        .map_err(anyhow::Error::msg)?;
+    let mut push = |tool: &Arc<dyn crate::tools::Tool>| {
+        if !tools.iter().any(|t| t.name() == tool.name()) {
+            tools.push(tool.clone());
+        }
+    };
+    for server in server_refs {
+        match resolution.by_server.get(&server) {
+            Some(server_tools) => server_tools.iter().for_each(&mut push),
+            None if config.mcp.contains_key(&server) => {
+                // Disabled or failed; `resolve` already warned about failures.
+                if config.mcp.get(&server).is_some_and(|s| !s.enabled) {
+                    warnings.push(format!(
+                        "profile names `mcp:{server}`, but [mcp.{server}] has enabled = false"
+                    ));
+                }
+            }
+            None => {
+                let known: Vec<&str> = config.mcp.keys().map(String::as_str).collect();
+                anyhow::bail!(
+                    "profile names unknown MCP server `{server}`; configured servers: {}",
+                    if known.is_empty() {
+                        "none (add an [mcp.<name>] table)".to_string()
+                    } else {
+                        known.join(", ")
+                    }
+                );
+            }
+        }
+    }
+    resolution.auto.iter().for_each(&mut push);
+    Ok((tools, warnings))
 }
 
 /// Rebuild the core between turns after a config change (`/model`,
@@ -444,13 +517,15 @@ pub async fn rebuild_core(old: &Arc<Core>, mut config: Config) -> Result<Arc<Cor
         Default::default()
     };
     let registry = ToolRegistry::builtin();
-    let external_tools = external::load_tools(&old.paths, config.trust).unwrap_or_else(|err| {
-        tracing::warn!(%err, "external tools were not loaded");
-        Vec::new()
-    });
-    let tools = registry
-        .select(config.profile(), &external_tools)
-        .map_err(anyhow::Error::msg)?;
+    let (tools, mcp_warnings) = select_tools(&registry, &config, &old.paths, &old.mcp).await?;
+    if !mcp_warnings.is_empty() {
+        for warning in &mcp_warnings {
+            tracing::warn!("{warning}");
+        }
+        if let Ok(mut session) = old.session.lock() {
+            session.warnings.extend(mcp_warnings);
+        }
+    }
     let tool_specs = ToolRegistry::specs(&tools);
     let skills = SkillIndex::load(&old.paths, config.trust)
         .advertised_for(&crate::tools::active_packs(&tools));
@@ -518,6 +593,7 @@ pub async fn rebuild_core(old: &Arc<Core>, mut config: Config) -> Result<Arc<Cor
         window_notice_sent: std::sync::Once::new(),
         detected_window,
         window_cache: old.window_cache.clone(),
+        mcp: old.mcp.clone(),
         // Endpoint bring-up is not retried on `/model` or `/login`; only a
         // still-running bring-up for the same target carries over.
         startup: if same_target {

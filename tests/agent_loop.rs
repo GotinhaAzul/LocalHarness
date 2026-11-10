@@ -147,6 +147,16 @@ fn harness(dir: &std::path::Path, scripts: Vec<Script>, tools: &[&str]) -> Harne
 }
 
 fn harness_config(dir: &std::path::Path, scripts: Vec<Script>, config: Config) -> Harness {
+    harness_with_extra(dir, scripts, config, Vec::new())
+}
+
+/// Like `harness_config`, with extra tools (MCP, external) after the profile's.
+fn harness_with_extra(
+    dir: &std::path::Path,
+    scripts: Vec<Script>,
+    config: Config,
+    extra: Vec<Arc<dyn localharness::Tool>>,
+) -> Harness {
     let mut paths = Paths::discover(dir).unwrap();
     paths.data_dir = dir.join("data");
     paths.config_dir = dir.join("config");
@@ -167,7 +177,8 @@ fn harness_config(dir: &std::path::Path, scripts: Vec<Script>, config: Config) -
     let session: SessionHandle = Arc::new(Mutex::new(session));
     let artifacts = session.lock().unwrap().artifacts.clone();
     let registry = ToolRegistry::builtin();
-    let selected = registry.select(config.profile(), &[]).unwrap();
+    let mut selected = registry.select(config.profile(), &[]).unwrap();
+    selected.extend(extra);
     let provider = Arc::new(ScriptedProvider {
         scripts: Mutex::new(scripts.into()),
         requests: Mutex::new(Vec::new()),
@@ -204,6 +215,7 @@ fn harness_config(dir: &std::path::Path, scripts: Vec<Script>, config: Config) -
         detected_window: Default::default(),
         window_cache: Default::default(),
         startup: None,
+        mcp: Default::default(),
     };
     Harness {
         core: Arc::new(core),
@@ -1303,4 +1315,58 @@ async fn the_model_loads_a_skill_and_it_arrives_whole() {
     let last = requests.last().unwrap();
     let sent = format!("{:?}", last.messages);
     assert!(sent.contains("[skill: security-red]"));
+}
+
+#[tokio::test]
+async fn model_calls_an_mcp_tool_through_the_loop() {
+    let python = std::process::Command::new("python3")
+        .arg("--version")
+        .output()
+        .is_ok_and(|out| out.status.success());
+    if !python {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let fixture =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mcp_stdio_server.py");
+    let mut config = base_config();
+    config.mcp.insert(
+        "fx".into(),
+        localharness::config::McpServerConfig {
+            command: "python3".into(),
+            args: vec![fixture.display().to_string()],
+            ..Default::default()
+        },
+    );
+    let manager = localharness::mcp::McpManager::new();
+    let resolution = manager.resolve(&config, dir.path(), &[]).await;
+    assert!(resolution.warnings.is_empty(), "{:?}", resolution.warnings);
+    let harness = harness_with_extra(
+        dir.path(),
+        vec![
+            tool_script("fx__echo", serde_json::json!({"text": "through the loop"})),
+            text_script("The server echoed it."),
+        ],
+        config,
+        resolution.auto.clone(),
+    );
+    let (outcome, _) = run(&harness, "echo something via MCP").await;
+    assert_eq!(outcome.status, TurnStatus::Done);
+    assert!(
+        tool_results(&harness.session)
+            .iter()
+            .any(|result| result.contains("echo: through the loop")),
+        "{:?}",
+        tool_results(&harness.session)
+    );
+    {
+        let requests = harness.provider.requests.lock().unwrap();
+        let spec = requests[0]
+            .tools
+            .iter()
+            .find(|tool| tool.name == "fx__echo")
+            .expect("the MCP tool is advertised to the model");
+        assert_eq!(spec.parameters["required"], serde_json::json!(["text"]));
+    }
+    manager.shutdown().await;
 }

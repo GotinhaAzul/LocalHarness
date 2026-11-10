@@ -120,6 +120,31 @@ pub enum Command {
         #[arg(long)]
         fix: bool,
     },
+    /// Inspect and exercise configured MCP servers.
+    Mcp {
+        #[command(subcommand)]
+        action: McpCommand,
+    },
+}
+
+#[derive(Debug, clap::Subcommand)]
+pub enum McpCommand {
+    /// Connect to every enabled server and list its tools.
+    List {
+        /// Emit one stable JSON object.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Call one tool directly, bypassing the model.
+    Call {
+        /// Server name from [mcp.<name>].
+        server: String,
+        /// Remote tool name as the server advertises it.
+        tool: String,
+        /// Arguments as a JSON object.
+        #[arg(default_value = "{}")]
+        args: String,
+    },
 }
 
 pub async fn run(cli: Cli) -> Result<i32> {
@@ -198,6 +223,9 @@ pub async fn run(cli: Cli) -> Result<i32> {
     if let Some(Command::Doctor { json, fix }) = &cli.command {
         return run_doctor(&config, &paths, *json, *fix).await;
     }
+    if let Some(Command::Mcp { action }) = &cli.command {
+        return run_mcp(&config, &paths, action).await;
+    }
 
     let resume = match (&cli.resume, cli.continue_last) {
         (Some(id_or_path), _) => {
@@ -253,7 +281,10 @@ pub async fn run(cli: Cli) -> Result<i32> {
         );
     }
 
-    match cli.print.clone() {
+    // Every core rebuild shares this manager, so one shutdown stops every
+    // MCP server this process started.
+    let mcp = runtime.core.mcp.clone();
+    let outcome = match cli.print.clone() {
         Some(prompt) => run_headless(runtime, prompt, cli.json).await,
         None => {
             let ui_options = UiOptions {
@@ -262,10 +293,11 @@ pub async fn run(cli: Cli) -> Result<i32> {
                 skills: crate::skills::SkillIndex::load(&paths, trust)
                     .advertised_for(&crate::tools::active_packs(&runtime.core.tools)),
             };
-            ui::run(runtime, ui_options).await?;
-            Ok(0)
+            ui::run(runtime, ui_options).await.map(|()| 0)
         }
-    }
+    };
+    mcp.shutdown().await;
+    outcome
 }
 
 /// `lh doctor`: fingerprint the engine and print a capability manifest. Only
@@ -305,6 +337,138 @@ async fn run_doctor(config: &Config, paths: &Paths, json: bool, fix: bool) -> Re
         tracing::warn!(%error, "cannot write the doctor cache");
     }
     Ok(0)
+}
+
+/// `lh mcp`: connect to configured servers without starting a model turn.
+async fn run_mcp(config: &Config, paths: &Paths, action: &McpCommand) -> Result<i32> {
+    match action {
+        McpCommand::List { json } => {
+            let probes = crate::mcp::McpManager::probe_all(config, &paths.cwd).await;
+            let disabled: Vec<&String> = config
+                .mcp
+                .iter()
+                .filter(|(_, server)| !server.enabled)
+                .map(|(name, _)| name)
+                .collect();
+            let failed = probes.iter().filter(|(_, _, r)| r.is_err()).count();
+            if *json {
+                let servers: Vec<serde_json::Value> = probes
+                    .iter()
+                    .map(|(name, server, result)| {
+                        let transport = if server.url.trim().is_empty() {
+                            "stdio"
+                        } else {
+                            "http"
+                        };
+                        match result {
+                            Ok((info, tools)) => json!({
+                                "name": name,
+                                "transport": transport,
+                                "ok": true,
+                                "server": info.name,
+                                "version": info.version,
+                                "protocol": info.protocol,
+                                "tools": tools.iter().map(|tool| json!({
+                                    "name": tool.name,
+                                    "exposed_as": crate::mcp::exposed_name(name, &tool.name),
+                                    "description": tool.description,
+                                    "read_only": tool.read_only,
+                                })).collect::<Vec<_>>(),
+                            }),
+                            Err(error) => json!({
+                                "name": name,
+                                "transport": transport,
+                                "ok": false,
+                                "error": error.to_string(),
+                            }),
+                        }
+                    })
+                    .collect();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "servers": servers,
+                        "disabled": disabled,
+                    }))?
+                );
+            } else if config.mcp.is_empty() {
+                println!(
+                    "no MCP servers configured; add an [mcp.<name>] table to {}",
+                    paths.config_file().display()
+                );
+            } else {
+                for (name, server, result) in &probes {
+                    let transport = if server.url.trim().is_empty() {
+                        "stdio"
+                    } else {
+                        "http"
+                    };
+                    match result {
+                        Ok((info, tools)) => {
+                            println!(
+                                "{name} ({transport}): ok · {} {} · protocol {} · {} tool{}",
+                                info.name,
+                                info.version,
+                                info.protocol,
+                                tools.len(),
+                                if tools.len() == 1 { "" } else { "s" }
+                            );
+                            for tool in tools {
+                                let hidden = (!server.tools.is_empty()
+                                    && !server.tools.contains(&tool.name))
+                                    || server.exclude_tools.contains(&tool.name);
+                                let first_line =
+                                    tool.description.lines().next().unwrap_or("").trim();
+                                println!(
+                                    "  {}{}{}",
+                                    crate::mcp::exposed_name(name, &tool.name),
+                                    if hidden { " (filtered out)" } else { "" },
+                                    if first_line.is_empty() {
+                                        String::new()
+                                    } else {
+                                        format!(" — {first_line}")
+                                    }
+                                );
+                            }
+                        }
+                        Err(error) => println!("{name} ({transport}): FAILED · {error}"),
+                    }
+                }
+                for name in disabled {
+                    println!("{name}: disabled");
+                }
+            }
+            Ok(if failed > 0 { 1 } else { 0 })
+        }
+        McpCommand::Call { server, tool, args } => {
+            let Some(server_config) = config.mcp.get(server) else {
+                bail!(
+                    "no [mcp.{server}] in the config; configured servers: {}",
+                    config.mcp.keys().cloned().collect::<Vec<_>>().join(", ")
+                );
+            };
+            let args: serde_json::Value =
+                serde_json::from_str(args).context("arguments must be a JSON object")?;
+            if !args.is_object() {
+                bail!("arguments must be a JSON object, for example '{{\"query\": \"x\"}}'");
+            }
+            let client = crate::mcp::McpClient::new(server, server_config.clone(), &paths.cwd);
+            let cancel = CancellationToken::new();
+            let outcome = client.call_tool(tool, args, &cancel).await;
+            client.close().await;
+            match outcome {
+                Ok(result) => {
+                    let converted = crate::mcp::convert_result(server, tool, &result);
+                    println!("{}", converted.content);
+                    Ok(if converted.is_error { 1 } else { 0 })
+                }
+                Err(error) => {
+                    eprintln!("MCP call failed: {error}");
+                    Ok(1)
+                }
+            }
+        }
+    }
 }
 
 async fn run_headless(runtime: crate::app::Runtime, prompt: String, json: bool) -> Result<i32> {

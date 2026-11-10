@@ -11,6 +11,7 @@ pub mod context;
 pub mod doctor;
 pub mod external;
 pub mod git;
+pub mod mcp;
 pub mod paths;
 pub mod provider;
 pub mod sandbox;

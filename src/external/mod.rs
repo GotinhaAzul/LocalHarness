@@ -435,7 +435,7 @@ static INTERNER: LazyLock<Interner> = LazyLock::new(|| Interner {
     strings: Mutex::new(HashMap::new()),
 });
 
-fn intern(text: &str) -> &'static str {
+pub(crate) fn intern(text: &str) -> &'static str {
     let mut strings = match INTERNER.strings.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
@@ -513,7 +513,11 @@ fn scalar_text(manifest: &Manifest, key: &str, value: &Value) -> Result<String, 
 
 /// Validate required keys and declared primitive types. Unknown keys are
 /// allowed: they still reach the tool on stdin.
-fn validate_args(tool: &str, args: &Map<String, Value>, schema: &Value) -> Result<(), String> {
+pub(crate) fn validate_args(
+    tool: &str,
+    args: &Map<String, Value>,
+    schema: &Value,
+) -> Result<(), String> {
     if let Some(required) = schema.get("required").and_then(Value::as_array) {
         for key in required.iter().filter_map(Value::as_str) {
             if !args.contains_key(key) {
@@ -631,7 +635,7 @@ fn truncate_description(text: &str) -> String {
     out
 }
 
-fn cap_content(content: String) -> String {
+pub(crate) fn cap_content(content: String) -> String {
     if content.len() <= CONTENT_CAP {
         return content;
     }
@@ -646,7 +650,7 @@ fn cap_content(content: String) -> String {
     )
 }
 
-fn cap_details(value: Value) -> Value {
+pub(crate) fn cap_details(value: Value) -> Value {
     match serde_json::to_string(&value) {
         Ok(serialized) if serialized.len() <= DETAILS_CAP => value,
         Ok(serialized) => json!({
