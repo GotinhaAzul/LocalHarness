@@ -131,6 +131,7 @@ mod tests {
                 profile: "full".into(),
                 app: "test".into(),
                 context: None,
+                redact: true,
             },
             true,
         )
