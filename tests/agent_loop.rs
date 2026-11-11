@@ -14,7 +14,7 @@ use localharness::provider::{
     ChatMessage, ChatRequest, ErrorClass, Provider, ProviderError, StreamEvent, StreamItem, Usage,
 };
 use localharness::security::SecurityState;
-use localharness::session::{CompactionData, EntryKind, Session, SessionData};
+use localharness::session::{CompactionData, EntryKind, Session, SessionData, ToolResultData};
 use localharness::tools::{BgRegistry, ReadTracker, SessionHandle, ToolRegistry};
 use serde_json::json;
 use tokio::sync::mpsc::UnboundedSender;
@@ -101,6 +101,15 @@ fn text_script(text: &str) -> Script {
     ])
 }
 
+/// Text without a usage report, so a long synthetic transcript cannot trip the
+/// prompt-token shortfall heuristic.
+fn bare_text_script(text: &str) -> Script {
+    Script::Events(vec![
+        StreamEvent::Delta(text.into()),
+        StreamEvent::Finish("stop".into()),
+    ])
+}
+
 fn tool_script(name: &str, args: serde_json::Value) -> Script {
     Script::Events(vec![
         StreamEvent::ToolCallDelta {
@@ -111,6 +120,26 @@ fn tool_script(name: &str, args: serde_json::Value) -> Script {
         },
         StreamEvent::Finish("tool_calls".into()),
     ])
+}
+
+fn parallel_tool_script(calls: &[(&str, serde_json::Value)]) -> Script {
+    let mut events = Vec::new();
+    for (index, (name, args)) in calls.iter().enumerate() {
+        events.push(StreamEvent::ToolCallDelta {
+            index,
+            id: Some(format!("call_{}", index + 1)),
+            name: Some((*name).into()),
+            arguments: Some(args.to_string()),
+        });
+    }
+    events.push(StreamEvent::Finish("tool_calls".into()));
+    Script::Events(events)
+}
+
+fn harness_with_profile(dir: &std::path::Path, scripts: Vec<Script>, profile: &str) -> Harness {
+    let mut config = base_config();
+    config.profile_name = profile.into();
+    harness_config(dir, scripts, config)
 }
 
 struct Harness {
@@ -169,6 +198,7 @@ fn harness_with_extra(
             model: "test-model".into(),
             profile: "test".into(),
             app: "test".into(),
+            redact: true,
             context: None,
         },
         true,
@@ -179,21 +209,28 @@ fn harness_with_extra(
     let registry = ToolRegistry::builtin();
     let mut selected = registry.select(config.profile(), &[]).unwrap();
     selected.extend(extra);
+    let (_, model_profile) = config.model_profile();
+    let tool_specs = ToolRegistry::specs_with(&selected, model_profile.short_tool_schemas());
     let provider = Arc::new(ScriptedProvider {
         scripts: Mutex::new(scripts.into()),
         requests: Mutex::new(Vec::new()),
         strict_system: AtomicBool::new(false),
     });
+    let budget = TokenBudget::new(config.context_window(), config.model.max_output_tokens);
+    let tool_specs_json = localharness::provider::tools_json(&tool_specs);
+    let tool_specs_cost = localharness::context::ToolSpecCost::from_json(&tool_specs_json, &budget);
     let core = Core {
-        budget: TokenBudget::new(config.context_window(), config.model.max_output_tokens),
+        budget,
         static_prompt: localharness::context::StaticPrompt::default(),
+        tool_specs_cost,
         tokenize: false,
         limits: localharness::agent::RunLimits::from(&config.budgets),
         config,
         paths: paths.clone(),
         provider: provider.clone(),
         registry,
-        tool_specs: ToolRegistry::specs(&selected),
+        tool_specs,
+        tool_specs_json,
         tools: selected,
         session: session.clone(),
         artifacts,
@@ -203,7 +240,8 @@ fn harness_with_extra(
         sandbox: None,
         system_prompt: "system".into(),
         repo_brief: String::new(),
-        model_profile: localharness::config::ModelProfile::default(),
+        model_profile,
+        tool_probe: None,
         cancel: CancellationToken::new(),
         tool_timeout: std::time::Duration::from_secs(10),
         path_jail: false,
@@ -302,6 +340,55 @@ async fn bash_records_evidence_and_findings_link_to_it() {
             .and_then(|reference| reference.artifact.as_deref()),
         Some(evidence.artifact.as_str())
     );
+}
+
+#[tokio::test]
+async fn bash_secrets_are_redacted_in_session_and_evidence() {
+    const KEY: &str = "AKIAIOSFODNN7EXAMPLE";
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness(
+        dir.path(),
+        vec![
+            tool_script("bash", json!({"command": format!("echo {KEY}")})),
+            text_script("done"),
+        ],
+        &["bash"],
+    );
+    {
+        let mut state = harness.core.security.lock().unwrap();
+        state
+            .ensure_engagement(&harness.core.paths)
+            .expect("engagement");
+    }
+    let (outcome, _) = run(&harness, "run a command").await;
+    assert_eq!(outcome.status, TurnStatus::Done);
+
+    {
+        let session = harness.session.lock().unwrap();
+        let entry = session
+            .branch_entries()
+            .into_iter()
+            .find(|entry| entry.is_tool_result())
+            .expect("tool result");
+        let content = &entry.tool_result().expect("tool result data").content;
+        assert!(!content.contains(KEY), "{content}");
+        assert!(content.contains("[REDACTED:aws:AKIA..."), "{content}");
+    }
+
+    let state = harness.core.security.lock().unwrap();
+    let engagement = state.engagement.as_ref().expect("engagement");
+    let evidence = &engagement.evidence.list()[0];
+    assert!(evidence.redacted);
+    let raw = format!("stdout:\n{KEY}\n");
+    assert_eq!(
+        evidence.sha256,
+        localharness::security::evidence::sha256_hex(raw.as_bytes()),
+        "the digest still describes raw output"
+    );
+    let (_, artifact) = engagement.evidence.read(&evidence.id).unwrap();
+    assert!(!artifact.contains(KEY), "{artifact}");
+    assert!(artifact.contains("[REDACTED:aws:AKIA..."), "{artifact}");
+    assert!(engagement.evidence.verify(&evidence.id).unwrap().1);
 }
 
 #[tokio::test]
@@ -430,6 +517,18 @@ fn tool_results(session: &SessionHandle) -> Vec<String> {
         .collect()
 }
 
+fn executed_glob_results(session: &SessionHandle) -> usize {
+    let session = session.lock().unwrap();
+    session
+        .branch_entries()
+        .iter()
+        .filter(|entry| {
+            matches!(&entry.kind, EntryKind::ToolResult(result)
+                if !result.is_error && result.content.starts_with("[tool] glob"))
+        })
+        .count()
+}
+
 fn last_assistant(session: &SessionHandle) -> String {
     let session = session.lock().unwrap();
     session
@@ -474,6 +573,100 @@ fn finish_script(deltas: &[&str], finish: &str) -> Script {
         .collect();
     events.push(StreamEvent::Finish(finish.into()));
     Script::Events(events)
+}
+
+#[tokio::test]
+async fn duplicate_engine_ids_get_distinct_internal_ids_and_results() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.rs"), "a\n").unwrap();
+    std::fs::write(dir.path().join("b.rs"), "b\n").unwrap();
+    let harness = harness(
+        dir.path(),
+        vec![
+            Script::Events(vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call_1".into()),
+                    name: Some("read".into()),
+                    arguments: Some("{\"path\":\"a.rs\"}".into()),
+                },
+                StreamEvent::ToolCallDelta {
+                    index: 1,
+                    id: Some("call_1".into()),
+                    name: Some("read".into()),
+                    arguments: Some("{\"path\":\"b.rs\"}".into()),
+                },
+                StreamEvent::Finish("tool_calls".into()),
+            ]),
+            text_script("done"),
+        ],
+        &["read"],
+    );
+    let (outcome, _) = run(&harness, "read both").await;
+    assert_eq!(outcome.status, TurnStatus::Done);
+    let call_ids: Vec<String> = assistants(&harness.session)
+        .into_iter()
+        .flat_map(|assistant| assistant.tool_calls.unwrap_or_default())
+        .map(|call| call.id)
+        .collect();
+    assert_eq!(call_ids, ["call_0001", "call_0002"]);
+    assert_eq!(tool_results(&harness.session).len(), 2);
+}
+
+#[tokio::test]
+async fn internal_call_ids_increase_across_turns() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.rs"), "a\n").unwrap();
+    let harness = harness(
+        dir.path(),
+        vec![
+            tool_script("read", json!({"path":"a.rs"})),
+            text_script("one"),
+            tool_script("read", json!({"path":"a.rs"})),
+            text_script("two"),
+        ],
+        &["read"],
+    );
+    run(&harness, "first").await;
+    run(&harness, "second").await;
+    let call_ids: Vec<String> = assistants(&harness.session)
+        .into_iter()
+        .flat_map(|assistant| assistant.tool_calls.unwrap_or_default())
+        .map(|call| call.id)
+        .collect();
+    assert_eq!(call_ids, ["call_0001", "call_0002"]);
+}
+
+#[tokio::test]
+async fn a_missing_tool_result_fails_before_the_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness(dir.path(), vec![text_script("unused")], &["read"]);
+    harness
+        .session
+        .lock()
+        .unwrap()
+        .append(EntryKind::Assistant(localharness::session::AssistantData {
+            tool_calls: Some(vec![localharness::session::ToolCall {
+                id: "call_0001".into(),
+                name: "read".into(),
+                arguments: json!({"path":"a.rs"}),
+            }]),
+            ..Default::default()
+        }))
+        .unwrap();
+    let (outcome, events) = run(&harness, "continue").await;
+    assert_eq!(outcome.status, TurnStatus::Error);
+    let (code, message) = outcome.error.expect("typed pair error");
+    assert_eq!(code, "tool_result_missing");
+    assert!(message.contains("call_0001"), "{message}");
+    assert_eq!(
+        harness.provider.requests.lock().unwrap().len(),
+        0,
+        "the request must not be sent with an unanswered call"
+    );
+    assert!(events.iter().any(
+        |event| matches!(event, AgentEvent::Error { code, .. } if code == "tool_result_missing")
+    ));
 }
 
 #[tokio::test]
@@ -593,35 +786,33 @@ async fn output_limit_cut_tool_call_does_not_run() {
     let dir = tempfile::tempdir().unwrap();
     let harness = harness(
         dir.path(),
-        vec![
-            Script::Events(vec![
-                StreamEvent::ToolCallDelta {
-                    index: 0,
-                    id: Some("call_1".into()),
-                    name: Some("write".into()),
-                    arguments: Some("{\"path\":\"big.rs\",\"content\":\"fn a() {}\\nfn b".into()),
-                },
-                StreamEvent::Finish("length".into()),
-            ]),
-            text_script("I will write it in parts."),
-        ],
+        vec![Script::Events(vec![
+            StreamEvent::ToolCallDelta {
+                index: 0,
+                id: Some("call_1".into()),
+                name: Some("write".into()),
+                arguments: Some("{\"path\":\"big.rs\",\"content\":\"fn a() {}\\nfn b".into()),
+            },
+            StreamEvent::Finish("length".into()),
+        ])],
         &["write"],
     );
     let (outcome, events) = run(&harness, "write big.rs").await;
-    assert_eq!(outcome.status, TurnStatus::Done);
+    assert_eq!(outcome.status, TurnStatus::Error);
+    let (code, message) = outcome.error.expect("typed truncation error");
+    assert_eq!(code, "tool_call_truncated");
+    assert!(message.contains("incomplete"), "{message}");
     assert!(!dir.path().join("big.rs").exists());
     assert!(tool_results(&harness.session).is_empty());
-    let nudges = user_messages(&harness.session);
-    assert!(
-        nudges
-            .iter()
-            .any(|m| m.contains("while writing the write call")),
-        "{nudges:?}"
+    assert_eq!(
+        harness.provider.requests.lock().unwrap().len(),
+        1,
+        "a truncated call must not be retried or dispatched"
     );
     assert!(
         events
             .iter()
-            .any(|e| matches!(e, AgentEvent::Notice(n) if n.contains("max_output_tokens")))
+            .any(|e| matches!(e, AgentEvent::Error { code, .. } if code == "tool_call_truncated"))
     );
 }
 
@@ -782,6 +973,14 @@ async fn cache_and_timing_reports_are_stored_with_the_reply() {
         last.perf_line().contains("cache 90%"),
         "{}",
         last.perf_line()
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::Usage(_)))
+            .count(),
+        1,
+        "usage must be reported once, not per chunk and once at the end"
     );
 }
 
@@ -1030,20 +1229,62 @@ async fn model_budget_stops_before_another_call() {
 async fn oversized_context_compacts_before_the_model_call() {
     let dir = tempfile::tempdir().unwrap();
     let mut harness = harness(dir.path(), vec![text_script("after compaction")], &["read"]);
-    // Shrink the budget so the large user prompt crosses 80%.
+    // Shrink the budget so the large user prompt crosses 80% but the
+    // window-derived summary still fits after one compaction.
     let mut core = Arc::try_unwrap(harness.core).unwrap_or_else(|_| panic!("sole owner"));
-    core.budget = TokenBudget::new(1000, 100);
+    core.budget = TokenBudget::new(4096, 1024);
     harness.core = Arc::new(core);
     let (outcome, _) = run(&harness, &"x".repeat(8000)).await;
     assert_eq!(outcome.status, TurnStatus::Done);
     let session = harness.session.lock().unwrap();
-    assert!(
-        session
-            .branch_entries()
-            .iter()
-            .any(|entry| entry.is_compaction()),
-        "expected a compaction entry"
+    let compactions = session
+        .branch_entries()
+        .iter()
+        .filter(|entry| entry.is_compaction())
+        .count();
+    assert_eq!(compactions, 1, "expected exactly one compaction entry");
+}
+
+#[tokio::test]
+async fn repeated_over_threshold_ends_with_budget_context_after_one_compaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut harness = harness(
+        dir.path(),
+        vec![text_script("should not be called")],
+        &["read"],
     );
+    let mut core = Arc::try_unwrap(harness.core).unwrap_or_else(|_| panic!("sole owner"));
+    core.budget = TokenBudget::new(1000, 100);
+    // The fixed system prompt alone stays above the threshold, so one
+    // compaction cannot converge.
+    core.system_prompt = "s".repeat(6000);
+    core.window_source = localharness::agent::WindowSource::Configured;
+    harness.core = Arc::new(core);
+
+    let (outcome, events) = run(&harness, "go").await;
+    assert_eq!(outcome.status, TurnStatus::Budget);
+    let (code, message) = outcome.error.expect("diagnostic");
+    assert_eq!(code, "budget_context");
+    assert!(message.contains("static overhead"), "{message}");
+    assert!(message.contains("system prompt"), "{message}");
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Error { code, .. } if code == "budget_context"
+        )),
+        "missing budget_context event"
+    );
+    let session = harness.session.lock().unwrap();
+    let compactions = session
+        .branch_entries()
+        .iter()
+        .filter(|entry| entry.is_compaction())
+        .count();
+    assert_eq!(compactions, 1, "the loop must not compact twice");
+    assert!(session.branch_entries().iter().any(
+        |entry| matches!(&entry.kind, EntryKind::Error(data) if data.code == "budget_context")
+    ));
+    assert_eq!(harness.provider.requests.lock().unwrap().len(), 0);
 }
 
 #[tokio::test]
@@ -1369,4 +1610,192 @@ async fn model_calls_an_mcp_tool_through_the_loop() {
         assert_eq!(spec.parameters["required"], serde_json::json!(["text"]));
     }
     manager.shutdown().await;
+}
+#[tokio::test]
+async fn strict_profile_rejects_a_parallel_call_at_dispatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness_with_profile(
+        dir.path(),
+        vec![
+            parallel_tool_script(&[
+                ("bash", json!({"command": "echo one"})),
+                ("bash", json!({"command": "echo two"})),
+            ]),
+            text_script("done"),
+        ],
+        "strict",
+    );
+    let (outcome, _) = run(&harness, "run one command").await;
+    assert_eq!(outcome.status, TurnStatus::Done);
+
+    let results = tool_results(&harness.session);
+    assert_eq!(results.len(), 2, "{results:?}");
+    assert!(results[0].contains("one"), "{}", results[0]);
+    assert!(
+        results[1].contains("[tool_call_invalid]"),
+        "the second call must be rejected: {}",
+        results[1]
+    );
+    assert!(
+        !results.iter().any(|result| result.contains("two")),
+        "the rejected command must not run: {results:?}"
+    );
+
+    let requests = harness.provider.requests.lock().unwrap();
+    let first = &requests[0];
+    assert_eq!(first.tool_choice.as_deref(), Some("required"));
+    assert_eq!(first.parallel_tool_calls, Some(false));
+    assert_eq!(first.tools.len(), 6, "{:?}", first.tools);
+    assert_eq!(harness.core.system_prompt, "system");
+    for spec in &first.tools {
+        assert!(
+            spec.description.chars().count() <= 92,
+            "{} has an unshortened description: {}",
+            spec.name,
+            spec.description
+        );
+    }
+}
+
+#[tokio::test]
+async fn strict_profile_reminds_after_two_and_stops_after_three_invalid_calls() {
+    let dir = tempfile::tempdir().unwrap();
+    let invalid = || {
+        parallel_tool_script(&[
+            ("bash", json!({"command": "echo first"})),
+            ("bash", json!({"command": "echo second"})),
+        ])
+    };
+    let harness = harness_with_profile(dir.path(), vec![invalid(), invalid(), invalid()], "strict");
+    let (outcome, _) = run(&harness, "keep making parallel calls").await;
+    assert_eq!(outcome.status, TurnStatus::Error);
+    assert_eq!(
+        outcome.error.as_ref().map(|(code, _)| code.as_str()),
+        Some("tool_call_invalid")
+    );
+
+    let messages = user_messages(&harness.session);
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("one JSON object, one tool")),
+        "a compact reminder must arrive after two rejected calls: {messages:?}"
+    );
+    let session = harness.session.lock().unwrap();
+    assert!(
+        session
+            .branch_entries()
+            .iter()
+            .any(|entry| matches!(&entry.kind, EntryKind::Error(data) if data.code == "tool_call_invalid")),
+        "the turn must end with a tool_call_invalid error"
+    );
+    drop(session);
+    assert_eq!(assistants(&harness.session).len(), 3);
+}
+
+#[tokio::test]
+async fn malformed_parallel_fixture_is_contained_by_strict_not_full() {
+    let mut strict_contained = 0;
+    let mut full_parallel = 0;
+    for case in 0..50 {
+        let width = 2 + case % 3;
+        let calls: Vec<(&str, serde_json::Value)> = (0..width)
+            .map(|index| {
+                (
+                    "glob",
+                    json!({"pattern": format!("fixture-{case}-{index}.rs")}),
+                )
+            })
+            .collect();
+
+        let strict_dir = tempfile::tempdir().unwrap();
+        let strict = harness_with_profile(
+            strict_dir.path(),
+            vec![parallel_tool_script(&calls), bare_text_script("done")],
+            "strict",
+        );
+        let (strict_outcome, _) = run(&strict, "run the fixture").await;
+        let contained = strict_outcome.status == TurnStatus::Done
+            || strict_outcome
+                .error
+                .as_ref()
+                .is_some_and(|(code, _)| code == "tool_call_invalid");
+        assert!(
+            contained,
+            "strict must either continue or stop with tool_call_invalid: {:?}",
+            strict_outcome.error
+        );
+        let executed = executed_glob_results(&strict.session);
+        if executed == 1 {
+            strict_contained += 1;
+        }
+
+        let full_dir = tempfile::tempdir().unwrap();
+        let full = harness_with_profile(
+            full_dir.path(),
+            vec![parallel_tool_script(&calls), bare_text_script("done")],
+            "full",
+        );
+        let (full_outcome, _) = run(&full, "run the fixture").await;
+        assert_eq!(full_outcome.status, TurnStatus::Done);
+        let executed = executed_glob_results(&full.session);
+        if executed == width {
+            full_parallel += 1;
+        }
+    }
+    eprintln!(
+        "malformed 50-case fixture: strict one-call containment {strict_contained}/50; full parallel execution {full_parallel}/50"
+    );
+    assert_eq!(strict_contained, 50, "strict must reject every extra call");
+    assert_eq!(full_parallel, 50, "full must remain parallel");
+}
+
+#[tokio::test]
+async fn shell_profile_reads_edits_and_tests_with_bash_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness_with_profile(
+        dir.path(),
+        vec![
+            tool_script(
+                "bash",
+                json!({"command": "printf 'alpha\\nbeta\\n' > toy.txt"}),
+            ),
+            tool_script("bash", json!({"command": "cat toy.txt"})),
+            tool_script("bash", json!({"command": "sed -i 's/beta/gamma/' toy.txt"})),
+            tool_script(
+                "bash",
+                json!({"command": "grep -qx gamma toy.txt && test \"$(wc -l < toy.txt)\" -eq 2"}),
+            ),
+            text_script("read, edited, and tested"),
+        ],
+        "shell",
+    );
+    assert_eq!(harness.core.tools.len(), 1);
+    assert_eq!(harness.core.tools[0].name(), "bash");
+
+    let (outcome, _) = run(&harness, "fix toy.txt and test it").await;
+    assert_eq!(outcome.status, TurnStatus::Done);
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("toy.txt")).unwrap(),
+        "alpha\ngamma\n"
+    );
+    let results = tool_results(&harness.session);
+    assert_eq!(results.len(), 4, "{results:?}");
+    let session = harness.session.lock().unwrap();
+    let errors: Vec<&ToolResultData> = session
+        .branch_entries()
+        .iter()
+        .filter_map(|entry| match &entry.kind {
+            EntryKind::ToolResult(result) if result.is_error => Some(result),
+            _ => None,
+        })
+        .collect();
+    assert!(errors.is_empty(), "{errors:?}");
+    let requests = harness.provider.requests.lock().unwrap();
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.tools.iter().all(|tool| tool.name == "bash")),
+        "shell must never expose a non-bash tool"
+    );
 }

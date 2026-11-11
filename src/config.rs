@@ -22,6 +22,7 @@ pub struct Config {
     pub session: SessionConfig,
     pub budgets: BudgetConfig,
     pub prompt: PromptConfig,
+    pub lsp: LspConfig,
     /// Profile used when neither `--profile` nor `LH_PROFILE` is set.
     pub default_profile: String,
     #[serde(rename = "profile")]
@@ -136,6 +137,43 @@ impl Config {
                 theme: None,
             },
         );
+        // Small, tested surface for weak tool callers: six flat tools, one
+        // call per model message, and a server-side "must call a tool" nudge.
+        cfg.profiles.insert(
+            "strict".into(),
+            ProfileConfig {
+                packs: vec![],
+                tools: vec![
+                    "read".into(),
+                    "grep".into(),
+                    "glob".into(),
+                    "edit".into(),
+                    "bash".into(),
+                    "todo".into(),
+                ],
+                model_profile: Some("strict".into()),
+                prompt: None,
+                description: Some(
+                    "Weak-model defaults: six flat tools, one tool call per message".into(),
+                ),
+                theme: None,
+            },
+        );
+        // The mini-swe-agent shape: one shell tool and a documented
+        // read/edit/test contract, for models that cannot emit JSON calls.
+        cfg.profiles.insert(
+            "shell".into(),
+            ProfileConfig {
+                packs: vec![],
+                tools: vec!["bash".into()],
+                model_profile: Some("shell".into()),
+                prompt: None,
+                description: Some(
+                    "Experimental: bash only; read, edit, and test through commands".into(),
+                ),
+                theme: None,
+            },
+        );
         cfg.model_profiles.insert(
             "default".into(),
             ModelProfile {
@@ -144,6 +182,34 @@ impl Config {
                 context_window: None,
                 tool_mode: ToolMode::Repair,
                 strip_reasoning: Some(true),
+                ..ModelProfile::default()
+            },
+        );
+        cfg.model_profiles.insert(
+            "strict".into(),
+            ModelProfile {
+                match_: vec![],
+                context_window: None,
+                tool_mode: ToolMode::Repair,
+                strip_reasoning: Some(true),
+                parallel_tool_calls: Some(false),
+                tool_choice: Some("required".into()),
+                one_call: true,
+                short_tool_schemas: Some(true),
+                ..ModelProfile::default()
+            },
+        );
+        cfg.model_profiles.insert(
+            "shell".into(),
+            ModelProfile {
+                match_: vec![],
+                context_window: None,
+                tool_mode: ToolMode::Repair,
+                strip_reasoning: Some(true),
+                parallel_tool_calls: Some(false),
+                tool_choice: None,
+                one_call: false,
+                short_tool_schemas: Some(true),
                 ..ModelProfile::default()
             },
         );
@@ -558,6 +624,9 @@ pub struct SessionConfig {
     /// Empty means the default data directory.
     pub dir: PathBuf,
     pub no_session: bool,
+    /// Redact secret values before session entries, artifacts, evidence, and
+    /// reports are written. `--no-redact` disables it for one session.
+    pub redact: bool,
     /// Artifact retention in days; 0 disables cleanup.
     pub artifact_retention_days: u32,
     pub keep_artifacts: bool,
@@ -569,6 +638,7 @@ impl Default for SessionConfig {
         Self {
             dir: PathBuf::new(),
             no_session: false,
+            redact: true,
             artifact_retention_days: 30,
             keep_artifacts: false,
             clean_artifacts: false,
@@ -702,6 +772,36 @@ impl McpServerConfig {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
+pub struct LspConfig {
+    /// Whether post-mutation diagnostics block a write, warn, or are ignored.
+    pub gate: LspGate,
+}
+
+/// How a new language-server error after a mutation is handled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum LspGate {
+    /// Do not snapshot, check, or attach diagnostics.
+    Off,
+    /// Attach new errors to the tool result; keep the change.
+    #[default]
+    Warn,
+    /// Restore the pre-edit file and fail with `EDIT_REGRESSION`.
+    Block,
+}
+
+impl LspGate {
+    pub fn label(self) -> &'static str {
+        match self {
+            LspGate::Off => "off",
+            LspGate::Warn => "warn",
+            LspGate::Block => "block",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ProfileConfig {
     pub packs: Vec<String>,
     pub tools: Vec<String>,
@@ -721,6 +821,12 @@ pub struct ModelProfile {
     pub reasoning_field: Option<String>,
     pub tool_mode: ToolMode,
     pub parallel_tool_calls: Option<bool>,
+    /// Value sent as the request's `tool_choice`; `None` keeps `auto`.
+    pub tool_choice: Option<String>,
+    /// Reject a second tool call in the same assistant message at dispatch.
+    pub one_call: bool,
+    /// Strip property descriptions and shorten tool descriptions in requests.
+    pub short_tool_schemas: Option<bool>,
     pub stop: Vec<String>,
     pub extra_body: Option<toml::Value>,
     /// Hint for tool schema style; the harness always sends JSON schema.
@@ -736,6 +842,9 @@ impl Default for ModelProfile {
             reasoning_field: None,
             tool_mode: ToolMode::Auto,
             parallel_tool_calls: None,
+            tool_choice: None,
+            one_call: false,
+            short_tool_schemas: None,
             stop: vec![],
             extra_body: None,
             native_tools: None,
@@ -746,6 +855,10 @@ impl Default for ModelProfile {
 impl ModelProfile {
     pub fn strip_reasoning(&self) -> bool {
         self.strip_reasoning.unwrap_or(true)
+    }
+
+    pub fn short_tool_schemas(&self) -> bool {
+        self.short_tool_schemas.unwrap_or(false)
     }
 }
 
@@ -832,6 +945,7 @@ mod tests {
         assert_eq!(cfg.context_window(), 32768);
         assert_eq!(cfg.profile().packs, ["core", "coding"]);
         assert_eq!(cfg.ui.theme, "default");
+        assert!(cfg.session.redact, "secret redaction is on by default");
         assert_eq!(cfg.profiles["full"].packs, ["core", "coding", "security"]);
 
         let mut cfg = Config::builtin();
@@ -843,6 +957,58 @@ mod tests {
             "minimal",
             "an explicit selection wins over the config default"
         );
+    }
+
+    #[test]
+    fn strict_and_shell_profiles_are_discoverable() {
+        let cfg = Config::builtin();
+        for name in ["strict", "shell"] {
+            assert!(
+                cfg.profiles.contains_key(name),
+                "missing built-in profile {name}"
+            );
+        }
+        let strict = &cfg.profiles["strict"];
+        assert_eq!(
+            strict.tools,
+            ["read", "grep", "glob", "edit", "bash", "todo"]
+        );
+        assert!(strict.packs.is_empty());
+        assert_eq!(strict.model_profile.as_deref(), Some("strict"));
+
+        let mut cfg = Config::builtin();
+        cfg.profile_name = "strict".into();
+        let (name, profile) = cfg.model_profile();
+        assert_eq!(name, "strict");
+        assert_eq!(profile.parallel_tool_calls, Some(false));
+        assert_eq!(profile.tool_choice.as_deref(), Some("required"));
+        assert!(profile.one_call);
+        assert!(profile.short_tool_schemas());
+
+        let shell = &cfg.profiles["shell"];
+        assert_eq!(shell.tools, ["bash"]);
+        cfg.profile_name = "shell".into();
+        assert_eq!(cfg.model_profile().0, "shell");
+
+        let registry = crate::tools::ToolRegistry::builtin();
+        for name in ["strict", "shell"] {
+            let profile = &cfg.profiles[name];
+            let selected = registry
+                .select(profile, &[])
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+            assert!(!selected.is_empty(), "{name} selects no tools");
+        }
+    }
+
+    #[test]
+    fn lsp_gate_defaults_to_warn_and_parses_names() {
+        let cfg = Config::builtin();
+        assert_eq!(cfg.lsp.gate, LspGate::Warn);
+        let parsed: Config = toml::from_str("[lsp]\ngate = \"block\"\n").expect("block is valid");
+        assert_eq!(parsed.lsp.gate, LspGate::Block);
+        let parsed: Config = toml::from_str("[lsp]\ngate = \"off\"\n").expect("off is valid");
+        assert_eq!(parsed.lsp.gate, LspGate::Off);
+        assert!(toml::from_str::<Config>("[lsp]\ngate = \"sometimes\"\n").is_err());
     }
 
     #[test]

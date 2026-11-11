@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agent::{Core, RunLimits, WindowSource, prompt};
 use crate::config::Config;
-use crate::context::{StaticPrompt, TokenBudget};
+use crate::context::{StaticPrompt, TokenBudget, ToolSpecCost};
 use crate::external;
 use crate::paths::Paths;
 use crate::provider::{OpenAiCompatProvider, Provider, probe};
@@ -27,6 +27,8 @@ pub struct RuntimeOptions {
     pub path_jail: bool,
     pub engagement: Option<String>,
     pub no_session: bool,
+    /// Disable secret redaction for this session. Recorded in the header.
+    pub no_redact: bool,
     pub resume: Option<PathBuf>,
     pub continue_last: bool,
 }
@@ -39,6 +41,38 @@ pub struct Runtime {
 const START_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const START_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const START_RETRY_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Explicit wire format used when the conformance probe did not find native
+/// tool calls. `recover_output` already recognizes `<tool_call>` blocks.
+const REPAIR_PROTOCOL: &str = "\n\n## Tool calls\n\
+This server does not return structured tool calls. When you need a tool, write exactly one call as:\n\
+<tool_call>{\"name\":\"tool_name\",\"arguments\":{...}}</tool_call>\n\
+Use a bare block, not a fenced code block. Give the final answer in prose when no tool is needed.";
+
+/// Append the text-call instructions only when the probe found that native
+/// calls do not work. A configured `tool_mode = repair` still sends `tools[]`
+/// when the probe returned `native_ok`; telling that model the server is
+/// text-only would push it off the path the probe just verified. When the
+/// probe also made the request drop `tools[]` (`rejected_400`), include the
+/// argument reference the request can no longer carry.
+fn repair_protocol(
+    probe: Option<&probe::ToolProbe>,
+    tools: &[Arc<dyn crate::tools::Tool>],
+    tools_sent: bool,
+) -> Option<String> {
+    if tools.is_empty() {
+        return None;
+    }
+    let probe = probe?;
+    if probe.native() {
+        return None;
+    }
+    let mut text = REPAIR_PROTOCOL.to_string();
+    if !tools_sent {
+        text.push_str(&prompt::tool_argument_reference(tools));
+    }
+    Some(text)
+}
 
 /// Run the configured startup command once when the endpoint is unreachable,
 /// then wait for it to come up. Empty `model.start_command` disables this.
@@ -174,7 +208,7 @@ pub async fn create_runtime(
     config.model.model = model.clone();
     let probe_provider = OpenAiCompatProvider::new(&config.model, model.clone())?;
 
-    let (_, profile) = config.model_profile();
+    let (_, mut profile) = config.model_profile();
     let window_cache: Arc<Mutex<std::collections::HashMap<String, u32>>> = Default::default();
     let resolved = resolve_window_truth(&config, &probe_provider, &window_cache).await;
     let context_window = resolved.window;
@@ -185,9 +219,11 @@ pub async fn create_runtime(
         Arc::new(OpenAiCompatProvider::new(&config.model, model.clone())?);
     warn_if_remote(&config.model.endpoint);
 
-    let security = Arc::new(Mutex::new(SecurityState::load(
+    let redact = !options.no_redact;
+    let security = Arc::new(Mutex::new(SecurityState::load_with_redact(
         &paths,
         options.engagement.clone(),
+        redact,
     )?));
 
     if !options.no_session {
@@ -202,7 +238,7 @@ pub async fn create_runtime(
     };
     let mut session = match session_path {
         Some(path) => {
-            let mut session = Session::open(&path)
+            let mut session = Session::open_with(&path, Some(redact))
                 .with_context(|| format!("cannot resume {}", path.display()))?;
             if let Some(header) = session.header().cloned() {
                 if header.endpoint != config.model.endpoint {
@@ -232,12 +268,31 @@ pub async fn create_runtime(
                 model: model.clone(),
                 profile: config.profile_name().to_string(),
                 app: APP_VERSION.to_string(),
+                redact,
                 context: session_context(window_truth.as_ref()),
             },
             options.no_session,
         )?,
     };
     session.warnings.extend(startup_warnings);
+    let recorded_redact = session.header().map(|header| header.redact).unwrap_or(true);
+    if recorded_redact != redact {
+        if let Err(error) = session.append(EntryKind::Custom(
+            CustomData::new("redaction").with("enabled", redact),
+        )) {
+            tracing::warn!(%error, "cannot record the redaction mode in the session");
+        }
+        if redact {
+            session
+                .warnings
+                .push("secret redaction was re-enabled for this resumed no-redact session".into());
+        } else {
+            session.warnings.push(
+                "secret redaction is disabled for this session by --no-redact; secrets may be written to disk"
+                    .into(),
+            );
+        }
+    }
     let window_notice = window_notice(window_truth.as_ref(), configured_window);
     if let Some(notice) = &window_notice {
         session.warnings.push(notice.clone());
@@ -286,10 +341,41 @@ pub async fn create_runtime(
     }
 
     let registry = ToolRegistry::builtin();
+    registry.lsp().set_gate(config.lsp.gate);
     let mcp = Arc::new(crate::mcp::McpManager::new());
     let (tools, mcp_warnings) = select_tools(&registry, &config, &paths, &mcp).await?;
     session.warnings.extend(mcp_warnings);
-    let tool_specs = ToolRegistry::specs(&tools);
+    let mut tool_specs = ToolRegistry::specs_with(&tools, profile.short_tool_schemas());
+    // With a background `model.start_command`, the server may not be up yet;
+    // probing would stall the TUI for the request timeout. The probe runs on
+    // the next rebuild (model switch/profile reload) instead.
+    let tool_probe = if deferred_start {
+        None
+    } else {
+        resolve_tool_probe(provider.as_ref(), &paths, &mut profile, &mut tool_specs).await
+    };
+    if let Some(probe) = &tool_probe {
+        if let Some(warning) = probe.warning() {
+            session.warnings.push(warning.clone());
+        }
+        let payload = serde_json::json!({
+            "outcome": probe.outcome.code(),
+            "mode": probe.mode,
+            "model": probe.model,
+            "build": probe.build,
+            "message": probe.message,
+            "checked": probe.checked,
+        });
+        if let Some(object) = payload.as_object() {
+            let mut data = CustomData::new("tool-probe");
+            for (key, value) in object {
+                data.payload.insert(key.clone(), value.clone());
+            }
+            if let Err(error) = session.append(EntryKind::Custom(data)) {
+                tracing::warn!(%error, "cannot record the tool probe in the session");
+            }
+        }
+    }
     let skills =
         SkillIndex::load(&paths, config.trust).advertised_for(&crate::tools::active_packs(&tools));
     let repo_brief = registry
@@ -297,6 +383,12 @@ pub async fn create_runtime(
         .brief(&paths.cwd, crate::tools::repo_map::BRIEF_BUDGET);
     let system_prompt =
         prompt::build_system_prompt(&config, &paths, &skills, &tools, Some(&repo_brief));
+    // A server without native tool calls still lists the tools in the system
+    // prompt; name the exact wire format the repair layer can execute.
+    let mut system_prompt = system_prompt;
+    if let Some(text) = repair_protocol(tool_probe.as_ref(), &tools, !tool_specs.is_empty()) {
+        system_prompt.push_str(&text);
+    }
     let mut budget = TokenBudget::new(context_window, config.model.max_output_tokens);
     let sampled = tokio::time::timeout(
         Duration::from_secs(2),
@@ -314,12 +406,22 @@ pub async fn create_runtime(
             tokens.min(u32::MAX as usize) as u32,
         );
     }
+    let tool_specs_json = if tool_specs.is_empty() {
+        String::new()
+    } else {
+        crate::provider::tools_json(&tool_specs)
+    };
+    let mut tool_specs_cost = ToolSpecCost::from_json(&tool_specs_json, &budget);
+    if tokenize && !tool_specs_json.is_empty() {
+        tool_specs_cost =
+            measure_tool_specs(&probe_provider, &tool_specs_json, tool_specs_cost).await;
+    }
     // Measure the static prompt with the calibrated ratio, not the initial
     // 3.5-chars-per-token guess.
     let static_prompt = measure_static_prompt(
         &budget,
         &system_prompt,
-        &tool_specs,
+        tool_specs_cost,
         Some(repo_brief.as_str()),
     );
     if static_prompt.total > budget.usable_prompt() {
@@ -383,6 +485,8 @@ pub async fn create_runtime(
         registry,
         tools,
         tool_specs,
+        tool_specs_json,
+        tool_specs_cost,
         session: session_handle.clone(),
         artifacts,
         reads,
@@ -396,6 +500,7 @@ pub async fn create_runtime(
         system_prompt,
         repo_brief,
         model_profile: profile,
+        tool_probe,
         cancel: CancellationToken::new(),
         tool_timeout: Duration::from_secs(660),
         path_jail: options.path_jail,
@@ -517,6 +622,7 @@ pub async fn rebuild_core(old: &Arc<Core>, mut config: Config) -> Result<Arc<Cor
         Default::default()
     };
     let registry = ToolRegistry::builtin();
+    registry.lsp().set_gate(config.lsp.gate);
     let (tools, mcp_warnings) = select_tools(&registry, &config, &old.paths, &old.mcp).await?;
     if !mcp_warnings.is_empty() {
         for warning in &mcp_warnings {
@@ -526,15 +632,34 @@ pub async fn rebuild_core(old: &Arc<Core>, mut config: Config) -> Result<Arc<Cor
             session.warnings.extend(mcp_warnings);
         }
     }
-    let tool_specs = ToolRegistry::specs(&tools);
+    let (_, mut model_profile) = config.model_profile();
+    let mut tool_specs = ToolRegistry::specs_with(&tools, model_profile.short_tool_schemas());
     let skills = SkillIndex::load(&old.paths, config.trust)
         .advertised_for(&crate::tools::active_packs(&tools));
     let repo_brief = registry
         .repo()
         .brief(&old.paths.cwd, crate::tools::repo_map::BRIEF_BUDGET);
-    let system_prompt =
+    let mut system_prompt =
         prompt::build_system_prompt(&config, &old.paths, &skills, &tools, Some(&repo_brief));
-    let (_, model_profile) = config.model_profile();
+    // Same target: keep the conformance result unless it never ran. A model
+    // switch probes again so the mode tracks the newly loaded server.
+    let tool_probe = if same_target && old.tool_probe.is_some() {
+        old.tool_probe.clone()
+    } else {
+        resolve_tool_probe(
+            provider.as_ref(),
+            &old.paths,
+            &mut model_profile,
+            &mut tool_specs,
+        )
+        .await
+    };
+    if let Some(probe) = &tool_probe {
+        apply_tool_probe(probe, &mut model_profile, &mut tool_specs);
+    }
+    if let Some(text) = repair_protocol(tool_probe.as_ref(), &tools, !tool_specs.is_empty()) {
+        system_prompt.push_str(&text);
+    }
     let mut budget = TokenBudget::new(context_window, config.model.max_output_tokens);
     if same_target {
         // The tokenizer calibration only holds for the same model.
@@ -556,10 +681,20 @@ pub async fn rebuild_core(old: &Arc<Core>, mut config: Config) -> Result<Arc<Cor
             tokens.min(u32::MAX as usize) as u32,
         );
     }
+    let tool_specs_json = if tool_specs.is_empty() {
+        String::new()
+    } else {
+        crate::provider::tools_json(&tool_specs)
+    };
+    let mut tool_specs_cost = ToolSpecCost::from_json(&tool_specs_json, &budget);
+    if tokenize && !tool_specs_json.is_empty() {
+        tool_specs_cost =
+            measure_tool_specs(provider.as_ref(), &tool_specs_json, tool_specs_cost).await;
+    }
     let static_prompt = measure_static_prompt(
         &budget,
         &system_prompt,
-        &tool_specs,
+        tool_specs_cost,
         Some(repo_brief.as_str()),
     );
     let limits = RunLimits::from(&config.budgets);
@@ -570,6 +705,8 @@ pub async fn rebuild_core(old: &Arc<Core>, mut config: Config) -> Result<Arc<Cor
         registry,
         tools,
         tool_specs,
+        tool_specs_json,
+        tool_specs_cost,
         session: old.session.clone(),
         artifacts: old.artifacts.clone(),
         reads: old.reads.clone(),
@@ -583,6 +720,7 @@ pub async fn rebuild_core(old: &Arc<Core>, mut config: Config) -> Result<Arc<Cor
         system_prompt,
         repo_brief,
         model_profile,
+        tool_probe,
         cancel: old.cancel.clone(),
         tool_timeout: old.tool_timeout,
         path_jail: old.path_jail,
@@ -648,30 +786,46 @@ fn session_context(truth: Option<&probe::WindowTruth>) -> Option<SessionContextW
     })
 }
 
+/// Exact tool-schema tokens when the engine answers `/tokenize`, otherwise the
+/// fixed JSON-density estimate. Called once when the core is built (and once
+/// after a deferred startup learns the tokenizer).
+pub(crate) async fn measure_tool_specs(
+    provider: &dyn Provider,
+    tool_specs_json: &str,
+    estimated: ToolSpecCost,
+) -> ToolSpecCost {
+    if tool_specs_json.is_empty() {
+        return estimated;
+    }
+    let measured = tokio::time::timeout(
+        Duration::from_secs(2),
+        probe::token_count(provider, tool_specs_json),
+    )
+    .await
+    .ok()
+    .flatten()
+    // A token count above the byte count is impossible for a real tokenizer;
+    // treat it as a broken probe instead of inflating the budget.
+    .filter(|tokens| *tokens > 0 && *tokens <= tool_specs_json.len())
+    .map(|tokens| tokens.min(u32::MAX as usize) as u32);
+    measured.map_or(estimated, |tokens| estimated.with_tokens(tokens))
+}
+
 /// Static prompt cost at build time. The repository brief is part of the
 /// system prompt, so it is measured once and subtracted from the system
-/// total; the message can then name the three contributors separately.
+/// total; the message can then name the three contributors separately. The
+/// tools term is the fixed cost computed from the request's serialized array.
 pub(crate) fn measure_static_prompt(
     budget: &TokenBudget,
     system_prompt: &str,
-    tool_specs: &[crate::provider::ToolSpec],
+    tools: ToolSpecCost,
     repo_brief: Option<&str>,
 ) -> StaticPrompt {
     let repo = repo_brief
         .map(|brief| budget.estimate_text(brief))
         .unwrap_or(0);
     let system = budget.estimate_text(system_prompt).saturating_sub(repo);
-    let tool_chars: usize = tool_specs
-        .iter()
-        .map(|tool| {
-            tool.name.len()
-                + tool.description.len()
-                + serde_json::to_string(&tool.parameters)
-                    .map(|schema| schema.len())
-                    .unwrap_or(0)
-        })
-        .sum();
-    StaticPrompt::new(system, budget.estimate_char_len(tool_chars), repo)
+    StaticPrompt::new(system, tools.tokens, repo)
 }
 
 struct ResolvedWindow {
@@ -780,6 +934,74 @@ fn context_fix(truth: &probe::WindowTruth) -> String {
         )
     } else {
         "Raise the server's context size, or lower [model] max_output_tokens.".to_string()
+    }
+}
+
+/// Run the forced-tool conformance probe once per model/build and apply its
+/// result to the effective profile. A cached `native_ok` for the same model
+/// and build skips the request; everything else is re-probed because a server
+/// restart often changes the tool configuration.
+async fn resolve_tool_probe(
+    provider: &dyn Provider,
+    paths: &Paths,
+    profile: &mut crate::config::ModelProfile,
+    tool_specs: &mut Vec<crate::provider::ToolSpec>,
+) -> Option<probe::ToolProbe> {
+    if std::env::var_os("LH_SKIP_TOOL_PROBE").is_some() {
+        return None;
+    }
+    if provider.model().trim().is_empty() {
+        return None;
+    }
+    let metadata = probe::tool_probe_metadata(provider).await;
+    let key = probe::tool_probe_key(provider, metadata.build.as_deref());
+    let cache_path = paths.data_dir.join("tool-probe-cache.json");
+    if let Some(cached) = probe::load_tool_probe(&cache_path, &key)
+        && cached.native()
+        && cached.model == provider.model()
+        && cached.build.as_deref() == metadata.build.as_deref()
+    {
+        apply_tool_probe(&cached, profile, tool_specs);
+        return Some(cached);
+    }
+    let probed = tokio::time::timeout(
+        Duration::from_secs(20),
+        probe::probe_tool_conformance(provider, &metadata),
+    )
+    .await;
+    match probed {
+        Ok(Ok(result)) => {
+            if let Err(error) = probe::store_tool_probe(&cache_path, &key, &result) {
+                tracing::warn!(%error, "cannot write the tool probe cache");
+            }
+            apply_tool_probe(&result, profile, tool_specs);
+            Some(result)
+        }
+        Ok(Err(error)) => {
+            tracing::debug!(%error, "tool-call conformance probe did not run");
+            None
+        }
+        Err(_) => {
+            tracing::warn!("tool-call conformance probe timed out; assuming configured tool mode");
+            None
+        }
+    }
+}
+
+/// A non-native probe result switches the effective mode to the text/JSON
+/// repair protocol. A server that rejects tool definitions also stops
+/// receiving them, so the next request is not rejected the same way.
+fn apply_tool_probe(
+    probe: &probe::ToolProbe,
+    profile: &mut crate::config::ModelProfile,
+    tool_specs: &mut Vec<crate::provider::ToolSpec>,
+) {
+    if probe.native() {
+        return;
+    }
+    profile.tool_mode = crate::config::ToolMode::Repair;
+    if probe.outcome == probe::ToolProbeOutcome::Rejected400 {
+        tool_specs.clear();
     }
 }
 
@@ -910,6 +1132,149 @@ mod tests {
         assert_eq!(
             gemma.window_source,
             WindowSource::Probed(probe::WindowProbe::Remembered)
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_tool_probe_switches_to_repair_and_is_recorded() {
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                (
+                    StatusCode::BAD_REQUEST,
+                    "tools are not supported; enable the tool parser",
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(dir.path());
+        let mut config = Config::builtin();
+        config.model.endpoint = format!("http://{address}");
+        config.model.model = "spark26".into();
+        config.model.context_window = Some(8192);
+        let runtime = create_runtime(
+            config,
+            paths,
+            RuntimeOptions {
+                no_session: true,
+                ..RuntimeOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        let probe = runtime.core.tool_probe.as_ref().expect("probe ran");
+        assert_eq!(
+            probe.outcome,
+            probe::ToolProbeOutcome::Rejected400,
+            "{:?}",
+            probe.outcome
+        );
+        assert_eq!(
+            runtime.core.model_profile.tool_mode,
+            crate::config::ToolMode::Repair
+        );
+        assert!(
+            runtime.core.tool_specs.is_empty(),
+            "a 400 must stop sending tool definitions"
+        );
+        assert!(
+            runtime
+                .core
+                .system_prompt
+                .contains("<tool_call>{\"name\":\"tool_name\""),
+            "the repair protocol must name the wire format"
+        );
+        let session = runtime.session.lock().unwrap();
+        let recorded = session
+            .latest_custom_on_path("tool-probe")
+            .expect("tool probe is in the session header");
+        match &recorded.kind {
+            EntryKind::Custom(custom) => {
+                assert_eq!(custom.payload["outcome"], "rejected_400");
+                assert_eq!(custom.payload["mode"], "repair");
+            }
+            _ => panic!("wrong entry type"),
+        }
+        assert!(
+            session
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("tool-call probe")),
+            "missing warning: {:?}",
+            session.warnings
+        );
+    }
+
+    #[tokio::test]
+    async fn native_tool_probe_is_skipped_on_the_next_start_for_the_same_model() {
+        use axum::routing::post;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let counter = counter.clone();
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    axum::Json(serde_json::json!({
+                        "choices": [{
+                            "message": {
+                                "role": "assistant",
+                                "content": null,
+                                "tool_calls": [{
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "probe_echo",
+                                        "arguments": "{\"value\":\"ok\"}"
+                                    }
+                                }]
+                            }
+                        }]
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(dir.path());
+        let endpoint = format!("http://{address}");
+        let config = crate::config::ModelConfig {
+            endpoint,
+            ..Default::default()
+        };
+        let provider = OpenAiCompatProvider::new(&config, "spark26").unwrap();
+        let mut profile = crate::config::ModelProfile::default();
+        let mut specs = vec![crate::provider::ToolSpec {
+            name: "read".into(),
+            description: "read".into(),
+            parameters: serde_json::json!({"type":"object"}),
+        }];
+        let first = resolve_tool_probe(&provider, &paths, &mut profile, &mut specs)
+            .await
+            .expect("first probe");
+        assert!(first.native());
+        let second = resolve_tool_probe(&provider, &paths, &mut profile, &mut specs)
+            .await
+            .expect("cached probe");
+        assert!(second.native());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a known-good probe must not run again for the same model/build"
         );
     }
 
@@ -1135,6 +1500,56 @@ mod tests {
         assert_eq!(
             gate.ready(&CancellationToken::new()).await,
             Some(Err("endpoint down".to_string()))
+        );
+    }
+
+    fn tool_probe(outcome: probe::ToolProbeOutcome, mode: &str) -> probe::ToolProbe {
+        probe::ToolProbe {
+            outcome,
+            model: "spark26".into(),
+            build: None,
+            mode: mode.into(),
+            message: outcome.code().into(),
+            checked: "2026-11-11T00:00:00Z".into(),
+        }
+    }
+
+    #[test]
+    fn native_probe_does_not_advertise_text_calls() {
+        let config = Config::builtin();
+        let registry = ToolRegistry::builtin();
+        let tools = registry.select(config.profile(), &[]).unwrap();
+        let native = tool_probe(probe::ToolProbeOutcome::NativeOk, "native");
+        assert!(
+            repair_protocol(Some(&native), &tools, true).is_none(),
+            "a native probe must not push the model to text calls"
+        );
+        assert!(
+            repair_protocol(None, &tools, true).is_none(),
+            "without probe evidence the protocol would claim native calls fail"
+        );
+    }
+
+    #[test]
+    fn rejected_probe_adds_argument_guidance_when_schemas_are_dropped() {
+        let config = Config::builtin();
+        let registry = ToolRegistry::builtin();
+        let tools = registry.select(config.profile(), &[]).unwrap();
+        let rejected = tool_probe(probe::ToolProbeOutcome::Rejected400, "repair");
+
+        let text = repair_protocol(Some(&rejected), &tools, false).unwrap();
+        assert!(text.contains("does not return structured tool calls"));
+        assert!(text.contains("## Tool arguments"));
+        assert!(text.contains("`read`"));
+        assert!(
+            text.contains("\"required\":[\"path\"]"),
+            "read's required keys must survive when tools[] is not sent"
+        );
+
+        let with_schemas = repair_protocol(Some(&rejected), &tools, true).unwrap();
+        assert!(
+            !with_schemas.contains("## Tool arguments"),
+            "the request already carries the schemas; do not repeat them"
         );
     }
 }

@@ -58,13 +58,18 @@ impl Tool for EditTool {
             .get("path")
             .and_then(|value| value.as_str())
             .map(str::to_string);
+        let resolved = raw.as_deref().and_then(|raw| ctx.resolve(raw).ok());
+        let snapshot = match &resolved {
+            Some(path) => ctx.lsp.snapshot_before_edit(ctx, path).await,
+            None => crate::tools::lsp::EditSnapshot::default(),
+        };
         let result = match run(ctx, &args) {
             Ok(result) => result,
             Err(err) => return err,
         };
-        match raw.as_deref().map(|raw| ctx.resolve(raw)) {
-            Some(Ok(path)) => result.with_diagnostics(ctx, &path).await,
-            _ => result,
+        match resolved {
+            Some(path) => result.with_diagnostics(ctx, &path, snapshot).await,
+            None => result,
         }
     }
 }

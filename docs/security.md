@@ -286,13 +286,30 @@ in the system prompt. This reduces, but does not eliminate, prompt injection.
 
 - No telemetry, analytics, or phone-home.
 - Endpoint defaults to `http://127.0.0.1:8080`; non-local endpoints warn.
-- Session logs and artifacts are plaintext. `--no-session` writes neither. An
-  explicitly created engagement file is separate, user-owned data. Engagement
-  evidence artifacts, findings, and the surface inventory remain on disk after
-  the session.
+- Session logs, artifacts, evidence artifacts, and exported reports are
+  redacted before they are written. Private key blocks, bearer and
+  `Authorization` header values, AWS/GCP/Azure keys, GitHub tokens, secret-like
+  `.env` assignments, and the exact values of environment variables matching
+  `*TOKEN*`, `*SECRET*`, `*KEY*`, or `*PASSWORD*` become
+  `[REDACTED:<kind>:<first4>...<hash8>]` (the prefix is omitted for values
+  shorter than 12 characters). The short prefix and hash keep evidence
+  comparable without exposing the value; paths and command names are left
+  intact.
+- `--no-redact` disables that pass for one session and is recorded in the
+  session header (`"redact": false`). Use it only for disposable test data.
+- Evidence `sha256` continues to describe the raw tool output. A
+  `stored_sha256` field describes the redacted artifact on disk, so
+  `evidence verify` still detects tampering without keeping the secret.
+- `--no-session` writes neither a session nor artifacts. An explicitly created
+  engagement file is separate, user-owned data. Engagement evidence artifacts,
+  findings, and the surface inventory remain on disk after the session.
 - Evidence artifacts are `0600`; credentials extracted into the surface map are
   stored as SHA-256 references, never plaintext. URL userinfo is stripped from
   stored URLs.
+- Live `bg` logs are streamed by the process supervisor. Output is redacted when
+  it is read back through `bg`, session entries, and evidence, but the live log
+  file is not rewritten line-by-line while the process runs. Prefer `bash` for
+  one-shot commands that print secrets.
 - Diagnostic logs are metadata only: timings, tool names, token counts, error
   codes. Prompt and tool content is not logged unless `LH_DEBUG_CONTENT=1`,
   which prints a warning.

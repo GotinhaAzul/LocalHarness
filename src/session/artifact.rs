@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::security::redact::Redactor;
+
 #[derive(Debug, Clone)]
 pub struct Artifact {
     pub id: String,
@@ -44,10 +46,19 @@ pub struct ArtifactStore {
     root: Option<PathBuf>,
     counter: AtomicU64,
     memory: Mutex<HashMap<String, String>>,
+    redactor: Redactor,
 }
 
 impl ArtifactStore {
     pub fn new(session_id: impl Into<String>, root: Option<PathBuf>) -> io::Result<Self> {
+        Self::new_with(session_id, root, true)
+    }
+
+    pub fn new_with(
+        session_id: impl Into<String>,
+        root: Option<PathBuf>,
+        redact: bool,
+    ) -> io::Result<Self> {
         use std::os::unix::fs::PermissionsExt;
         let session_id = session_id.into();
         let mut next = 0u64;
@@ -73,15 +84,21 @@ impl ArtifactStore {
             root,
             counter: AtomicU64::new(next),
             memory: Mutex::new(HashMap::new()),
+            redactor: Redactor::new(redact),
         })
     }
 
     pub fn ephemeral() -> Self {
+        Self::ephemeral_with(true)
+    }
+
+    pub fn ephemeral_with(redact: bool) -> Self {
         Self {
             session_id: "ephemeral".into(),
             root: None,
             counter: AtomicU64::new(0),
             memory: Mutex::new(HashMap::new()),
+            redactor: Redactor::new(redact),
         }
     }
 
@@ -93,10 +110,18 @@ impl ArtifactStore {
         self.root.as_deref()
     }
 
+    /// Redact text with this session's redaction setting. Used by tools that
+    /// read files outside [`ArtifactStore::write`] (for example live `bg`
+    /// logs).
+    pub fn redact_owned(&self, text: &str) -> String {
+        self.redactor.redact_owned(text)
+    }
+
     pub fn write(&self, content: &str) -> io::Result<Artifact> {
         let n = self.counter.fetch_add(1, Ordering::SeqCst) + 1;
         let id = format!("out-{n}");
-        self.write_named(&id, content)?;
+        let content = self.redactor.redact(content);
+        self.write_stored(&id, content.as_ref())?;
         Ok(Artifact {
             id,
             bytes: content.len(),
@@ -105,6 +130,11 @@ impl ArtifactStore {
 
     pub fn write_named(&self, id: &str, content: &str) -> io::Result<()> {
         validate_id(id).map_err(io::Error::other)?;
+        let content = self.redactor.redact(content);
+        self.write_stored(id, content.as_ref())
+    }
+
+    fn write_stored(&self, id: &str, content: &str) -> io::Result<()> {
         match &self.root {
             Some(root) => {
                 use std::io::Write;
@@ -353,5 +383,27 @@ mod tests {
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
         assert_eq!(store.read_all(&a.id).unwrap(), "secret");
+    }
+
+    #[test]
+    fn artifacts_are_redacted_before_storage() {
+        const KEY: &str = "AKIAIOSFODNN7EXAMPLE";
+        let store = ArtifactStore::ephemeral();
+        let a = store
+            .write(&format!("aws_access_key_id = {KEY}\n"))
+            .unwrap();
+        let content = store.read_all(&a.id).unwrap();
+        assert!(!content.contains(KEY), "{content}");
+        assert!(content.contains("[REDACTED:aws:AKIA..."), "{content}");
+        assert!(content.contains("aws_access_key_id"), "{content}");
+    }
+
+    #[test]
+    fn no_redact_keeps_raw_artifact_values() {
+        const KEY: &str = "AKIAIOSFODNN7EXAMPLE";
+        let store = ArtifactStore::ephemeral_with(false);
+        let raw = format!("{KEY}\n");
+        let a = store.write(&raw).unwrap();
+        assert_eq!(store.read_all(&a.id).unwrap(), raw);
     }
 }

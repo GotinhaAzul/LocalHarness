@@ -358,6 +358,7 @@ impl App {
             git: GitStatus::none(),
             profile: config.profile_name().to_string(),
             model: runtime.core.provider.model().to_string(),
+            tool_mode: runtime.core.tool_mode_label().unwrap_or_default(),
             logged_in: runtime.core.logged_in(),
             used,
             window,
@@ -650,6 +651,7 @@ impl App {
         self.header.model = runtime.core.provider.model().to_string();
         self.header.logged_in = runtime.core.logged_in();
         self.header.profile = self.config.profile_name().to_string();
+        self.header.tool_mode = runtime.core.tool_mode_label().unwrap_or_default();
         self.header.trust = self.config.trust || self.options.trust;
         self.window = runtime.core.effective_window().0;
         self.header.window = self.window;
@@ -1076,10 +1078,15 @@ impl App {
 
     fn handle_agent_event(&mut self, event: AgentEvent) {
         match event {
-            AgentEvent::TurnStarted { model, profile } => {
+            AgentEvent::TurnStarted {
+                model,
+                profile,
+                tool_mode,
+            } => {
                 self.header.logged_in = !model.trim().is_empty();
                 self.header.model = model;
                 self.header.profile = profile;
+                self.header.tool_mode = tool_mode;
                 self.turn_state = Some(AgentState::AssembleContext);
             }
             AgentEvent::State(state) => {
@@ -1918,6 +1925,7 @@ impl App {
         self.header.model = core.provider.model().to_string();
         self.header.logged_in = core.logged_in();
         self.header.profile = self.config.profile_name().to_string();
+        self.header.tool_mode = core.tool_mode_label().unwrap_or_default();
         self.header.trust = self.config.trust || self.options.trust;
         self.window = core.effective_window().0;
         self.header.window = self.window;
@@ -2119,7 +2127,8 @@ impl App {
                 Ok(session) => session,
                 Err(poison) => poison.into_inner(),
             };
-            let summary = context::build_summary(&session, findings.as_ref(), 4500);
+            let budget = context::compact::summary_budget(&runtime.core.budget);
+            let summary = context::build_summary(&session, findings.as_ref(), budget);
             let result = session
                 .append(EntryKind::Compaction(CompactionData {
                     summary: summary.summary.clone(),
@@ -2505,8 +2514,12 @@ impl App {
                         Err(poison) => poison.into_inner(),
                     };
                     let name = state.engagement_name.clone();
+                    let redact = state.redact;
                     match state.ensure_engagement(&paths) {
-                        Ok(engagement) => Some((name, crate::security::render_report(engagement))),
+                        Ok(engagement) => Some((
+                            name,
+                            crate::security::render_report_with(engagement, redact),
+                        )),
                         Err(error) => {
                             self.set_notice(
                                 format!("cannot open engagement: {error}"),
@@ -2631,6 +2644,7 @@ impl App {
             SkillIndex::load(&paths, true).advertised_for(&crate::tools::active_packs(&core.tools));
         self.header.trust = true;
         self.header.profile = self.config.profile_name().to_string();
+        self.header.tool_mode = core.tool_mode_label().unwrap_or_default();
         self.window = core.effective_window().0;
         self.header.window = self.window;
         self.used_tokens = estimate_used(&core);
@@ -2770,6 +2784,7 @@ impl App {
             path_jail,
             engagement: engagement.clone(),
             no_session: ephemeral,
+            no_redact: !config.session.redact,
             resume: target.clone(),
             continue_last: false,
         };
@@ -2792,6 +2807,7 @@ impl App {
                     path_jail,
                     engagement,
                     no_session: ephemeral,
+                    no_redact: !config.session.redact,
                     resume: old_resume,
                     continue_last: false,
                 };
@@ -3192,6 +3208,7 @@ mod tests {
             git: GitStatus::none(),
             profile: "full".into(),
             model: model.into(),
+            tool_mode: String::new(),
             logged_in: true,
             used: 12400,
             window: 64000,

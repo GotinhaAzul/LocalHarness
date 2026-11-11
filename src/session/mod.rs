@@ -21,6 +21,7 @@ pub use store::{SessionStore, StoreError};
 pub use tree::{CheckoutError, SessionTree};
 
 use crate::paths::{Paths, new_session_id};
+use crate::security::redact::Redactor;
 
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -33,15 +34,17 @@ pub struct Session {
     pub warnings: Vec<String>,
     store: Option<SessionStore>,
     next_seq: u64,
+    redactor: Redactor,
 }
 
 impl Session {
     /// Create a new session. With `no_session` nothing is written to disk and
     /// artifacts stay in memory.
     pub fn create(paths: &Paths, header: SessionData, no_session: bool) -> Result<Self> {
+        let redact = header.redact;
         if no_session {
             let id = "ephemeral".to_string();
-            let artifacts = Arc::new(ArtifactStore::ephemeral());
+            let artifacts = Arc::new(ArtifactStore::ephemeral_with(redact));
             let mut session = Self {
                 id,
                 path: None,
@@ -50,6 +53,7 @@ impl Session {
                 warnings: Vec::new(),
                 store: None,
                 next_seq: 1,
+                redactor: Redactor::new(redact),
             };
             let header = session.make_entry(0, "s0", None, EntryKind::Session(header));
             session.tree.push(header);
@@ -71,7 +75,7 @@ impl Session {
             .with_context(|| format!("cannot create session {}", path.display()))?;
         let artifacts_root = paths.artifacts_dir(&id);
         let artifacts = Arc::new(
-            ArtifactStore::new(id.clone(), Some(artifacts_root))
+            ArtifactStore::new_with(id.clone(), Some(artifacts_root), redact)
                 .context("cannot create artifact directory")?,
         );
         let mut session = Self {
@@ -82,6 +86,7 @@ impl Session {
             warnings: Vec::new(),
             store: Some(store),
             next_seq: 1,
+            redactor: Redactor::new(redact),
         };
         let header_entry = session.make_entry(0, "s0", None, EntryKind::Session(header));
         session.write_entry(&header_entry)?;
@@ -91,6 +96,12 @@ impl Session {
 
     /// Open an existing session file, acquiring its advisory lock.
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with(path, None)
+    }
+
+    /// Open a session with an explicit redaction setting. `None` follows the
+    /// mode recorded in the header; old sessions default to redaction on.
+    pub fn open_with(path: &Path, redact: Option<bool>) -> Result<Self> {
         let (store, entries) = SessionStore::open(path)
             .with_context(|| format!("cannot open session {}", path.display()))?;
         let (tree, warnings) = SessionTree::from_entries(entries);
@@ -101,17 +112,21 @@ impl Session {
             .file_stem()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| "session".into());
+        let redact = redact.unwrap_or_else(|| match tree.header().map(|entry| &entry.kind) {
+            Some(EntryKind::Session(data)) => data.redact,
+            _ => true,
+        });
         let artifacts_root = path
             .parent()
             .unwrap_or_else(|| Path::new("."))
             .join("artifacts")
             .join(&id);
         let artifacts = Arc::new(
-            ArtifactStore::new(id.clone(), Some(artifacts_root))
+            ArtifactStore::new_with(id.clone(), Some(artifacts_root), redact)
                 .context("cannot create artifact directory")?,
         );
         let next_seq = tree.entries().iter().map(|e| e.seq).max().unwrap_or(0) + 1;
-        Ok(Self {
+        let mut session = Self {
             id,
             path: Some(path.to_path_buf()),
             tree,
@@ -119,7 +134,17 @@ impl Session {
             warnings,
             store: Some(store),
             next_seq,
-        })
+            redactor: Redactor::new(redact),
+        };
+        if redact {
+            // Old sessions may predate redaction. Clean them in memory before
+            // their entries are replayed into a new prompt.
+            let redactor = &session.redactor;
+            for entry in session.tree.entries_mut() {
+                Self::redact_entry(redactor, &mut entry.kind);
+            }
+        }
+        Ok(session)
     }
 
     /// Most recently modified session file for the project.
@@ -202,9 +227,14 @@ impl Session {
         Ok(())
     }
 
-    pub fn append(&mut self, kind: EntryKind) -> Result<Entry> {
+    pub fn redaction_enabled(&self) -> bool {
+        self.redactor.enabled()
+    }
+
+    pub fn append(&mut self, mut kind: EntryKind) -> Result<Entry> {
         let seq = self.next_seq;
         self.next_seq += 1;
+        Self::redact_entry(&self.redactor, &mut kind);
         let checkout = matches!(kind, EntryKind::Checkout(_));
         let parent = if checkout {
             None
@@ -311,7 +341,66 @@ impl Session {
                 }
             }
         }
-        out
+        // Entries are already redacted on append; this also covers sessions
+        // written before redaction existed. With --no-redact it is a no-op.
+        self.redactor.redact_owned(&out)
+    }
+
+    /// Redact values in every entry kind before it reaches the in-memory tree
+    /// or disk. Names, paths, and structural fields stay intact.
+    fn redact_entry(redactor: &Redactor, kind: &mut EntryKind) {
+        if !redactor.enabled() {
+            return;
+        }
+        let redact = |text: &mut String| *text = redactor.redact_owned(text);
+        match kind {
+            EntryKind::Session(data) => {
+                // The header records the mode; cwd and endpoint are paths.
+                redact(&mut data.model);
+                redact(&mut data.profile);
+            }
+            EntryKind::User(data) => {
+                redact(&mut data.content);
+                for attachment in &mut data.attachments {
+                    redact(&mut attachment.content);
+                }
+            }
+            EntryKind::Assistant(data) => {
+                if let Some(content) = &mut data.content {
+                    redact(content);
+                }
+                if let Some(reasoning) = &mut data.reasoning {
+                    redact(reasoning);
+                }
+                if let Some(calls) = &mut data.tool_calls {
+                    for call in calls {
+                        redactor.redact_json(&mut call.arguments);
+                    }
+                }
+            }
+            EntryKind::ToolResult(data) => {
+                redact(&mut data.content);
+                if let Some(details) = &mut data.details {
+                    redactor.redact_json(details);
+                }
+            }
+            EntryKind::Compaction(data) => {
+                redact(&mut data.summary);
+                redact(&mut data.reason);
+            }
+            EntryKind::Checkout(data) => {
+                // `target` is a path or commit; only the prose reason is a value.
+                redact(&mut data.reason);
+            }
+            EntryKind::Custom(data) => {
+                for value in data.payload.values_mut() {
+                    redactor.redact_json(value);
+                }
+            }
+            EntryKind::Error(data) => {
+                redact(&mut data.message);
+            }
+        }
     }
 
     fn make_entry(&self, seq: u64, id: &str, parent: Option<String>, kind: EntryKind) -> Entry {
@@ -346,6 +435,7 @@ mod tests {
             model: "test".into(),
             profile: "full".into(),
             app: APP_VERSION.into(),
+            redact: true,
             context: None,
         }
     }
@@ -429,5 +519,99 @@ mod tests {
             .unwrap();
         assert!(!dir.path().join("data").exists());
         assert_eq!(session.context_path().len(), 1);
+    }
+
+    #[test]
+    fn entries_are_redacted_before_they_reach_disk_or_export() {
+        const KEY: &str = "AKIAIOSFODNN7EXAMPLE";
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths(dir.path());
+        let mut session = Session::create(&paths, header(), false).unwrap();
+        session
+            .append(EntryKind::ToolResult(ToolResultData {
+                call_id: "c1".into(),
+                content: format!("aws_access_key_id = {KEY}\n"),
+                is_error: false,
+                details: Some(serde_json::json!({"value": KEY})),
+                artifact: None,
+            }))
+            .unwrap();
+        session.fsync().unwrap();
+        let path = session.path.clone().unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains(KEY), "{raw}");
+        assert!(raw.contains("[REDACTED:aws:AKIA..."), "{raw}");
+        let export = session.export_markdown();
+        assert!(!export.contains(KEY), "{export}");
+        assert!(export.contains("[REDACTED:aws:AKIA..."), "{export}");
+    }
+
+    #[test]
+    fn old_plaintext_entries_are_redacted_when_replayed() {
+        const KEY: &str = "AKIAIOSFODNN7EXAMPLE";
+        let dir = tempfile::tempdir().unwrap();
+        let mut paths = paths(dir.path());
+        paths.sessions_dir_override = Some(dir.path().join("sessions"));
+        paths.ensure_dirs().unwrap();
+        let path = paths.session_file("old");
+        let now = Utc::now().to_rfc3339();
+        let header = serde_json::json!({
+            "v": 1, "seq": 0, "id": "s0", "parent": null, "ts": now,
+            "type": "session",
+            "data": {
+                "cwd": "/tmp", "endpoint": "http://x", "model": "m",
+                "profile": "p", "app": "test"
+            }
+        });
+        let user = serde_json::json!({
+            "v": 1, "seq": 1, "id": "e1", "parent": "s0", "ts": now,
+            "type": "user",
+            "data": {"content": format!("the key is {KEY}")}
+        });
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&header).unwrap(),
+                serde_json::to_string(&user).unwrap()
+            ),
+        )
+        .unwrap();
+        let session = Session::open(&path).unwrap();
+        let content = match &session.tree.get("e1").unwrap().kind {
+            EntryKind::User(data) => &data.content,
+            _ => panic!("wrong entry"),
+        };
+        assert!(!content.contains(KEY), "{content}");
+        assert!(content.contains("[REDACTED:aws:AKIA..."), "{content}");
+    }
+
+    #[test]
+    fn no_redact_is_recorded_in_the_header_and_keeps_raw_values() {
+        const KEY: &str = "AKIAIOSFODNN7EXAMPLE";
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths(dir.path());
+        let mut session_header = header();
+        session_header.redact = false;
+        let mut session = Session::create(&paths, session_header, false).unwrap();
+        session
+            .append(EntryKind::ToolResult(ToolResultData {
+                call_id: "c1".into(),
+                content: format!("aws_access_key_id = {KEY}\n"),
+                is_error: false,
+                details: None,
+                artifact: None,
+            }))
+            .unwrap();
+        session.fsync().unwrap();
+        let path = session.path.clone().unwrap();
+        drop(session);
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains(KEY), "{raw}");
+        let first = raw.lines().next().unwrap();
+        let header: serde_json::Value = serde_json::from_str(first).unwrap();
+        assert_eq!(header["data"]["redact"], false, "{header}");
+        let reopened = Session::open(&path).unwrap();
+        assert!(!reopened.redaction_enabled());
     }
 }

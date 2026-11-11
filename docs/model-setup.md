@@ -214,6 +214,24 @@ Probes are tried in this order and stop at the first match:
 available. A manifest is cached per `(API base, model, build)` under the data
 directory.
 
+### Tool-call conformance probe
+
+Selecting a model (or switching models) sends one tiny, forced tool call with a
+one-field schema and classifies the result as `native_ok`, `prose_fallback`,
+`rejected_400`, `tools_dropped`, or `empty_call`. A known-good result is cached
+per `(API base, model, build)` and skipped next time; a failed classification is
+retried on the next start because server flags change. `lh doctor` only reads
+the cached result and never sends a chat completion itself.
+
+Anything other than `native_ok` switches the effective mode to `repair` and
+records a warning; the system prompt then names the `<tool_call>` JSON block
+the repair layer executes. A server that rejects tool definitions
+(`rejected_400`) also stops receiving them, so the next request is not rejected
+the same way. The chosen mode appears as `tool_probe` in `lh doctor`, as a
+`tool-probe` custom entry in the session, and as `tools:native`/`tools:repair`
+in the TUI header. Set `LH_SKIP_TOOL_PROBE=1` to skip the probe (diagnostics and
+scripted tests).
+
 ### Manifest fields
 
 | Field | Meaning |
@@ -224,6 +242,7 @@ directory.
 | `context` | `trained`, `allocated`, `per_slot`, `effective`, plus `trained_source`, `allocated_source`, `per_slot_source`. `effective` is zero when nothing was reported. |
 | `tool_dialect` | `native`, `repair`, `none`, or `unknown`, from server metadata (Ollama capabilities, llama.cpp chat template). |
 | `tool_parser` | Parser name the server reports, if any. |
+| `tool_probe` | Last forced-tool conformance result (`native_ok`, `prose_fallback`, `rejected_400`, `tools_dropped`, `empty_call`), its effective `mode`, model, build, message, and check time; `null` when none is cached. |
 | `reasoning_field` | Streaming reasoning field the server reports, if any. |
 | `structured_output` | `json_schema`, `grammar`, `none`, or `unknown`; unknown when the server does not report it. |
 | `cache_mode` | Engine cache mode, if reported (for example TabbyAPI's `cache_mode`). |
@@ -253,6 +272,7 @@ directory.
   },
   "tool_dialect": "native",
   "tool_parser": null,
+  "tool_probe": null,
   "reasoning_field": null,
   "structured_output": "unknown",
   "cache_mode": null,

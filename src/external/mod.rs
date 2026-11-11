@@ -735,6 +735,7 @@ mod tests {
             model: "test".to_string(),
             profile: "full".to_string(),
             app: "test".to_string(),
+            redact: true,
             context: None,
         };
         let session = Session::create(&paths, header, true).unwrap();

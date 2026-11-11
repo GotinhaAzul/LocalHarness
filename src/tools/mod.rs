@@ -105,18 +105,33 @@ impl ToolResult {
         }
     }
 
-    /// Append language-server diagnostics for a successful mutation. A missing
-    /// server or a still-indexing server adds nothing and never fails the edit.
-    pub async fn with_diagnostics(mut self, ctx: &ToolContext, path: &Path) -> Self {
+    /// Gate language-server diagnostics for a successful mutation.
+    ///
+    /// `snapshot` is taken before the tool writes. A new error under
+    /// `lsp.gate = "block"` restores the snapshot and returns
+    /// `EDIT_REGRESSION`; under `warn` the new error is appended. A clean,
+    /// cold, or non-project edit adds no text.
+    pub async fn with_diagnostics(
+        mut self,
+        ctx: &ToolContext,
+        path: &Path,
+        snapshot: lsp::EditSnapshot,
+    ) -> Self {
         if self.is_error {
             return self;
         }
-        if let Some(diagnostics) = ctx.lsp.diagnostics_after_edit(ctx, path).await {
-            self.content.push_str("\n\n");
-            self.content.push_str(&diagnostics);
-            if let Some(details) = self.details.as_mut().and_then(Value::as_object_mut) {
-                details.insert("diagnostics".to_string(), Value::Bool(true));
-            }
+        let Some(verdict) = ctx.lsp.check_edit(ctx, path, &snapshot).await else {
+            return self;
+        };
+        if let Some(regression) = verdict.regression {
+            let mut result = ToolResult::err("EDIT_REGRESSION", verdict.text);
+            result.details = Some(regression.details());
+            return result;
+        }
+        self.content.push_str("\n\n");
+        self.content.push_str(&verdict.text);
+        if let Some(details) = self.details.as_mut().and_then(Value::as_object_mut) {
+            details.insert("diagnostics".to_string(), Value::Bool(true));
         }
         self
     }
@@ -596,14 +611,57 @@ impl ToolRegistry {
     }
 
     pub fn specs(tools: &[Arc<dyn Tool>]) -> Vec<ToolSpec> {
+        Self::specs_with(tools, false)
+    }
+
+    /// Tool specs for one model profile. `short` strips property descriptions
+    /// and truncates each tool description, which keeps prompt cost low for
+    /// weak models and small windows.
+    pub fn specs_with(tools: &[Arc<dyn Tool>], short: bool) -> Vec<ToolSpec> {
         tools
             .iter()
             .map(|tool| ToolSpec {
                 name: tool.name().to_string(),
-                description: tool.description().to_string(),
-                parameters: tool.schema(),
+                description: if short {
+                    short_description(tool.description())
+                } else {
+                    tool.description().to_string()
+                },
+                parameters: if short {
+                    compact_schema(tool.schema())
+                } else {
+                    tool.schema()
+                },
             })
             .collect()
+    }
+}
+
+/// First sentence of a tool description, capped for schemas sent to weak models.
+fn short_description(description: &str) -> String {
+    let first = description.split(". ").next().unwrap_or(description).trim();
+    let mut text: String = first.chars().take(90).collect();
+    if first.chars().count() > 90 {
+        text.push('…');
+    }
+    if !text.ends_with('.') {
+        text.push('.');
+    }
+    text
+}
+
+/// Drop `description` keys at every depth. Types, enums, required keys, and
+/// bounds remain, so the model still sees a valid JSON schema.
+fn compact_schema(schema: Value) -> Value {
+    match schema {
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .filter(|(key, _)| key != "description")
+                .map(|(key, value)| (key, compact_schema(value)))
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.into_iter().map(compact_schema).collect()),
+        other => other,
     }
 }
 
@@ -795,6 +853,32 @@ mod tests {
         let tool = registry.get("repo_map").expect("repo_map is registered");
         assert_eq!(tool.pack(), ToolPack::Coding);
         assert!(tool.read_only());
+    }
+
+    #[test]
+    fn short_specs_trim_description_text_and_schema_noise() {
+        let registry = ToolRegistry::builtin();
+        let tools = vec![registry.get("edit").expect("edit tool")];
+        let full = ToolRegistry::specs(&tools);
+        let short = ToolRegistry::specs_with(&tools, true);
+        assert_eq!(full[0].name, short[0].name);
+        assert!(short[0].description.chars().count() <= 92);
+        assert!(
+            full[0].parameters["properties"]["path"]["description"]
+                .as_str()
+                .is_some()
+        );
+        assert!(
+            short[0].parameters["properties"]["path"]
+                .get("description")
+                .is_none(),
+            "{}",
+            short[0].parameters
+        );
+        assert_eq!(
+            short[0].parameters["required"],
+            full[0].parameters["required"]
+        );
     }
 
     #[test]

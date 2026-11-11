@@ -59,6 +59,10 @@ impl SessionTree {
         &self.entries
     }
 
+    pub(crate) fn entries_mut(&mut self) -> &mut [Entry] {
+        &mut self.entries
+    }
+
     pub fn len(&self) -> usize {
         self.entries.len()
     }

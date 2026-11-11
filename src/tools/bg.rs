@@ -330,6 +330,7 @@ impl BgTool {
                 );
             }
         };
+        let raw = ctx.artifacts.redact_owned(&raw);
         let body = tail_chars(&last_lines(&raw, lines), MAX_LOG_CHARS);
         let body = if body.is_empty() {
             "(log is empty; the process may not have written output yet)".to_string()

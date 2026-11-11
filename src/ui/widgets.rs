@@ -16,6 +16,9 @@ pub struct HeaderData {
     pub git: GitStatus,
     pub profile: String,
     pub model: String,
+    /// Effective tool mode from the conformance probe (`tools:native` or
+    /// `tools:repair`); empty when unknown.
+    pub tool_mode: String,
     /// False until a model is selected; the header then shows `not logged in`.
     pub logged_in: bool,
     pub used: u32,
@@ -154,6 +157,7 @@ pub fn clip_end(text: &str, max: usize) -> String {
 
 struct HeaderFlags {
     profile: bool,
+    tool_mode: bool,
     session: bool,
     throughput: bool,
     cache: bool,
@@ -240,6 +244,17 @@ fn header_sides(
             theme.style(Role::Muted),
         )]);
     }
+    if flags.tool_mode && !data.tool_mode.is_empty() {
+        let role = if data.tool_mode.ends_with("repair") {
+            Role::Warning
+        } else {
+            Role::Muted
+        };
+        left.push(vec![Span::styled(
+            data.tool_mode.clone(),
+            theme.style(role),
+        )]);
+    }
     if !data.trust {
         left.push(vec![Span::styled("untrusted", theme.style(Role::Warning))]);
     }
@@ -276,6 +291,7 @@ fn header_sides(
 pub fn header_line(data: &HeaderData, width: usize, theme: &Theme) -> Line<'static> {
     let mut flags = HeaderFlags {
         profile: width >= 70,
+        tool_mode: width >= 80,
         session: width >= 90,
         throughput: width >= 100,
         cache: width >= 110,
@@ -298,6 +314,8 @@ pub fn header_line(data: &HeaderData, width: usize, theme: &Theme) -> Line<'stat
             flags.throughput = false;
         } else if flags.session {
             flags.session = false;
+        } else if flags.tool_mode {
+            flags.tool_mode = false;
         } else if flags.profile {
             flags.profile = false;
         } else if flags.gauge {

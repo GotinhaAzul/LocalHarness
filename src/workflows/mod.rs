@@ -183,4 +183,36 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn workflow_profiles_and_small_model_profiles_exist() {
+        let config = crate::config::Config::builtin();
+        for workflow in all() {
+            if let Some(profile) = &workflow.profile {
+                assert!(
+                    config.profiles.contains_key(profile),
+                    "{} uses unknown profile {profile}",
+                    workflow.name
+                );
+            }
+        }
+        // The weak-model presets are part of the validated surface.
+        for name in ["strict", "shell"] {
+            assert!(
+                config.profiles.contains_key(name),
+                "missing built-in profile {name}"
+            );
+        }
+        for name in ["strict", "shell"] {
+            let profile = &config.profiles[name];
+            let model_profile = profile
+                .model_profile
+                .as_ref()
+                .expect("a dedicated model profile");
+            assert!(
+                config.model_profiles.contains_key(model_profile),
+                "{name} names missing model profile {model_profile}"
+            );
+        }
+    }
 }
