@@ -6,7 +6,7 @@ use std::sync::Arc;
 use crate::config::Config;
 use crate::paths::Paths;
 use crate::skills::SkillIndex;
-use crate::tools::{Tool, ToolPack};
+use crate::tools::{Tool, ToolPack, ToolRegistry};
 
 const MAX_AGENTS_MD_CHARS: usize = 12_000;
 
@@ -139,6 +139,24 @@ fn tool_index_line(tools: &[Arc<dyn Tool>]) -> String {
     format!(
         "Available tools (names only; descriptions and schemas travel with the request): {names}"
     )
+}
+
+/// Argument reference for a request that cannot carry the `tools` field (a
+/// server that rejects tool definitions). The name-only index does not tell
+/// the model which keys a call needs, and the repair layer validates required
+/// keys instead of inventing them. Compact schemas keep the keys, types,
+/// enums, and bounds while dropping prose descriptions.
+pub fn tool_argument_reference(tools: &[Arc<dyn Tool>]) -> String {
+    let mut out = String::from(
+        "\n## Tool arguments\n\nEach call's `arguments` object must include the required keys of the tool's schema:\n\n",
+    );
+    for spec in ToolRegistry::specs_with(tools, true) {
+        out.push_str(&format!(
+            "- `{}` — {}\n  `{}`\n",
+            spec.name, spec.description, spec.parameters
+        ));
+    }
+    out
 }
 
 fn clip(text: &str, max_chars: usize) -> String {

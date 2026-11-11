@@ -1323,10 +1323,15 @@ impl StreamAccum {
             return Ok(());
         }
         for call in self.calls.values() {
-            if call.name.trim().is_empty() || call.arguments.trim().is_empty() {
+            if call.name.trim().is_empty() {
                 continue;
             }
-            if serde_json::from_str::<Value>(&call.arguments).is_err() {
+            // A call cut off right after its name has no argument text at
+            // all. Finalization would turn that into `{}`, which can run a
+            // no-required-keys tool from a reply the output limit cut off.
+            if call.arguments.trim().is_empty()
+                || serde_json::from_str::<Value>(&call.arguments).is_err()
+            {
                 return Err(ProviderError::new(
                     ErrorClass::ToolCallTruncated,
                     format!(
@@ -2598,6 +2603,19 @@ mod tests {
         assert_eq!(err.class, ErrorClass::ToolCallTruncated);
         assert!(err.message.contains("incomplete"), "{}", err.message);
         assert!(err.message.contains("max_output_tokens"), "{}", err.message);
+    }
+
+    #[test]
+    fn a_length_cut_call_without_arguments_is_rejected() {
+        let mut accum = StreamAccum::new();
+        accum.finish = Some("max_tokens".into());
+        let call = accum.calls.entry(0).or_default();
+        // The stream stopped after the name, before any argument text.
+        call.name = "todo".into();
+        assert!(call.arguments.is_empty());
+        let err = accum.validate_calls().expect_err("truncated call");
+        assert_eq!(err.class, ErrorClass::ToolCallTruncated);
+        assert!(err.message.contains("incomplete"), "{}", err.message);
     }
 
     #[test]

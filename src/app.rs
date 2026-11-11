@@ -49,6 +49,31 @@ This server does not return structured tool calls. When you need a tool, write e
 <tool_call>{\"name\":\"tool_name\",\"arguments\":{...}}</tool_call>\n\
 Use a bare block, not a fenced code block. Give the final answer in prose when no tool is needed.";
 
+/// Append the text-call instructions only when the probe found that native
+/// calls do not work. A configured `tool_mode = repair` still sends `tools[]`
+/// when the probe returned `native_ok`; telling that model the server is
+/// text-only would push it off the path the probe just verified. When the
+/// probe also made the request drop `tools[]` (`rejected_400`), include the
+/// argument reference the request can no longer carry.
+fn repair_protocol(
+    probe: Option<&probe::ToolProbe>,
+    tools: &[Arc<dyn crate::tools::Tool>],
+    tools_sent: bool,
+) -> Option<String> {
+    if tools.is_empty() {
+        return None;
+    }
+    let probe = probe?;
+    if probe.native() {
+        return None;
+    }
+    let mut text = REPAIR_PROTOCOL.to_string();
+    if !tools_sent {
+        text.push_str(&prompt::tool_argument_reference(tools));
+    }
+    Some(text)
+}
+
 /// Run the configured startup command once when the endpoint is unreachable,
 /// then wait for it to come up. Empty `model.start_command` disables this.
 async fn ensure_endpoint(
@@ -365,8 +390,8 @@ pub async fn create_runtime(
     // A server without native tool calls still lists the tools in the system
     // prompt; name the exact wire format the repair layer can execute.
     let mut system_prompt = system_prompt;
-    if profile.tool_mode == crate::config::ToolMode::Repair {
-        system_prompt.push_str(REPAIR_PROTOCOL);
+    if let Some(text) = repair_protocol(tool_probe.as_ref(), &tools, !tool_specs.is_empty()) {
+        system_prompt.push_str(&text);
     }
     let mut budget = TokenBudget::new(context_window, config.model.max_output_tokens);
     let sampled = tokio::time::timeout(
@@ -557,8 +582,8 @@ pub async fn rebuild_core(old: &Arc<Core>, mut config: Config) -> Result<Arc<Cor
     if let Some(probe) = &tool_probe {
         apply_tool_probe(probe, &mut model_profile, &mut tool_specs);
     }
-    if model_profile.tool_mode == crate::config::ToolMode::Repair {
-        system_prompt.push_str(REPAIR_PROTOCOL);
+    if let Some(text) = repair_protocol(tool_probe.as_ref(), &tools, !tool_specs.is_empty()) {
+        system_prompt.push_str(&text);
     }
     let mut budget = TokenBudget::new(context_window, config.model.max_output_tokens);
     if same_target {
@@ -1399,6 +1424,56 @@ mod tests {
         assert_eq!(
             gate.ready(&CancellationToken::new()).await,
             Some(Err("endpoint down".to_string()))
+        );
+    }
+
+    fn tool_probe(outcome: probe::ToolProbeOutcome, mode: &str) -> probe::ToolProbe {
+        probe::ToolProbe {
+            outcome,
+            model: "spark26".into(),
+            build: None,
+            mode: mode.into(),
+            message: outcome.code().into(),
+            checked: "2026-11-11T00:00:00Z".into(),
+        }
+    }
+
+    #[test]
+    fn native_probe_does_not_advertise_text_calls() {
+        let config = Config::builtin();
+        let registry = ToolRegistry::builtin();
+        let tools = registry.select(config.profile(), &[]).unwrap();
+        let native = tool_probe(probe::ToolProbeOutcome::NativeOk, "native");
+        assert!(
+            repair_protocol(Some(&native), &tools, true).is_none(),
+            "a native probe must not push the model to text calls"
+        );
+        assert!(
+            repair_protocol(None, &tools, true).is_none(),
+            "without probe evidence the protocol would claim native calls fail"
+        );
+    }
+
+    #[test]
+    fn rejected_probe_adds_argument_guidance_when_schemas_are_dropped() {
+        let config = Config::builtin();
+        let registry = ToolRegistry::builtin();
+        let tools = registry.select(config.profile(), &[]).unwrap();
+        let rejected = tool_probe(probe::ToolProbeOutcome::Rejected400, "repair");
+
+        let text = repair_protocol(Some(&rejected), &tools, false).unwrap();
+        assert!(text.contains("does not return structured tool calls"));
+        assert!(text.contains("## Tool arguments"));
+        assert!(text.contains("`read`"));
+        assert!(
+            text.contains("\"required\":[\"path\"]"),
+            "read's required keys must survive when tools[] is not sent"
+        );
+
+        let with_schemas = repair_protocol(Some(&rejected), &tools, true).unwrap();
+        assert!(
+            !with_schemas.contains("## Tool arguments"),
+            "the request already carries the schemas; do not repeat them"
         );
     }
 }
