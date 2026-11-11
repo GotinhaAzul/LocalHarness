@@ -51,6 +51,7 @@ mouse = true                    # wheel scrolls the conversation; Shift+drag sel
 [session]
 dir = ""                        # default data dir's sessions/
 no_session = false
+redact = true                   # redact secret values before persistence
 artifact_retention_days = 30
 
 [budgets]
@@ -240,10 +241,10 @@ Steps run sequentially without a shell and stop at the first failure.
 ## Flags
 
 `--print`, `--json`, `--endpoint`, `--model`, `--model-profile`, `--profile`,
-`--theme`, `--api-key`, `--trust`, `--no-session`, `--continue`, `--resume`,
-`--path-jail`, `--sandbox [read-only|workspace-write]`, `--no-sandbox`,
-`--engagement`, `--no-color`, `--keep-artifacts`, `--clean-artifacts`,
-`--debug`.
+`--theme`, `--api-key`, `--trust`, `--no-session`, `--no-redact`, `--continue`,
+`--resume`, `--path-jail`, `--sandbox [read-only|workspace-write]`,
+`--no-sandbox`, `--engagement`, `--no-color`, `--keep-artifacts`,
+`--clean-artifacts`, `--debug`.
 
 `lh doctor [--json] [--fix]` prints the engine capability manifest without
 sending a chat completion. See [model-setup.md](model-setup.md).

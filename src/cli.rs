@@ -65,6 +65,11 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub no_session: bool,
 
+    /// Disable secret redaction in sessions, artifacts, evidence, and reports.
+    /// The choice is recorded in the session header.
+    #[arg(long, global = true)]
+    pub no_redact: bool,
+
     /// Resume the most recent session for this project.
     #[arg(long = "continue", conflicts_with = "resume")]
     pub continue_last: bool,
@@ -179,6 +184,9 @@ pub async fn run(cli: Cli) -> Result<i32> {
     }
     config.trust = trust;
     config.session.no_session |= cli.no_session;
+    if cli.no_redact {
+        config.session.redact = false;
+    }
     if cli.keep_artifacts {
         config.session.keep_artifacts = true;
     }
@@ -226,6 +234,7 @@ pub async fn run(cli: Cli) -> Result<i32> {
         path_jail: cli.path_jail,
         engagement: cli.engagement.clone(),
         no_session: config.session.no_session,
+        no_redact: !config.session.redact,
         resume,
         continue_last: cli.continue_last,
     };
@@ -487,5 +496,17 @@ fn init_logging(paths: &Paths, debug: bool) {
         .finish();
     if tracing::subscriber::set_global_default(subscriber).is_ok() {
         std::mem::forget(guard);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_redact_is_an_explicit_global_flag() {
+        let cli = Cli::try_parse_from(["lh", "--no-redact"]).unwrap();
+        assert!(cli.no_redact);
+        assert!(!Cli::try_parse_from(["lh"]).unwrap().no_redact);
     }
 }

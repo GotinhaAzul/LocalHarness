@@ -1,9 +1,15 @@
 //! Markdown engagement report.
 
 use super::findings::{Engagement, Severity, Status};
+use super::redact::Redactor;
 
-/// Render findings grouped by severity, most severe first.
+/// Render findings grouped by severity, most severe first, with secret values
+/// redacted. Use [`render_with`] to follow the session's `--no-redact` setting.
 pub fn render(engagement: &Engagement) -> String {
+    render_with(engagement, true)
+}
+
+pub fn render_with(engagement: &Engagement, redact: bool) -> String {
     let mut out = format!("# Findings — {}\n\n", engagement.name);
     let (open, high, medium) = engagement.counts();
     out.push_str(&format!(
@@ -97,7 +103,11 @@ pub fn render(engagement: &Engagement) -> String {
             out.push('\n');
         }
     }
-    out
+    if redact {
+        Redactor::new(true).redact_owned(&out)
+    } else {
+        out
+    }
 }
 
 fn title_case(value: &str) -> String {
@@ -138,5 +148,28 @@ mod tests {
         let report = render(&engagement);
         assert!(report.find("## Critical").unwrap() < report.find("## Info").unwrap());
         assert!(report.contains("db.test"));
+    }
+
+    #[test]
+    fn report_redacts_secret_values() {
+        const KEY: &str = "AKIAIOSFODNN7EXAMPLE";
+        let dir = tempfile::tempdir().unwrap();
+        let mut paths = crate::paths::Paths::discover(dir.path()).unwrap();
+        paths.data_dir = dir.path().join("data");
+        let mut engagement = Engagement::open(&paths, "eng").unwrap();
+        engagement
+            .add(NewFinding {
+                title: "Leaked key".into(),
+                severity: Severity::High,
+                target: "db.test".into(),
+                impact: Some(format!("the command printed {KEY}")),
+                ..NewFinding::default()
+            })
+            .unwrap();
+        let redacted = render(&engagement);
+        assert!(!redacted.contains(KEY), "{redacted}");
+        assert!(redacted.contains("[REDACTED:aws:AKIA..."), "{redacted}");
+        let raw = render_with(&engagement, false);
+        assert!(raw.contains(KEY), "{raw}");
     }
 }

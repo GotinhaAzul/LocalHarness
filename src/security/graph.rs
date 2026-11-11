@@ -729,6 +729,8 @@ mod tests {
                 is_error: false,
                 artifact: "evidence/e1.txt".into(),
                 sha256: "hash".into(),
+                stored_sha256: None,
+                redacted: false,
                 bytes: 0,
                 summary: None,
             }],

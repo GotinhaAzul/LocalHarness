@@ -149,7 +149,7 @@ One append-only JSONL file per session tree under `~/.local/share/localharness/s
 /export     write a Markdown transcript
 ```
 
-Compaction is deterministic, not model-written. Tool output is archived with an id, and `recall` reads an exact range. `--no-session` writes nothing: no session file, no artifacts.
+Compaction is deterministic, not model-written. Tool output is archived with an id, and `recall` reads an exact range. `--no-session` writes nothing: no session file, no artifacts. Persisted session entries, artifacts, evidence, and reports redact secret-shaped values by default; `--no-redact` is the explicit opt-out and is recorded in the session header.
 
 ## 04 · One binary, two front ends
 
@@ -193,7 +193,7 @@ Security is opt-in. The default `coding` profile has no security tools or postur
 
 Security work is for authorized labs, CTFs, and engagements only. Scope is set by the user with `/sec scope add|remove|clear`; there is no model tool for it. The scope gate blocks a known set of active-testing tools when no scope is set or when an extracted target is outside it. It is a speed bump; `--sandbox` is the process boundary.
 
-- **Evidence.** `bash`, `bg`, and external tool runs append an evidence entry with target, command, timestamps, exit status, output artifact, and SHA-256.
+- **Evidence.** `bash`, `bg`, and external tool runs append an evidence entry with target, command, timestamps, exit status, output artifact, and SHA-256. Secret values are redacted before session, artifact, evidence, and report writes; `--no-redact` is the explicit, recorded opt-out.
 - **Surface.** `surface` parses nmap/HTTP/TLS output into one inventory; `attack_path` queries the graph derived from surface, findings, and evidence.
 - **Findings.** `finding add` auto-links the last evidence entry. A finding can carry bounded `poc_steps`; `finding verify` replays them locally and stores `reproduced`/`confirmed`, `not_reproduced`/`rejected`, or `error|skipped`/`inconclusive`.
 - **Detection.** `detect` validates and runs a Sigma subset against local JSONL logs or plain-text samples.

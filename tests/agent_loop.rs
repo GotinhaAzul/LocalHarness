@@ -188,6 +188,7 @@ fn harness_config(dir: &std::path::Path, scripts: Vec<Script>, config: Config) -
             model: "test-model".into(),
             profile: "test".into(),
             app: "test".into(),
+            redact: true,
             context: None,
         },
         true,
@@ -327,6 +328,55 @@ async fn bash_records_evidence_and_findings_link_to_it() {
             .and_then(|reference| reference.artifact.as_deref()),
         Some(evidence.artifact.as_str())
     );
+}
+
+#[tokio::test]
+async fn bash_secrets_are_redacted_in_session_and_evidence() {
+    const KEY: &str = "AKIAIOSFODNN7EXAMPLE";
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness(
+        dir.path(),
+        vec![
+            tool_script("bash", json!({"command": format!("echo {KEY}")})),
+            text_script("done"),
+        ],
+        &["bash"],
+    );
+    {
+        let mut state = harness.core.security.lock().unwrap();
+        state
+            .ensure_engagement(&harness.core.paths)
+            .expect("engagement");
+    }
+    let (outcome, _) = run(&harness, "run a command").await;
+    assert_eq!(outcome.status, TurnStatus::Done);
+
+    {
+        let session = harness.session.lock().unwrap();
+        let entry = session
+            .branch_entries()
+            .into_iter()
+            .find(|entry| entry.is_tool_result())
+            .expect("tool result");
+        let content = &entry.tool_result().expect("tool result data").content;
+        assert!(!content.contains(KEY), "{content}");
+        assert!(content.contains("[REDACTED:aws:AKIA..."), "{content}");
+    }
+
+    let state = harness.core.security.lock().unwrap();
+    let engagement = state.engagement.as_ref().expect("engagement");
+    let evidence = &engagement.evidence.list()[0];
+    assert!(evidence.redacted);
+    let raw = format!("stdout:\n{KEY}\n");
+    assert_eq!(
+        evidence.sha256,
+        localharness::security::evidence::sha256_hex(raw.as_bytes()),
+        "the digest still describes raw output"
+    );
+    let (_, artifact) = engagement.evidence.read(&evidence.id).unwrap();
+    assert!(!artifact.contains(KEY), "{artifact}");
+    assert!(artifact.contains("[REDACTED:aws:AKIA..."), "{artifact}");
+    assert!(engagement.evidence.verify(&evidence.id).unwrap().1);
 }
 
 #[tokio::test]

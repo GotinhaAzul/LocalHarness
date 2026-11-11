@@ -2440,6 +2440,7 @@ mod tests {
                 model: "m".into(),
                 profile: "test".into(),
                 app: "test".into(),
+                redact: true,
                 context: None,
             },
             true,

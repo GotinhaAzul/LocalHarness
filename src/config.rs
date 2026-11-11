@@ -617,6 +617,9 @@ pub struct SessionConfig {
     /// Empty means the default data directory.
     pub dir: PathBuf,
     pub no_session: bool,
+    /// Redact secret values before session entries, artifacts, evidence, and
+    /// reports are written. `--no-redact` disables it for one session.
+    pub redact: bool,
     /// Artifact retention in days; 0 disables cleanup.
     pub artifact_retention_days: u32,
     pub keep_artifacts: bool,
@@ -628,6 +631,7 @@ impl Default for SessionConfig {
         Self {
             dir: PathBuf::new(),
             no_session: false,
+            redact: true,
             artifact_retention_days: 30,
             keep_artifacts: false,
             clean_artifacts: false,
@@ -846,6 +850,7 @@ mod tests {
         assert_eq!(cfg.context_window(), 32768);
         assert_eq!(cfg.profile().packs, ["core", "coding"]);
         assert_eq!(cfg.ui.theme, "default");
+        assert!(cfg.session.redact, "secret redaction is on by default");
         assert_eq!(cfg.profiles["full"].packs, ["core", "coding", "security"]);
 
         let mut cfg = Config::builtin();

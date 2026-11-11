@@ -108,18 +108,40 @@ pub enum EntryKind {
     Error(ErrorData),
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionData {
     pub cwd: String,
     pub endpoint: String,
     pub model: String,
     pub profile: String,
     pub app: String,
+    /// Whether secret values were redacted before persistence. Always written
+    /// so `--no-redact` is visible in the header; old files default to true.
+    #[serde(default = "default_redact")]
+    pub redact: bool,
     /// Context window resolution at session start: trained maximum, server
     /// allocation, per-slot budget, and the effective minimum. Absent in
     /// session files written before this field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<SessionContextWindow>,
+}
+
+fn default_redact() -> bool {
+    true
+}
+
+impl Default for SessionData {
+    fn default() -> Self {
+        Self {
+            cwd: String::new(),
+            endpoint: String::new(),
+            model: String::new(),
+            profile: String::new(),
+            app: String::new(),
+            redact: true,
+            context: None,
+        }
+    }
 }
 
 /// The four context-window numbers recorded in a session header.
@@ -308,9 +330,15 @@ mod tests {
                 model: "qwen3".into(),
                 profile: "full".into(),
                 app: "test".into(),
+                redact: true,
                 context,
             }),
         }
+    }
+
+    #[test]
+    fn default_header_is_safe() {
+        assert!(SessionData::default().redact);
     }
 
     #[test]
@@ -324,7 +352,23 @@ mod tests {
         });
         let data: SessionData = serde_json::from_value(json).unwrap();
         assert!(data.context.is_none());
+        assert!(data.redact, "old headers default to redaction on");
         assert_eq!(data.model, "qwen3");
+    }
+
+    #[test]
+    fn session_header_records_no_redact() {
+        let mut entry = session_entry(None);
+        if let EntryKind::Session(data) = &mut entry.kind {
+            data.redact = false;
+        }
+        let json = serde_json::to_value(&entry).unwrap();
+        assert_eq!(json["data"]["redact"], false);
+        let back: Entry = serde_json::from_value(json).unwrap();
+        match back.kind {
+            EntryKind::Session(data) => assert!(!data.redact),
+            _ => panic!("wrong type"),
+        }
     }
 
     #[test]

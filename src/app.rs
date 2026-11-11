@@ -27,6 +27,8 @@ pub struct RuntimeOptions {
     pub path_jail: bool,
     pub engagement: Option<String>,
     pub no_session: bool,
+    /// Disable secret redaction for this session. Recorded in the header.
+    pub no_redact: bool,
     pub resume: Option<PathBuf>,
     pub continue_last: bool,
 }
@@ -192,9 +194,11 @@ pub async fn create_runtime(
         Arc::new(OpenAiCompatProvider::new(&config.model, model.clone())?);
     warn_if_remote(&config.model.endpoint);
 
-    let security = Arc::new(Mutex::new(SecurityState::load(
+    let redact = !options.no_redact;
+    let security = Arc::new(Mutex::new(SecurityState::load_with_redact(
         &paths,
         options.engagement.clone(),
+        redact,
     )?));
 
     if !options.no_session {
@@ -209,7 +213,7 @@ pub async fn create_runtime(
     };
     let mut session = match session_path {
         Some(path) => {
-            let mut session = Session::open(&path)
+            let mut session = Session::open_with(&path, Some(redact))
                 .with_context(|| format!("cannot resume {}", path.display()))?;
             if let Some(header) = session.header().cloned() {
                 if header.endpoint != config.model.endpoint {
@@ -239,12 +243,31 @@ pub async fn create_runtime(
                 model: model.clone(),
                 profile: config.profile_name().to_string(),
                 app: APP_VERSION.to_string(),
+                redact,
                 context: session_context(window_truth.as_ref()),
             },
             options.no_session,
         )?,
     };
     session.warnings.extend(startup_warnings);
+    let recorded_redact = session.header().map(|header| header.redact).unwrap_or(true);
+    if recorded_redact != redact {
+        if let Err(error) = session.append(EntryKind::Custom(
+            CustomData::new("redaction").with("enabled", redact),
+        )) {
+            tracing::warn!(%error, "cannot record the redaction mode in the session");
+        }
+        if redact {
+            session
+                .warnings
+                .push("secret redaction was re-enabled for this resumed no-redact session".into());
+        } else {
+            session.warnings.push(
+                "secret redaction is disabled for this session by --no-redact; secrets may be written to disk"
+                    .into(),
+            );
+        }
+    }
     let window_notice = window_notice(window_truth.as_ref(), configured_window);
     if let Some(notice) = &window_notice {
         session.warnings.push(notice.clone());

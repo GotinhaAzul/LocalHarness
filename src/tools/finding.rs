@@ -17,7 +17,7 @@ use crate::security::verify::{
     validate_steps,
 };
 use crate::security::{
-    EvidenceRef, FindingPatch, NewFinding, SecurityState, Severity, Status, render_report,
+    EvidenceRef, FindingPatch, NewFinding, SecurityState, Severity, Status, render_report_with,
 };
 use crate::tools::{
     Tool, ToolContext, ToolPack, ToolResult, display_path, optional_bool, optional_str,
@@ -510,6 +510,7 @@ impl FindingTool {
     fn report(ctx: &ToolContext) -> Result<ToolResult, ToolResult> {
         let state = lock_security(ctx)?;
         let name = state.engagement_name.clone();
+        let redact = state.redact;
         let Some(engagement) = state.engagement.as_ref() else {
             return Ok(no_findings(&name));
         };
@@ -517,7 +518,7 @@ impl FindingTool {
             return Ok(no_findings(&name));
         }
 
-        let markdown = render_report(engagement);
+        let markdown = render_report_with(engagement, redact);
         let stamp = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
         let path = engagement.dir.join(format!("report-{stamp}.md"));
         write_0600(&path, &markdown).map_err(|err| {
@@ -902,6 +903,7 @@ mod tests {
             model: "test".into(),
             profile: "test".into(),
             app: "test".into(),
+            redact: true,
             context: None,
         };
         let session = Session::create(&paths, header, true).unwrap();

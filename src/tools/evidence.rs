@@ -157,14 +157,21 @@ impl EvidenceTool {
         match engagement.evidence.verify(&id) {
             Ok((entry, ok)) => {
                 let content = if ok {
-                    format!(
-                        "{} verified: sha256 {} matches the artifact",
-                        entry.id, entry.sha256
-                    )
+                    if entry.redacted {
+                        format!(
+                            "{} verified: stored artifact matches its redacted sha256; raw output sha256 {}",
+                            entry.id, entry.sha256
+                        )
+                    } else {
+                        format!(
+                            "{} verified: sha256 {} matches the artifact",
+                            entry.id, entry.sha256
+                        )
+                    }
                 } else {
                     format!(
-                        "{} FAILED verification: artifact {} no longer matches sha256 {}",
-                        entry.id, entry.artifact, entry.sha256
+                        "{} FAILED verification: artifact {} no longer matches its recorded sha256",
+                        entry.id, entry.artifact
                     )
                 };
                 ToolResult::ok(content).with_details(json!({"evidence": entry.id, "verified": ok}))
