@@ -323,6 +323,82 @@ async fn http_without_credentials_names_the_header_to_set() {
     assert!(error.contains("[mcp.docs.headers]"), "{error}");
 }
 
+/// Answer the handshake, then stall every call and cancellation notification.
+async fn stalling_http_server() -> String {
+    async fn handler(body: String) -> Response {
+        let message: Value = serde_json::from_str(&body).unwrap();
+        let method = message["method"].as_str().unwrap_or("");
+        let Some(id) = message.get("id").cloned() else {
+            // `notifications/initialized` must complete; cancellation stalls.
+            if method == "notifications/initialized" {
+                return StatusCode::ACCEPTED.into_response();
+            }
+            return std::future::pending::<Response>().await;
+        };
+        match method {
+            "initialize" => (
+                [
+                    ("mcp-session-id", "sess-stall"),
+                    (header::CONTENT_TYPE.as_str(), "application/json"),
+                ],
+                json!({"jsonrpc":"2.0","id":id,"result":{
+                    "protocolVersion":"2025-03-26",
+                    "capabilities":{"tools":{}},
+                    "serverInfo":{"name":"stall","version":"1"}
+                }})
+                .to_string(),
+            )
+                .into_response(),
+            "tools/list" => (
+                [(header::CONTENT_TYPE.as_str(), "application/json")],
+                json!({"jsonrpc":"2.0","id":id,"result":{"tools":[
+                    {"name":"slow","inputSchema":{"type":"object"}}
+                ]}})
+                .to_string(),
+            )
+                .into_response(),
+            _ => std::future::pending::<Response>().await,
+        }
+    }
+    let app = Router::new().route("/mcp", post(handler));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    format!("http://{addr}/mcp")
+}
+
+#[tokio::test]
+async fn http_cancel_notification_cannot_hold_the_call_open() {
+    let url = stalling_http_server().await;
+    let dir = tempfile::tempdir().unwrap();
+    let client = McpClient::new(
+        "stall",
+        McpServerConfig {
+            url,
+            timeout_secs: 1,
+            startup_timeout_secs: 5,
+            ..Default::default()
+        },
+        dir.path(),
+    );
+    let started = Instant::now();
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(8),
+        client.call_tool("slow", json!({}), &CancellationToken::new()),
+    )
+    .await;
+    assert!(
+        matches!(outcome, Ok(Err(McpError::Timeout(_)))),
+        "{outcome:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(8),
+        "the cancelled call waited on the cancellation notification: {:?}",
+        started.elapsed()
+    );
+    client.close().await;
+}
+
 // ------------------------------------------------------ profile selection
 
 fn paths_in(dir: &std::path::Path) -> Paths {
@@ -468,6 +544,33 @@ fn config_rejects_ambiguous_servers() {
     assert_eq!(server.args, ["-y", "server"]);
     assert!(server.attaches_to("coding") && !server.attaches_to("security"));
     assert_eq!(server.timeout_secs, 120);
+}
+
+#[test]
+fn cli_refuses_a_disabled_server_before_connecting() {
+    let home = tempfile::tempdir().unwrap();
+    let config_dir = home.path().join("config/localharness");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("config.toml"),
+        "[mcp.off]\ncommand = \"/nonexistent/mcp-server\"\nenabled = false\n",
+    )
+    .unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_lh"))
+        .args(["mcp", "call", "off", "echo", "{}"])
+        .env("XDG_CONFIG_HOME", home.path().join("config"))
+        .env("XDG_DATA_HOME", home.path().join("data"))
+        .env("HOME", home.path())
+        .current_dir(home.path())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("disabled"), "{stderr}");
+    assert!(
+        !stderr.contains("cannot reach"),
+        "the disabled server was contacted: {stderr}"
+    );
 }
 
 #[test]

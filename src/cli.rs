@@ -447,6 +447,11 @@ async fn run_mcp(config: &Config, paths: &Paths, action: &McpCommand) -> Result<
                     config.mcp.keys().cloned().collect::<Vec<_>>().join(", ")
                 );
             };
+            if !server_config.enabled {
+                bail!(
+                    "MCP server `{server}` is disabled (enabled = false in [mcp.{server}]); set enabled = true to call it"
+                );
+            }
             let args: serde_json::Value =
                 serde_json::from_str(args).context("arguments must be a JSON object")?;
             if !args.is_object() {

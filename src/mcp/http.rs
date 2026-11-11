@@ -23,6 +23,11 @@ const SESSION_HEADER: &str = "mcp-session-id";
 const VERSION_HEADER: &str = "mcp-protocol-version";
 /// A response body larger than this is refused.
 const BODY_CAP: usize = 16 * 1024 * 1024;
+/// Only this much of an HTTP error body is kept for the message.
+const ERROR_BODY_CAP: usize = 4 * 1024;
+/// Notifications are fire-and-forget; a server that stalls on one must not
+/// hold a timed-out or cancelled call open.
+const NOTIFICATION_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub struct HttpTransport {
     name: String,
@@ -127,8 +132,12 @@ impl HttpTransport {
             )));
         }
         if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            let body: String = body.chars().take(500).collect();
+            let (body, _) = collect_capped(response.bytes_stream(), ERROR_BODY_CAP)
+                .await
+                .map_err(|error| {
+                    McpError::Other(format!("MCP server `{}` body failed: {error}", self.name))
+                })?;
+            let body: String = String::from_utf8_lossy(&body).chars().take(500).collect();
             return Err(McpError::Other(format!(
                 "MCP server `{}` returned HTTP {status}: {}",
                 self.name,
@@ -179,13 +188,16 @@ impl HttpTransport {
             )));
         }
 
-        let bytes = response.bytes().await.map_err(|error| {
-            McpError::Other(format!("MCP server `{}` body failed: {error}", self.name))
-        })?;
-        if bytes.len() > BODY_CAP {
+        let (bytes, over_cap) = collect_capped(response.bytes_stream(), BODY_CAP)
+            .await
+            .map_err(|error| {
+                McpError::Other(format!("MCP server `{}` body failed: {error}", self.name))
+            })?;
+        if over_cap {
             return Err(McpError::Other(format!(
-                "MCP server `{}` response is over the size cap",
-                self.name
+                "MCP server `{}` response is over the {} MiB size cap",
+                self.name,
+                BODY_CAP / (1024 * 1024)
             )));
         }
         let value: Value = serde_json::from_slice(&bytes).map_err(|error| {
@@ -259,9 +271,15 @@ impl Transport for HttpTransport {
     }
 
     async fn notify(&self, method: &str, params: Value) -> Result<(), McpError> {
-        self.post(&notification_message(method, &params))
-            .await
-            .map(|_| ())
+        let message = notification_message(method, &params);
+        match tokio::time::timeout(NOTIFICATION_TIMEOUT, self.post(&message)).await {
+            Ok(result) => result.map(|_| ()),
+            Err(_) => Err(McpError::Other(format!(
+                "MCP server `{}` did not accept `{method}` within {}s",
+                self.name,
+                NOTIFICATION_TIMEOUT.as_secs()
+            ))),
+        }
     }
 
     fn set_protocol_version(&self, version: &str) {
@@ -288,5 +306,55 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     match mutex.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// Read a body stream up to `limit` bytes. The bool reports that more arrived,
+/// so a large JSON body is rejected while an error message keeps its prefix.
+/// Reading stops at the cap instead of buffering the rest of the response.
+async fn collect_capped<S, B, E>(mut chunks: S, limit: usize) -> Result<(Vec<u8>, bool), E>
+where
+    S: futures_util::Stream<Item = Result<B, E>> + Unpin,
+    B: AsRef<[u8]>,
+{
+    let mut body = Vec::new();
+    while let Some(chunk) = chunks.next().await {
+        let chunk = chunk?;
+        let chunk = chunk.as_ref();
+        let room = limit.saturating_sub(body.len());
+        if chunk.len() > room {
+            body.extend_from_slice(&chunk[..room]);
+            return Ok((body, true));
+        }
+        body.extend_from_slice(chunk);
+    }
+    Ok((body, false))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn capped_body_stops_once_the_limit_is_crossed() {
+        let chunks = futures_util::stream::iter(vec![
+            Ok::<&[u8], std::io::Error>(b"12345"),
+            Ok(b"67890"),
+            Ok(b"never read"),
+        ]);
+        let (body, over) = collect_capped(chunks, 8).await.unwrap();
+        assert_eq!(body, b"12345678");
+        assert!(over);
+    }
+
+    #[tokio::test]
+    async fn capped_body_reads_a_complete_response() {
+        let chunks = futures_util::stream::iter(vec![
+            Ok::<&[u8], std::io::Error>(b"{\"ok\":"),
+            Ok(b"true}"),
+        ]);
+        let (body, over) = collect_capped(chunks, 64).await.unwrap();
+        assert_eq!(body, b"{\"ok\":true}");
+        assert!(!over);
     }
 }
