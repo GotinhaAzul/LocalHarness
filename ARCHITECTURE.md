@@ -1045,10 +1045,17 @@ input characters. Missing input and unreadable files return prescriptive errors.
 - No telemetry, no analytics, no phone-home.
 - Endpoint defaults to `http://127.0.0.1:8080`. A non-local endpoint is allowed
   only when explicitly configured, with a warning.
-- Session logs and artifacts are plaintext. This is documented. `--no-session`
-  disables both for sensitive engagements. It does not delete or disable an
-  engagement file the user explicitly created; findings are separate,
-  user-owned data.
+- Session entries, archived tool artifacts, evidence, and exported reports pass
+  through `security::redact` before they reach disk. Provider tokens, private
+  key blocks, bearer and high-entropy `Authorization` values, secret-like
+  `.env` assignments, and the exact values of `*TOKEN*`, `*SECRET*`, `*KEY*`,
+  and `*PASSWORD*` environment variables become
+  `[REDACTED:<kind>:<first4>...<hash8>]`. Evidence keeps `sha256` over the raw
+  output and `stored_sha256` over the redacted artifact. `--no-redact` is the
+  explicit opt-out and is recorded in the session header. `--no-session`
+  disables session and artifact writes for sensitive engagements. It does not
+  delete or disable an engagement file the user explicitly created; findings
+  are separate, user-owned data.
 - Diagnostic logs are metadata only: timings, tool names, token counts, error
   codes. Prompts and tool output are not logged unless `LH_DEBUG_CONTENT=1` is
   set, which prints a warning.
@@ -1379,8 +1386,9 @@ endpoint.
 
 - Config and data directories are created with `0700`.
 - Session, artifact, and engagement files are `0600`.
-- API keys are never written to session logs. Error rendering redacts
-  `Authorization` and any configured key.
+- API keys are never written to session logs. Persisted content passes through
+  the redaction pass, and error rendering redacts `Authorization` and any
+  configured key.
 - `--no-session` writes no session or artifact files. An explicitly created
   engagement file under `engagements/` is independent and remains.
 
@@ -1668,5 +1676,7 @@ These do not block implementation; defaults are specified.
   acceptable after Linux is stable.
 - **Multiple live sessions.** One active session per process in v1. Tabs or
   multiple windows are later.
-- **Redaction.** Session logs are plaintext and documented. Automatic secret
-  redaction is a possible later feature, not a promise.
+- **Redaction coverage.** Secret redaction is shape-based. Unknown credential
+  formats, secrets split across stream chunks, and live `bg` log files before
+  they are read as tool output are not guaranteed. `--no-redact` is explicit
+  and recorded; it is not a default.
