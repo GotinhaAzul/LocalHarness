@@ -174,7 +174,7 @@ Tab completes the token at the cursor: commands, arguments (themes, profiles, sk
 
 Write `@path` in a prompt to attach a file: `fix the panic in @src/parser.rs`. The file is read through the same path as the `read` tool and appended to your message, so the model can edit it without another read. Up to eight files per prompt, within a quarter of the usable context.
 
-Slash commands: `/help /quit /login /model /profile /theme /tree /fork /new /resume /sessions /compact /tools /skill /workflow /sec /trust /export /clear /debug`.
+Slash commands: `/help /quit /login /model /profile /theme /tree /fork /new /resume /sessions /compact /tools /mcp /skill /workflow /sec /trust /export /clear /debug`.
 
 ### Headless
 
@@ -210,6 +210,7 @@ Everything at the edge is configurable; the loop itself stays small and auditabl
 - **Skills** are Markdown instructions. The model loads a matching skill with the `skill` tool, or you load one with `/skill <name>`. Bundled security skills advertise only when the security pack is active and remain loadable by name.
 - **Workflows** are playbooks plus a profile and tool allowlist. The bundled set covers coding, review, general assistance, and security.
 - **External tools** are any executable speaking one JSON object in, one JSON object out. No plugin ABI, no second runtime.
+- **MCP servers** plug in over stdio or Streamable HTTP with one `[mcp.<name>]` table. Their tools join the profile as `<server>__<tool>`; `lh mcp list` and `/mcp` show what connected.
 - **Themes** are TOML files of semantic color tokens. `default` is bundled with four alternatives; `omarchy` is an alias for existing configs.
 
 ```toml
@@ -259,6 +260,7 @@ Global config: `~/.config/localharness/config.toml`. A trusted project `.harness
 | [Skills and workflows](docs/skills-workflows.md) | Skill format, references, bundled playbooks, tool allowlists |
 | [Security](docs/security.md) | Authorization, scope, evidence, findings, PoC replay, sandbox |
 | [External tools](docs/external-tools.md) | Manifest format, protocol, schemas, scope gating |
+| [MCP servers](docs/mcp.md) | stdio and HTTP servers, tool naming, profiles, `lh mcp` |
 | [Themes](docs/themes.md) | Semantic tokens, color modes, user themes |
 | [Architecture](ARCHITECTURE.md) | Implementation specification and design decisions |
 

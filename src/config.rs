@@ -30,6 +30,8 @@ pub struct Config {
     #[serde(rename = "model_profile")]
     pub model_profiles: BTreeMap<String, ModelProfile>,
     pub verify: VerifyConfig,
+    /// Model Context Protocol servers, keyed by server name (`[mcp.<name>]`).
+    pub mcp: BTreeMap<String, McpServerConfig>,
     /// Runtime selection, set from CLI or environment.
     #[serde(skip)]
     pub profile_name: String,
@@ -283,6 +285,11 @@ impl Config {
         }
         if self.model.max_output_tokens == 0 {
             bail!("model.max_output_tokens must be greater than 0");
+        }
+        for (name, server) in &self.mcp {
+            server
+                .validate(name)
+                .with_context(|| format!("invalid [mcp.{name}]"))?;
         }
         Ok(())
     }
@@ -673,6 +680,94 @@ pub struct PromptConfig {
     pub instructions: String,
     /// Extra instructions file, resolved like a profile prompt.
     pub file: PathBuf,
+}
+
+/// One Model Context Protocol server. Exactly one of `command` (stdio) or
+/// `url` (Streamable HTTP) is set. `${VAR}` in `args`, `env`, `url`, and
+/// `headers` expands from the environment so secrets stay out of the file.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct McpServerConfig {
+    /// Executable for a stdio server.
+    pub command: String,
+    pub args: Vec<String>,
+    pub env: BTreeMap<String, String>,
+    /// Working directory for a stdio server; the project directory when empty.
+    pub cwd: PathBuf,
+    /// Endpoint for a Streamable HTTP server.
+    pub url: String,
+    pub headers: BTreeMap<String, String>,
+    /// `false` keeps the server configured but never started.
+    pub enabled: bool,
+    /// Profiles that attach every tool of this server. Unset attaches the
+    /// server to every profile; `[]` attaches it only where a profile names
+    /// `mcp:<name>` or one of its tools.
+    pub profiles: Option<Vec<String>>,
+    /// Remote tool names to expose; empty exposes all.
+    pub tools: Vec<String>,
+    /// Remote tool names to hide.
+    pub exclude_tools: Vec<String>,
+    /// Handshake and tool-listing deadline.
+    pub startup_timeout_secs: u64,
+    /// Deadline for one `tools/call`.
+    pub timeout_secs: u64,
+}
+
+impl Default for McpServerConfig {
+    fn default() -> Self {
+        Self {
+            command: String::new(),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            cwd: PathBuf::new(),
+            url: String::new(),
+            headers: BTreeMap::new(),
+            enabled: true,
+            profiles: None,
+            tools: Vec::new(),
+            exclude_tools: Vec::new(),
+            startup_timeout_secs: 30,
+            timeout_secs: 120,
+        }
+    }
+}
+
+impl McpServerConfig {
+    fn validate(&self, name: &str) -> Result<()> {
+        if name.is_empty()
+            || !name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            bail!("server names may only use letters, digits, '-' and '_'");
+        }
+        match (self.command.trim().is_empty(), self.url.trim().is_empty()) {
+            (true, true) => bail!("set `command` for a stdio server or `url` for an HTTP server"),
+            (false, false) => bail!("set either `command` or `url`, not both"),
+            _ => {}
+        }
+        if self.timeout_secs == 0 || self.startup_timeout_secs == 0 {
+            bail!("timeouts must be at least 1 second");
+        }
+        Ok(())
+    }
+
+    /// Whether this server attaches all of its tools to `profile` without the
+    /// profile naming it.
+    pub fn attaches_to(&self, profile: &str) -> bool {
+        match &self.profiles {
+            None => true,
+            Some(profiles) => profiles.iter().any(|p| p == profile),
+        }
+    }
+
+    pub fn timeout(&self) -> Duration {
+        Duration::from_secs(self.timeout_secs)
+    }
+
+    pub fn startup_timeout(&self) -> Duration {
+        Duration::from_secs(self.startup_timeout_secs)
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

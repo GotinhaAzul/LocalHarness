@@ -90,6 +90,8 @@ pub struct Core {
     /// background. Turns wait for it so the first request does not race the
     /// server. `None` when nothing was started or it finished before launch.
     pub startup: Option<StartupGate>,
+    /// MCP server connections, shared across core rebuilds.
+    pub mcp: Arc<crate::mcp::McpManager>,
 }
 
 /// One-time endpoint bring-up that outlives the launch path. The TUI opens

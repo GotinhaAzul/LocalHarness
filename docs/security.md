@@ -258,6 +258,16 @@ Paths are ranked by summed node risk, then hop count. Choke points are ranked
 by betweenness centrality, computed in code. The tool returns summaries and
 query results, not a raw graph dump.
 
+## MCP servers
+
+MCP servers ([docs/mcp.md](mcp.md)) are user-chosen code. stdio servers run as
+your user outside `--sandbox` and `--path-jail`. Project-declared servers need
+`--trust`. Their tool descriptions and results are untrusted input. During an
+engagement every MCP call appends an evidence entry, but calls are not
+scope-gated, because the harness cannot see what a remote tool will touch.
+Leave servers that reach out-of-scope systems out of security profiles with
+`profiles = [...]`.
+
 ## Trust
 
 Global config under `~/.config/localharness/` is trusted because the user wrote

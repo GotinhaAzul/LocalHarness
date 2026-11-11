@@ -59,6 +59,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("sessions", "list and switch sessions"),
     ("compact", "append a deterministic compaction"),
     ("tools", "show the active tools"),
+    ("mcp", "show MCP server status"),
     ("skill", "append a skill's instructions"),
     ("workflow", "start a workflow on a new branch"),
     ("sec", "engagement scope, summary, or report"),
@@ -71,7 +72,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
 const HELP: &str = "\
 Commands: /help /quit /login [endpoint] [model] [api-key] /model [name]
 /profile <name> /theme [name|save] /tree /fork /new /resume [id] /sessions
-/compact /tools
+/compact /tools /mcp
 /skill <name> /workflow <name> /sec ... /trust [confirm] /export [path]
 /clear /debug
 
@@ -1593,6 +1594,7 @@ impl App {
             "sessions" => self.command_sessions(),
             "compact" => self.command_compact(),
             "tools" => self.command_tools(),
+            "mcp" => self.command_mcp(),
             "skill" => self.command_skill(rest),
             "workflow" => self.command_workflow(rest).await,
             "sec" => self.command_sec(rest),
@@ -2169,6 +2171,26 @@ impl App {
             selected: 0,
             scroll: 0,
         }));
+    }
+
+    fn command_mcp(&mut self) {
+        let Some(runtime) = &self.runtime else {
+            return;
+        };
+        let statuses = runtime.core.mcp.status();
+        if statuses.is_empty() {
+            self.transcript.push_note(
+                "mcp",
+                "no MCP servers configured; add an [mcp.<name>] table to config.toml (see docs/mcp.md)",
+                false,
+            );
+            return;
+        }
+        let lines: Vec<String> = statuses.iter().map(|status| status.summary()).collect();
+        let failed = statuses
+            .iter()
+            .any(|status| matches!(status.state, crate::mcp::ServerState::Failed(_)));
+        self.transcript.push_note("mcp", lines.join("\n"), failed);
     }
 
     fn command_skill(&mut self, name: &str) {

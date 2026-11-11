@@ -12,6 +12,7 @@ defaults. Environment variables fill the gaps.
 | Skills | `~/.config/localharness/skills/<name>/SKILL.md` |
 | Workflows | `~/.config/localharness/workflows/` |
 | External tools | `~/.config/localharness/tools/*.toml` |
+| MCP servers | `[mcp.<name>]` tables in `config.toml` ([docs/mcp.md](mcp.md)) |
 | Themes | `~/.config/localharness/themes/*.toml` |
 | Data | `~/.local/share/localharness/` |
 | Sessions | `~/.local/share/localharness/sessions/<project-id>/` |
@@ -202,6 +203,24 @@ successful command the harness waits up to 30 seconds for the endpoint to
 answer; a command that exits non-zero is reported at once without waiting out
 the retry window. It is not run when the endpoint is already reachable, and it
 is not retried during the session. The command runs as the invoking user.
+
+## MCP servers
+
+```toml
+[mcp.time]
+command = "uvx"                 # stdio server
+args = ["mcp-server-time"]
+profiles = ["coding"]           # unset = every profile
+
+[mcp.docs]
+url = "https://mcp.example.com/mcp"   # Streamable HTTP server
+[mcp.docs.headers]
+Authorization = "Bearer ${DOCS_MCP_TOKEN}"
+```
+
+Each remote tool is exposed as `<server>__<tool>`. Profiles can also name
+`mcp:<server>` or a single `<server>__<tool>` in `tools`. Keys, lifecycle, and
+result handling are in [docs/mcp.md](mcp.md).
 
 ## Verify steps
 
