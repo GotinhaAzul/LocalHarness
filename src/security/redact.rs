@@ -49,6 +49,14 @@ const PATTERN: &str = concat!(
         r"[ \t]*=[ \t]*)",
         r#"(?P<env_value>"[^"\r\n]*"|'[^'\r\n]*'|[^\s#\r\n]+)"#,
     ),
+    // `.env` files also carry connection strings and opaque tokens under names
+    // that do not contain a marker word. Redact only values that look
+    // sensitive; paths and ordinary settings stay readable.
+    concat!(
+        r"|(?m:^[ \t]*(?:[+\-][ \t]*)?(?:\d+[ \t]+)?(?:export[ \t]+)?",
+        r"(?P<env_generic_name>[A-Za-z_][A-Za-z0-9_]*)[ \t]*=[ \t]*)",
+        r#"(?P<env_generic_value>"[^"\r\n]*"|'[^'\r\n]*'|[^\s#;\r\n]+)"#,
+    ),
 );
 
 static PATTERNS: LazyLock<Regex> =
@@ -63,6 +71,7 @@ const GROUPS: &[(&str, &str)] = &[
     ("auth_value", "auth_header"),
     ("bearer_value", "bearer"),
     ("env_value", "env"),
+    ("env_generic_value", "env_generic"),
     ("env_exact", "env"),
 ];
 
@@ -115,18 +124,20 @@ impl Redactor {
 
         let mut replaced = String::with_capacity(text.len());
         let mut last = 0usize;
+        let mut changed = false;
         for caps in matches {
             let Some(whole) = caps.get(0) else {
                 continue;
             };
             replaced.push_str(&text[last..whole.start()]);
-            let Some((kind, value)) = classify(&caps) else {
+            let Some((raw_kind, value)) = classify(&caps) else {
                 replaced.push_str(whole.as_str());
                 last = whole.end();
                 continue;
             };
-            let kind = refine_kind(kind, value.as_str());
-            if should_redact(kind, value.as_str(), whole.as_str()) {
+            if should_redact(raw_kind, value.as_str(), whole.as_str()) {
+                let kind = refine_kind(raw_kind, value.as_str());
+                changed = true;
                 replaced.push_str(&text[whole.start()..value.start()]);
                 replaced.push_str(&placeholder(kind, value.as_str()));
                 replaced.push_str(&text[value.end()..whole.end()]);
@@ -134,6 +145,9 @@ impl Redactor {
                 replaced.push_str(whole.as_str());
             }
             last = whole.end();
+        }
+        if !changed {
+            return Cow::Borrowed(text);
         }
         replaced.push_str(&text[last..]);
         Cow::Owned(replaced)
@@ -286,8 +300,37 @@ fn should_redact(kind: &str, value: &str, whole: &str) -> bool {
                 looks_high_entropy(value)
             }
         }
+        "env_generic" => looks_sensitive_assignment(value),
         _ => true,
     }
+}
+
+/// A generic `.env` value is redacted only when it looks like a credential or
+/// a URL with userinfo. Plain paths (which are never redacted) and ordinary
+/// settings such as `PORT=8080` pass through.
+fn looks_sensitive_assignment(value: &str) -> bool {
+    let value = value.trim_matches(|ch| ch == '"' || ch == '\'');
+    if looks_like_path(value) {
+        return false;
+    }
+    if let Some(scheme) = value.find("://") {
+        // Ordinary URLs are not secrets; userinfo in a URL is.
+        return value[scheme + 3..].contains('@');
+    }
+    looks_high_entropy(value)
+}
+
+fn looks_like_path(value: &str) -> bool {
+    if value.starts_with('/')
+        || value.starts_with("./")
+        || value.starts_with("../")
+        || value.starts_with('~')
+        || value.starts_with("C:\\")
+        || value.starts_with("c:\\")
+    {
+        return true;
+    }
+    !value.contains("://") && value.contains('/') && !value.contains('@')
 }
 
 /// Heuristic for opaque authorization values. `authentication` and prose do
@@ -438,11 +481,12 @@ mod tests {
 
     #[test]
     fn env_assignments_keep_names_and_skip_ordinary_values() {
-        let text = "1  DB_PASSWORD=hunter2\n2  GITHUB_TOKEN=abc123456789\n3  PORT=8080\n4  export API_KEY=\"quoted-secret\"\n";
+        let text = "1  DB_PASSWORD=hunter2\n2  GITHUB_TOKEN=abc123456789\n3  PORT=8080\n4  export API_KEY=\"quoted-secret\"\n5  DATABASE_URL=postgres://user:pass@db.test/app\n6  HOME=/home/user\n7  PACKAGE=src/lib.rs\n8  RUST_LOG=debug\n9  API_BASE=https://api.example.test/v1\n";
         let redacted = redactor().redact_owned(text);
         assert!(!redacted.contains("hunter2"), "{redacted}");
         assert!(!redacted.contains("abc123456789"), "{redacted}");
         assert!(!redacted.contains("quoted-secret"), "{redacted}");
+        assert!(!redacted.contains("pass@db.test"), "{redacted}");
         assert!(
             redacted.contains("DB_PASSWORD=[REDACTED:env:"),
             "{redacted}"
@@ -451,7 +495,18 @@ mod tests {
             redacted.contains("GITHUB_TOKEN=[REDACTED:env:"),
             "{redacted}"
         );
+        assert!(
+            redacted.contains("DATABASE_URL=[REDACTED:env:"),
+            "{redacted}"
+        );
         assert!(redacted.contains("PORT=8080"), "{redacted}");
+        assert!(redacted.contains("HOME=/home/user"), "{redacted}");
+        assert!(redacted.contains("PACKAGE=src/lib.rs"), "{redacted}");
+        assert!(redacted.contains("RUST_LOG=debug"), "{redacted}");
+        assert!(
+            redacted.contains("API_BASE=https://api.example.test/v1"),
+            "{redacted}"
+        );
         assert!(redacted.contains("export API_KEY="), "{redacted}");
     }
 
