@@ -534,6 +534,361 @@ pub async fn ollama_show(
     })
 }
 
+/// One-shot tool-call conformance result. The probe sends a forced, one-field
+/// tool call and classifies what the server did, instead of trusting a model
+/// card or a chat-template heuristic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolProbeOutcome {
+    /// A structured tool call came back.
+    NativeOk,
+    /// The model answered in prose instead of calling the forced tool.
+    ProseFallback,
+    /// The server rejected the tool definitions with 400/422.
+    Rejected400,
+    /// The template accepted tools but dropped them before generation.
+    ToolsDropped,
+    /// The server returned an empty `tool_calls` array. That is not a model
+    /// choice and must trip the repair protocol.
+    EmptyCall,
+}
+
+impl ToolProbeOutcome {
+    pub fn code(self) -> &'static str {
+        match self {
+            ToolProbeOutcome::NativeOk => "native_ok",
+            ToolProbeOutcome::ProseFallback => "prose_fallback",
+            ToolProbeOutcome::Rejected400 => "rejected_400",
+            ToolProbeOutcome::ToolsDropped => "tools_dropped",
+            ToolProbeOutcome::EmptyCall => "empty_call",
+        }
+    }
+
+    /// The tool mode this result calls for.
+    pub fn mode(self) -> &'static str {
+        match self {
+            ToolProbeOutcome::NativeOk => "native",
+            ToolProbeOutcome::ProseFallback
+            | ToolProbeOutcome::Rejected400
+            | ToolProbeOutcome::ToolsDropped
+            | ToolProbeOutcome::EmptyCall => "repair",
+        }
+    }
+
+    pub fn is_native(self) -> bool {
+        self == ToolProbeOutcome::NativeOk
+    }
+}
+
+/// Whether server metadata says the active template understands tools.
+/// Distinguishes a model that chose prose from a template that dropped the
+/// tool definitions before generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ToolTemplate {
+    Supported,
+    Unsupported,
+    #[default]
+    Unknown,
+}
+
+/// Fingerprint inputs for the probe cache: build when the engine reports one.
+#[derive(Debug, Clone, Default)]
+pub struct ToolProbeMetadata {
+    pub build: Option<String>,
+    pub template: ToolTemplate,
+}
+
+/// Read the engine's build string and template tool support once. Both come
+/// from metadata endpoints, never a generation.
+pub async fn tool_probe_metadata(provider: &dyn Provider) -> ToolProbeMetadata {
+    if let Ok(Ok(props)) = tokio::time::timeout(Duration::from_secs(2), llama_props(provider)).await
+    {
+        let template = if props
+            .chat_template
+            .as_deref()
+            .is_some_and(template_supports_tools)
+        {
+            ToolTemplate::Supported
+        } else {
+            ToolTemplate::Unsupported
+        };
+        return ToolProbeMetadata {
+            build: props.build_info,
+            template,
+        };
+    }
+    if let Ok(Ok(info)) = tokio::time::timeout(
+        Duration::from_secs(2),
+        ollama_show(provider, provider.model()),
+    )
+    .await
+    {
+        let template = if info.capabilities.iter().any(|cap| cap == "tools") {
+            ToolTemplate::Supported
+        } else if !info.capabilities.is_empty() {
+            ToolTemplate::Unsupported
+        } else {
+            ToolTemplate::Unknown
+        };
+        return ToolProbeMetadata {
+            build: None,
+            template,
+        };
+    }
+    ToolProbeMetadata::default()
+}
+
+/// A stored conformance result. `build` is the server build when known, so a
+/// known-good result is not reused across an engine upgrade.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolProbe {
+    pub outcome: ToolProbeOutcome,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build: Option<String>,
+    /// `native` or `repair`.
+    pub mode: String,
+    pub message: String,
+    /// When the probe last ran (RFC 3339, seconds).
+    pub checked: String,
+}
+
+impl ToolProbe {
+    pub fn native(&self) -> bool {
+        self.outcome.is_native()
+    }
+
+    /// A warning for the session header when native tools are not usable.
+    pub fn warning(&self) -> Option<String> {
+        if self.native() {
+            return None;
+        }
+        Some(format!(
+            "tool-call probe: {} — {}. The harness is using the {} tool protocol.",
+            self.outcome.code(),
+            self.message,
+            self.mode
+        ))
+    }
+}
+
+/// Classify a successful (2xx) chat-completion body. Pure so every engine
+/// shape can be replayed against fixtures without a server.
+pub fn classify_tool_probe(
+    value: &serde_json::Value,
+    template: ToolTemplate,
+) -> Result<ToolProbeOutcome, ProviderError> {
+    let choices = value["choices"].as_array().ok_or_else(|| {
+        ProviderError::new(
+            ErrorClass::Parse,
+            "tool probe response has no choices array",
+        )
+    })?;
+    let choice = choices.first().ok_or_else(|| {
+        ProviderError::new(ErrorClass::Parse, "tool probe response has no choices")
+    })?;
+    let message = choice.get("message").ok_or_else(|| {
+        ProviderError::new(ErrorClass::Parse, "tool probe response has no message")
+    })?;
+    if let Some(calls) = message.get("tool_calls") {
+        let calls = calls
+            .as_array()
+            .ok_or_else(|| ProviderError::new(ErrorClass::Parse, "tool_calls is not an array"))?;
+        if !calls.is_empty() {
+            return Ok(ToolProbeOutcome::NativeOk);
+        }
+        return Ok(ToolProbeOutcome::EmptyCall);
+    }
+    let content = message["content"].as_str().unwrap_or("").trim();
+    if content.is_empty() {
+        return Ok(ToolProbeOutcome::EmptyCall);
+    }
+    Ok(match template {
+        ToolTemplate::Unsupported => ToolProbeOutcome::ToolsDropped,
+        ToolTemplate::Supported | ToolTemplate::Unknown => ToolProbeOutcome::ProseFallback,
+    })
+}
+
+/// Send one forced-tool request and classify the response. The request is
+/// non-streaming and tiny; it never runs once native tools are known good for
+/// this model and build (callers check the cache first).
+pub async fn probe_tool_conformance(
+    provider: &dyn Provider,
+    metadata: &ToolProbeMetadata,
+) -> Result<ToolProbe, ProviderError> {
+    if provider.model().trim().is_empty() {
+        return Err(ProviderError::new(
+            ErrorClass::BadRequest,
+            "no model is selected for the tool probe",
+        ));
+    }
+    let (client, urls) = client_and_urls(provider)?;
+    let url = format!("{}/chat/completions", urls.api);
+    let body = json!({
+        "model": provider.model(),
+        "messages": [{
+            "role": "user",
+            "content": "Call the probe_echo tool with value \"ok\". Use the tool; do not answer in prose."
+        }],
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "probe_echo",
+                "description": "Echo one value. Used only to check tool-call support.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"value": {"type": "string"}},
+                    "required": ["value"]
+                }
+            }
+        }],
+        "tool_choice": {
+            "type": "function",
+            "function": {"name": "probe_echo"}
+        },
+        "temperature": 0.0,
+        "max_tokens": 64,
+        "stream": false
+    });
+    let mut request = client
+        .post(&url)
+        .json(&body)
+        .timeout(Duration::from_secs(20));
+    if !provider.api_key().is_empty() {
+        request = request.bearer_auth(provider.api_key());
+    }
+    let response = request.send().await.map_err(|err| {
+        ProviderError::new(
+            ErrorClass::Connection,
+            format!("tool probe POST {url} failed: {err}"),
+        )
+    })?;
+    let status = response.status();
+    let text = response.text().await.unwrap_or_default();
+    let checked = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    if status.as_u16() == 400 || status.as_u16() == 422 {
+        let message = rejected_tool_message(status.as_u16(), &text);
+        return Ok(ToolProbe {
+            outcome: ToolProbeOutcome::Rejected400,
+            model: provider.model().to_string(),
+            build: metadata.build.clone(),
+            mode: ToolProbeOutcome::Rejected400.mode().into(),
+            message,
+            checked,
+        });
+    }
+    if !status.is_success() {
+        return Err(ProviderError::with_status(
+            ErrorClass::BadRequest,
+            status.as_u16(),
+            format!(
+                "tool probe returned {status}: {}",
+                truncate_probe_body(&text)
+            ),
+        ));
+    }
+    let value: serde_json::Value = serde_json::from_str(&text).map_err(|err| {
+        ProviderError::new(
+            ErrorClass::Parse,
+            format!(
+                "tool probe response is not JSON ({err}): {}",
+                truncate_probe_body(&text)
+            ),
+        )
+    })?;
+    if let Some(message) = value["error"]["message"].as_str() {
+        return Err(ProviderError::new(
+            ErrorClass::BadRequest,
+            format!("tool probe returned a provider error: {message}"),
+        ));
+    }
+    let outcome = classify_tool_probe(&value, metadata.template)?;
+    Ok(ToolProbe {
+        outcome,
+        model: provider.model().to_string(),
+        build: metadata.build.clone(),
+        mode: outcome.mode().into(),
+        message: probe_message(outcome),
+        checked,
+    })
+}
+
+fn probe_message(outcome: ToolProbeOutcome) -> String {
+    match outcome {
+        ToolProbeOutcome::NativeOk => "the server returned a structured tool call".into(),
+        ToolProbeOutcome::ProseFallback => {
+            "the model answered in prose instead of calling the forced tool".into()
+        }
+        ToolProbeOutcome::ToolsDropped => {
+            "the server accepted the tools but the chat template dropped them".into()
+        }
+        ToolProbeOutcome::EmptyCall => {
+            "the server returned an empty tool_calls array; that is not a model choice".into()
+        }
+        ToolProbeOutcome::Rejected400 => "the server rejected the tool definitions".into(),
+    }
+}
+
+fn rejected_tool_message(status: u16, body: &str) -> String {
+    format!(
+        "the server rejected the forced tool call ({status}): {}. Tool calling is configured on the server: vLLM needs --enable-auto-tool-choice plus --tool-call-parser <name>; llama.cpp needs --jinja; Ollama needs a recent version and a tool-capable model.",
+        truncate_probe_body(body)
+    )
+}
+
+fn truncate_probe_body(body: &str) -> String {
+    let body = body.trim();
+    if body.chars().count() <= 500 {
+        return body.to_string();
+    }
+    body.chars().take(499).collect::<String>() + "…"
+}
+
+/// Whether a llama.cpp chat template mentions tools or functions. Necessary,
+/// not sufficient: the forced-call probe is the authority.
+pub(crate) fn template_supports_tools(template: &str) -> bool {
+    let template = template.to_ascii_lowercase();
+    template.contains("tool") || template.contains("function")
+}
+
+/// Cache key: API base, model, and the engine build when reported.
+pub fn tool_probe_key(provider: &dyn Provider, build: Option<&str>) -> String {
+    format!(
+        "{}|{}|{}",
+        endpoint_urls(provider.endpoint()).api,
+        provider.model().trim(),
+        build.unwrap_or("")
+    )
+}
+
+/// Read a cached probe. A missing or corrupt file is a miss.
+pub fn load_tool_probe(path: &std::path::Path, key: &str) -> Option<ToolProbe> {
+    let bytes = std::fs::read(path).ok()?;
+    let cache: std::collections::BTreeMap<String, ToolProbe> =
+        serde_json::from_slice(&bytes).ok()?;
+    cache.get(key).cloned()
+}
+
+/// Store a probe result in the JSON map at `path`.
+pub fn store_tool_probe(
+    path: &std::path::Path,
+    key: &str,
+    probe: &ToolProbe,
+) -> std::io::Result<()> {
+    let mut cache: std::collections::BTreeMap<String, ToolProbe> = std::fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default();
+    cache.insert(key.to_string(), probe.clone());
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let bytes = serde_json::to_vec_pretty(&cache).map_err(std::io::Error::other)?;
+    let temporary = path.with_extension("json.tmp");
+    std::fs::write(&temporary, bytes)?;
+    std::fs::rename(&temporary, path)
+}
+
 /// Probe what the endpoint supports, with a short timeout per probe.
 pub async fn detect(provider: &dyn Provider) -> Capabilities {
     let mut caps = Capabilities::default();
@@ -1094,6 +1449,109 @@ mod tests {
         assert_eq!(truth.per_slot, Some(4096));
         assert_eq!(truth.effective, 4096);
         assert_eq!(window_probe_for(&truth), Some(WindowProbe::LlamaProps));
+    }
+
+    #[tokio::test]
+    async fn tool_conformance_probe_classifies_all_five_outcomes() {
+        use axum::http::StatusCode;
+        use axum::routing::{get, post};
+
+        async fn probe_one(
+            status: u16,
+            body: &'static str,
+            template: Option<&'static str>,
+        ) -> ToolProbe {
+            let mut app = axum::Router::new().route(
+                "/v1/chat/completions",
+                post(move || async move {
+                    (
+                        StatusCode::from_u16(status).unwrap(),
+                        [(axum::http::header::CONTENT_TYPE, "application/json")],
+                        body,
+                    )
+                }),
+            );
+            if let Some(template) = template {
+                app = app.route(
+                    "/props",
+                    get(move || async move { axum::Json(json!({"chat_template": template})) }),
+                );
+            }
+            let provider = provider_for(serve(app).await);
+            let metadata = tool_probe_metadata(&provider).await;
+            assert_eq!(
+                metadata.template,
+                if template.is_some_and(template_supports_tools) {
+                    ToolTemplate::Supported
+                } else if template.is_some() {
+                    ToolTemplate::Unsupported
+                } else {
+                    ToolTemplate::Unknown
+                }
+            );
+            probe_tool_conformance(&provider, &metadata)
+                .await
+                .expect("probe result")
+        }
+
+        let native_body = r#"{"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"probe_echo","arguments":"{\"value\":\"ok\"}"}}]}}]}"#;
+        let prose_body = r#"{"choices":[{"message":{"role":"assistant","content":"I would call probe_echo with ok."}}]}"#;
+        let empty_body =
+            r#"{"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[]}}]}"#;
+
+        let native = probe_one(200, native_body, Some("tool-aware template")).await;
+        assert_eq!(native.outcome, ToolProbeOutcome::NativeOk);
+        assert!(native.native());
+        assert_eq!(native.mode, "native");
+
+        let prose = probe_one(200, prose_body, Some("tool-aware template")).await;
+        assert_eq!(prose.outcome, ToolProbeOutcome::ProseFallback);
+        assert_eq!(prose.mode, "repair");
+
+        let dropped = probe_one(200, prose_body, Some("plain chat template")).await;
+        assert_eq!(dropped.outcome, ToolProbeOutcome::ToolsDropped);
+
+        let empty = probe_one(200, empty_body, Some("tool-aware template")).await;
+        assert_eq!(empty.outcome, ToolProbeOutcome::EmptyCall);
+
+        let rejected = probe_one(400, "tools are not supported", None).await;
+        assert_eq!(rejected.outcome, ToolProbeOutcome::Rejected400);
+        assert!(
+            rejected.message.contains("--enable-auto-tool-choice")
+                && rejected.message.contains("--tool-call-parser"),
+            "{}",
+            rejected.message
+        );
+        assert!(rejected.warning().is_some());
+    }
+
+    #[test]
+    fn tool_probe_cache_skips_only_a_native_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tool-probe-cache.json");
+        let native = ToolProbe {
+            outcome: ToolProbeOutcome::NativeOk,
+            model: "qwen3".into(),
+            build: Some("b6040".into()),
+            mode: "native".into(),
+            message: "ok".into(),
+            checked: "2026-01-01T00:00:00Z".into(),
+        };
+        store_tool_probe(&path, "key", &native).unwrap();
+        let loaded = load_tool_probe(&path, "key").expect("cached");
+        assert!(loaded.native());
+        assert_eq!(loaded.build.as_deref(), Some("b6040"));
+        assert!(load_tool_probe(&path, "other-key").is_none());
+    }
+
+    #[test]
+    fn classify_rejects_an_empty_choice_list() {
+        let err = classify_tool_probe(&json!({"choices": []}), ToolTemplate::Unknown)
+            .expect_err("no choices");
+        assert_eq!(err.class, ErrorClass::Parse);
+        let err = classify_tool_probe(&json!({"choices": [{}]}), ToolTemplate::Unknown)
+            .expect_err("no message");
+        assert_eq!(err.class, ErrorClass::Parse);
     }
 
     #[tokio::test]

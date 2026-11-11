@@ -7,6 +7,7 @@ pub mod detect;
 pub mod evidence;
 pub mod findings;
 pub mod graph;
+pub mod redact;
 pub mod report;
 pub mod scope;
 pub mod surface;
@@ -18,19 +19,41 @@ use anyhow::{Context, Result};
 
 use crate::paths::Paths;
 pub use findings::{Engagement, EvidenceRef, Finding, FindingPatch, NewFinding, Severity, Status};
-pub use report::render as render_report;
+pub use redact::Redactor;
+pub use report::{render as render_report, render_with as render_report_with};
 pub use scope::{Scope, ScopeViolation, extract_targets, gate_command, is_security_command};
 
 /// Per-session security state. The scope file is shared per engagement.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct SecurityState {
     pub engagement_name: String,
     pub scope: Scope,
     pub engagement: Option<Engagement>,
+    /// Whether persisted evidence and reports redact secret values.
+    pub redact: bool,
+}
+
+impl Default for SecurityState {
+    fn default() -> Self {
+        Self {
+            engagement_name: String::new(),
+            scope: Scope::default(),
+            engagement: None,
+            redact: true,
+        }
+    }
 }
 
 impl SecurityState {
     pub fn load(paths: &Paths, engagement: Option<String>) -> Result<Self> {
+        Self::load_with_redact(paths, engagement, true)
+    }
+
+    pub fn load_with_redact(
+        paths: &Paths,
+        engagement: Option<String>,
+        redact: bool,
+    ) -> Result<Self> {
         let name = engagement.unwrap_or_else(|| default_engagement_name(&paths.cwd));
         let scope_path = paths.engagement_dir(&name).join("scope.toml");
         let scope = if scope_path.exists() {
@@ -51,7 +74,7 @@ impl SecurityState {
         .iter()
         .any(|file| engagement_dir.join(file).exists());
         let engagement = if active {
-            Some(Engagement::open(paths, &name)?)
+            Some(Engagement::open_with(paths, &name, redact)?)
         } else {
             None
         };
@@ -59,6 +82,7 @@ impl SecurityState {
             engagement_name: name,
             scope,
             engagement,
+            redact,
         })
     }
 
@@ -87,7 +111,11 @@ impl SecurityState {
     /// Load the findings ledger on first use.
     pub fn ensure_engagement(&mut self, paths: &Paths) -> Result<&mut Engagement> {
         if self.engagement.is_none() {
-            self.engagement = Some(Engagement::open(paths, &self.engagement_name)?);
+            self.engagement = Some(Engagement::open_with(
+                paths,
+                &self.engagement_name,
+                self.redact,
+            )?);
         }
         Ok(self.engagement.as_mut().expect("set above"))
     }

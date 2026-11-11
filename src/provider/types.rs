@@ -22,6 +22,31 @@ pub struct ToolSpec {
     pub parameters: Value,
 }
 
+/// The `tools` array exactly as an OpenAI-compatible request carries it.
+/// Shared by the request body and the one-time startup tokenizer measurement.
+pub fn tools_payload(tools: &[ToolSpec]) -> Value {
+    Value::Array(
+        tools
+            .iter()
+            .map(|tool| {
+                serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": tool.parameters,
+                    }
+                })
+            })
+            .collect(),
+    )
+}
+
+/// Serialized [`tools_payload`] for `/tokenize` and character accounting.
+pub fn tools_json(tools: &[ToolSpec]) -> String {
+    serde_json::to_string(&tools_payload(tools)).unwrap_or_default()
+}
+
 #[derive(Debug, Clone)]
 pub enum ChatMessage {
     System {
@@ -75,6 +100,8 @@ pub struct ChatRequest {
     pub messages: Vec<ChatMessage>,
     pub tools: Vec<ToolSpec>,
     pub tool_choice: Option<String>,
+    /// Server-side hint; dispatch still enforces a profile's one-call rule.
+    pub parallel_tool_calls: Option<bool>,
     pub temperature: f32,
     pub top_p: f32,
     pub max_tokens: u32,
@@ -202,6 +229,9 @@ pub enum ErrorClass {
     Server,
     Cancelled,
     Parse,
+    /// The output limit cut a streamed tool call before its JSON closed. The
+    /// call is dropped, never dispatched with partial arguments.
+    ToolCallTruncated,
 }
 
 impl ErrorClass {
@@ -215,6 +245,7 @@ impl ErrorClass {
             ErrorClass::Server => "server",
             ErrorClass::Cancelled => "cancelled",
             ErrorClass::Parse => "parse",
+            ErrorClass::ToolCallTruncated => "tool_call_truncated",
         }
     }
 }

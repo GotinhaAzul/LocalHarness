@@ -353,14 +353,17 @@ usable_prompt = context_window - max_output_tokens - safety_margin
 - `max_output_tokens` defaults to 4096.
 - `safety_margin` is 5% of the context window, minimum 512 tokens.
 - Tool schemas, system prompt, skills index, and state blocks count toward the
-  prompt.
+  prompt. The serialized `tools` array is measured once when the core is built:
+  exact `/tokenize` tokens when the engine exposes it, otherwise JSON density
+  (2.6 chars/token) rather than the prose ratio.
 - Compaction triggers at 80% of `usable_prompt`, or when the provider returns a
   context-length error.
 
 ### 4.2 Token accounting
 
 - If `/tokenize` is available, use it to calibrate a characters-per-token ratio
-  on a representative sample, and periodically re-calibrate.
+  on a representative sample, and periodically re-calibrate. The ratio applies
+  to prose and messages; tool schemas keep their own fixed JSON estimate.
 - After each model call, use `usage.prompt_tokens` to correct the estimate.
 - If no usage is available, estimate from characters with the calibrated ratio.
 - Every entry stores an optional `tokens` estimate for the tree view and budget
@@ -409,14 +412,26 @@ bash(cargo test) -> 12 passed
 edit(src/parser.rs) -> +18 -4
 ```
 
-Budget target: 4500 characters. Trim in this order until under budget:
+Budget target: `clamp(chars_for(usable_prompt) / 3, 1200, 4500)` characters, so a
+small window gets a proportionally small summary. A hard postcondition keeps
+the summary at or under 40% of the usable prompt.
+
+Trim in this order until under the target:
 
 1. last actions;
 2. facts;
 3. done/open lists (keep the first three);
 4. last instruction to 300 characters.
 
+If even that exceeds 40%, drop `## Repo`, `## Findings`, `## Last actions`, and
+the optional lists, keeping only the objective, open tasks, and last
+instruction.
+
 Never trim the active objective or title.
+
+Only one compaction runs per turn. If the estimate is still over the threshold
+after it, the turn ends with a `budget_context` diagnostic naming the static
+overhead instead of compacting again.
 
 A compaction entry is a node on the branch. Context assembly starts after the
 latest compaction on the path. The compaction entry itself is not a message;
@@ -761,7 +776,7 @@ code and, where useful, the exact call shape.
 | `attack_path` | 400 nodes for full betweenness; 5000 simple paths |
 | `iocs` | 100 per category, 2,000,000 input chars |
 | tool result | 2500 chars per result, 8000 chars per batch |
-| compaction | 4500 chars |
+| compaction | `clamp(usable prompt / 3, 1200, 4500)` chars, max 40% of usable |
 
 Limits are constants or config values, not model-controlled.
 
@@ -1045,10 +1060,17 @@ input characters. Missing input and unreadable files return prescriptive errors.
 - No telemetry, no analytics, no phone-home.
 - Endpoint defaults to `http://127.0.0.1:8080`. A non-local endpoint is allowed
   only when explicitly configured, with a warning.
-- Session logs and artifacts are plaintext. This is documented. `--no-session`
-  disables both for sensitive engagements. It does not delete or disable an
-  engagement file the user explicitly created; findings are separate,
-  user-owned data.
+- Session entries, archived tool artifacts, evidence, and exported reports pass
+  through `security::redact` before they reach disk. Provider tokens, private
+  key blocks, bearer and high-entropy `Authorization` values, secret-like
+  `.env` assignments, and the exact values of `*TOKEN*`, `*SECRET*`, `*KEY*`,
+  and `*PASSWORD*` environment variables become
+  `[REDACTED:<kind>:<first4>...<hash8>]`. Evidence keeps `sha256` over the raw
+  output and `stored_sha256` over the redacted artifact. `--no-redact` is the
+  explicit opt-out and is recorded in the session header. `--no-session`
+  disables session and artifact writes for sensitive engagements. It does not
+  delete or disable an engagement file the user explicitly created; findings
+  are separate, user-owned data.
 - Diagnostic logs are metadata only: timings, tool names, token counts, error
   codes. Prompts and tool output are not logged unless `LH_DEBUG_CONTENT=1` is
   set, which prints a warning.
@@ -1379,8 +1401,9 @@ endpoint.
 
 - Config and data directories are created with `0700`.
 - Session, artifact, and engagement files are `0600`.
-- API keys are never written to session logs. Error rendering redacts
-  `Authorization` and any configured key.
+- API keys are never written to session logs. Persisted content passes through
+  the redaction pass, and error rendering redacts `Authorization` and any
+  configured key.
 - `--no-session` writes no session or artifact files. An explicitly created
   engagement file under `engagements/` is independent and remains.
 
@@ -1668,5 +1691,7 @@ These do not block implementation; defaults are specified.
   acceptable after Linux is stable.
 - **Multiple live sessions.** One active session per process in v1. Tabs or
   multiple windows are later.
-- **Redaction.** Session logs are plaintext and documented. Automatic secret
-  redaction is a possible later feature, not a promise.
+- **Redaction coverage.** Secret redaction is shape-based. Unknown credential
+  formats, secrets split across stream chunks, and live `bg` log files before
+  they are read as tool output are not guaranteed. `--no-redact` is explicit
+  and recorded; it is not a default.

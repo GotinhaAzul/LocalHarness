@@ -17,6 +17,8 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex as AsyncMutex;
 
+use crate::config::LspGate;
+use crate::tools::write::{atomic_write, file_mode, record_own_write};
 use crate::tools::{
     Tool, ToolContext, ToolPack, ToolResult, display_path, object_schema, optional_str,
     optional_u64, required_str,
@@ -29,6 +31,10 @@ const DIAG_WINDOW: Duration = Duration::from_millis(2500);
 const EDIT_DIAG_WINDOW: Duration = Duration::from_millis(1500);
 const DIAG_GRACE: Duration = Duration::from_millis(250);
 const IDLE_DISPOSE: Duration = Duration::from_secs(10 * 60);
+/// The diagnostic gate is a hot path: cap its waits so a warm check stays
+/// well under the 300 ms p95 target. A late batch is skipped, never guessed.
+const GATE_SNAPSHOT_WINDOW: Duration = Duration::from_millis(200);
+const GATE_CHECK_WINDOW: Duration = Duration::from_millis(250);
 
 const MAX_OUTLINE: usize = 200;
 const MAX_DEFINITIONS: usize = 5;
@@ -52,6 +58,9 @@ pub struct LspService {
     /// Roots where automatic diagnostics failed to start. Avoid paying the
     /// startup timeout on every edit; an explicit `lsp` call clears the mark.
     auto_skipped: Mutex<HashSet<String>>,
+    /// How post-mutation diagnostics behave; shared by `write`, `edit`, and
+    /// `patch` through one service.
+    gate: Mutex<LspGate>,
     #[cfg(test)]
     binary_overrides: Mutex<HashMap<&'static str, PathBuf>>,
 }
@@ -61,9 +70,24 @@ impl LspService {
         Self {
             clients: Mutex::new(HashMap::new()),
             auto_skipped: Mutex::new(HashSet::new()),
+            gate: Mutex::new(LspGate::Warn),
             #[cfg(test)]
             binary_overrides: Mutex::new(HashMap::new()),
         }
+    }
+
+    pub fn gate(&self) -> LspGate {
+        *self
+            .gate
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    pub fn set_gate(&self, gate: LspGate) {
+        *self
+            .gate
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = gate;
     }
 
     fn auto_skipped(&self, key: &str) -> bool {
@@ -590,6 +614,249 @@ impl LspService {
             spec.binary,
             &guard.diagnostics_for(&uri),
         ))
+    }
+
+    /// Capture the diagnostics and bytes a mutation is about to replace.
+    ///
+    /// The gate never starts a language server: `None` when the file is not in
+    /// a real project, the server is cold, or the gate is off. Blocking on a
+    /// cold server would add seconds to the first edit.
+    pub async fn snapshot_before_edit(&self, ctx: &ToolContext, path: &Path) -> EditSnapshot {
+        let gate = self.gate();
+        if gate == LspGate::Off {
+            return EditSnapshot::default();
+        }
+        let Some(extension) = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(str::to_ascii_lowercase)
+        else {
+            return EditSnapshot::default();
+        };
+        let Some(spec) = server_spec_for_ext(&extension) else {
+            return EditSnapshot::default();
+        };
+        if self.resolve_binary(spec.binary).is_none() {
+            return EditSnapshot::default();
+        }
+        let Some(root) = project_root_marker(path, root_markers(&extension), &ctx.cwd) else {
+            return EditSnapshot::default();
+        };
+        let key = format!("{}|{}", spec.binary, root.display());
+        if self.auto_skipped(&key) {
+            return EditSnapshot::default();
+        }
+        self.dispose_idle();
+        let Some(client) = self.client_for_key(&key) else {
+            return EditSnapshot::default();
+        };
+
+        let before = match std::fs::read(path) {
+            Ok(bytes) if bytes.len() as u64 <= MAX_FILE_BYTES => Some(bytes),
+            Ok(_) => return EditSnapshot::default(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => return EditSnapshot::default(),
+        };
+        let text = before
+            .as_ref()
+            .and_then(|bytes| std::str::from_utf8(bytes).ok())
+            .map(str::to_string);
+
+        let mut guard = client.lock().await;
+        guard.last_used = Instant::now();
+        let uri = file_url(path);
+        let seen = guard.diag_seq(&uri);
+        let synced = match &text {
+            Some(text) => match guard.sync_document(path, text).await {
+                Ok((_, synced)) => synced,
+                Err(_) => return EditSnapshot::default(),
+            },
+            None => false,
+        };
+        if synced {
+            let _ = guard
+                .pump_diagnostics(&uri, seen, GATE_SNAPSHOT_WINDOW)
+                .await;
+        } else if guard.diag_seq(&uri) == 0 {
+            // A warm client that has never published for this file has no
+            // baseline to diff against; do not guess that every error is new.
+            return EditSnapshot::default();
+        }
+
+        let errors = error_keys(&guard.diagnostics_for(&uri));
+        EditSnapshot {
+            baseline: Some(DiagnosticBaseline {
+                key,
+                server: spec.binary,
+                errors,
+            }),
+            before,
+        }
+    }
+
+    /// Compare a mutation's diagnostics against its snapshot.
+    ///
+    /// Only new severity-error diagnostics count. Under `block`, the file is
+    /// restored and the caller returns `EDIT_REGRESSION`; under `warn`, the
+    /// new errors are appended to the result. Returns `None` for a skipped,
+    /// clean, or late check.
+    pub async fn check_edit(
+        &self,
+        ctx: &ToolContext,
+        path: &Path,
+        snapshot: &EditSnapshot,
+    ) -> Option<EditVerdict> {
+        let gate = self.gate();
+        let baseline = snapshot.baseline.as_ref()?;
+        if gate == LspGate::Off {
+            return None;
+        }
+        self.dispose_idle();
+        let client = self.client_for_key(&baseline.key)?;
+        let bytes = std::fs::read(path).ok()?;
+        if bytes.len() as u64 > MAX_FILE_BYTES || bytes.iter().take(4096).any(|byte| *byte == 0) {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&bytes).to_string();
+
+        let mut guard = client.lock().await;
+        guard.last_used = Instant::now();
+        let uri = file_url(path);
+        let seen = guard.diag_seq(&uri);
+        guard.sync_document(path, &text).await.ok()?;
+        let _ = guard.pump_diagnostics(&uri, seen, GATE_CHECK_WINDOW).await;
+        let new_errors: Vec<Value> = guard
+            .diagnostics_for(&uri)
+            .into_iter()
+            .filter(|diagnostic| {
+                is_error(diagnostic) && !baseline.errors.contains(&error_key(diagnostic))
+            })
+            .collect();
+        if new_errors.is_empty() {
+            return None;
+        }
+        let rendered = render_edit_diagnostics(baseline.server, &new_errors);
+        if gate == LspGate::Warn {
+            return Some(EditVerdict {
+                text: rendered,
+                regression: None,
+            });
+        }
+
+        let restored = restore_file(path, snapshot.before.as_deref());
+        if restored {
+            record_own_write(ctx, path);
+        }
+        let display = display_path(&ctx.cwd, path);
+        let count = new_errors.len();
+        let more = if restored {
+            format!(
+                "The change was rolled back; {display} is back to the pre-edit content. Fix hint: re-read {display} and retry with a smaller edit that keeps the file type-correct."
+            )
+        } else {
+            format!(
+                "The change could not be rolled back automatically. Fix hint: inspect {display} and restore the intended content before continuing."
+            )
+        };
+        Some(EditVerdict {
+            text: format!(
+                "the edit introduced {count} new language-server error{}:\n{rendered}\n{more}",
+                if count == 1 { "" } else { "s" }
+            ),
+            regression: Some(EditRegression {
+                rolled_back: restored,
+                diagnostics: new_errors,
+                server: baseline.server,
+            }),
+        })
+    }
+}
+
+/// Pre-mutation bytes and diagnostics. Default means the gate was skipped.
+#[derive(Debug, Clone, Default)]
+pub struct EditSnapshot {
+    baseline: Option<DiagnosticBaseline>,
+    /// `None` means the file did not exist before the mutation.
+    before: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone)]
+struct DiagnosticBaseline {
+    key: String,
+    server: &'static str,
+    errors: HashSet<String>,
+}
+
+/// Outcome of a post-mutation diagnostic check.
+#[derive(Debug, Clone)]
+pub struct EditVerdict {
+    pub text: String,
+    pub regression: Option<EditRegression>,
+}
+
+/// A new error that must fail the edit under `block`.
+#[derive(Debug, Clone)]
+pub struct EditRegression {
+    pub rolled_back: bool,
+    pub diagnostics: Vec<Value>,
+    pub server: &'static str,
+}
+
+impl EditRegression {
+    /// Tool-result details for `EDIT_REGRESSION`.
+    pub fn details(&self) -> Value {
+        json!({
+            "code": "EDIT_REGRESSION",
+            "server": self.server,
+            "rolled_back": self.rolled_back,
+            "new_errors": self.diagnostics,
+        })
+    }
+}
+
+fn is_error(diagnostic: &Value) -> bool {
+    diagnostic.get("severity").and_then(Value::as_u64) == Some(1)
+}
+
+/// Error identity for a baseline diff. Lines move on unrelated edits, so the
+/// code and message identify an error rather than its coordinates.
+fn error_key(diagnostic: &Value) -> String {
+    let code = diagnostic.get("code").and_then(|code| {
+        code.as_str()
+            .map(str::to_string)
+            .or_else(|| code.as_u64().map(|number| number.to_string()))
+    });
+    let message = diagnostic
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .lines()
+        .next()
+        .unwrap_or("")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("{}|{message}", code.unwrap_or_default())
+}
+
+fn error_keys(diagnostics: &[Value]) -> HashSet<String> {
+    diagnostics
+        .iter()
+        .filter(|diagnostic| is_error(diagnostic))
+        .map(error_key)
+        .collect()
+}
+
+fn restore_file(path: &Path, before: Option<&[u8]>) -> bool {
+    match before {
+        Some(bytes) => {
+            let mode = file_mode(path);
+            atomic_write(path, bytes, mode).is_ok()
+        }
+        None => match std::fs::remove_file(path) {
+            Ok(()) => true,
+            Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+        },
     }
 }
 
@@ -1717,19 +1984,10 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn fake_server_diagnostics_are_attached_to_writes() {
+    fn fake_language_server(dir: &std::path::Path) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = tempfile::tempdir().expect("temp dir");
-        std::fs::write(
-            dir.path().join("Cargo.toml"),
-            "[package]\nname = \"fake-diag\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-        )
-        .expect("manifest");
-        std::fs::create_dir_all(dir.path().join("src")).expect("src");
-
-        let script = dir.path().join("fake-rust-analyzer");
+        let script = dir.join("fake-lsp");
         std::fs::write(
             &script,
             r#"#!/bin/bash
@@ -1757,7 +2015,11 @@ while true; do
     *'"method":"textDocument/didOpen"'*|*'"method":"textDocument/didChange"'*)
       uri=""
       [[ "$body" =~ \"uri\":\"([^\"]+)\" ]] && uri="${BASH_REMATCH[1]}"
-      send "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":\"$uri\",\"diagnostics\":[{\"range\":{\"start\":{\"line\":0,\"character\":0}},\"severity\":1,\"code\":\"E0308\",\"message\":\"mismatched types\"}]}}"
+      if [[ "$body" == *LH_BAD* ]]; then
+        send "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":\"$uri\",\"diagnostics\":[{\"range\":{\"start\":{\"line\":0,\"character\":0}},\"severity\":1,\"code\":\"E0308\",\"message\":\"mismatched types\"}]}}"
+      else
+        send "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":\"$uri\",\"diagnostics\":[]}}"
+      fi
       ;;
     *)
       if [[ "$body" =~ \"id\":([0-9]+) ]]; then
@@ -1771,16 +2033,57 @@ done
         .expect("script");
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))
             .expect("executable");
+        script
+    }
 
+    fn fake_service(server: &'static str, dir: &std::path::Path) -> Arc<LspService> {
         let service = Arc::new(LspService::new());
-        service.override_binary("rust-analyzer", script);
-        let mut ctx = crate::tools::write::test_context(dir.path());
-        ctx.lsp = service;
+        service.override_binary(server, fake_language_server(dir));
+        service
+    }
 
-        let result = crate::tools::write::WriteTool
+    fn rust_project(dir: &std::path::Path) {
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"gate-test\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .expect("manifest");
+        std::fs::create_dir_all(dir.join("src")).expect("src");
+    }
+
+    fn python_project(dir: &std::path::Path) {
+        std::fs::write(
+            dir.join("pyproject.toml"),
+            "[project]\nname = \"gate-test\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("manifest");
+    }
+
+    async fn warm(ctx: &ToolContext, path: &str) {
+        let result = LspTool::with_service(ctx.lsp.clone())
+            .call(ctx, json!({"action": "diagnostics", "path": path}))
+            .await;
+        assert!(!result.is_error, "warm-up failed: {}", result.content);
+    }
+
+    #[tokio::test]
+    async fn warn_appends_only_a_new_error_after_a_warm_edit() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        rust_project(dir.path());
+        let file = dir.path().join("src/lib.rs");
+        std::fs::write(&file, "pub fn value() -> u32 { 1 }\n").expect("source");
+        let mut ctx = crate::tools::write::test_context(dir.path());
+        ctx.lsp = fake_service("rust-analyzer", dir.path());
+        ctx.lsp.set_gate(crate::config::LspGate::Warn);
+        warm(&ctx, "src/lib.rs").await;
+        let _ = crate::tools::read::ReadTool
+            .call(&ctx, json!({"path": "src/lib.rs"}))
+            .await;
+
+        let result = crate::tools::edit::EditTool
             .call(
                 &ctx,
-                json!({"path": "src/lib.rs", "content": "pub fn bad() -> u32 { \"no\" }\n"}),
+                json!({"path": "src/lib.rs", "old": "1", "new": "LH_BAD"}),
             )
             .await;
         assert!(!result.is_error, "{}", result.content);
@@ -1793,6 +2096,260 @@ done
             result.content.contains("mismatched types"),
             "diagnostic message missing: {}",
             result.content
+        );
+        assert!(
+            std::fs::read_to_string(&file).unwrap().contains("LH_BAD"),
+            "warn must keep the change"
+        );
+    }
+
+    #[tokio::test]
+    async fn block_rolls_back_a_rust_type_error() {
+        use crate::config::LspGate;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        rust_project(dir.path());
+        let file = dir.path().join("src/lib.rs");
+        let original = "pub fn value() -> u32 { 1 }\n";
+        std::fs::write(&file, original).expect("source");
+        let mut ctx = crate::tools::write::test_context(dir.path());
+        ctx.lsp = fake_service("rust-analyzer", dir.path());
+        ctx.lsp.set_gate(LspGate::Block);
+        warm(&ctx, "src/lib.rs").await;
+        let _ = crate::tools::read::ReadTool
+            .call(&ctx, json!({"path": "src/lib.rs"}))
+            .await;
+
+        let result = crate::tools::edit::EditTool
+            .call(
+                &ctx,
+                json!({"path": "src/lib.rs", "old": "1", "new": "LH_BAD"}),
+            )
+            .await;
+        assert!(result.is_error, "{}", result.content);
+        assert!(
+            result.content.starts_with("[EDIT_REGRESSION]"),
+            "{}",
+            result.content
+        );
+        assert!(
+            result.content.contains("mismatched types"),
+            "{}",
+            result.content
+        );
+        assert!(result.content.contains("rolled back"), "{}", result.content);
+        assert!(result.content.contains("Fix hint:"), "{}", result.content);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), original);
+        let details = result.details.expect("details");
+        assert_eq!(details["rolled_back"].as_bool(), Some(true));
+        assert_eq!(details["new_errors"][0]["code"].as_str(), Some("E0308"));
+
+        // The restored file is stamped as read, so a corrected retry works.
+        let retry = crate::tools::edit::EditTool
+            .call(&ctx, json!({"path": "src/lib.rs", "old": "1", "new": "2"}))
+            .await;
+        assert!(!retry.is_error, "{}", retry.content);
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "pub fn value() -> u32 { 2 }\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn block_rolls_back_a_python_type_error() {
+        use crate::config::LspGate;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        python_project(dir.path());
+        let file = dir.path().join("app.py");
+        let original = "value: int = 1\n";
+        std::fs::write(&file, original).expect("source");
+        let mut ctx = crate::tools::write::test_context(dir.path());
+        ctx.lsp = fake_service("pyright-langserver", dir.path());
+        ctx.lsp.set_gate(LspGate::Block);
+        warm(&ctx, "app.py").await;
+        let _ = crate::tools::read::ReadTool
+            .call(&ctx, json!({"path": "app.py"}))
+            .await;
+
+        let result = crate::tools::edit::EditTool
+            .call(
+                &ctx,
+                json!({"path": "app.py", "old": "1", "new": "\"LH_BAD\""}),
+            )
+            .await;
+        assert!(result.is_error, "{}", result.content);
+        assert!(
+            result.content.starts_with("[EDIT_REGRESSION]"),
+            "{}",
+            result.content
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn clean_edit_adds_no_diagnostic_text() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        rust_project(dir.path());
+        std::fs::write(
+            dir.path().join("src/lib.rs"),
+            "pub fn value() -> u32 { 1 }\n",
+        )
+        .expect("source");
+        let mut ctx = crate::tools::write::test_context(dir.path());
+        ctx.lsp = fake_service("rust-analyzer", dir.path());
+        warm(&ctx, "src/lib.rs").await;
+        let _ = crate::tools::read::ReadTool
+            .call(&ctx, json!({"path": "src/lib.rs"}))
+            .await;
+
+        let result = crate::tools::edit::EditTool
+            .call(&ctx, json!({"path": "src/lib.rs", "old": "1", "new": "2"}))
+            .await;
+        assert!(!result.is_error, "{}", result.content);
+        assert!(
+            !result.content.contains("diagnostics"),
+            "a clean edit must stay clean: {}",
+            result.content
+        );
+        assert!(
+            result
+                .details
+                .as_ref()
+                .unwrap()
+                .get("diagnostics")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_existing_errors_are_not_repeated_or_blocking() {
+        use crate::config::LspGate;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        rust_project(dir.path());
+        std::fs::write(
+            dir.path().join("src/lib.rs"),
+            "pub fn value() -> u32 { LH_BAD }\n",
+        )
+        .expect("source");
+        let mut ctx = crate::tools::write::test_context(dir.path());
+        ctx.lsp = fake_service("rust-analyzer", dir.path());
+        ctx.lsp.set_gate(LspGate::Block);
+        warm(&ctx, "src/lib.rs").await;
+        let _ = crate::tools::read::ReadTool
+            .call(&ctx, json!({"path": "src/lib.rs"}))
+            .await;
+
+        let result = crate::tools::edit::EditTool
+            .call(
+                &ctx,
+                json!({"path": "src/lib.rs", "old": "value", "new": "answer"}),
+            )
+            .await;
+        assert!(!result.is_error, "{}", result.content);
+        assert!(
+            !result.content.contains("diagnostics"),
+            "pre-existing errors must not be repeated: {}",
+            result.content
+        );
+        assert!(
+            std::fs::read_to_string(dir.path().join("src/lib.rs"))
+                .unwrap()
+                .contains("answer")
+        );
+    }
+
+    #[tokio::test]
+    async fn cold_and_non_project_files_are_unaffected() {
+        use crate::config::LspGate;
+
+        // Cold server in a real project: no snapshot, no block.
+        let dir = tempfile::tempdir().expect("temp dir");
+        rust_project(dir.path());
+        let mut ctx = crate::tools::write::test_context(dir.path());
+        ctx.lsp = fake_service("rust-analyzer", dir.path());
+        ctx.lsp.set_gate(LspGate::Block);
+        let result = crate::tools::write::WriteTool
+            .call(
+                &ctx,
+                json!({"path": "src/cold.rs", "content": "pub fn bad() -> u32 { LH_BAD }\n"}),
+            )
+            .await;
+        assert!(!result.is_error, "{}", result.content);
+        assert!(
+            !result.content.contains("diagnostics"),
+            "{}",
+            result.content
+        );
+
+        // Loose file without a project marker cannot be gated, even warm.
+        let loose = tempfile::tempdir().expect("loose dir");
+        std::fs::write(
+            loose.path().join("loose.rs"),
+            "pub fn value() -> u32 { 1 }\n",
+        )
+        .expect("source");
+        let mut ctx = crate::tools::write::test_context(loose.path());
+        ctx.lsp = fake_service("rust-analyzer", loose.path());
+        ctx.lsp.set_gate(LspGate::Block);
+        warm(&ctx, "loose.rs").await;
+        let _ = crate::tools::read::ReadTool
+            .call(&ctx, json!({"path": "loose.rs"}))
+            .await;
+        let result = crate::tools::edit::EditTool
+            .call(
+                &ctx,
+                json!({"path": "loose.rs", "old": "1", "new": "LH_BAD"}),
+            )
+            .await;
+        assert!(!result.is_error, "{}", result.content);
+        assert!(
+            std::fs::read_to_string(loose.path().join("loose.rs"))
+                .unwrap()
+                .contains("LH_BAD")
+        );
+    }
+
+    #[tokio::test]
+    async fn warm_gate_stays_under_the_latency_target() {
+        use std::time::Instant;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        rust_project(dir.path());
+        std::fs::write(
+            dir.path().join("src/lib.rs"),
+            "pub fn value() -> u32 { 0 }\n",
+        )
+        .expect("source");
+        let mut ctx = crate::tools::write::test_context(dir.path());
+        ctx.lsp = fake_service("rust-analyzer", dir.path());
+        warm(&ctx, "src/lib.rs").await;
+        let _ = crate::tools::read::ReadTool
+            .call(&ctx, json!({"path": "src/lib.rs"}))
+            .await;
+
+        let mut latencies = Vec::new();
+        for value in 1..=5 {
+            let started = Instant::now();
+            let result = crate::tools::edit::EditTool
+                .call(
+                    &ctx,
+                    json!({
+                        "path": "src/lib.rs",
+                        "old": format!("pub fn value() -> u32 {{ {} }}\n", value - 1),
+                        "new": format!("pub fn value() -> u32 {{ {value} }}\n"),
+                    }),
+                )
+                .await;
+            latencies.push(started.elapsed());
+            assert!(!result.is_error, "{}", result.content);
+        }
+        latencies.sort();
+        let p95 = latencies[(latencies.len() * 95 / 100).min(latencies.len() - 1)];
+        assert!(
+            p95 < std::time::Duration::from_millis(300),
+            "warm gate p95 was {p95:?}"
         );
     }
 

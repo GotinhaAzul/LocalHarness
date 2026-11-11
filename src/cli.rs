@@ -65,6 +65,11 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub no_session: bool,
 
+    /// Disable secret redaction in sessions, artifacts, evidence, and reports.
+    /// The choice is recorded in the session header.
+    #[arg(long, global = true)]
+    pub no_redact: bool,
+
     /// Resume the most recent session for this project.
     #[arg(long = "continue", conflicts_with = "resume")]
     pub continue_last: bool,
@@ -179,6 +184,9 @@ pub async fn run(cli: Cli) -> Result<i32> {
     }
     config.trust = trust;
     config.session.no_session |= cli.no_session;
+    if cli.no_redact {
+        config.session.redact = false;
+    }
     if cli.keep_artifacts {
         config.session.keep_artifacts = true;
     }
@@ -226,6 +234,7 @@ pub async fn run(cli: Cli) -> Result<i32> {
         path_jail: cli.path_jail,
         engagement: cli.engagement.clone(),
         no_session: config.session.no_session,
+        no_redact: !config.session.redact,
         resume,
         continue_last: cli.continue_last,
     };
@@ -289,6 +298,15 @@ async fn run_doctor(config: &Config, paths: &Paths, json: bool, fix: bool) -> Re
         .or(config.model.context_window)
         .unwrap_or(0);
     let manifest = crate::doctor::DoctorManifest::probe(&provider, configured).await;
+    let mut manifest = manifest;
+    // `lh doctor` never sends a chat completion. Show the last conformance
+    // result the runtime stored for this model/build, if any.
+    let probe_path = paths.data_dir.join("tool-probe-cache.json");
+    let probe_key = crate::provider::probe::tool_probe_key(&provider, manifest.build.as_deref());
+    if let Some(cached) = crate::provider::probe::load_tool_probe(&probe_path, &probe_key) {
+        manifest.tool_dialect = cached.mode.clone();
+        manifest.tool_probe = Some(cached);
+    }
     if json {
         println!("{}", manifest.to_json_pretty());
     } else {
@@ -356,8 +374,12 @@ async fn run_headless(runtime: crate::app::Runtime, prompt: String, json: bool) 
 fn render_event(event: AgentEvent, json: bool) -> Result<Option<TurnStatus>> {
     if json {
         let value = match &event {
-            AgentEvent::TurnStarted { model, profile } => {
-                json!({"type":"started","model":model,"profile":profile})
+            AgentEvent::TurnStarted {
+                model,
+                profile,
+                tool_mode,
+            } => {
+                json!({"type":"started","model":model,"profile":profile,"tool_mode":tool_mode})
             }
             AgentEvent::State(state) => json!({"type":"state","state":format!("{state:?}")}),
             AgentEvent::TextDelta(text) => json!({"type":"text","text":text}),
@@ -474,5 +496,17 @@ fn init_logging(paths: &Paths, debug: bool) {
         .finish();
     if tracing::subscriber::set_global_default(subscriber).is_ok() {
         std::mem::forget(guard);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_redact_is_an_explicit_global_flag() {
+        let cli = Cli::try_parse_from(["lh", "--no-redact"]).unwrap();
+        assert!(cli.no_redact);
+        assert!(!Cli::try_parse_from(["lh"]).unwrap().no_redact);
     }
 }

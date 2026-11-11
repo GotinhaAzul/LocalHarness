@@ -391,6 +391,7 @@ pub(crate) fn test_context(dir: &Path) -> ToolContext {
             model: "test".into(),
             profile: "full".into(),
             app: APP_VERSION.into(),
+            redact: true,
             context: None,
         },
         true,
