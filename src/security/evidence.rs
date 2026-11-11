@@ -13,6 +13,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use super::redact::Redactor;
+
 const MAX_EVIDENCE: usize = 20_000;
 const MAX_COMMAND_CHARS: usize = 2_000;
 const MAX_TARGET_CHARS: usize = 500;
@@ -42,7 +44,17 @@ pub struct Evidence {
     pub is_error: bool,
     /// Path relative to the engagement directory.
     pub artifact: String,
+    /// Digest of the raw command output, before redaction. This keeps
+    /// evidence comparable with the output the tool actually returned.
     pub sha256: String,
+    /// Digest of the bytes stored in `artifact` (the redacted form). Absent in
+    /// entries written before redaction existed, where it equals `sha256`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stored_sha256: Option<String>,
+    /// True when at least one value was redacted before the artifact and
+    /// metadata were written.
+    #[serde(default)]
+    pub redacted: bool,
     pub bytes: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
@@ -72,10 +84,15 @@ pub struct EvidenceLedger {
     path: PathBuf,
     entries: Vec<Evidence>,
     next_id: u32,
+    redactor: Redactor,
 }
 
 impl EvidenceLedger {
     pub fn open(engagement_dir: &Path) -> Result<Self> {
+        Self::open_with(engagement_dir, true)
+    }
+
+    pub fn open_with(engagement_dir: &Path, redact: bool) -> Result<Self> {
         use std::os::unix::fs::PermissionsExt;
 
         let evidence_dir = engagement_dir.join("evidence");
@@ -112,6 +129,7 @@ impl EvidenceLedger {
             path,
             entries,
             next_id,
+            redactor: Redactor::new(redact),
         })
     }
 
@@ -147,7 +165,13 @@ impl EvidenceLedger {
     pub fn verify(&self, id: &str) -> Result<(Evidence, bool)> {
         let (evidence, content) = self.read(id)?;
         let digest = sha256_hex(content.as_bytes());
-        let matches = digest == evidence.sha256;
+        // Entries written before redaction have no stored digest; their
+        // artifact is the raw output and `sha256` still describes it.
+        let expected = evidence
+            .stored_sha256
+            .as_deref()
+            .unwrap_or(&evidence.sha256);
+        let matches = digest == expected;
         Ok((evidence, matches))
     }
 
@@ -168,15 +192,32 @@ impl EvidenceLedger {
         let id = format!("e{}", self.next_id);
         let artifact_name = format!("{id}.txt");
         let artifact_path = self.dir.join("evidence").join(&artifact_name);
-        write_private(&artifact_path, new.output.as_bytes())?;
+        // The on-disk artifact and metadata are redacted, but the digest keeps
+        // describing the raw output the tool returned.
+        let output = self.redactor.redact(&new.output);
+        let redacted_target = self.redactor.redact_owned(&new.target);
+        let redacted_command = self.redactor.redact_owned(&new.command);
+        let redacted_summary = new
+            .summary
+            .as_deref()
+            .map(|summary| self.redactor.redact_owned(summary));
+        let redacted = output.as_ref() != new.output
+            || redacted_target != new.target
+            || redacted_command != new.command
+            || redacted_summary.as_deref() != new.summary.as_deref();
+        let target = clip(&redacted_target, MAX_TARGET_CHARS);
+        let command = clip(&redacted_command, MAX_COMMAND_CHARS);
+        let summary = redacted_summary.map(|summary| clip(&summary, MAX_SUMMARY_CHARS));
+        write_private(&artifact_path, output.as_bytes())?;
         let sha256 = sha256_hex(new.output.as_bytes());
+        let stored_sha256 = sha256_hex(output.as_bytes());
         let entry = Evidence {
             id: id.clone(),
             tool: clip(&new.tool, 80),
             session: new.session,
             entry: new.entry,
-            target: clip(&new.target, MAX_TARGET_CHARS),
-            command: clip(&new.command, MAX_COMMAND_CHARS),
+            target,
+            command,
             started: new.started,
             finished: new.finished,
             duration_ms: new.duration_ms,
@@ -186,8 +227,10 @@ impl EvidenceLedger {
             is_error: new.is_error,
             artifact: format!("evidence/{artifact_name}"),
             sha256,
+            stored_sha256: Some(stored_sha256),
+            redacted,
             bytes: new.output.len(),
-            summary: new.summary.map(|summary| clip(&summary, MAX_SUMMARY_CHARS)),
+            summary,
         };
         self.append(&entry)?;
         self.entries.push(entry.clone());
@@ -305,6 +348,60 @@ mod tests {
         ledger.add(new_evidence("original\n")).unwrap();
         std::fs::write(dir.path().join("evidence/e1.txt"), "changed\n").unwrap();
         assert!(!ledger.verify("e1").unwrap().1);
+    }
+
+    #[test]
+    fn output_is_redacted_but_the_digest_is_the_raw_output_digest() {
+        const KEY: &str = "AKIAIOSFODNN7EXAMPLE";
+        let dir = tempfile::tempdir().unwrap();
+        let mut ledger = EvidenceLedger::open(dir.path()).unwrap();
+        let raw = format!("aws_access_key_id = {KEY}\n");
+        let evidence = ledger.add(new_evidence(&raw)).unwrap();
+        assert!(evidence.redacted);
+        assert_eq!(evidence.sha256, sha256_hex(raw.as_bytes()));
+        assert_ne!(
+            evidence.stored_sha256.as_deref(),
+            Some(evidence.sha256.as_str())
+        );
+        let (_, content) = ledger.read("e1").unwrap();
+        assert!(!content.contains(KEY), "{content}");
+        assert!(content.contains("[REDACTED:aws:AKIA..."), "{content}");
+        assert!(content.contains("aws_access_key_id"), "{content}");
+        assert!(ledger.verify("e1").unwrap().1);
+    }
+
+    #[test]
+    fn no_redact_stores_raw_output_and_still_verifies() {
+        const KEY: &str = "AKIAIOSFODNN7EXAMPLE";
+        let dir = tempfile::tempdir().unwrap();
+        let mut ledger = EvidenceLedger::open_with(dir.path(), false).unwrap();
+        let raw = format!("{KEY}\n");
+        let evidence = ledger.add(new_evidence(&raw)).unwrap();
+        assert!(!evidence.redacted);
+        assert_eq!(evidence.sha256, sha256_hex(raw.as_bytes()));
+        let (_, content) = ledger.read("e1").unwrap();
+        assert_eq!(content, raw);
+        assert!(ledger.verify("e1").unwrap().1);
+    }
+
+    #[test]
+    fn old_entries_without_stored_digest_still_verify() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ledger = EvidenceLedger::open(dir.path()).unwrap();
+        ledger.add(new_evidence("PORT 443 open\n")).unwrap();
+        // Rewrite the line without the newer fields, like an old ledger.
+        let path = dir.path().join("evidence.jsonl");
+        let line = std::fs::read_to_string(&path).unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        value.as_object_mut().unwrap().remove("stored_sha256");
+        value.as_object_mut().unwrap().remove("redacted");
+        std::fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string(&value).unwrap()),
+        )
+        .unwrap();
+        let reloaded = EvidenceLedger::open(dir.path()).unwrap();
+        assert!(reloaded.verify("e1").unwrap().1);
     }
 
     #[test]

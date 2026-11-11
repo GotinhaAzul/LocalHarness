@@ -2483,8 +2483,12 @@ impl App {
                         Err(poison) => poison.into_inner(),
                     };
                     let name = state.engagement_name.clone();
+                    let redact = state.redact;
                     match state.ensure_engagement(&paths) {
-                        Ok(engagement) => Some((name, crate::security::render_report(engagement))),
+                        Ok(engagement) => Some((
+                            name,
+                            crate::security::render_report_with(engagement, redact),
+                        )),
                         Err(error) => {
                             self.set_notice(
                                 format!("cannot open engagement: {error}"),
@@ -2748,6 +2752,7 @@ impl App {
             path_jail,
             engagement: engagement.clone(),
             no_session: ephemeral,
+            no_redact: !config.session.redact,
             resume: target.clone(),
             continue_last: false,
         };
@@ -2770,6 +2775,7 @@ impl App {
                     path_jail,
                     engagement,
                     no_session: ephemeral,
+                    no_redact: !config.session.redact,
                     resume: old_resume,
                     continue_last: false,
                 };

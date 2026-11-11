@@ -185,11 +185,15 @@ pub struct Engagement {
 
 impl Engagement {
     pub fn open(paths: &Paths, name: &str) -> anyhow::Result<Self> {
+        Self::open_with(paths, name, true)
+    }
+
+    pub fn open_with(paths: &Paths, name: &str, redact: bool) -> anyhow::Result<Self> {
         use std::os::unix::fs::PermissionsExt;
         let dir = paths.engagement_dir(name);
         std::fs::create_dir_all(&dir)?;
         let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
-        let evidence = EvidenceLedger::open(&dir)?;
+        let evidence = EvidenceLedger::open_with(&dir, redact)?;
         let surface = SurfaceMap::open(&dir)?;
         let path = dir.join("findings.jsonl");
         let mut findings: Vec<Finding> = Vec::new();
