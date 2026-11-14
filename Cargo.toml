@@ -32,7 +32,7 @@ textwrap = "0.16"
 unicode-width = "0.2"
 chrono = { version = "0.4", features = ["serde"] }
 sha2 = "0.10"
-dirs = "6"
+dirs = "7"
 futures-util = "0.3"
 tokio-util = "0.7"
 regex = "1"
