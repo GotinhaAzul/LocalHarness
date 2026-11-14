@@ -3,11 +3,78 @@
 //! These use approval-only workflows, so no model is needed. The engine's
 //! prompt-step behavior is covered by unit tests in `src/workflows/engine.rs`.
 
+use std::convert::Infallible;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 
+use axum::Router;
+use axum::body::Body;
+use axum::extract::State;
+use axum::http::{HeaderValue, StatusCode, header};
+use axum::response::Response;
+use axum::routing::post;
+use bytes::Bytes;
+use futures_util::stream;
 use serde_json::Value;
 use tokio::io::AsyncWriteExt;
+
+#[derive(Clone, Default)]
+struct Fake {
+    requests: Arc<Mutex<Vec<Value>>>,
+}
+
+async fn chat(State(fake): State<Fake>, body: String) -> Response {
+    fake.requests
+        .lock()
+        .unwrap()
+        .push(serde_json::from_str(&body).unwrap_or_default());
+    let frames = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+    let chunks: Vec<Result<Bytes, Infallible>> = frames
+        .as_bytes()
+        .chunks(9)
+        .map(|chunk| Ok(Bytes::copy_from_slice(chunk)))
+        .collect();
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream"),
+        )
+        .body(Body::from_stream(stream::iter(chunks)))
+        .unwrap()
+}
+
+async fn models() -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        )
+        .body(Body::from(
+            r#"{"object":"list","data":[{"id":"test-model","object":"model"}]}"#,
+        ))
+        .unwrap()
+}
+
+async fn spawn_endpoint() -> (String, Fake) {
+    let fake = Fake::default();
+    let app = Router::new()
+        .route("/v1/chat/completions", post(chat))
+        .route("/v1/models", axum::routing::get(models))
+        .with_state(fake.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (format!("http://{address}"), fake)
+}
 
 struct Env {
     _dir: tempfile::TempDir,
@@ -207,6 +274,49 @@ async fn a_completed_run_resumes_without_a_model() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(0), "{stderr}");
     assert!(!stderr.contains("no model is selected"), "{stderr}");
+}
+
+#[tokio::test]
+async fn a_workflow_preloads_its_named_skills() {
+    let (base, fake) = spawn_endpoint().await;
+    let env = env();
+    write_workflow(
+        &env,
+        "skilled",
+        r#"
+name = "skilled"
+skills = ["test-repair"]
+[[step]]
+id = "work"
+prompt = "Repair the test."
+"#,
+    );
+    let output = run(
+        &env,
+        &[
+            "--endpoint",
+            &base,
+            "--model",
+            "test-model",
+            "workflow",
+            "run",
+            "skilled",
+        ],
+        "",
+    )
+    .await;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
+    let requests = fake.requests.lock().unwrap();
+    let prompt = requests[0]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|message| message["content"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(prompt.contains("[skill: test-repair]"), "{prompt}");
+    assert!(prompt.contains("Repair the test."), "{prompt}");
 }
 
 #[tokio::test]

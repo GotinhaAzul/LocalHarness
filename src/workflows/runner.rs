@@ -226,27 +226,77 @@ impl StepExecutor for AgentExecutor {
             );
             let _ = std::io::stderr().flush();
         }
-        let mut line = String::new();
-        let read = tokio::select! {
-            biased;
-            _ = self.cancel.cancelled() => return Approval::Cancelled,
-            read = self.stdin.read_line(&mut line) => read,
-        };
-        // A signal can interrupt the pending read; that is a cancellation,
-        // not a denial. Check the token before interpreting the result.
-        if self.cancel.is_cancelled() {
-            return Approval::Cancelled;
-        }
-        match read {
-            Ok(0) | Err(_) => Approval::Denied,
-            Ok(_) => {
-                let answer = line.trim().to_ascii_lowercase();
-                if matches!(answer.as_str(), "y" | "yes") {
-                    Approval::Accepted
-                } else {
-                    Approval::Denied
-                }
+        read_approval(&mut self.stdin, &self.cancel).await
+    }
+}
+
+/// One line from `reader`: `y`/`yes` accepts, anything else denies, EOF
+/// denies, and cancellation wins over both.
+async fn read_approval<R>(reader: &mut R, cancel: &CancellationToken) -> Approval
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    let mut line = String::new();
+    let read = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return Approval::Cancelled,
+        read = reader.read_line(&mut line) => read,
+    };
+    // A signal can interrupt the pending read; that is a cancellation, not a
+    // denial. Check the token before interpreting the result.
+    if cancel.is_cancelled() {
+        return Approval::Cancelled;
+    }
+    match read {
+        Ok(0) | Err(_) => Approval::Denied,
+        Ok(_) => {
+            let answer = line.trim().to_ascii_lowercase();
+            if matches!(answer.as_str(), "y" | "yes") {
+                Approval::Accepted
+            } else {
+                Approval::Denied
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncWriteExt, BufReader, duplex};
+
+    #[tokio::test]
+    async fn approval_reads_accept_deny_and_eof() {
+        for (input, expected) in [
+            ("y\n", Approval::Accepted),
+            ("YES\n", Approval::Accepted),
+            ("n\n", Approval::Denied),
+            ("\n", Approval::Denied),
+        ] {
+            let (mut client, server) = duplex(64);
+            client.write_all(input.as_bytes()).await.unwrap();
+            drop(client);
+            let mut reader = BufReader::new(server);
+            let cancel = CancellationToken::new();
+            assert_eq!(read_approval(&mut reader, &cancel).await, expected);
+        }
+
+        let (client, server) = duplex(64);
+        drop(client);
+        let mut reader = BufReader::new(server);
+        let cancel = CancellationToken::new();
+        assert_eq!(read_approval(&mut reader, &cancel).await, Approval::Denied);
+    }
+
+    #[tokio::test]
+    async fn approval_cancellation_wins_over_a_pending_read() {
+        let (_client, server) = duplex(64);
+        let mut reader = BufReader::new(server);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        assert_eq!(
+            read_approval(&mut reader, &cancel).await,
+            Approval::Cancelled
+        );
     }
 }
