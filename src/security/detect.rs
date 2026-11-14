@@ -28,6 +28,7 @@ use serde::Deserialize;
 use serde_yaml::Value as Yaml;
 
 use crate::security::findings::Severity;
+use crate::text::clip;
 
 const MAX_RULE_FILES: usize = 300;
 const MAX_HITS: usize = 500;
@@ -668,15 +669,6 @@ fn flatten_value(value: &serde_json::Value, out: &mut Vec<String>) {
         }
         serde_json::Value::Null => {}
     }
-}
-
-fn clip(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
-        return text.to_string();
-    }
-    let mut out: String = text.chars().take(max_chars).collect();
-    out.push('…');
-    out
 }
 
 fn slug(title: &str) -> String {

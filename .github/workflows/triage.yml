@@ -1,0 +1,42 @@
+name: Triage
+
+# Only issues a maintainer has labelled `needs-info` are touched. The backlog
+# and open pull requests are never marked stale by a bot.
+on:
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  issues: write
+  contents: read
+
+concurrency:
+  group: triage
+  cancel-in-progress: true
+
+jobs:
+  stale:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/stale@v11
+        with:
+          only-issue-labels: needs-info
+          days-before-issue-stale: 21
+          days-before-issue-close: 14
+          days-before-pr-stale: -1
+          days-before-pr-close: -1
+          stale-issue-label: stale
+          remove-stale-when-updated: true
+          exempt-issue-labels: "pinned,priority: P0,priority: P1"
+          operations-per-run: 40
+          stale-issue-message: |
+            This issue is waiting on information that has not arrived, so it is
+            now marked stale. Comment with the reproduction, the `lh --version`
+            output, or the answer that was asked for and it returns to the queue.
+          close-issue-message: |
+            Closed for lack of a reproduction after 35 days. It is not a verdict
+            on the report: comment here with the missing details and it will be
+            reopened.
+          close-issue-reason: not_planned

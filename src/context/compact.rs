@@ -2,6 +2,7 @@
 
 use crate::context::budget::TokenBudget;
 use crate::session::{Entry, EntryKind, Session};
+use crate::text::one_line;
 
 /// Upper bound for a summary, kept for large windows.
 pub const COMPACTION_BUDGET_CHARS: usize = 4500;
@@ -169,13 +170,13 @@ pub fn build_summary_keeping(
     if title.is_empty() {
         title = "main".into();
     }
-    let title = clip(&title, 100);
+    let title = one_line(&title, 100);
     let objective = thread
         .objective
         .clone()
         .or_else(|| first_instruction(&branch))
         .unwrap_or_else(|| session.title());
-    let objective = clip(objective.trim(), 400);
+    let objective = one_line(objective.trim(), 400);
 
     // What this compaction replaces: the current context, not the whole
     // branch with every earlier compaction's history.
@@ -188,7 +189,7 @@ pub fn build_summary_keeping(
 
     let mut last_instruction = instruction.unwrap_or_default();
     if last_instruction.chars().count() > LAST_INSTRUCTION_CHARS {
-        last_instruction = clip(&last_instruction, LAST_INSTRUCTION_CHARS);
+        last_instruction = one_line(&last_instruction, LAST_INSTRUCTION_CHARS);
     }
 
     let compose = |actions_kept: bool,
@@ -260,7 +261,7 @@ pub fn build_summary_keeping(
         }
         if !last_instruction.is_empty() {
             out.push_str("\n## Last instruction (verbatim)\n");
-            let text = clip(&last_instruction, instruction_chars);
+            let text = one_line(&last_instruction, instruction_chars);
             out.push_str(&text);
             out.push('\n');
         }
@@ -300,7 +301,7 @@ pub fn build_summary_keeping(
         summary = compose(false, false, 1, 120, true);
     }
     if summary.chars().count() > budget.max_chars {
-        summary = clip(&summary, budget.max_chars);
+        summary = one_line(&summary, budget.max_chars);
     }
 
     CompactionSummary {
@@ -450,9 +451,9 @@ fn last_actions(session: &Session, branch: &[&Entry]) -> Vec<String> {
         let line = format!(
             "{}({}) -> {} {}",
             call.name,
-            clip(argument, 60),
+            one_line(argument, 60),
             status,
-            clip(first_line, 100)
+            one_line(first_line, 100)
         );
         actions.push(line);
     }
@@ -486,17 +487,6 @@ fn entry_char_len(entry: &Entry) -> usize {
         EntryKind::Error(e) => e.message.len(),
         _ => 0,
     }
-}
-
-fn clip(text: &str, max_chars: usize) -> String {
-    let flat: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if flat.chars().count() <= max_chars {
-        return flat;
-    }
-    flat.chars()
-        .take(max_chars.saturating_sub(1))
-        .collect::<String>()
-        + "…"
 }
 
 fn join_limited(items: &[&str], limit: usize) -> String {

@@ -169,7 +169,9 @@ window was chosen. Older session files without that field load unchanged.
 usable_prompt = effective_window - max_output_tokens - safety_margin
 ```
 
-The safety margin is 5% of the window, minimum 512 tokens. Compaction starts at
+`max_output_tokens` is capped at a quarter of the window (a 4096-token server
+reserves 1024 for output). The safety margin is 5% of the window, minimum 512
+tokens. Compaction starts at
 80% of the usable prompt, or when the provider returns a context-length error.
 Prompt token counts from `usage` correct the character-based estimate after each
 call; `/tokenize` calibrates it when available.

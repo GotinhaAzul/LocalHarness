@@ -350,6 +350,26 @@ const BLUE_REFERENCES: &[(&str, &str)] = &[
         include_str!("bundled/security-blue-references/hardening.md"),
     ),
 ];
+/// The bundled coding pack. Each skill is a single self-contained document;
+/// they are advertised while the `coding` pack is active and stay loadable by
+/// name from any profile.
+const CODING_SKILLS: &[(&str, &str)] = &[
+    ("test-repair", include_str!("bundled/test-repair.md")),
+    ("code-review", include_str!("bundled/code-review.md")),
+    ("refactor", include_str!("bundled/refactor.md")),
+    (
+        "dependency-upgrade",
+        include_str!("bundled/dependency-upgrade.md"),
+    ),
+    ("perf-profile", include_str!("bundled/perf-profile.md")),
+    (
+        "incident-triage",
+        include_str!("bundled/incident-triage.md"),
+    ),
+    ("release-notes", include_str!("bundled/release-notes.md")),
+    ("issue-to-pr", include_str!("bundled/issue-to-pr.md")),
+];
+
 const METHODS_SKILL: &str = include_str!("bundled/security-methods.md");
 const METHODS_REFERENCES: &[(&str, &str)] = &[
     (
@@ -407,18 +427,20 @@ fn bundled_skill(
 
 /// Skills compiled into the binary.
 pub fn bundled() -> SkillIndex {
-    SkillIndex {
-        skills: vec![
-            bundled_skill(RED_SKILL, RED_REFERENCES, "security-red", &["security"]),
-            bundled_skill(BLUE_SKILL, BLUE_REFERENCES, "security-blue", &["security"]),
-            bundled_skill(
-                METHODS_SKILL,
-                METHODS_REFERENCES,
-                "security-methods",
-                &["security"],
-            ),
-        ],
+    let mut skills = vec![
+        bundled_skill(RED_SKILL, RED_REFERENCES, "security-red", &["security"]),
+        bundled_skill(BLUE_SKILL, BLUE_REFERENCES, "security-blue", &["security"]),
+        bundled_skill(
+            METHODS_SKILL,
+            METHODS_REFERENCES,
+            "security-methods",
+            &["security"],
+        ),
+    ];
+    for (name, raw) in CODING_SKILLS {
+        skills.push(bundled_skill(raw, &[], name, &["coding"]));
     }
+    SkillIndex { skills }
 }
 
 #[cfg(test)]
@@ -550,5 +572,143 @@ mod tests {
             loaded.reference("rollback.md").unwrap().text().as_deref(),
             Some("Roll back with x.")
         );
+    }
+
+    const CODING_PACK: &[&str] = &[
+        "test-repair",
+        "code-review",
+        "refactor",
+        "dependency-upgrade",
+        "perf-profile",
+        "incident-triage",
+        "release-notes",
+        "issue-to-pr",
+    ];
+
+    #[test]
+    fn coding_pack_is_bundled_and_complete() {
+        let index = bundled();
+        for name in CODING_PACK {
+            let skill = index
+                .get(name)
+                .unwrap_or_else(|| panic!("missing bundled skill {name}"));
+            assert!(skill.bundled, "{name} is not marked bundled");
+            assert!(!skill.body.trim().is_empty(), "{name} has no body");
+            assert!(
+                !skill.description.trim().is_empty(),
+                "{name} has no description"
+            );
+            assert!(
+                skill
+                    .when
+                    .as_deref()
+                    .is_some_and(|when| !when.trim().is_empty()),
+                "{name} has no when"
+            );
+            assert!(
+                skill.body.lines().count() < 120,
+                "{name} is longer than 120 lines"
+            );
+            assert!(
+                skill.body.contains("Stop and"),
+                "{name} does not say when to stop"
+            );
+            assert!(
+                skill.full_text().chars().count() < 24_000,
+                "{name} exceeds the skill result cap"
+            );
+        }
+        // The index injected into the system prompt names every one.
+        let index_text = index.index_text();
+        for name in CODING_PACK {
+            assert!(index_text.contains(name), "index is missing {name}");
+        }
+    }
+
+    #[test]
+    fn coding_skills_name_only_tools_the_pack_has() {
+        let index = bundled();
+        let registry = crate::tools::ToolRegistry::builtin();
+        // Security-only tools are not in the coding pack; a coding skill that
+        // tells the model to call one would name a tool it cannot use.
+        let security_only = [
+            "finding",
+            "iocs",
+            "surface",
+            "evidence",
+            "detect",
+            "attack_path",
+        ];
+        let backticked = regex::Regex::new(r"`([a-z][a-z0-9_]*)`").unwrap();
+        let action = regex::Regex::new(r#"\{"action":"([a-z_]+)"\}"#).unwrap();
+        let lsp_actions = [
+            "outline",
+            "definition",
+            "references",
+            "diagnostics",
+            "hover",
+        ];
+        let harness_tools = [
+            "read", "write", "edit", "patch", "undo", "bash", "grep", "glob", "todo", "skill",
+            "verify", "recall", "thread", "bg", "repo_map", "lsp", "test", "review",
+        ];
+        for name in CODING_PACK {
+            let skill = index.get(name).unwrap();
+            for banned in security_only {
+                assert!(
+                    !skill.body.contains(&format!("`{banned}`")),
+                    "{name} names security-only tool {banned}"
+                );
+            }
+            assert!(!skill.body.contains("save_finding"));
+            assert!(!skill.body.contains("verify_finding"));
+            // Every backticked identifier that is a harness tool must exist.
+            // Other identifiers are commands, paths, or file names.
+            for capture in backticked.captures_iter(&skill.body) {
+                let token = &capture[1];
+                if harness_tools.contains(&token) {
+                    assert!(
+                        registry.get(token).is_some(),
+                        "{name} names missing tool {token}"
+                    );
+                }
+            }
+            // `lsp` is read-only and has no rename action; validate every
+            // action example so the skill cannot drift from the schema.
+            if skill.body.contains("`lsp`") {
+                for capture in action.captures_iter(&skill.body) {
+                    assert!(
+                        lsp_actions.contains(&&capture[1]),
+                        "{name} names unsupported lsp action {}",
+                        &capture[1]
+                    );
+                }
+                assert!(
+                    !skill.body.contains("\"rename\"") && !skill.body.contains("lsp` rename"),
+                    "{name} still promises an lsp rename"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn coding_pack_index_follows_active_packs() {
+        // The index is filtered by active packs; an explicit load still works.
+        // The tool-level three-task smoke test lives in tools::skill.
+        let index = bundled();
+        let coding = index.advertised_for(&["core".into(), "coding".into()]);
+        assert!(coding.get("test-repair").is_some());
+        assert!(coding.get("code-review").is_some());
+        assert!(coding.get("security-red").is_none());
+        assert!(coding.get("security-blue").is_none());
+
+        let security = index.advertised_for(&["core".into(), "security".into()]);
+        assert!(security.get("security-blue").is_some());
+        assert!(security.get("test-repair").is_none());
+        assert!(security.get("release-notes").is_none());
+
+        // The model can still load an unadvertised skill by name.
+        assert!(index.get("incident-triage").is_some());
+        assert!(index.get("security-red").is_some());
     }
 }

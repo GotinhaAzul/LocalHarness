@@ -50,6 +50,7 @@ tracing-appender = "0.2"
 tempfile = "3"
 bytes = "1"
 axum = "0.8"
+vt100 = "0.18.1"
 
 [profile.release]
 lto = true

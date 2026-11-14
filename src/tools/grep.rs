@@ -8,6 +8,7 @@ use ignore::WalkBuilder;
 use regex::{Regex, RegexBuilder};
 use serde_json::{Value, json};
 
+use crate::text::clip;
 use crate::tools::read::split_lines;
 use crate::tools::{
     Tool, ToolContext, ToolPack, ToolResult, display_path, optional_bool, optional_str,
@@ -294,7 +295,7 @@ fn scan_file(
         }
         for (offset, line) in lines[start..=hi].iter().enumerate() {
             let index = start + offset;
-            let line = truncate_line(line, MAX_LINE_CHARS);
+            let line = clip(line, MAX_LINE_CHARS);
             if hits.binary_search(&index).is_ok() {
                 out.push(format!("{label}:{}:{line}", index + 1));
             } else {
@@ -309,15 +310,6 @@ fn scan_file(
         truncated: hits.len() > take,
         had_hit: true,
     }
-}
-
-fn truncate_line(line: &str, max: usize) -> String {
-    if line.chars().count() <= max {
-        return line.to_string();
-    }
-    let mut truncated: String = line.chars().take(max).collect();
-    truncated.push_str("...");
-    truncated
 }
 
 /// The `path` argument, for deciding whether hidden entries were asked for.

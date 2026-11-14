@@ -1,0 +1,80 @@
+name: Feature request
+description: Propose a change in behavior, a new tool, or a new integration.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The backlog is public: read the [backlog map](https://github.com/GotinhaAzul/LocalHarness/issues/45)
+        first. If the item is already there, comment on it instead of opening a new issue.
+
+        Proposed PRs for large features need agreement on the issue before the code.
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Preflight
+      options:
+        - label: I searched issues and discussions, and this is not already tracked.
+          required: true
+        - label: This is a request for the harness, not for the model to behave better.
+          required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What you cannot do today, and what it costs you. Concrete beats hypothetical.
+      placeholder: "On a 16k context window, ... so I have to ..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: What the harness should do, from the user's side. Command, flag, config key, or tool call.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Where does it live?
+      options:
+        - Agent loop or a guard
+        - Tool or tool protocol
+        - TUI or CLI
+        - Providers or model adapters
+        - Context, compaction, or sessions
+        - Security pack
+        - Skills, workflows, MCP, or external tools
+        - Docs, packaging, or distribution
+        - Not sure
+    validations:
+      required: true
+
+  - type: dropdown
+    id: enforcement
+    attributes:
+      label: Can this be enforced in code?
+      description: Anything the model can ignore is not a guarantee. If this is a rule, say how a code path could hold it.
+      options:
+        - "Yes — a guard, a gate, or a validation can hold it"
+        - "Partly — code can detect it but not prevent it"
+        - "No — it is model behavior, and this is a prompt or UX change"
+        - "Not sure"
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Existing flags, config, skills, or workflows you tried. "Fork the crate" is a legitimate answer you should rule out.
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence
+      description: Prior art, specifications, links, or a transcript that motivates the request.

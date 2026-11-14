@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::redact::Redactor;
+use crate::text::clip;
 
 const MAX_EVIDENCE: usize = 20_000;
 const MAX_COMMAND_CHARS: usize = 2_000;
@@ -258,15 +259,6 @@ impl EvidenceLedger {
 pub fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     format!("{digest:x}")
-}
-
-fn clip(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
-        return text.to_string();
-    }
-    let mut out: String = text.chars().take(max_chars).collect();
-    out.push('…');
-    out
 }
 
 fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {

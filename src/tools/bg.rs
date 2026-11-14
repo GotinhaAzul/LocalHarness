@@ -10,6 +10,7 @@ use nix::sys::signal::Signal;
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
+use crate::text::one_line;
 use crate::tools::bash::{kill_group, sandbox_error, shell_command, terminate_group};
 use crate::tools::{
     Tool, ToolContext, ToolPack, ToolResult, object_schema, optional_str, optional_u64,
@@ -330,6 +331,9 @@ impl BgTool {
                 );
             }
         };
+        // Dev servers and watchers color their output and redraw spinners;
+        // resolve that before counting lines.
+        let raw = crate::sanitize::terminal_output(&raw).into_owned();
         let raw = ctx.artifacts.redact_owned(&raw);
         let body = tail_chars(&last_lines(&raw, lines), MAX_LOG_CHARS);
         let body = if body.is_empty() {
@@ -412,6 +416,10 @@ impl BgTool {
 
 #[async_trait]
 impl Tool for BgTool {
+    fn preview_tail(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &'static str {
         "bg"
     }
@@ -500,16 +508,6 @@ fn describe(process: &BgProcess) -> (String, Value) {
     )
 }
 
-fn one_line(text: &str, max_chars: usize) -> String {
-    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if flat.chars().count() <= max_chars {
-        return flat;
-    }
-    let mut short: String = flat.chars().take(max_chars).collect();
-    short.push('…');
-    short
-}
-
 fn tail_chars(text: &str, max: usize) -> String {
     if text.len() <= max {
         return text.to_string();
@@ -589,16 +587,7 @@ fn open_log(path: &Path) -> std::io::Result<std::fs::File> {
 }
 
 fn sanitize(value: &str) -> String {
-    let cleaned: String = value
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect();
+    let cleaned = crate::text::slug(value, '-');
     if cleaned.is_empty() {
         "session".into()
     } else {
