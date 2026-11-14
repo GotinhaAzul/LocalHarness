@@ -1497,7 +1497,12 @@ src/
     render.rs             layout and drawing
     sanitize.rs           make text safe to paint (escapes, tabs, emoji)
     input.rs              key handling, history, completion
-    tui.rs                terminal setup/restore, event loop
+    tui.rs                App state, event loop, drawing, agent events
+    tui/terminal.rs       terminal setup/restore, panic hook
+    tui/keys.rs           keyboard, mouse, paste, modal pickers
+    tui/commands.rs       slash commands
+    tui/support.rs        endpoint probing, themes, workflows, sessions
+    tui/tests.rs          TUI tests, including the screen-drift check
   skills/                 bundled red/blue skill text (embedded)
 ```
 
