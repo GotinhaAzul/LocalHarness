@@ -313,6 +313,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn coding_pack_lists_and_loads_its_skills() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = context(dir.path(), false);
+        ctx.packs = vec!["core".into(), "coding".into()];
+
+        let listed = SkillTool.call(&ctx, json!({})).await;
+        assert!(listed.content.contains("test-repair"), "{}", listed.content);
+        assert!(listed.content.contains("code-review"), "{}", listed.content);
+        assert!(
+            !listed.content.contains("security-red"),
+            "the security pack is off, so its skills must stay out of the list"
+        );
+
+        let loaded = SkillTool.call(&ctx, json!({"name": "test-repair"})).await;
+        assert!(!loaded.is_error, "{}", loaded.content);
+        assert!(loaded.content.starts_with("[skill: test-repair]"));
+        assert!(loaded.content.contains("Stop and"));
+    }
+
+    #[tokio::test]
     async fn project_skills_need_trust() {
         let dir = tempfile::tempdir().unwrap();
         let skill = dir.path().join(".harness/skills/deploy");

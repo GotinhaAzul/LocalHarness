@@ -72,6 +72,30 @@ Skills are data: they cannot grant security scope, load tools, or bypass a
 guard. Project skills load only in trusted sessions, for the tool and for
 `/skill` alike.
 
+### Bundled coding skill pack
+
+Eight coding skills ship in the binary. They advertise while the `coding` pack
+is active, so the coding profile's index carries them and a security-only
+profile stays focused; any of them is still loadable by name. Each is a single
+document under 120 lines, names only core/coding tools, and ends with the
+condition that means "stop and ask".
+
+| Skill | Triggers |
+| --- | --- |
+| `test-repair` | A failing test or a red suite: reproduce, classify, one hypothesis, smallest fix, exact test then suite |
+| `code-review` | A diff, pull request, or pre-handback self-review: scope, correctness, security, tests, compatibility, severity, verdict |
+| `refactor` | A behavior-preserving restructure: behavior contract, green baseline, small moves, `lsp` rename, verify each step |
+| `dependency-upgrade` | A version bump or CVE fix: changelog, breaking changes, one package, adapt, test, rollback |
+| `perf-profile` | A slowness report: one metric, baseline, profile before optimizing, one change, re-measure |
+| `incident-triage` | An alert or outage: UTC timeline, symptom vs cause, recent changes, mitigate before root cause |
+| `release-notes` | A release or changelog: commits since the tag, classify, link issues, upgrade notes, invent nothing |
+| `issue-to-pr` | An issue to implement: read the comments, reproduce, plan, implement, test, self-review, PR body |
+
+The pack is loaded the same way as any other skill: the model calls
+`skill {"name":"test-repair"}`, or you run `/skill test-repair`. Loading one
+adds instructions only; it does not add tools, change the profile, or relax a
+gate. The index filter is a prompt-budget aid, not a permission boundary.
+
 ## Workflows
 
 A workflow is a TOML playbook plus a profile and tool allowlist:
