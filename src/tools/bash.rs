@@ -330,7 +330,9 @@ pub(crate) async fn collect(mut handle: JoinHandle<Vec<u8>>) -> Vec<u8> {
 
 fn render_preview(stdout: &[u8], stderr: &[u8]) -> String {
     let mut body = String::new();
+    // Color codes and redrawn progress lines are noise for the model.
     let stdout = String::from_utf8_lossy(stdout);
+    let stdout = crate::sanitize::terminal_output(&stdout);
     if !stdout.is_empty() {
         body.push_str("stdout:\n");
         body.push_str(&stdout);
@@ -339,6 +341,7 @@ fn render_preview(stdout: &[u8], stderr: &[u8]) -> String {
         }
     }
     let stderr = String::from_utf8_lossy(stderr);
+    let stderr = crate::sanitize::terminal_output(&stderr);
     if !stderr.is_empty() {
         body.push_str("stderr:\n");
         body.push_str(&stderr);

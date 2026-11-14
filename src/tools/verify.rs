@@ -290,7 +290,7 @@ async fn run_step(ctx: &ToolContext, step: &VerifyStep) -> StepOutcome {
         exit_code,
         timed_out,
         duration_ms,
-        output: strip_ansi(&output),
+        output: crate::sanitize::terminal_output(&output).into_owned(),
     })
 }
 
@@ -329,46 +329,6 @@ async fn collect_readers(
     tokio::time::timeout(Duration::from_secs(READER_GRACE_SECS), joined)
         .await
         .unwrap_or_default()
-}
-
-fn strip_ansi(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let mut chars = input.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch != '\x1b' {
-            out.push(ch);
-            continue;
-        }
-        match chars.peek() {
-            Some('[') => {
-                chars.next();
-                // CSI: consume parameters until a final byte.
-                for next in chars.by_ref() {
-                    if ('@'..='~').contains(&next) {
-                        break;
-                    }
-                }
-            }
-            Some(']') => {
-                chars.next();
-                // OSC: consume until BEL or ST.
-                while let Some(next) = chars.next() {
-                    if next == '\x07' {
-                        break;
-                    }
-                    if next == '\x1b' && chars.peek() == Some(&'\\') {
-                        chars.next();
-                        break;
-                    }
-                }
-            }
-            Some(_) => {
-                chars.next();
-            }
-            None => {}
-        }
-    }
-    out
 }
 
 fn failure_excerpt(output: &str) -> String {

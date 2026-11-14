@@ -172,6 +172,8 @@ pub struct Transcript {
     turn_cache: Vec<Option<Vec<Line<'static>>>>,
     /// Rendered `live_user`, reused while the reply streams.
     live_user_cache: Option<Vec<Line<'static>>>,
+    /// The streaming reply's settled Markdown.
+    live_markdown: LiveMarkdown,
     built_width: usize,
     /// Identifies the theme the cached lines were styled with.
     built_theme: String,
@@ -201,6 +203,7 @@ impl Transcript {
             prefix_len: 0,
             turn_cache: Vec::new(),
             live_user_cache: None,
+            live_markdown: LiveMarkdown::default(),
             built_width: 0,
             built_theme: String::new(),
             show_reasoning,
@@ -493,11 +496,13 @@ impl Transcript {
         }
         if let Some(block) = &self.live_assistant {
             separate(&mut lines);
-            lines.extend(render_block(
+            lines.extend(render_live_assistant(
                 block,
                 width,
                 theme,
+                &theme_key,
                 RenderOpts { live: true, ..opts },
+                &mut self.live_markdown,
             ));
         }
         self.lines = lines;
@@ -883,12 +888,108 @@ fn plain_lines(text: &str, width: usize, style: ratatui::style::Style) -> Vec<Li
     lines
 }
 
+/// A copy of `block` with every string made safe to paint, or `None` when it
+/// already is (the common case, which then costs one scan and no clone).
+fn sanitized(block: &Block) -> Option<Block> {
+    use crate::sanitize::{display, needs_cleaning as dirty};
+    use std::borrow::Cow;
+    fn clean(text: &mut String) {
+        if let Cow::Owned(fixed) = display(text) {
+            *text = fixed;
+        }
+    }
+    let needs = match &block.kind {
+        BlockKind::User(text) => dirty(text),
+        BlockKind::Assistant { text, reasoning } => {
+            dirty(text) || reasoning.as_deref().is_some_and(dirty)
+        }
+        BlockKind::Tool {
+            name,
+            summary,
+            preview,
+            artifact,
+            ..
+        } => {
+            dirty(name)
+                || dirty(summary)
+                || dirty(preview)
+                || artifact.as_deref().is_some_and(dirty)
+        }
+        BlockKind::Error { code, message } => dirty(code) || dirty(message),
+        BlockKind::Compaction {
+            reason, summary, ..
+        } => dirty(reason) || dirty(summary),
+        BlockKind::Note { title, body, .. } => dirty(title) || dirty(body),
+        BlockKind::TurnSummary { .. } => false,
+        BlockKind::Banner { title, rows, hint } => {
+            dirty(title)
+                || dirty(hint)
+                || rows
+                    .iter()
+                    .any(|(key, value, _)| dirty(key) || dirty(value))
+        }
+    };
+    if !needs {
+        return None;
+    }
+    let mut block = block.clone();
+    match &mut block.kind {
+        BlockKind::User(text) => clean(text),
+        BlockKind::Assistant { text, reasoning } => {
+            clean(text);
+            if let Some(reasoning) = reasoning {
+                clean(reasoning);
+            }
+        }
+        BlockKind::Tool {
+            name,
+            summary,
+            preview,
+            artifact,
+            ..
+        } => {
+            clean(name);
+            clean(summary);
+            clean(preview);
+            if let Some(artifact) = artifact {
+                clean(artifact);
+            }
+        }
+        BlockKind::Error { code, message } => {
+            clean(code);
+            clean(message);
+        }
+        BlockKind::Compaction {
+            reason, summary, ..
+        } => {
+            clean(reason);
+            clean(summary);
+        }
+        BlockKind::Note { title, body, .. } => {
+            clean(title);
+            clean(body);
+        }
+        BlockKind::TurnSummary { .. } => {}
+        BlockKind::Banner { title, rows, hint } => {
+            clean(title);
+            clean(hint);
+            for (key, value, _) in rows {
+                clean(key);
+                clean(value);
+            }
+        }
+    }
+    Some(block)
+}
+
 fn render_block(
     block: &Block,
     width: usize,
     theme: &Theme,
     opts: RenderOpts,
 ) -> Vec<Line<'static>> {
+    let cleaned = sanitized(block);
+    let block = cleaned.as_ref().unwrap_or(block);
     let width = width.max(GUTTER + 1);
     let inner = width - GUTTER;
     match &block.kind {
@@ -909,23 +1010,9 @@ fn render_block(
             lines
         }
         BlockKind::Assistant { text, reasoning } => {
-            let mut lines = Vec::new();
-            if let Some(reasoning) = reasoning.as_deref().filter(|r| !r.trim().is_empty()) {
-                // Still thinking: no answer text yet on a streaming block.
-                let thinking = opts.live && text.trim().is_empty();
-                lines.extend(reasoning_lines(
-                    reasoning,
-                    thinking,
-                    opts.show_reasoning,
-                    inner,
-                    theme,
-                ));
-            }
-            if !text.trim().is_empty() {
-                let marker = Span::styled("● ", theme.style(Role::Assistant));
-                lines.extend(with_gutter(marker, assistant_markdown(text, inner, theme)));
-            }
-            lines
+            assistant_lines(text, reasoning.as_deref(), inner, theme, opts, |text| {
+                assistant_markdown(text, inner, theme)
+            })
         }
         BlockKind::Tool {
             name,
@@ -1042,6 +1129,178 @@ fn render_block(
         }
         BlockKind::Banner { title, rows, hint } => banner_lines(title, rows, hint, width, theme),
     }
+}
+
+fn assistant_lines(
+    text: &str,
+    reasoning: Option<&str>,
+    inner: usize,
+    theme: &Theme,
+    opts: RenderOpts,
+    markdown: impl FnOnce(&str) -> Vec<Line<'static>>,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    if let Some(reasoning) = reasoning.filter(|r| !r.trim().is_empty()) {
+        // Still thinking: no answer text yet on a streaming block.
+        let thinking = opts.live && text.trim().is_empty();
+        lines.extend(reasoning_lines(
+            reasoning,
+            thinking,
+            opts.show_reasoning,
+            inner,
+            theme,
+        ));
+    }
+    if !text.trim().is_empty() {
+        let marker = Span::styled("● ", theme.style(Role::Assistant));
+        lines.extend(with_gutter(marker, markdown(text)));
+    }
+    lines
+}
+
+/// The streaming assistant block, with its settled Markdown reused.
+fn render_live_assistant(
+    block: &Block,
+    width: usize,
+    theme: &Theme,
+    theme_key: &str,
+    opts: RenderOpts,
+    cache: &mut LiveMarkdown,
+) -> Vec<Line<'static>> {
+    let cleaned = sanitized(block);
+    let block = cleaned.as_ref().unwrap_or(block);
+    let BlockKind::Assistant { text, reasoning } = &block.kind else {
+        return render_block(block, width, theme, opts);
+    };
+    let inner = width.max(GUTTER + 1) - GUTTER;
+    assistant_lines(text, reasoning.as_deref(), inner, theme, opts, |text| {
+        cache.render(text, inner, theme, theme_key)
+    })
+}
+
+/// Markdown for a reply that is still streaming.
+///
+/// Re-parsing the whole reply every frame makes a long answer cost more the
+/// longer it gets. Instead the reply is split at the last settled block
+/// boundary: a blank line followed by a line that can only start a new
+/// top-level block (a heading, a paragraph, or a code fence) outside any
+/// fence. Text appended later can no longer change how the part before such
+/// a boundary renders, so that head is rendered once and only the tail is
+/// re-rendered per frame. `streamed_markdown_matches_a_full_render` checks
+/// the result against `assistant_markdown` at every byte of a sample reply.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct LiveMarkdown {
+    width: usize,
+    theme: String,
+    /// The settled source; every call's text starts with it.
+    head: String,
+    /// `assistant_markdown(head)`, without trailing blank lines.
+    lines: Vec<Line<'static>>,
+    /// Whether `head` ends with a code fence.
+    ends_with_fence: bool,
+}
+
+impl LiveMarkdown {
+    fn render(
+        &mut self,
+        text: &str,
+        width: usize,
+        theme: &Theme,
+        theme_key: &str,
+    ) -> Vec<Line<'static>> {
+        if self.width != width || self.theme != theme_key || !text.starts_with(self.head.as_str()) {
+            *self = LiveMarkdown {
+                width,
+                theme: theme_key.to_string(),
+                ..LiveMarkdown::default()
+            };
+        }
+        if let Some(at) = settled_boundary(text, self.head.len()) {
+            let segment = &text[self.head.len()..at];
+            let mut rendered = assistant_markdown(segment, width, theme);
+            trim_blank_tail(&mut rendered);
+            join_segments(&mut self.lines, self.ends_with_fence, segment);
+            self.lines.extend(rendered);
+            self.ends_with_fence = ends_with_fence(segment);
+            self.head.push_str(segment);
+        }
+        let tail = &text[self.head.len()..];
+        let mut out = self.lines.clone();
+        join_segments(&mut out, self.ends_with_fence, tail);
+        out.extend(assistant_markdown(tail, width, theme));
+        out
+    }
+}
+
+/// Add what `assistant_markdown` puts between two segments: one blank line
+/// between prose blocks or between two fences, nothing between prose and a
+/// fence.
+fn join_segments(lines: &mut Vec<Line<'static>>, after_fence: bool, next: &str) {
+    if !lines.is_empty() && after_fence == starts_with_fence(next) {
+        lines.push(Line::raw(""));
+    }
+}
+
+fn trim_blank_tail(lines: &mut Vec<Line<'static>>) {
+    while lines.last().is_some_and(|line| line.width() == 0) {
+        lines.pop();
+    }
+}
+
+fn is_fence_line(line: &str) -> bool {
+    line.trim_start().starts_with("```")
+}
+
+fn starts_with_fence(text: &str) -> bool {
+    text.split('\n').next().is_some_and(is_fence_line)
+}
+
+/// Whether the last non-blank line of a balanced segment closes a fence.
+fn ends_with_fence(text: &str) -> bool {
+    text.split('\n')
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .is_some_and(is_fence_line)
+}
+
+/// The latest offset after `from` where the reply can be split without
+/// changing how either side renders (see [`LiveMarkdown`]). `from` is itself
+/// such a boundary (or 0), so scanning starts outside any fence.
+fn settled_boundary(text: &str, from: usize) -> Option<usize> {
+    let mut best = None;
+    let mut in_fence = false;
+    let mut previous_blank = false;
+    let mut content = false;
+    let mut offset = from;
+    for line in text[from..].split_inclusive('\n') {
+        let start = offset;
+        offset += line.len();
+        let body = line.strip_suffix('\n').unwrap_or(line);
+        let fence = is_fence_line(body);
+        if !in_fence && previous_blank && content && starts_top_level_block(body, fence) {
+            best = Some(start);
+        }
+        if fence {
+            in_fence = !in_fence;
+        }
+        let blank = body.trim().is_empty();
+        content |= !blank;
+        previous_blank = blank;
+    }
+    best
+}
+
+/// Whether a line after a blank line can only begin a new top-level block:
+/// a fence, a heading, or a paragraph. Lists, quotes, tables, indented code,
+/// HTML, and link definitions are excluded, since they can continue or
+/// reinterpret what came before.
+fn starts_top_level_block(line: &str, fence: bool) -> bool {
+    if fence {
+        return true;
+    }
+    line.chars()
+        .next()
+        .is_some_and(|c| c.is_alphabetic() || matches!(c, '#' | '"' | '(' | '\''))
 }
 
 fn reasoning_lines(
@@ -2345,6 +2604,46 @@ mod perf_bench {
         assert_eq!(text(t.lines()), fresh(&t, 50));
     }
 
+    /// Streaming through the settled-head cache paints exactly what a full
+    /// render of the same text paints, at every byte.
+    #[test]
+    fn streamed_markdown_matches_a_full_render() {
+        let theme = Theme::bundled("default");
+        let key = theme_key(&theme);
+        let sample = "Intro paragraph with **bold** and `code`.\n\n\
+            # Heading\n\nText right after.\n\n\
+            - one\n- two\n\n  continued item\n\nAfter the list.\n\n\
+            1. first\n2. second\n\n\
+            > quoted\n> more\n\nPlain again.\n\n\
+            | a | b |\n|---|---|\n| 1 | 2 |\n\nTable done.\n\n\
+            ```rust\nfn main() {\n\n    println!(\"hi\");\n}\n```\n\n\
+            ```diff\n-old\n+new\n```\nDirectly after a fence.\n\n\n\
+            ```\nbare fence\n```\n\n\
+            Setext title\n============\n\n\
+                indented code\n\n\
+            \"Quoted\" start and (paren) start.\n\n\
+            'single' start\n\n## Done\n\nlast words";
+        for width in [30, 80] {
+            let mut cache = LiveMarkdown::default();
+            for (end, _) in sample.char_indices().chain([(sample.len(), ' ')]) {
+                let prefix = &sample[..end];
+                let streamed = cache.render(prefix, width, &theme, &key);
+                let full = assistant_markdown(prefix, width, &theme);
+                assert_eq!(
+                    text(&streamed),
+                    text(&full),
+                    "width {width}, after {end} bytes: {:?}",
+                    &prefix[prefix.len().saturating_sub(40)..]
+                );
+                assert_eq!(streamed, full, "styles differ after {end} bytes");
+            }
+            assert!(
+                cache.head.len() > sample.len() / 2,
+                "the head should settle"
+            );
+        }
+    }
+
     #[test]
     #[ignore]
     fn bench_transcript_prepare() {
@@ -2372,6 +2671,27 @@ mod perf_bench {
         eprintln!(
             "lines={} full={full:?} per_delta_rebuild={per_delta:?} per_frame_window={per_clone:?}",
             transcript.lines().len()
+        );
+
+        // A long reply still streaming: the live block re-renders per frame.
+        transcript.begin_turn("write a long answer");
+        let paragraph = "Some **bold** prose with `code` and a [link](https://example.com) that wraps across the line. ";
+        for n in 0..300 {
+            transcript.text_delta(&format!(
+                "\n\n## Section {n}\n\n{}\n\n```rust\nfn f{n}() {{ let x = {n}; }}\n```",
+                paragraph.repeat(3)
+            ));
+        }
+        transcript.prepare(120, &theme, false);
+        let start = Instant::now();
+        for _ in 0..20 {
+            transcript.text_delta("more streamed text ");
+            transcript.prepare(120, &theme, false);
+        }
+        eprintln!(
+            "long live reply: lines={} per_delta_rebuild={:?}",
+            transcript.lines().len(),
+            start.elapsed() / 20
         );
     }
 }
