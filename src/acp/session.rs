@@ -681,10 +681,11 @@ pub(crate) struct AcpApprover {
 
 #[async_trait]
 impl ToolApprover for AcpApprover {
-    async fn approve(&self, call: &ToolCall, args: &Value, read_only: bool) -> ToolApproval {
-        // Reading and session-only bookkeeping need no prompt. Everything
-        // that can touch files or run processes does.
-        if read_only || matches!(call.name.as_str(), "todo" | "thread") {
+    async fn approve(&self, call: &ToolCall, args: &Value, _read_only: bool) -> ToolApproval {
+        // Only the built-in read and session tools skip the prompt. A tool
+        // that merely declares itself read-only (an MCP server, for example)
+        // does not get to decide its own permission level.
+        if !needs_permission(&call.name) {
             return ToolApproval::Allow;
         }
         let Some(server) = self.server.upgrade() else {
@@ -788,6 +789,24 @@ fn sanitize_value(value: &Value) -> Value {
     }
 }
 
+/// Built-in tools that cannot touch the filesystem or run a process. MCP and
+/// external tools always ask, even when their manifest claims read-only.
+fn needs_permission(name: &str) -> bool {
+    !matches!(
+        name,
+        "read"
+            | "grep"
+            | "glob"
+            | "repo_map"
+            | "recall"
+            | "review"
+            | "lsp"
+            | "skill"
+            | "todo"
+            | "thread"
+    )
+}
+
 fn permission_title(name: &str, args: &Value, summary: Option<&str>) -> String {
     let detail = summary.map(str::to_string).or_else(|| match name {
         "bash" | "bg" => args
@@ -849,6 +868,23 @@ mod tests {
         let out = stream.push("a\u{1b}]0;title\u{7}b\u{1b}[2Jc");
         assert_eq!(out, "abc");
         assert_eq!(stream.finish(), "");
+    }
+
+    #[test]
+    fn only_builtin_read_tools_skip_permission() {
+        for name in [
+            "read", "grep", "glob", "repo_map", "recall", "review", "lsp", "skill", "todo",
+            "thread",
+        ] {
+            assert!(!needs_permission(name), "{name} should be free");
+        }
+        for name in ["write", "edit", "patch", "bash", "bg", "verify", "test"] {
+            assert!(needs_permission(name), "{name} must ask");
+        }
+        // MCP/external names are not self-certifying.
+        for name in ["files__read_file", "mcp_read", "readOnlyThing"] {
+            assert!(needs_permission(name), "{name} must ask");
+        }
     }
 
     #[test]

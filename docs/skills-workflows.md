@@ -236,7 +236,8 @@ are written to the journal. A denial ends the run with
 its step finishes, and every artifact belonging to a completed step is checked
 again before the workflow reports success, so a later step cannot delete an
 earlier output. A missing artifact ends the run with
-`workflow_artifact_missing` and names it. Paths must be relative, cannot
+`workflow_artifact_missing`, names it, and reopens the prompt step that owns it
+so `--resume` can recreate it. Paths must be relative, cannot
 contain `.`/`..`, and must still resolve inside the working directory after
 symlinks.
 

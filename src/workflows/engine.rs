@@ -1132,6 +1132,56 @@ pub async fn execute(
         );
     }
     if !missing.is_empty() {
+        // The steps are recorded as completed, so a plain resume would skip
+        // them and fail this same check again. Reopen the step that owns each
+        // missing artifact (or the last completed prompt step for a top-level
+        // artifact) so `--resume` can recreate it.
+        let mut owners: HashMap<String, Vec<String>> = HashMap::new();
+        for step in &spec.steps {
+            // An approval gate cannot recreate a file; reopen the prompt step
+            // that can.
+            if step.is_approval() {
+                continue;
+            }
+            for artifact in &step.artifacts {
+                owners
+                    .entry(artifact.clone())
+                    .or_default()
+                    .push(step.id.clone());
+            }
+        }
+        let mut reopen: Vec<String> = Vec::new();
+        for artifact in &missing {
+            if let Some(ids) = owners.get(artifact.as_str()) {
+                for id in ids {
+                    if !reopen.contains(id) {
+                        reopen.push(id.clone());
+                    }
+                }
+            }
+        }
+        if reopen.is_empty()
+            && let Some(step) = spec.steps.iter().rev().find(|step| {
+                !step.is_approval()
+                    && journal
+                        .step(&step.id)
+                        .is_some_and(|record| record.status == StepState::Completed)
+            })
+        {
+            reopen.push(step.id.clone());
+        }
+        for id in &reopen {
+            let record = journal.ensure_step(id);
+            if record.status == StepState::Completed {
+                record.status = StepState::Pending;
+                record.attempts = 0;
+                record.detail =
+                    Some("final artifact check failed; rerun this step to recreate it".into());
+                record.finished_at = None;
+            }
+        }
+        facts.steps_completed = count_completed(&journal);
+        journal.facts = facts.clone();
         let names: Vec<&str> = missing.iter().map(|name| name.as_str()).collect();
         return fail(
             journal,
@@ -1499,6 +1549,12 @@ mod tests {
     enum Action {
         /// Remove a file on the Nth prompt call (1-based).
         Remove { path: PathBuf, at: usize },
+        /// Write a file on the Nth prompt call (1-based).
+        Create {
+            path: PathBuf,
+            content: String,
+            at: usize,
+        },
     }
 
     struct Fake {
@@ -1540,13 +1596,21 @@ mod tests {
             self.calls
                 .push((step.id.clone(), attempt, previous.map(str::to_string)));
             self.prompts += 1;
-            if self.actions.first().is_some_and(
-                |action| matches!(action, Action::Remove { at, .. } if *at == self.prompts),
-            ) {
+            if self.actions.first().is_some_and(|action| {
+                matches!(action, Action::Remove { at, .. } | Action::Create { at, .. } if *at == self.prompts)
+            }) {
                 let action = self.actions.remove(0);
                 match action {
                     Action::Remove { path, .. } => {
                         let _ = std::fs::remove_file(path);
+                    }
+                    Action::Create {
+                        path, content, ..
+                    } => {
+                        let _ = std::fs::create_dir_all(
+                            path.parent().unwrap_or_else(|| Path::new(".")),
+                        );
+                        let _ = std::fs::write(path, content);
                     }
                 }
             }
@@ -2067,14 +2131,14 @@ mod tests {
             vec![],
         );
         let mut fake = Fake::new(vec![], vec![]).with_action(Action::Remove {
-            path: output,
+            path: output.clone(),
             at: 2,
         });
         // The first step's artifact check passes; the second prompt attempt
         // removes it before the final check.
         let report = execute(
             &spec,
-            options(path, dir.path(), false),
+            options(path.clone(), dir.path(), false),
             &mut fake,
             &mut |_| {},
         )
@@ -2082,6 +2146,33 @@ mod tests {
         let failure = report.failure.unwrap();
         assert_eq!(failure.code, "workflow_artifact_missing");
         assert!(failure.message.contains("out.txt"));
+
+        // The owner is reopened so a resume can recreate the output instead
+        // of skipping every step and failing the same check again.
+        let journal = Journal::load(&path).unwrap();
+        assert_eq!(journal.step("one").unwrap().status, StepState::Pending);
+        assert_eq!(journal.step("one").unwrap().attempts, 0);
+        let mut fake = Fake::new(vec![], vec![]).with_action(Action::Create {
+            path: output,
+            content: "recreated\n".into(),
+            at: 1,
+        });
+        let report = execute(
+            &spec,
+            options(path.clone(), dir.path(), true),
+            &mut fake,
+            &mut |_| {},
+        )
+        .await;
+        assert!(report.failure.is_none(), "{:?}", report.failure);
+        assert_eq!(
+            fake.calls
+                .iter()
+                .map(|(id, _, _)| id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["one"]
+        );
+        assert_eq!(Journal::load(&path).unwrap().status, RunState::Completed);
     }
 
     #[tokio::test]
