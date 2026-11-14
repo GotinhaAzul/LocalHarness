@@ -5,6 +5,15 @@ on:
     branches: [main]
   pull_request:
 
+# A pull request from a fork gets a read-only token and no secrets. Nothing in
+# this workflow needs more than that.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -12,6 +21,7 @@ jobs:
   test:
     name: fmt, clippy, test
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -26,6 +36,7 @@ jobs:
   cross:
     name: build aarch64
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -40,6 +51,7 @@ jobs:
   audit:
     name: advisories and licenses (advisory)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
