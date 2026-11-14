@@ -13,6 +13,7 @@ use serde_json::{Value, json};
 use tokio::task::JoinHandle;
 
 use crate::sandbox::Sandbox;
+use crate::text::head_and_tail;
 use crate::tools::{
     Tool, ToolContext, ToolPack, ToolResult, object_schema, optional_str, optional_u64,
     required_str,
@@ -383,46 +384,6 @@ fn render_preview(stdout: &[u8], stderr: &[u8]) -> String {
     )
 }
 
-/// `text` within `head + tail` bytes: its start and its end, cut at line
-/// boundaries where possible, with a marker for what was left out.
-pub(crate) fn head_and_tail(text: &str, head: usize, tail: usize) -> String {
-    if text.len() <= head + tail {
-        return text.to_string();
-    }
-    let mut head_end = head;
-    while !text.is_char_boundary(head_end) {
-        head_end -= 1;
-    }
-    if let Some(newline) = text[..head_end].rfind('\n') {
-        head_end = newline + 1;
-    }
-    let mut tail_start = text.len() - tail;
-    while !text.is_char_boundary(tail_start) {
-        tail_start += 1;
-    }
-    if let Some(newline) = text[tail_start..].find('\n') {
-        tail_start += newline + 1;
-    }
-    format!(
-        "{}[... {} bytes of output omitted ...]\n{}",
-        &text[..head_end],
-        tail_start - head_end,
-        &text[tail_start..]
-    )
-}
-
-/// Take at most `max` bytes without splitting a UTF-8 code point.
-pub(crate) fn take_bytes(text: &str, max: usize) -> (String, bool) {
-    if text.len() <= max {
-        return (text.to_string(), false);
-    }
-    let mut end = max;
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    (text[..end].to_string(), true)
-}
-
 #[cfg(test)]
 pub(crate) fn test_context(dir: &Path) -> ToolContext {
     use std::sync::Mutex;
@@ -589,19 +550,6 @@ mod tests {
             "{}",
             result.content.len()
         );
-    }
-
-    #[test]
-    fn head_and_tail_cuts_at_lines() {
-        let text: String = (0..100).map(|n| format!("line {n}\n")).collect();
-        assert_eq!(head_and_tail(&text, 1000, 1000), text);
-        let cut = head_and_tail(&text, 30, 30);
-        assert!(cut.starts_with("line 0\n"));
-        assert!(cut.ends_with("line 99\n"));
-        assert!(cut.contains("bytes of output omitted"));
-        for line in cut.lines().filter(|line| !line.contains("omitted")) {
-            assert!(line.starts_with("line "), "no partial lines: {line:?}");
-        }
     }
 
     #[tokio::test]

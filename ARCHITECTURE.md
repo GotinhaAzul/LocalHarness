@@ -1229,7 +1229,7 @@ cursor = "#c0caf5"
   or fence, outside any fence); the head is rendered once and only the tail is
   re-parsed per frame. Incomplete fences and lists render as plain text until
   closed.
-- Display safety (`ui/sanitize.rs`): every string that reaches the screen has
+- Display safety (`sanitize.rs`): every string that reaches the screen has
   ANSI escapes stripped, tabs expanded, carriage returns resolved, and
   width-ambiguous format characters (emoji variation selectors, zero-width
   joiners, skin-tone modifiers, bidi controls) dropped, so ratatui's idea of
@@ -1444,6 +1444,8 @@ src/
   config.rs               config load, merge, validation
   paths.rs                config/data/project paths, project id
   git.rs                  branch and dirty status
+  sanitize.rs             text safe to paint or read (escapes, tabs, emoji)
+  text.rs                 shared clipping, one-line, slug, byte excerpts
   provider/
     mod.rs                Provider trait and error types
     openai.rs             OpenAI-compatible client
@@ -1495,7 +1497,6 @@ src/
     tree.rs               /tree modal
     widgets.rs            header, tool card, diff, input
     render.rs             layout and drawing
-    sanitize.rs           make text safe to paint (escapes, tabs, emoji)
     input.rs              key handling, history, completion
     tui.rs                App state, event loop, drawing, agent events
     tui/terminal.rs       terminal setup/restore, panic hook

@@ -13,6 +13,7 @@ use ratatui_textarea::TextArea;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::session::{EntryKind, Session};
+use crate::text::one_line;
 use crate::tools::todo::PlanStatus;
 use crate::ui::markdown::{render_diff, render_markdown, wrap_plain};
 use crate::ui::theme::{Role, Theme};
@@ -753,19 +754,7 @@ fn summarize_arguments(value: &serde_json::Value) -> String {
         serde_json::Value::Object(_) => String::new(),
         other => other.to_string(),
     };
-    clip_text(&text, 90)
-}
-
-fn clip_text(text: &str, max: usize) -> String {
-    let one_line: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if one_line.chars().count() <= max {
-        return one_line;
-    }
-    one_line
-        .chars()
-        .take(max.saturating_sub(1))
-        .collect::<String>()
-        + "…"
+    one_line(&text, 90)
 }
 
 fn strip_tool_header(content: &str) -> &str {

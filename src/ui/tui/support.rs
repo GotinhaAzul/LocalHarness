@@ -99,18 +99,6 @@ pub(super) fn short_session_id(id: &str) -> String {
     chars[chars.len() - 8..].iter().collect()
 }
 
-pub(super) fn sanitize_name(name: &str) -> String {
-    name.chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
-                ch
-            } else {
-                '-'
-            }
-        })
-        .collect()
-}
-
 pub(super) fn save_theme(path: &Path, theme: &str) -> Result<()> {
     let mut value = if path.exists() {
         toml::from_str::<toml::Value>(&std::fs::read_to_string(path)?)

@@ -14,6 +14,7 @@ use async_trait::async_trait;
 use ignore::WalkBuilder;
 use serde_json::{Value, json};
 
+use crate::text::clip;
 use crate::tools::{
     Tool, ToolContext, ToolPack, ToolResult, display_path, object_schema, optional_str,
     optional_u64,
@@ -359,7 +360,7 @@ fn symbol(kind: &'static str, name: String, line: usize, indent: usize) -> Symbo
     Symbol {
         line,
         kind,
-        name: truncate_chars(name.trim(), 80),
+        name: clip(name.trim(), 80),
         indent,
     }
 }
@@ -620,7 +621,7 @@ fn simple_name(text: &str) -> String {
         .take_while(|character| character.is_alphanumeric() || matches!(character, '_' | '$' | '~'))
         .collect();
     if name.is_empty() {
-        truncate_chars(text.trim(), 60)
+        clip(text.trim(), 60)
     } else {
         name
     }
@@ -628,15 +629,6 @@ fn simple_name(text: &str) -> String {
 
 fn collapse_spaces(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-fn truncate_chars(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
-        return text.to_string();
-    }
-    let mut out: String = text.chars().take(max_chars).collect();
-    out.push('…');
-    out
 }
 
 /// The `repo_map` tool adapter.

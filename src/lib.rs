@@ -20,6 +20,7 @@ pub mod sanitize;
 pub mod security;
 pub mod session;
 pub mod skills;
+pub mod text;
 pub mod tools;
 pub mod ui;
 pub mod workflows;

@@ -838,7 +838,7 @@ impl App {
         }
         if !workflow.tools.is_empty() {
             let base = config.profile().clone();
-            let derived_name = format!("workflow-{}", sanitize_name(name));
+            let derived_name = format!("workflow-{}", crate::text::slug(name, '-'));
             let mut derived = base;
             // A workflow's tool list is an allowlist: drop the base profile's
             // packs so unlisted tools in those packs are not silently enabled.

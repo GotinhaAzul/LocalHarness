@@ -355,17 +355,15 @@ pub fn referenced_servers(config: &Config) -> Vec<String> {
     servers
 }
 
+/// A description or label within `limit` characters, outer whitespace
+/// removed.
+fn clip_trimmed(text: &str, limit: usize) -> String {
+    crate::text::clip(text.trim(), limit)
+}
+
 /// Characters allowed in function names by OpenAI-compatible servers.
 fn sanitize(text: &str) -> String {
-    text.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
+    crate::text::slug(text, '_')
 }
 
 /// `<server>__<tool>`, sanitized and kept within 64 characters. Long names are
@@ -395,16 +393,6 @@ pub fn normalize_schema(schema: &Value) -> Value {
     Value::Object(map)
 }
 
-fn truncate_chars(text: &str, limit: usize) -> String {
-    let text = text.trim();
-    if text.chars().count() <= limit {
-        return text.to_string();
-    }
-    let mut out: String = text.chars().take(limit.saturating_sub(3)).collect();
-    out.push_str("...");
-    out
-}
-
 /// One remote tool exposed through the harness `Tool` contract.
 pub struct McpTool {
     client: Arc<McpClient>,
@@ -428,7 +416,7 @@ impl McpTool {
             server: server.to_string(),
             remote: tool.name,
             name: intern(exposed),
-            description: intern(&truncate_chars(&description, DESCRIPTION_LIMIT)),
+            description: intern(&clip_trimmed(&description, DESCRIPTION_LIMIT)),
             schema: normalize_schema(&tool.input_schema),
             read_only: tool.read_only,
         }
