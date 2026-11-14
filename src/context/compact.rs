@@ -87,8 +87,11 @@ pub fn tail_budget(budget: &TokenBudget) -> usize {
 /// Without a tail, a compaction in the middle of a run leaves the model a
 /// summary and nothing it just read, so it re-reads files and re-runs
 /// commands. The tail starts on a user or assistant entry, holds every tool
-/// result with its call, comes only from after the latest compaction, and
-/// never covers the whole context (that would compact nothing).
+/// result with its call, and comes only from after the latest compaction.
+/// Without an earlier compaction it never covers the whole context (that
+/// would compact nothing); after one it may keep everything since, because
+/// the earlier summary is still folded away (the loop compacts again without
+/// a tail if that leaves the context over budget).
 pub fn recent_tail_start(session: &Session, max_chars: usize) -> Option<String> {
     let branch = session.branch_entries();
     let after = branch
@@ -96,6 +99,7 @@ pub fn recent_tail_start(session: &Session, max_chars: usize) -> Option<String> 
         .rposition(|entry| entry.is_compaction())
         .map_or(0, |pos| pos + 1);
     let body = &branch[after..];
+    let first_allowed = usize::from(after == 0);
     let first_message = body
         .iter()
         .position(|entry| matches!(entry.kind, EntryKind::User(_) | EntryKind::Assistant(_)))?;
@@ -106,7 +110,7 @@ pub fn recent_tail_start(session: &Session, max_chars: usize) -> Option<String> 
         if used > max_chars {
             break;
         }
-        if index > first_message
+        if index >= first_message + first_allowed
             && matches!(entry.kind, EntryKind::User(_) | EntryKind::Assistant(_))
         {
             start = Some(index);
@@ -640,6 +644,29 @@ mod tests {
         );
         // Room for nothing.
         assert_eq!(recent_tail_start(&session, 5), None);
+    }
+
+    #[test]
+    fn after_a_compaction_the_tail_may_keep_everything_since() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = session(dir.path());
+        user(&mut session, "fix the build");
+        step(&mut session, "call_1", "cargo build", "built");
+        session
+            .append(EntryKind::Compaction(crate::session::CompactionData {
+                summary: "s".into(),
+                tokens_before: 10,
+                reason: "auto".into(),
+                thread_id: None,
+                keep_from: None,
+            }))
+            .unwrap();
+        // One large step since the compaction: keep its output verbatim.
+        let only = step(&mut session, "call_2", "cat big.rs", &"x".repeat(400));
+        assert_eq!(
+            recent_tail_start(&session, 100_000).as_deref(),
+            Some(only.as_str())
+        );
     }
 
     #[test]
