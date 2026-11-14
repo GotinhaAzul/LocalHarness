@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/GotinhaAzul/LocalHarness/security/advisories/new
+    about: Report privately. Never in a public issue, discussion, or PR.
+  - name: Question or open-ended idea
+    url: https://github.com/GotinhaAzul/LocalHarness/discussions
+    about: Use Discussions for setup help, model tuning, and design discussion.
+  - name: Backlog map
+    url: https://github.com/GotinhaAzul/LocalHarness/issues/45
+    about: How the backlog is organized, and the suggested order.

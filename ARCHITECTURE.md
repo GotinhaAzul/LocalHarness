@@ -34,7 +34,7 @@ work.
 - [6. Tools and packs](#6-tools-and-packs)
 - [7. Extensibility](#7-extensibility)
 - [8. Security model](#8-security-model)
-- [9. TUI](#9-tui)
+- [9. Interfaces: TUI, headless, and ACP](#9-tui)
 - [10. Configuration and storage](#10-configuration-and-storage)
 - [11. Module layout and dependencies](#11-module-layout-and-dependencies)
 - [12. Testing and verification](#12-testing-and-verification)
@@ -352,7 +352,9 @@ continues. Nudges are capped at three per turn.
 usable_prompt = context_window - max_output_tokens - safety_margin
 ```
 
-- `max_output_tokens` defaults to 4096.
+- `max_output_tokens` defaults to 4096 and is capped at a quarter of the
+  window, so a small server window always leaves room for the prompt. The
+  request's `max_tokens` uses the capped value.
 - `safety_margin` is 5% of the context window, minimum 512 tokens.
 - Tool schemas, system prompt, skills index, and state blocks count toward the
   prompt. The serialized `tools` array is measured once when the core is built:
@@ -377,7 +379,10 @@ usable_prompt = context_window - max_output_tokens - safety_margin
   at 8000 characters.
 - Larger output is written to an artifact under the session's artifact
   directory. The tool result contains a short preview plus `[out-N]` and the
-  artifact size.
+  artifact size. Command tools (`bash`, `bg`, `test`, `verify`) preview the
+  first and the last lines, where errors and summaries land, and name the
+  omitted range: `… 380 lines omitted (12-391); recall out-3 12-131 …`.
+  Other tools preview the start.
 - `recall` reads an artifact range, capped at 4000 characters per call.
 - Artifacts are user-readable files with `0700` directories. Retention is
   configurable; default is 30 days.
@@ -800,7 +805,7 @@ code and, where useful, the exact call shape.
 | `write` | 256 KB content |
 | `edit` / `patch` | 256 KB file, 200 diff lines returned |
 | `undo` | 4 MB snapshot; snapshots live as long as session artifacts |
-| `bash` | 600 s maximum, 1 MiB captured, 64 KB preview |
+| `bash` | 600 s maximum, 1 MiB captured plus the last 256 KiB per stream, 64 KB preview (start and end) |
 | `grep` | 200 matches, 5 lines of context |
 | `glob` | 200 paths |
 | `bg` | 4 live processes, 16 MB log per process |
@@ -901,7 +906,8 @@ when: engagement scope is set and the task is active testing
 
 ### 7.3 Workflows
 
-A workflow is a playbook plus a profile and tool allowlist. No step scripting.
+A workflow is a playbook plus a profile and tool allowlist. Optional `[[step]]`
+tables add a deterministic state machine; there is no step scripting.
 
 ```toml
 name = "recon"
@@ -915,6 +921,54 @@ tools = ["read", "grep", "glob", "bash", "bg", "finding", "iocs"]
 `/workflow recon` starts a new branch with the workflow prompt as the first user
 message and the profile applied. The model follows the playbook; code still
 enforces the gates.
+
+A step workflow drops the top-level prompt and declares its own:
+
+```toml
+[[step]]
+id = "reproduce"
+prompt = "Reproduce the failure."
+require = { tool = "bash", exit = 0 }
+retry = 1
+
+[[step]]
+id = "test"
+prompt = "Fix it and run the suite."
+when = "changed_files > 0"
+require = { verify = "pass" }
+
+[[step]]
+id = "push"
+run = "approval"
+message = "Push the branch?"
+```
+
+- `lh workflow run <name>` executes steps in order in one session; `/workflow`
+  refuses step workflows because the TUI owns one turn at a time.
+- Conditions read only `changed_files`, `open_tasks`, `last_exit`,
+  `steps_completed`, and `last_verify`, through `<fact> <op> <value>` clauses
+  joined by `and`. An unknown fact or operator is a configuration error.
+- Requirements are `tool` (with an optional `exit`), `verify`, or `artifact`.
+  A failed turn or unmet requirement consumes one of the `retry + 1` attempts
+  in an invocation; the last failure ends the run with
+  `workflow_step_failed` and prints the step and reason. A crash leaves the
+  step pending and resume continues its remaining budget.
+- An approval step blocks on stdin, records accept/deny in the journal, and
+  cannot be retried. Denial ends the run with `workflow_approval_denied`.
+- Declared artifacts are relative, non-empty files checked after their step
+  and again before success; `..`, absolute paths, and symlinks that leave the
+  working directory are rejected.
+- Prompt files must stay inside the workflow directory.
+- The journal carries a step fingerprint and is written atomically with `0600`
+  permissions under `<data>/sessions/<project>/workflows/<name>.json`.
+  `--resume` skips unchanged completed or skipped steps, reruns a changed step,
+  and reopens the recorded session. `--no-session` keeps the journal in memory.
+- A step cannot select tools, skills, or a profile. The engine evaluates no
+  code, and the turn inside a step still goes through every gate.
+- `lh workflow run` loads the workflow's named skills into the first prompt
+  step after validating them.
+
+`lh workflow list` prints bundled, global, and trusted project workflows.
 
 ### 7.4 External tools
 
@@ -1168,7 +1222,7 @@ input characters. Missing input and unreadable files return prescriptive errors.
 
 ---
 
-## 9. TUI
+## 9. Interfaces: TUI, headless, and ACP
 
 ### 9.1 Layout
 
@@ -1259,8 +1313,19 @@ cursor = "#c0caf5"
 - Tool cards: border by status, tool name, one-line argument summary, duration,
   output preview, expand key.
 - Errors: red card with code, message, and next action.
-- Streaming: re-render accumulated Markdown at most once per 30 ms. Incomplete
-  fences and lists render as plain text until closed.
+- Streaming: frames are drawn at most every 16 ms. The live reply is split at
+  its last settled block boundary (a blank line before a heading, paragraph,
+  or fence, outside any fence); the head is rendered once and only the tail is
+  re-parsed per frame. Incomplete fences and lists render as plain text until
+  closed.
+- Display safety (`sanitize.rs`): every string that reaches the screen has
+  ANSI escapes stripped, tabs expanded, carriage returns resolved, and
+  width-ambiguous format characters (emoji variation selectors, zero-width
+  joiners, skin-tone modifiers, bidi controls) dropped, so ratatui's idea of
+  each cell matches the terminal's and no stale characters are left behind.
+- Output: frames go through one 256 KiB buffered write wrapped in
+  synchronized-update markers (DEC 2026). `Ctrl+L`, a resize, or regaining
+  focus clears the screen and repaints every cell.
 - Wrapping: pre-wrap styled spans to the viewport width and cache per width so
   scrolling is line-accurate. Long words are broken, not clipped.
 - Scroll: `PgUp`/`PgDn`, `Home`/`End`; auto-follow while streaming unless the
@@ -1290,6 +1355,7 @@ cursor = "#c0caf5"
   cursor within the textarea.
 - `Ctrl+C` cancels the current run; a second `Ctrl+C` quits.
 - `Ctrl+D` quits when the input is empty.
+- `Ctrl+L` redraws the whole screen.
 - Slash commands: `/help`, `/quit`, `/login`, `/model`, `/profile`, `/theme`,
   `/tree`, `/fork`, `/sessions`, `/compact`, `/tools`, `/skill`, `/workflow`,
   `/sec`, `/trust`, `/commit`, `/pr`, `/export`, `/clear`, `/debug`. `/commit`
@@ -1333,6 +1399,38 @@ cursor = "#c0caf5"
 exits with the turn status. `--json` emits newline-delimited events for
 scripting. The same core and session code is used. This is not a second
 implementation.
+
+### 9.8 Agent Client Protocol
+
+`lh acp` serves ACP v1 over stdio: newline-delimited JSON-RPC 2.0 on stdin and
+stdout, with logs kept in the log file. It exposes `initialize`, `session/new`,
+`session/load`, `session/prompt`, and `session/cancel`, streams
+`session/update`, and sends `session/request_permission` before every
+non-read-only tool call.
+
+- Each session owns one `Core` rooted at the client's absolute `cwd`; file
+  tools run with the path jail on, so `..` and absolute paths outside the root
+  are refused. `additionalDirectories` is refused rather than ignored.
+- The permission callback is a `ToolApprover` on `Core`. It runs after the
+  harness gates and can only deny. An ACP approval never widens policy, and a
+  denial prevents the tool call from running. `bash` and `bg` are process
+  tools, so the path jail does not confine them; the prompt and `--sandbox`
+  are their boundary.
+- Terminal access is not advertised; `terminal/*` and client `fs/*` requests
+  return `unsupported_capability`. Prompt image and audio blocks are refused
+  for the same reason.
+- Stop reasons map from `TurnStatus`: done → `end_turn`, cancelled →
+  `cancelled`, budget/context → `max_tokens`, stalled → `max_turn_requests`,
+  blocked → `refusal`. A turn error is a JSON-RPC error (`-32000`) so a
+  transient endpoint failure does not make the client drop the conversation;
+  the exact status and code ride in the error data and `_meta.localharness`.
+- Agent text is passed through `sanitize::display` before it reaches the
+  client. Streamed deltas are buffered across chunk boundaries so an escape
+  sequence cannot be split into visible payload, and tool titles, arguments,
+  locations, and previews are sanitized too.
+- `session/new` and `session/load` run in a task so the reader stays free for
+  `session/cancel` and permission replies from other sessions.
+- `tests/acp.rs` drives the binary over stdio against a scripted endpoint.
 
 ---
 
@@ -1470,6 +1568,8 @@ src/
   config.rs               config load, merge, validation
   paths.rs                config/data/project paths, project id
   git.rs                  branch and dirty status
+  sanitize.rs             text safe to paint or read (escapes, tabs, emoji)
+  text.rs                 shared clipping, one-line, slug, byte excerpts
   provider/
     mod.rs                Provider trait and error types
     openai.rs             OpenAI-compatible client
@@ -1522,8 +1622,20 @@ src/
     widgets.rs            header, tool card, diff, input
     render.rs             layout and drawing
     input.rs              key handling, history, completion
-    tui.rs                terminal setup/restore, event loop
-  skills/                 bundled red/blue skill text (embedded)
+    tui.rs                App state, event loop, drawing, agent events
+    tui/terminal.rs       terminal setup/restore, panic hook
+    tui/keys.rs           keyboard, mouse, paste, modal pickers
+    tui/commands.rs       slash commands
+    tui/support.rs        endpoint probing, themes, workflows, sessions
+    tui/tests.rs          TUI tests, including the screen-drift check
+  acp/
+    mod.rs                JSON-RPC loop, capabilities, reverse requests
+    session.rs            roots, turns, updates, permission callback
+  skills/                 bundled red/blue and coding skill text (embedded)
+  workflows/
+    mod.rs                workflow schema, validation, bundled set, loader
+    engine.rs             steps: conditions, retries, approvals, artifacts, resume
+    runner.rs             step executor over the agent loop and stdin approvals
 ```
 
 Dependencies, with reasons:
@@ -1606,6 +1718,12 @@ Build:
 ### 12.3 TUI tests
 
 - `ratatui::backend::TestBackend` at 80x24, 120x40, and 40x12.
+- Screen consistency: the real crossterm output is fed to a `vt100` terminal
+  emulator through 600 random steps of hostile text (escapes, tabs, emoji
+  sequences, flags, CJK, bidi controls), resizes, repaints, scrolling, and
+  pastes. After every frame the emulated screen must match what ratatui drew,
+  no painted cell may hold text the sanitizer would rewrite, and nothing may
+  query the cursor position.
 - Assert header contains cwd, git branch, model, context; context gauge changes
   color at thresholds; `/tree` shows both branches and the active marker;
   theme switch changes cell styles; narrow layout drops fields in the specified

@@ -13,6 +13,7 @@ use serde_json::{Value, json};
 use tokio::task::JoinHandle;
 
 use crate::sandbox::Sandbox;
+use crate::text::head_and_tail;
 use crate::tools::{
     Tool, ToolContext, ToolPack, ToolResult, object_schema, optional_str, optional_u64,
     required_str,
@@ -22,10 +23,16 @@ use crate::tools::{
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
 /// Hard ceiling; larger values are clamped.
 const MAX_TIMEOUT_SECS: u64 = 600;
-/// Combined bytes captured from stdout and stderr.
+/// Combined bytes captured from the start of stdout and stderr.
 const MAX_CAPTURE_BYTES: usize = 1024 * 1024;
-/// Combined bytes returned to the model.
+/// Bytes each stream also keeps from its end once the capture is full, so
+/// a long build still shows how it finished.
+const TAIL_CAPTURE_BYTES: usize = 256 * 1024;
+/// Combined bytes returned to the model (start and end; the middle is
+/// dropped first).
 const MAX_PREVIEW_BYTES: usize = 64 * 1024;
+/// Of `MAX_PREVIEW_BYTES`, the part kept from the start.
+const PREVIEW_HEAD_BYTES: usize = 16 * 1024;
 /// How long a terminated process group gets after SIGTERM.
 const TERM_GRACE: Duration = Duration::from_secs(2);
 
@@ -244,6 +251,10 @@ impl BashTool {
 
 #[async_trait]
 impl Tool for BashTool {
+    fn preview_tail(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &'static str {
         "bash"
     }
@@ -303,19 +314,33 @@ where
         };
         use tokio::io::AsyncReadExt;
         let mut out = Vec::new();
+        // What did not fit the head: the last TAIL_CAPTURE_BYTES of it, and
+        // how much was dropped in between.
+        let mut tail = std::collections::VecDeque::<u8>::new();
+        let mut dropped = 0usize;
         let mut buf = vec![0u8; 64 * 1024];
         loop {
             match reader.read(&mut buf).await {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     let previous = captured.fetch_add(n, Ordering::SeqCst);
-                    if previous < MAX_CAPTURE_BYTES {
-                        let take = n.min(MAX_CAPTURE_BYTES - previous);
-                        out.extend_from_slice(&buf[..take]);
+                    let take = n.min(MAX_CAPTURE_BYTES.saturating_sub(previous));
+                    out.extend_from_slice(&buf[..take]);
+                    tail.extend(&buf[take..n]);
+                    if tail.len() > TAIL_CAPTURE_BYTES {
+                        let excess = tail.len() - TAIL_CAPTURE_BYTES;
+                        tail.drain(..excess);
+                        dropped += excess;
                     }
                 }
             }
         }
+        if dropped > 0 {
+            out.extend_from_slice(
+                format!("\n[... {dropped} bytes of output omitted ...]\n").as_bytes(),
+            );
+        }
+        out.extend(tail);
         out
     })
 }
@@ -333,7 +358,9 @@ pub(crate) async fn collect(mut handle: JoinHandle<Vec<u8>>) -> Vec<u8> {
 
 fn render_preview(stdout: &[u8], stderr: &[u8]) -> String {
     let mut body = String::new();
+    // Color codes and redrawn progress lines are noise for the model.
     let stdout = String::from_utf8_lossy(stdout);
+    let stdout = crate::sanitize::terminal_output(&stdout);
     if !stdout.is_empty() {
         body.push_str("stdout:\n");
         body.push_str(&stdout);
@@ -342,6 +369,7 @@ fn render_preview(stdout: &[u8], stderr: &[u8]) -> String {
         }
     }
     let stderr = String::from_utf8_lossy(stderr);
+    let stderr = crate::sanitize::terminal_output(&stderr);
     if !stderr.is_empty() {
         body.push_str("stderr:\n");
         body.push_str(&stderr);
@@ -352,23 +380,11 @@ fn render_preview(stdout: &[u8], stderr: &[u8]) -> String {
     if body.is_empty() {
         body.push_str("(no output)\n");
     }
-    let (mut body, truncated) = take_bytes(&body, MAX_PREVIEW_BYTES);
-    if truncated {
-        body.push_str("[output truncated to 64 KB]\n");
-    }
-    body
-}
-
-/// Take at most `max` bytes without splitting a UTF-8 code point.
-pub(crate) fn take_bytes(text: &str, max: usize) -> (String, bool) {
-    if text.len() <= max {
-        return (text.to_string(), false);
-    }
-    let mut end = max;
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    (text[..end].to_string(), true)
+    head_and_tail(
+        &body,
+        PREVIEW_HEAD_BYTES,
+        MAX_PREVIEW_BYTES - PREVIEW_HEAD_BYTES,
+    )
 }
 
 #[cfg(test)]
@@ -508,6 +524,34 @@ mod tests {
             !temp.is_error,
             "private /tmp must be writable: {}",
             temp.content
+        );
+    }
+
+    #[tokio::test]
+    async fn huge_output_keeps_how_the_command_ended() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_context(dir.path());
+        // ~2 MB of noise, then the line that matters.
+        let command = "for i in $(seq 1 40000); do echo \"   Compiling crate-$i v0.1.0 (padding padding)\"; done; echo 'error: THE-REAL-FAILURE' >&2; exit 1";
+        let result = BashTool.call(&ctx, json!({"command": command})).await;
+        assert!(result.is_error);
+        assert!(
+            result.content.contains("THE-REAL-FAILURE"),
+            "the end of stderr is kept"
+        );
+        assert!(
+            result.content.contains("Compiling crate-40000 "),
+            "the end of stdout is kept"
+        );
+        assert!(
+            result.content.contains("Compiling crate-1 "),
+            "the start is kept"
+        );
+        assert!(result.content.contains("bytes of output omitted"));
+        assert!(
+            result.content.len() <= MAX_PREVIEW_BYTES + 512,
+            "{}",
+            result.content.len()
         );
     }
 

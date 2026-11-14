@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 use tokio::io::AsyncReadExt;
 use tokio::process::{ChildStderr, ChildStdout, Command};
 
+use crate::text::clip;
 use crate::tools::{
     Tool, ToolContext, ToolPack, ToolResult, display_path, object_schema, optional_str,
     optional_u64,
@@ -25,6 +26,10 @@ pub struct TestTool;
 
 #[async_trait]
 impl Tool for TestTool {
+    fn preview_tail(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &'static str {
         "test"
     }
@@ -100,7 +105,7 @@ impl TestTool {
             ));
         }
 
-        let cleaned = strip_ansi(&output.text);
+        let cleaned = crate::sanitize::terminal_output(&output.text).into_owned();
         let summary = summary_line(runner, &output, &cleaned);
         let body = match failure_excerpt(&cleaned) {
             Some(excerpt) => excerpt,
@@ -120,7 +125,7 @@ impl TestTool {
             content.push_str("\n\n");
             content.push_str(&body);
         }
-        let content = truncate_chars(&content, MAX_RESULT_CHARS);
+        let content = clip(&content, MAX_RESULT_CHARS);
 
         Ok(ToolResult::ok(content).with_details(json!({
             "runner": runner.name(),
@@ -615,42 +620,6 @@ fn extend_capped(target: &mut Vec<u8>, chunk: &[u8], cap: usize) {
 // Output parsing
 // ---------------------------------------------------------------------------
 
-fn strip_ansi(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let mut characters = input.chars().peekable();
-    while let Some(character) = characters.next() {
-        if character == '\u{1b}' {
-            match characters.peek() {
-                Some('[') => {
-                    characters.next();
-                    for tail in characters.by_ref() {
-                        if ('@'..='~').contains(&tail) {
-                            break;
-                        }
-                    }
-                }
-                Some(']') => {
-                    characters.next();
-                    let mut previous = '\0';
-                    for tail in characters.by_ref() {
-                        if tail == '\u{7}' || (previous == '\u{1b}' && tail == '\\') {
-                            break;
-                        }
-                        previous = tail;
-                    }
-                }
-                Some(_) => {
-                    characters.next();
-                }
-                None => {}
-            }
-        } else if character != '\r' {
-            out.push(character);
-        }
-    }
-    out
-}
-
 fn is_failure_marker(line: &str) -> bool {
     line.contains("FAILED") || line.starts_with("--- FAIL") || line.contains('✕')
 }
@@ -718,15 +687,6 @@ fn summary_line(runner: Runner, output: &RunOutput, cleaned: &str) -> String {
             None => format!("FAIL  {label}"),
         },
     }
-}
-
-fn truncate_chars(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
-        return text.to_string();
-    }
-    let mut out: String = text.chars().take(max_chars).collect();
-    out.push('…');
-    out
 }
 
 #[cfg(test)]
@@ -823,14 +783,17 @@ mod tests {
     #[test]
     fn ansi_noise_is_stripped() {
         let raw = "\u{1b}[31mFAILED\u{1b}[0m test_x\r\nprogress\rdone\n";
-        assert_eq!(strip_ansi(raw), "FAILED test_x\nprogressdone\n");
+        assert_eq!(
+            crate::sanitize::terminal_output(raw),
+            "FAILED test_x\ndone\n"
+        );
     }
 
     #[test]
     fn cargo_first_failure_section_is_returned() {
         let output = "\u{1b}[32mrunning 3 tests\u{1b}[0m\n\
 test a ... ok\ntest b ... FAILED\n\nfailures:\n\n---- b stdout ----\nassertion `left == right` failed\n";
-        let cleaned = strip_ansi(output);
+        let cleaned = crate::sanitize::terminal_output(output);
         let excerpt = failure_excerpt(&cleaned).expect("failure section");
         assert!(excerpt.starts_with("failures:"));
         assert!(excerpt.contains("assertion `left == right` failed"));
@@ -868,10 +831,13 @@ test a ... ok\ntest b ... FAILED\n\nfailures:\n\n---- b stdout ----\nassertion `
 
     #[test]
     fn result_is_capped() {
+        // Exactly the cap: one more character would push the result over
+        // the harness's archive limit and replace it with a preview.
         let long = "x".repeat(4000);
         assert_eq!(
-            truncate_chars(&long, MAX_RESULT_CHARS).chars().count(),
-            MAX_RESULT_CHARS + 1
+            clip(&long, MAX_RESULT_CHARS).chars().count(),
+            MAX_RESULT_CHARS
         );
+        const { assert!(MAX_RESULT_CHARS <= crate::context::RESULT_CAP_CHARS) };
     }
 }

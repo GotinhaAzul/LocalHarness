@@ -20,7 +20,8 @@ use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
 use super::scope::{Scope, gate_command};
-use crate::tools::bash::{collect, spawn_reader, take_bytes, terminate_group};
+use crate::text::take_bytes;
+use crate::tools::bash::{collect, spawn_reader, terminate_group};
 
 /// Hard cap on one PoC step graph.
 pub const MAX_STEPS: usize = 50;

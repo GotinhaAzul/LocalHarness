@@ -46,6 +46,24 @@ use crate::session::{ArtifactStore, Session};
 
 pub type SessionHandle = Arc<Mutex<Session>>;
 
+/// A frontend's per-call approval gate (for example ACP). The harness runs its
+/// own gates first; this can only deny, never widen policy or scope.
+#[async_trait]
+pub trait ToolApprover: Send + Sync {
+    async fn approve(
+        &self,
+        call: &crate::session::ToolCall,
+        args: &Value,
+        read_only: bool,
+    ) -> ToolApproval;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolApproval {
+    Allow,
+    Deny(String),
+}
+
 /// Which pack a tool belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolPack {
@@ -470,6 +488,12 @@ pub trait Tool: Send + Sync {
     /// for (skills) must arrive whole.
     fn result_cap(&self) -> Option<usize> {
         None
+    }
+    /// Whether an oversized result keeps its end as well as its start in the
+    /// inline preview. True for command output, where the error or summary
+    /// comes last.
+    fn preview_tail(&self) -> bool {
+        false
     }
     /// Whether runs of this tool append an engagement evidence entry.
     fn evidence_enabled(&self) -> bool {

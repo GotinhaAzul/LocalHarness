@@ -108,8 +108,13 @@ pub struct TokenBudget {
 }
 
 impl TokenBudget {
+    /// A budget for `context_window`. The output reservation is capped at a
+    /// quarter of the window: a configured `max_output_tokens` that matches
+    /// or exceeds a small window (the 4096 default against a 4096-token
+    /// server) would otherwise leave no room for the prompt at all.
     pub fn new(context_window: u32, max_output_tokens: u32) -> Self {
         let context_window = context_window.max(1);
+        let max_output_tokens = max_output_tokens.min((context_window / 4).max(1));
         let safety = ((context_window as f64 * 0.05).round() as u32).max(SAFETY_MARGIN_MIN);
         Self {
             context_window,
@@ -126,7 +131,7 @@ impl TokenBudget {
     /// Output is capped at a quarter of the window so a small server window
     /// still leaves room for the prompt.
     pub fn shrunk_to(&self, window: u32) -> Self {
-        let mut shrunk = Self::new(window, self.max_output_tokens.min(window / 4));
+        let mut shrunk = Self::new(window, self.max_output_tokens);
         shrunk.chars_per_token = self.chars_per_token;
         shrunk
     }
@@ -134,7 +139,7 @@ impl TokenBudget {
     /// The same budget against a different window (larger or smaller),
     /// keeping calibration and the configured output reservation.
     pub fn resized_to(&self, window: u32, max_output_tokens: u32) -> Self {
-        let mut resized = Self::new(window, max_output_tokens.min(window / 4));
+        let mut resized = Self::new(window, max_output_tokens);
         resized.chars_per_token = self.chars_per_token;
         resized
     }
@@ -245,9 +250,19 @@ mod tests {
 
     #[test]
     fn small_context_gets_minimum_margin() {
-        let budget = TokenBudget::new(4096, 2048);
+        let budget = TokenBudget::new(4096, 1024);
         assert_eq!(budget.safety_margin, 512);
-        assert_eq!(budget.usable_prompt(), 1536);
+        assert_eq!(budget.usable_prompt(), 2560);
+    }
+
+    #[test]
+    fn output_reservation_never_takes_the_whole_window() {
+        // The default 4096 output tokens against a 4096-token server.
+        let budget = TokenBudget::new(4096, 4096);
+        assert_eq!(budget.max_output_tokens, 1024);
+        assert_eq!(budget.usable_prompt(), 2560);
+        // Large windows keep the configured reservation.
+        assert_eq!(TokenBudget::new(131_072, 4096).max_output_tokens, 4096);
     }
 
     #[test]

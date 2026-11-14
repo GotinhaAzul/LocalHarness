@@ -3,6 +3,7 @@
 //! The library exposes the harness core for embedding and forking. The binary
 //! in `main.rs` is a thin wrapper.
 
+pub mod acp;
 pub mod agent;
 pub mod app;
 pub mod cli;
@@ -16,9 +17,11 @@ pub mod media;
 pub mod paths;
 pub mod provider;
 pub mod sandbox;
+pub mod sanitize;
 pub mod security;
 pub mod session;
 pub mod skills;
+pub mod text;
 pub mod tools;
 pub mod ui;
 pub mod workflows;

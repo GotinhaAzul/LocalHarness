@@ -255,6 +255,7 @@ fn harness_with_extra(
         window_cache: Default::default(),
         startup: None,
         mcp: Default::default(),
+        approver: None,
     };
     Harness {
         core: Arc::new(core),

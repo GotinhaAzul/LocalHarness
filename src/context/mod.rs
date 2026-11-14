@@ -12,7 +12,8 @@ use crate::session::{
 };
 
 pub use archive::{
-    BATCH_CAP_CHARS, CappedContent, RECALL_CAP_CHARS, RESULT_CAP_CHARS, cap_batch, cap_result,
+    BATCH_CAP_CHARS, CappedContent, Preview, RECALL_CAP_CHARS, RESULT_CAP_CHARS, cap_batch,
+    cap_result, cap_result_with,
 };
 pub use budget::{JSON_CHARS_PER_TOKEN, StaticPrompt, TokenBudget, ToolSpecCost};
 pub use compact::{CompactionSummary, FindingSummary, build_summary};

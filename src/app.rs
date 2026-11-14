@@ -22,7 +22,7 @@ use crate::session::{
 use crate::skills::SkillIndex;
 use crate::tools::{BgRegistry, ReadTracker, SessionHandle, SessionHandle as Handle, ToolRegistry};
 
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct RuntimeOptions {
     pub path_jail: bool,
     pub engagement: Option<String>,
@@ -31,6 +31,22 @@ pub struct RuntimeOptions {
     pub no_redact: bool,
     pub resume: Option<PathBuf>,
     pub continue_last: bool,
+    /// Frontend approval gate for tool calls; `None` for the CLI and TUI.
+    pub approver: Option<Arc<dyn crate::tools::ToolApprover>>,
+}
+
+impl std::fmt::Debug for RuntimeOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RuntimeOptions")
+            .field("path_jail", &self.path_jail)
+            .field("engagement", &self.engagement)
+            .field("no_session", &self.no_session)
+            .field("no_redact", &self.no_redact)
+            .field("resume", &self.resume)
+            .field("continue_last", &self.continue_last)
+            .field("approver", &self.approver.is_some())
+            .finish()
+    }
 }
 
 pub struct Runtime {
@@ -527,6 +543,7 @@ pub async fn create_runtime(
         window_cache,
         startup,
         mcp,
+        approver: options.approver.clone(),
     };
 
     Ok(Runtime {
@@ -760,6 +777,7 @@ pub async fn rebuild_core(old: &Arc<Core>, mut config: Config) -> Result<Arc<Cor
         detected_window,
         window_cache: old.window_cache.clone(),
         mcp: old.mcp.clone(),
+        approver: old.approver.clone(),
         // Endpoint bring-up is not retried on `/model` or `/login`; only a
         // still-running bring-up for the same target carries over.
         startup: if same_target {
