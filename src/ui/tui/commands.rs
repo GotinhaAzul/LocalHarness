@@ -809,6 +809,15 @@ impl App {
             return;
         };
         let skills = SkillIndex::load(&paths, trust);
+        if !workflow.steps.is_empty() {
+            self.set_notice(
+                format!(
+                    "workflow {name} has deterministic steps; run it from the shell with `lh workflow run {name}`"
+                ),
+                Role::Error,
+            );
+            return;
+        }
         for skill in &workflow.skills {
             if skills.get(skill).is_none() {
                 self.set_notice(

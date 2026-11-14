@@ -139,6 +139,33 @@ pub enum Command {
         #[command(subcommand)]
         action: McpCommand,
     },
+    /// List workflows, or run one with deterministic steps.
+    Workflow {
+        #[command(subcommand)]
+        action: WorkflowCommand,
+    },
+}
+
+#[derive(Debug, clap::Subcommand)]
+pub enum WorkflowCommand {
+    /// List bundled and installed workflows.
+    List {
+        /// Emit one stable JSON object.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run a workflow: prompt steps, approval gates, conditions, retries, and
+    /// declared artifacts.
+    Run {
+        /// Workflow name (bundled, global, or trusted project).
+        name: String,
+        /// Continue the last run at its first incomplete step.
+        #[arg(long)]
+        resume: bool,
+        /// Emit newline-delimited JSON events.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, clap::Subcommand)]
@@ -248,6 +275,16 @@ pub async fn run(cli: Cli) -> Result<i32> {
     }
     if let Some(Command::Mcp { action }) = &cli.command {
         return run_mcp(&config, &paths, action).await;
+    }
+    if let Some(Command::Workflow { action }) = &cli.command {
+        return run_workflow_command(
+            &config,
+            &paths,
+            action,
+            cli.path_jail,
+            cli.engagement.clone(),
+        )
+        .await;
     }
 
     let resume = match (&cli.resume, cli.continue_last) {
@@ -506,6 +543,243 @@ async fn run_mcp(config: &Config, paths: &Paths, action: &McpCommand) -> Result<
                 }
             }
         }
+    }
+}
+
+/// `lh workflow`: list playbooks or run one through the deterministic engine.
+async fn run_workflow_command(
+    config: &Config,
+    paths: &Paths,
+    action: &WorkflowCommand,
+    path_jail: bool,
+    engagement: Option<String>,
+) -> Result<i32> {
+    match action {
+        WorkflowCommand::List { json } => {
+            let names = crate::workflows::available_names(paths, config.trust);
+            let mut rows = Vec::new();
+            for name in &names {
+                match crate::workflows::resolve(paths, config.trust, name) {
+                    Ok(spec) => rows.push(json!({
+                        "name": name,
+                        "description": spec.description,
+                        "steps": spec.steps.len(),
+                        "artifacts": spec.artifacts.len(),
+                        "bundled": crate::workflows::get(name).is_some(),
+                    })),
+                    Err(error) => rows.push(json!({"name": name, "error": error})),
+                }
+            }
+            if *json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({"workflows": rows}))?
+                );
+            } else if rows.is_empty() {
+                println!(
+                    "no workflows; add one to {}",
+                    paths.workflows_dir().display()
+                );
+            } else {
+                for row in &rows {
+                    let name = row["name"].as_str().unwrap_or("?");
+                    if let Some(error) = row["error"].as_str() {
+                        println!("{name}: INVALID · {error}");
+                        continue;
+                    }
+                    let description = row["description"].as_str().unwrap_or("");
+                    let steps = row["steps"].as_u64().unwrap_or(0);
+                    let artifacts = row["artifacts"].as_u64().unwrap_or(0);
+                    println!(
+                        "{name}{} · {}{}{}",
+                        if row["bundled"].as_bool().unwrap_or(false) {
+                            " (bundled)"
+                        } else {
+                            ""
+                        },
+                        if steps == 0 {
+                            "prompt playbook".to_string()
+                        } else {
+                            format!("{steps} step{}", if steps == 1 { "" } else { "s" })
+                        },
+                        if artifacts > 0 {
+                            format!(
+                                " · {artifacts} artifact{}",
+                                if artifacts == 1 { "" } else { "s" }
+                            )
+                        } else {
+                            String::new()
+                        },
+                        if description.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" · {description}")
+                        }
+                    );
+                }
+            }
+            Ok(0)
+        }
+        WorkflowCommand::Run { name, resume, json } => {
+            let mut spec =
+                crate::workflows::resolve(paths, config.trust, name).map_err(anyhow::Error::msg)?;
+            if spec.steps.is_empty() {
+                // A prompt-only playbook is one prompt step. This keeps the
+                // bundled workflows and `lh workflow run coding` honest.
+                spec.steps.push(crate::workflows::engine::StepSpec {
+                    id: "workflow".into(),
+                    run: crate::workflows::engine::StepRun::Prompt,
+                    prompt: spec.prompt.clone(),
+                    message: None,
+                    when: None,
+                    require: crate::workflows::engine::Requirement::None,
+                    retry: 0,
+                    artifacts: Vec::new(),
+                });
+                spec.prompt.clear();
+            }
+            let mut run_config = config.clone();
+            spec.apply_to_config(&mut run_config)
+                .map_err(anyhow::Error::msg)?;
+
+            let journal_path = paths
+                .project_sessions_dir()
+                .join("workflows")
+                .join(format!("{}.json", crate::text::slug(name, '-')));
+            let resume_session = if *resume {
+                if !journal_path.is_file() {
+                    bail!(
+                        "no saved run for {name:?} at {}; run it without --resume to start one",
+                        journal_path.display()
+                    );
+                }
+                crate::workflows::engine::Journal::load(&journal_path)
+                    .map_err(anyhow::Error::msg)?
+                    .session_file
+                    .map(PathBuf::from)
+                    .filter(|path| path.is_file())
+            } else {
+                None
+            };
+            if run_config.session.no_session && *resume {
+                bail!("--no-session cannot be combined with --resume");
+            }
+            let options = RuntimeOptions {
+                path_jail,
+                engagement,
+                no_session: run_config.session.no_session,
+                no_redact: !run_config.session.redact,
+                resume: resume_session,
+                continue_last: false,
+            };
+            let runtime = create_runtime(run_config, paths.clone(), options).await?;
+            let needs_model = spec.steps.iter().any(|step| !step.is_approval());
+            if needs_model && !runtime.core.logged_in() {
+                bail!(
+                    "no model is selected. Start the inference server and pass --model (or set LH_MODEL), or run `/login` in the TUI."
+                );
+            }
+            let (session_id, session_file) = match runtime.core.session.lock() {
+                Ok(session) => (Some(session.id.clone()), session.path.clone()),
+                Err(poison) => {
+                    let session = poison.into_inner();
+                    (Some(session.id.clone()), session.path.clone())
+                }
+            };
+            if *resume && session_file.is_none() {
+                eprintln!(
+                    "[workflow] the earlier session file is gone; continuing with a fresh session"
+                );
+            }
+            let cancel = CancellationToken::new();
+            let signal = cancel.clone();
+            tokio::spawn(async move {
+                let _ = tokio::signal::ctrl_c().await;
+                signal.cancel();
+            });
+            let mut executor = crate::workflows::runner::AgentExecutor::new(
+                runtime.core.clone(),
+                spec.name.clone(),
+                cancel,
+                *json,
+            );
+            let run_options = crate::workflows::engine::RunOptions {
+                journal_path: journal_path.clone(),
+                cwd: paths.cwd.clone(),
+                resume: *resume,
+                session_id,
+                session_file,
+            };
+            let mut on_event = |event: &crate::workflows::engine::Event| {
+                print_workflow_event(event, *json);
+            };
+            let report =
+                crate::workflows::engine::execute(&spec, run_options, &mut executor, &mut on_event)
+                    .await;
+            runtime.core.mcp.shutdown().await;
+            match &report.failure {
+                None => Ok(0),
+                Some(failure) if failure.code == "workflow_cancelled" => Ok(130),
+                Some(_) => Ok(1),
+            }
+        }
+    }
+}
+
+fn print_workflow_event(event: &crate::workflows::engine::Event, json: bool) {
+    use crate::workflows::engine::Event;
+    if json {
+        if let Ok(line) = serde_json::to_string(event) {
+            println!("{line}");
+        }
+        return;
+    }
+    match event {
+        Event::WorkflowStarted {
+            workflow,
+            steps,
+            resumed,
+        } => println!(
+            "\n[workflow] {workflow} · {steps} step{}{}",
+            if *steps == 1 { "" } else { "s" },
+            if *resumed { " · resuming" } else { "" }
+        ),
+        Event::StepStarted { step, attempt } => {
+            eprintln!("[workflow] step {step} (attempt {attempt})")
+        }
+        Event::StepSucceeded { step, attempts } => eprintln!(
+            "[workflow] step {step} complete after {attempts} attempt{}",
+            if *attempts == 1 { "" } else { "s" }
+        ),
+        Event::StepSkipped { step, reason } => {
+            eprintln!("[workflow] step {step} skipped: {reason}")
+        }
+        Event::StepRetry {
+            step,
+            attempt,
+            reason,
+        } => eprintln!(
+            "[workflow] step {step} attempt {attempt} did not satisfy the step: {reason}; retrying"
+        ),
+        Event::ApprovalRequested { step, .. } => {
+            eprintln!("[workflow] approval gate: {step}")
+        }
+        Event::ApprovalRecorded { step, decision } => {
+            eprintln!("[workflow] approval {step}: {decision:?}")
+        }
+        Event::ArtifactChecked { artifact, ok } => eprintln!(
+            "[workflow] artifact {artifact}: {}",
+            if *ok { "ok" } else { "missing or empty" }
+        ),
+        Event::WorkflowFinished { status } => eprintln!("[workflow] finished: {status:?}"),
+        Event::Failure {
+            code,
+            step,
+            message,
+        } => match step {
+            Some(step) => eprintln!("\n[workflow] {code} ({step}): {message}"),
+            None => eprintln!("\n[workflow] {code}: {message}"),
+        },
     }
 }
 

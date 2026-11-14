@@ -159,6 +159,86 @@ The prompt path is resolved relative to the workflow file. Missing prompts,
 unknown profiles, and untrusted project workflows produce prescriptive errors
 and leave the session unchanged.
 
+### Deterministic steps
+
+A workflow can also declare steps. `lh workflow run <name>` executes them in
+order; `/workflow` refuses a step workflow and points at the command, because
+the TUI owns one turn at a time.
+
+```toml
+name = "tested-change"
+description = "Reproduce, verify, and gate the push"
+profile = "coding"
+
+[[step]]
+id = "reproduce"
+prompt = "Reproduce the reported failure. Run it once and quote the first error."
+require = { tool = "bash", exit = 0 }
+retry = 1
+
+[[step]]
+id = "test"
+prompt = "Make the smallest fix and run the configured verification."
+when = "changed_files > 0"
+require = { verify = "pass" }
+retry = 1
+
+[[step]]
+id = "push"
+run = "approval"
+message = "Push the branch and open a draft PR?"
+```
+
+Each `[[step]]` has an `id`, `run` (`prompt` or `approval`), and either inline
+`prompt` text or `prompt_file` relative to the TOML. Steps cannot name a
+profile, tools, or skills: the workflow-level fields are the only policy, and
+the engine has no code evaluator.
+
+**Conditions** read a fixed fact set: `changed_files`, `open_tasks`,
+`last_exit`, `steps_completed`, and `last_verify` (`pass`, `fail`, `none`).
+The grammar is one or more `<fact> <op> <value>` clauses joined by ` and `;
+operators are `==`, `!=`, `>`, `>=`, `<`, `<=`. Anything else is a
+configuration error, so a typo fails the run instead of silently skipping the
+step. Facts are read from session entries: file-change records, `verify`
+results, todo state, and the last `bash` exit code.
+
+**Requirements** decide whether an attempt succeeded:
+
+| Form | Passes when |
+| --- | --- |
+| `require = { tool = "bash", exit = 0 }` | the step called `bash` and its last result exited 0 |
+| `require = { tool = "bash" }` | the step called `bash` and it did not report an error |
+| `require = { verify = "pass" }` | the step's own `verify` result passed (`fail` also accepted) |
+| `require = { artifact = "out/report.md" }` | that file exists and is non-empty |
+
+**Retries** are bounded: `retry = 2` allows three attempts total, and every
+attempt is recorded. A failed turn or an unmet requirement consumes an attempt;
+when the last one fails, the run ends with `workflow_step_failed` and names the
+step and the reason. An approval step is not retried.
+
+**Approval gates** print the question and read one line from stdin; `y` or
+`yes` accepts, anything else denies (EOF denies). The decision and timestamp
+are written to the journal. A denial ends the run with
+`workflow_approval_denied`, names the step, and never runs it.
+
+**Artifacts** can be declared per step or at the top level with
+`artifacts = ["out/report.md"]`. Every one must exist as a non-empty file when
+its step finishes (or when the workflow finishes, for the top-level list),
+otherwise the run ends with `workflow_artifact_missing` before reporting
+success. Paths must be relative and cannot contain `..`, so a workflow cannot
+declare a file outside the working directory.
+
+**Resume** is stored in `<data>/sessions/<project>/workflows/<name>.json`. Every
+step transition is written atomically. `lh workflow run <name> --resume` skips
+steps already completed or skipped and starts at the first step that is
+pending or failed; it also reopens the recorded session so the model keeps its
+context. `--json` emits one JSON event per line, including each attempt.
+
+Success means: every executed step met its requirement and every declared
+artifact exists. The harness still applies the same gates inside each step's
+turn; a step cannot disable `verify`, the read-before-edit rule, the scope gate,
+or the sandbox.
+
 ## Installable copies
 
 Every bundled workflow also ships as a valid on-disk copy under
