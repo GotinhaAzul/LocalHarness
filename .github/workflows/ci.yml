@@ -53,6 +53,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     continue-on-error: true
+    # rustsec/audit-check publishes its findings as a check run. Without
+    # checks:write it fails to publish and the job stops before cargo-deny runs.
+    permissions:
+      contents: read
+      checks: write
     steps:
       - uses: actions/checkout@v4
       - uses: rustsec/audit-check@v2
