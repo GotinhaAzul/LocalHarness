@@ -3,18 +3,6 @@
 
 use super::*;
 
-#[derive(Debug, Deserialize, Default)]
-pub(super) struct WorkflowFile {
-    name: Option<String>,
-    description: Option<String>,
-    profile: Option<String>,
-    prompt: Option<String>,
-    #[serde(default)]
-    skills: Vec<String>,
-    #[serde(default)]
-    tools: Vec<String>,
-}
-
 pub(super) const LOGIN_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub(super) fn normalize_endpoint(raw: &str) -> String {
@@ -146,39 +134,7 @@ pub(super) fn available_theme_names(paths: &crate::paths::Paths) -> Vec<String> 
 /// Load an installable workflow TOML and its prompt, resolved relative to the
 /// file. Errors are the prescriptive messages `/workflow` has always shown.
 pub(super) fn load_workflow_file(path: &Path) -> std::result::Result<WorkflowSpec, String> {
-    let raw = std::fs::read_to_string(path)
-        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
-    let workflow: WorkflowFile = toml::from_str(&raw)
-        .map_err(|error| format!("invalid workflow {}: {error}", path.display()))?;
-    let Some(prompt_ref) = workflow.prompt.as_deref() else {
-        return Err(format!("workflow {} has no prompt file", path.display()));
-    };
-    let prompt_path = if Path::new(prompt_ref).is_absolute() {
-        PathBuf::from(prompt_ref)
-    } else {
-        path.parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join(prompt_ref)
-    };
-    let prompt = std::fs::read_to_string(&prompt_path).map_err(|error| {
-        format!(
-            "cannot read workflow prompt {}: {error}",
-            prompt_path.display()
-        )
-    })?;
-    let name = workflow.name.unwrap_or_else(|| {
-        path.file_stem()
-            .map(|stem| stem.to_string_lossy().to_string())
-            .unwrap_or_else(|| "workflow".to_string())
-    });
-    Ok(WorkflowSpec {
-        name,
-        description: workflow.description,
-        profile: workflow.profile,
-        prompt,
-        skills: workflow.skills,
-        tools: workflow.tools,
-    })
+    crate::workflows::load_file(path)
 }
 
 /// Picker rows for the endpoint's models.

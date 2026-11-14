@@ -44,6 +44,24 @@ use crate::session::{ArtifactStore, Session};
 
 pub type SessionHandle = Arc<Mutex<Session>>;
 
+/// A frontend's per-call approval gate (for example ACP). The harness runs its
+/// own gates first; this can only deny, never widen policy or scope.
+#[async_trait]
+pub trait ToolApprover: Send + Sync {
+    async fn approve(
+        &self,
+        call: &crate::session::ToolCall,
+        args: &Value,
+        read_only: bool,
+    ) -> ToolApproval;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolApproval {
+    Allow,
+    Deny(String),
+}
+
 /// Which pack a tool belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolPack {

@@ -72,6 +72,30 @@ Skills are data: they cannot grant security scope, load tools, or bypass a
 guard. Project skills load only in trusted sessions, for the tool and for
 `/skill` alike.
 
+### Bundled coding skill pack
+
+Eight coding skills ship in the binary. They advertise while the `coding` pack
+is active, so the coding profile's index carries them and a security-only
+profile stays focused; any of them is still loadable by name. Each is a single
+document under 120 lines, names only core/coding tools, and ends with the
+condition that means "stop and ask".
+
+| Skill | Triggers |
+| --- | --- |
+| `test-repair` | A failing test or a red suite: reproduce, classify, one hypothesis, smallest fix, exact test then suite |
+| `code-review` | A diff, pull request, or pre-handback self-review: scope, correctness, security, tests, compatibility, severity, verdict |
+| `refactor` | A behavior-preserving restructure: behavior contract, green baseline, small moves, `lsp` reference enumeration, verify each step |
+| `dependency-upgrade` | A version bump or CVE fix: changelog, breaking changes, one package, adapt, test, rollback |
+| `perf-profile` | A slowness report: one metric, baseline, profile before optimizing, one change, re-measure |
+| `incident-triage` | An alert or outage: UTC timeline, symptom vs cause, recent changes, mitigate before root cause |
+| `release-notes` | A release or changelog: commits since the tag, classify, link issues, upgrade notes, invent nothing |
+| `issue-to-pr` | An issue to implement: read the comments, reproduce, plan, implement, test, self-review, PR body |
+
+The pack is loaded the same way as any other skill: the model calls
+`skill {"name":"test-repair"}`, or you run `/skill test-repair`. Loading one
+adds instructions only; it does not add tools, change the profile, or relax a
+gate. The index filter is a prompt-budget aid, not a permission boundary.
+
 ## Workflows
 
 A workflow is a TOML playbook plus a profile and tool allowlist:
@@ -134,6 +158,104 @@ gates still apply.
 The prompt path is resolved relative to the workflow file. Missing prompts,
 unknown profiles, and untrusted project workflows produce prescriptive errors
 and leave the session unchanged.
+
+### Deterministic steps
+
+A workflow can also declare steps. `lh workflow run <name>` executes them in
+order; `/workflow` refuses a step workflow and points at the command, because
+the TUI owns one turn at a time.
+
+```toml
+name = "tested-change"
+description = "Reproduce, verify, and gate the push"
+profile = "coding"
+
+[[step]]
+id = "reproduce"
+prompt = "Reproduce the reported failure. Run it once and quote the first error."
+require = { tool = "bash", exit = 0 }
+retry = 1
+
+[[step]]
+id = "test"
+prompt = "Make the smallest fix and run the configured verification."
+when = "changed_files > 0"
+require = { verify = "pass" }
+retry = 1
+
+[[step]]
+id = "push"
+run = "approval"
+message = "Push the branch and open a draft PR?"
+```
+
+Each `[[step]]` has an `id`, `run` (`prompt` or `approval`), and either inline
+`prompt` text or `prompt_file` relative to the TOML. Prompt files must stay
+inside the workflow's directory: absolute paths, `.`/`..`, and symlinks that
+leave it are rejected. Steps cannot name a profile, tools, or skills: the
+workflow-level fields are the only policy, and the engine has no code
+evaluator. An approval step takes a `message` only; `prompt`, `require`, and
+`retry` are configuration errors on a gate.
+
+`lh workflow run` loads and validates the workflow's `skills` and prepends
+their instructions to the first prompt step. The TUI does the same by adding
+labeled user entries when it starts the workflow.
+
+**Conditions** read a fixed fact set: `changed_files`, `open_tasks`,
+`last_exit`, `steps_completed`, and `last_verify` (`pass`, `fail`, `none`).
+The grammar is one or more `<fact> <op> <value>` clauses joined by ` and `;
+operators are `==`, `!=`, `>`, `>=`, `<`, `<=`. Anything else is a
+configuration error, so a typo fails the run instead of silently skipping the
+step. Facts are read from session entries: file-change records, `verify`
+results, todo state, and the last `bash` exit code.
+
+**Requirements** decide whether an attempt succeeded:
+
+| Form | Passes when |
+| --- | --- |
+| `require = { tool = "bash", exit = 0 }` | the step called `bash` and its last result exited 0 |
+| `require = { tool = "bash" }` | the step called `bash` and it did not report an error |
+| `require = { verify = "pass" }` | the step's own `verify` result passed (`fail` also accepted) |
+| `require = { artifact = "out/report.md" }` | that file exists and is non-empty |
+
+**Retries** are bounded: `retry = 2` allows three attempts in one invocation,
+and every attempt is recorded with its cumulative count in the journal. A
+failed turn or an unmet requirement consumes an attempt; when the last one
+fails, the run ends with `workflow_step_failed` and prints the step and the
+reason. A crash leaves the step pending and `--resume` continues its remaining
+budget; an explicit `--resume` after a failure starts a fresh budget for that
+invocation. An approval step is not retried.
+
+**Approval gates** print the question and read one line from stdin; `y` or
+`yes` accepts, anything else denies (EOF denies). The decision and timestamp
+are written to the journal. A denial ends the run with
+`workflow_approval_denied`, names the step, and never runs it.
+
+**Artifacts** can be declared per step or at the top level with
+`artifacts = ["out/report.md"]`. Every one must exist as a non-empty file when
+its step finishes, and every artifact belonging to a completed step is checked
+again before the workflow reports success, so a later step cannot delete an
+earlier output. A missing artifact ends the run with
+`workflow_artifact_missing`, names it, and reopens the prompt step that owns it
+so `--resume` can recreate it. Paths must be relative, cannot
+contain `.`/`..`, and must still resolve inside the working directory after
+symlinks.
+
+**Resume** is stored in `<data>/sessions/<project>/workflows/<name>.json` with
+`0600` permissions in a `0700` directory. Every step transition is written
+atomically. Each record carries a hash of the step definition: a step whose
+prompt, condition, requirement, retry, or artifacts changed is rerun instead of
+being skipped by id. `lh workflow run <name> --resume` skips unchanged steps
+already completed or skipped and starts at the first step that is pending or
+failed; it also reopens the recorded session so the model keeps its context.
+If that session file is gone, the run warns and starts a new session. `--json`
+emits one JSON event per line, including each attempt and the terminal failure.
+`--no-session` keeps the journal in memory and writes nothing.
+
+Success means: every executed step met its requirement and every declared
+artifact exists. The harness still applies the same gates inside each step's
+turn; a step cannot disable `verify`, the read-before-edit rule, the scope gate,
+or the sandbox.
 
 ## Installable copies
 

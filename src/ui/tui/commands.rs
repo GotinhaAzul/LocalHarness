@@ -809,6 +809,15 @@ impl App {
             return;
         };
         let skills = SkillIndex::load(&paths, trust);
+        if !workflow.steps.is_empty() {
+            self.set_notice(
+                format!(
+                    "workflow {name} has deterministic steps; run it from the shell with `lh workflow run {name}`"
+                ),
+                Role::Error,
+            );
+            return;
+        }
         for skill in &workflow.skills {
             if skills.get(skill).is_none() {
                 self.set_notice(
@@ -1321,6 +1330,7 @@ impl App {
             no_redact: !config.session.redact,
             resume: target.clone(),
             continue_last: false,
+            approver: None,
         };
         match app::create_runtime(config.clone(), paths.clone(), options).await {
             Ok(runtime) => {
@@ -1344,6 +1354,7 @@ impl App {
                     no_redact: !config.session.redact,
                     resume: old_resume,
                     continue_last: false,
+                    approver: None,
                 };
                 match app::create_runtime(config, paths, options).await {
                     Ok(runtime) => {

@@ -15,7 +15,7 @@
   <img src="https://img.shields.io/badge/rust-1.88%2B-orange?style=flat-square" alt="Rust 1.88+">
   <img src="https://img.shields.io/badge/platform-linux%20x86__64%20%7C%20aarch64-lightgrey?style=flat-square" alt="Linux x86_64 and aarch64">
   <img src="https://img.shields.io/badge/telemetry-none-3FB950?style=flat-square" alt="No telemetry">
-  <img src="https://img.shields.io/badge/interface-TUI%20%7C%20headless-7AA2F7?style=flat-square" alt="TUI and headless interfaces">
+  <img src="https://img.shields.io/badge/interface-TUI%20%7C%20headless%20%7C%20ACP-7AA2F7?style=flat-square" alt="TUI, headless, and ACP interfaces">
 </p>
 
 <p align="center">
@@ -188,6 +188,25 @@ lh --resume 20261107-201500-1234
 
 `--print` streams text to stdout, diagnostics to stderr, and exits with the turn status: `0` done, `1` error/blocked, `2` budget/stalled, `130` cancelled. `--json` emits newline-delimited events for scripts and CI.
 
+### Editors
+
+`lh acp` speaks the Agent Client Protocol v1 over stdio, so Zed (and other ACP editors) can host a LocalHarness thread:
+
+```json
+{
+  "agent_servers": {
+    "localharness": {
+      "type": "custom",
+      "command": "lh",
+      "args": ["--endpoint", "http://127.0.0.1:8080", "--model", "qwen3", "acp"],
+      "env": {}
+    }
+  }
+}
+```
+
+The session root is the `cwd` the editor declares, and the path jail is always on for file tools. Every tool that can change files or run processes asks the editor first; a denial leaves no side effect, and an approval never widens a harness gate. `bash` and `bg` are processes, so their boundary is the permission prompt plus `--sandbox`. Terminal access is not advertised and a terminal request gets a typed refusal. See [docs/acp.md](docs/acp.md).
+
 ## 05 · Security, when you ask for it
 
 Security is opt-in. The default `coding` profile has no security tools or posture. `--profile security` adds core plus security; `--profile full` adds coding plus security. `/profile` switches during a session.
@@ -208,8 +227,8 @@ Everything at the edge is configurable; the loop itself stays small and auditabl
 
 - **Profiles** select packs and tools. Built-ins are `coding` (default), `full`, `security`, `minimal`, `strict` (six tools, one call per message for weak models), and experimental `shell` (bash only); add your own in `profiles/*.toml` or `.harness/profiles/`.
 - **Prompt** customization lives in `[prompt]`: replace the one-line identity, append inline instructions, or point at a Markdown file. Per-profile prompts still apply on top.
-- **Skills** are Markdown instructions. The model loads a matching skill with the `skill` tool, or you load one with `/skill <name>`. Bundled security skills advertise only when the security pack is active and remain loadable by name.
-- **Workflows** are playbooks plus a profile and tool allowlist. The bundled set covers coding, review, general assistance, and security.
+- **Skills** are Markdown instructions. The model loads a matching skill with the `skill` tool, or you load one with `/skill <name>`. Bundled security skills advertise only when the security pack is active and remain loadable by name; eight bundled coding skills advertise with the coding pack.
+- **Workflows** are playbooks plus a profile and tool allowlist. Optional `[[step]]` tables add conditions, bounded retries, approval gates, declared artifacts, and resume; `lh workflow run <name>` executes them. The bundled set covers coding, review, general assistance, and security.
 - **External tools** are any executable speaking one JSON object in, one JSON object out. No plugin ABI, no second runtime.
 - **MCP servers** plug in over stdio or Streamable HTTP with one `[mcp.<name>]` table. Their tools join the profile as `<server>__<tool>`; `lh mcp list` and `/mcp` show what connected.
 - **Themes** are TOML files of semantic color tokens. `default` is bundled with four alternatives; `omarchy` is an alias for existing configs.
@@ -262,6 +281,7 @@ Global config: `~/.config/localharness/config.toml`. A trusted project `.harness
 | [Security](docs/security.md) | Authorization, scope, evidence, findings, PoC replay, sandbox |
 | [External tools](docs/external-tools.md) | Manifest format, protocol, schemas, scope gating |
 | [MCP servers](docs/mcp.md) | stdio and HTTP servers, tool naming, profiles, `lh mcp` |
+| [Editor integration](docs/acp.md) | `lh acp`, Zed setup, permissions, roots, stop reasons, limitations |
 | [Images](docs/images.md) | `@image` attachments, vision models, the describer fallback, EXIF and remote rules |
 | [Themes](docs/themes.md) | Semantic tokens, color modes, user themes |
 | [Architecture](ARCHITECTURE.md) | Implementation specification and design decisions |

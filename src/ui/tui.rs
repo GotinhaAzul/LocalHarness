@@ -22,7 +22,6 @@ use ratatui::crossterm::terminal::{
     LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::layout::Rect;
-use serde::Deserialize;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 

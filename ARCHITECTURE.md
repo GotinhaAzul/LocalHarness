@@ -34,7 +34,7 @@ work.
 - [6. Tools and packs](#6-tools-and-packs)
 - [7. Extensibility](#7-extensibility)
 - [8. Security model](#8-security-model)
-- [9. TUI](#9-tui)
+- [9. Interfaces: TUI, headless, and ACP](#9-tui)
 - [10. Configuration and storage](#10-configuration-and-storage)
 - [11. Module layout and dependencies](#11-module-layout-and-dependencies)
 - [12. Testing and verification](#12-testing-and-verification)
@@ -866,7 +866,8 @@ when: engagement scope is set and the task is active testing
 
 ### 7.3 Workflows
 
-A workflow is a playbook plus a profile and tool allowlist. No step scripting.
+A workflow is a playbook plus a profile and tool allowlist. Optional `[[step]]`
+tables add a deterministic state machine; there is no step scripting.
 
 ```toml
 name = "recon"
@@ -880,6 +881,54 @@ tools = ["read", "grep", "glob", "bash", "bg", "finding", "iocs"]
 `/workflow recon` starts a new branch with the workflow prompt as the first user
 message and the profile applied. The model follows the playbook; code still
 enforces the gates.
+
+A step workflow drops the top-level prompt and declares its own:
+
+```toml
+[[step]]
+id = "reproduce"
+prompt = "Reproduce the failure."
+require = { tool = "bash", exit = 0 }
+retry = 1
+
+[[step]]
+id = "test"
+prompt = "Fix it and run the suite."
+when = "changed_files > 0"
+require = { verify = "pass" }
+
+[[step]]
+id = "push"
+run = "approval"
+message = "Push the branch?"
+```
+
+- `lh workflow run <name>` executes steps in order in one session; `/workflow`
+  refuses step workflows because the TUI owns one turn at a time.
+- Conditions read only `changed_files`, `open_tasks`, `last_exit`,
+  `steps_completed`, and `last_verify`, through `<fact> <op> <value>` clauses
+  joined by `and`. An unknown fact or operator is a configuration error.
+- Requirements are `tool` (with an optional `exit`), `verify`, or `artifact`.
+  A failed turn or unmet requirement consumes one of the `retry + 1` attempts
+  in an invocation; the last failure ends the run with
+  `workflow_step_failed` and prints the step and reason. A crash leaves the
+  step pending and resume continues its remaining budget.
+- An approval step blocks on stdin, records accept/deny in the journal, and
+  cannot be retried. Denial ends the run with `workflow_approval_denied`.
+- Declared artifacts are relative, non-empty files checked after their step
+  and again before success; `..`, absolute paths, and symlinks that leave the
+  working directory are rejected.
+- Prompt files must stay inside the workflow directory.
+- The journal carries a step fingerprint and is written atomically with `0600`
+  permissions under `<data>/sessions/<project>/workflows/<name>.json`.
+  `--resume` skips unchanged completed or skipped steps, reruns a changed step,
+  and reopens the recorded session. `--no-session` keeps the journal in memory.
+- A step cannot select tools, skills, or a profile. The engine evaluates no
+  code, and the turn inside a step still goes through every gate.
+- `lh workflow run` loads the workflow's named skills into the first prompt
+  step after validating them.
+
+`lh workflow list` prints bundled, global, and trusted project workflows.
 
 ### 7.4 External tools
 
@@ -1133,7 +1182,7 @@ input characters. Missing input and unreadable files return prescriptive errors.
 
 ---
 
-## 9. TUI
+## 9. Interfaces: TUI, headless, and ACP
 
 ### 9.1 Layout
 
@@ -1307,6 +1356,38 @@ cursor = "#c0caf5"
 exits with the turn status. `--json` emits newline-delimited events for
 scripting. The same core and session code is used. This is not a second
 implementation.
+
+### 9.8 Agent Client Protocol
+
+`lh acp` serves ACP v1 over stdio: newline-delimited JSON-RPC 2.0 on stdin and
+stdout, with logs kept in the log file. It exposes `initialize`, `session/new`,
+`session/load`, `session/prompt`, and `session/cancel`, streams
+`session/update`, and sends `session/request_permission` before every
+non-read-only tool call.
+
+- Each session owns one `Core` rooted at the client's absolute `cwd`; file
+  tools run with the path jail on, so `..` and absolute paths outside the root
+  are refused. `additionalDirectories` is refused rather than ignored.
+- The permission callback is a `ToolApprover` on `Core`. It runs after the
+  harness gates and can only deny. An ACP approval never widens policy, and a
+  denial prevents the tool call from running. `bash` and `bg` are process
+  tools, so the path jail does not confine them; the prompt and `--sandbox`
+  are their boundary.
+- Terminal access is not advertised; `terminal/*` and client `fs/*` requests
+  return `unsupported_capability`. Prompt image and audio blocks are refused
+  for the same reason.
+- Stop reasons map from `TurnStatus`: done → `end_turn`, cancelled →
+  `cancelled`, budget/context → `max_tokens`, stalled → `max_turn_requests`,
+  blocked → `refusal`. A turn error is a JSON-RPC error (`-32000`) so a
+  transient endpoint failure does not make the client drop the conversation;
+  the exact status and code ride in the error data and `_meta.localharness`.
+- Agent text is passed through `sanitize::display` before it reaches the
+  client. Streamed deltas are buffered across chunk boundaries so an escape
+  sequence cannot be split into visible payload, and tool titles, arguments,
+  locations, and previews are sanitized too.
+- `session/new` and `session/load` run in a task so the reader stays free for
+  `session/cancel` and permission replies from other sessions.
+- `tests/acp.rs` drives the binary over stdio against a scripted endpoint.
 
 ---
 
@@ -1504,7 +1585,14 @@ src/
     tui/commands.rs       slash commands
     tui/support.rs        endpoint probing, themes, workflows, sessions
     tui/tests.rs          TUI tests, including the screen-drift check
-  skills/                 bundled red/blue skill text (embedded)
+  acp/
+    mod.rs                JSON-RPC loop, capabilities, reverse requests
+    session.rs            roots, turns, updates, permission callback
+  skills/                 bundled red/blue and coding skill text (embedded)
+  workflows/
+    mod.rs                workflow schema, validation, bundled set, loader
+    engine.rs             steps: conditions, retries, approvals, artifacts, resume
+    runner.rs             step executor over the agent loop and stdin approvals
 ```
 
 Dependencies, with reasons:
