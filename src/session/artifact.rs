@@ -1,11 +1,12 @@
-//! Artifact storage: capped tool output written to `artifacts/<session>/out-N.txt`
-//! or kept in memory when sessions are disabled.
+//! Artifact storage: capped tool output written to `artifacts/<session>/out-N.txt`,
+//! attached images as `img-N.<ext>`, or both kept in memory when sessions are
+//! disabled.
 
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::security::redact::Redactor;
 
@@ -46,6 +47,9 @@ pub struct ArtifactStore {
     root: Option<PathBuf>,
     counter: AtomicU64,
     memory: Mutex<HashMap<String, String>>,
+    image_counter: AtomicU64,
+    /// Image bytes: the only copy without a root, a read cache with one.
+    images: Mutex<HashMap<String, Arc<Vec<u8>>>>,
     redactor: Redactor,
 }
 
@@ -62,6 +66,7 @@ impl ArtifactStore {
         use std::os::unix::fs::PermissionsExt;
         let session_id = session_id.into();
         let mut next = 0u64;
+        let mut next_image = 0u64;
         if let Some(root) = &root {
             std::fs::create_dir_all(root)?;
             let _ = std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700));
@@ -76,6 +81,13 @@ impl ArtifactStore {
                     {
                         next = next.max(number);
                     }
+                    if let Some(number) = name
+                        .strip_prefix("img-")
+                        .and_then(|rest| rest.split('.').next())
+                        .and_then(|digits| digits.parse::<u64>().ok())
+                    {
+                        next_image = next_image.max(number);
+                    }
                 }
             }
         }
@@ -84,6 +96,8 @@ impl ArtifactStore {
             root,
             counter: AtomicU64::new(next),
             memory: Mutex::new(HashMap::new()),
+            image_counter: AtomicU64::new(next_image),
+            images: Mutex::new(HashMap::new()),
             redactor: Redactor::new(redact),
         })
     }
@@ -98,6 +112,8 @@ impl ArtifactStore {
             root: None,
             counter: AtomicU64::new(0),
             memory: Mutex::new(HashMap::new()),
+            image_counter: AtomicU64::new(0),
+            images: Mutex::new(HashMap::new()),
             redactor: Redactor::new(redact),
         }
     }
@@ -155,6 +171,61 @@ impl ArtifactStore {
             }
         }
         Ok(())
+    }
+
+    /// Store an image (already validated and stripped) and return its id,
+    /// `img-N.<extension>`. Images are not redacted: they are binary.
+    pub fn write_image(&self, bytes: &[u8], extension: &str) -> io::Result<String> {
+        let n = self.image_counter.fetch_add(1, Ordering::SeqCst) + 1;
+        let id = format!("img-{n}.{extension}");
+        validate_image_id(&id).map_err(io::Error::other)?;
+        if let Some(root) = &self.root {
+            use std::io::Write;
+            use std::os::unix::fs::PermissionsExt;
+            let tmp = root.join(format!(".{id}.tmp"));
+            let mut file = std::fs::File::create(&tmp)?;
+            let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+            file.write_all(bytes)?;
+            file.sync_all()?;
+            std::fs::rename(&tmp, root.join(&id))?;
+        }
+        self.images
+            .lock()
+            .expect("artifact images poisoned")
+            .insert(id.clone(), Arc::new(bytes.to_vec()));
+        Ok(id)
+    }
+
+    /// Bytes of a stored image, cached after the first disk read.
+    pub fn read_image(&self, id: &str) -> Result<Arc<Vec<u8>>, ArtifactError> {
+        validate_image_id(id).map_err(ArtifactError::InvalidId)?;
+        if let Some(bytes) = self
+            .images
+            .lock()
+            .expect("artifact images poisoned")
+            .get(id)
+        {
+            return Ok(bytes.clone());
+        }
+        let Some(root) = &self.root else {
+            return Err(ArtifactError::NotFound(id.to_string()));
+        };
+        let bytes = std::fs::read(root.join(id)).map_err(|source| {
+            if source.kind() == io::ErrorKind::NotFound {
+                ArtifactError::NotFound(id.to_string())
+            } else {
+                ArtifactError::Io {
+                    id: id.to_string(),
+                    source,
+                }
+            }
+        })?;
+        let bytes = Arc::new(bytes);
+        self.images
+            .lock()
+            .expect("artifact images poisoned")
+            .insert(id.to_string(), bytes.clone());
+        Ok(bytes)
     }
 
     /// Approximate byte size of an artifact.
@@ -247,6 +318,9 @@ impl ArtifactStore {
 
     /// Remove every on-disk artifact for this session.
     pub fn clean_all(&self) -> io::Result<usize> {
+        if let Ok(mut images) = self.images.lock() {
+            images.clear();
+        }
         let Some(root) = &self.root else {
             if let Ok(mut memory) = self.memory.lock() {
                 memory.clear();
@@ -281,7 +355,9 @@ impl ArtifactStore {
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().is_some_and(|e| e == "txt")
+            if path
+                .extension()
+                .is_some_and(|e| e == "txt" || e == "png" || e == "jpg" || e == "webp")
                 && let Ok(meta) = entry.metadata()
                 && meta.modified().is_ok_and(|m| m < cutoff)
                 && std::fs::remove_file(&path).is_ok()
@@ -324,6 +400,24 @@ pub fn cleanup_root(root: &Path, days: u32) -> io::Result<usize> {
     Ok(removed)
 }
 
+/// `img-<digits>.<png|jpg|webp>`.
+fn validate_image_id(id: &str) -> Result<(), String> {
+    let valid = id
+        .strip_prefix("img-")
+        .and_then(|rest| rest.split_once('.'))
+        .is_some_and(|(digits, extension)| {
+            !digits.is_empty()
+                && digits.len() <= 20
+                && digits.chars().all(|c| c.is_ascii_digit())
+                && matches!(extension, "png" | "jpg" | "webp")
+        });
+    if valid {
+        Ok(())
+    } else {
+        Err(format!("invalid image id {id:?}"))
+    }
+}
+
 fn validate_id(id: &str) -> Result<(), String> {
     if id.is_empty()
         || id.len() > 64
@@ -351,6 +445,27 @@ mod tests {
         assert!(slice.content.contains("3  three"));
         assert_eq!(slice.total_lines, 4);
         assert!(slice.truncated);
+    }
+
+    #[test]
+    fn images_roundtrip_on_disk_and_in_memory() {
+        let memory = ArtifactStore::ephemeral();
+        let id = memory.write_image(b"\x89PNGdata", "png").unwrap();
+        assert_eq!(id, "img-1.png");
+        assert_eq!(memory.read_image(&id).unwrap().as_slice(), b"\x89PNGdata");
+
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let store = ArtifactStore::new("s", Some(dir.path().to_path_buf())).unwrap();
+            assert_eq!(store.write_image(b"a", "jpg").unwrap(), "img-1.jpg");
+        }
+        // A reopened store reads from disk and does not reuse ids.
+        let reopened = ArtifactStore::new("s", Some(dir.path().to_path_buf())).unwrap();
+        assert_eq!(reopened.read_image("img-1.jpg").unwrap().as_slice(), b"a");
+        assert_eq!(reopened.write_image(b"b", "png").unwrap(), "img-2.png");
+        for bad in ["../x.png", "img-1.txt", "img-.png", "img-1.png/.."] {
+            assert!(reopened.read_image(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

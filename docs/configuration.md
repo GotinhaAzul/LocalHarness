@@ -131,6 +131,20 @@ extra_body = { chat_template_kwargs = { enable_thinking = true } }
 `default` model profile is the fallback. `[model] context_window` is used only
 when the model profile does not set one.
 
+`vision = true` in a model profile sends images to that model as content parts;
+`[vision]` configures the size cap, EXIF handling, remote endpoints, and an
+optional model that describes images for text-only models. See
+[images.md](images.md).
+
+```toml
+[vision]
+model = ""            # describer for text-only models; empty disables
+endpoint = ""         # empty uses [model] endpoint
+allow_remote = false  # send images beyond loopback/private networks
+max_bytes = 5242880
+keep_exif = false
+```
+
 ## Weak-model profiles
 
 `strict` is the tested small-model configuration: `read`, `grep`, `glob`,
@@ -266,7 +280,7 @@ Steps run sequentially without a shell and stop at the first failure.
 `--theme`, `--api-key`, `--trust`, `--no-session`, `--no-redact`, `--continue`,
 `--resume`, `--path-jail`, `--sandbox [read-only|workspace-write]`,
 `--no-sandbox`, `--engagement`, `--no-color`, `--keep-artifacts`,
-`--clean-artifacts`, `--debug`.
+`--clean-artifacts`, `--allow-remote-images`, `--keep-exif`, `--debug`.
 
 `lh doctor [--json] [--fix]` prints the engine capability manifest without
 sending a chat completion. See [model-setup.md](model-setup.md).

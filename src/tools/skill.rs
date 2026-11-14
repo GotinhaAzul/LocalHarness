@@ -214,6 +214,7 @@ mod tests {
             paths,
             lsp: Default::default(),
             sandbox: None,
+            vision: Default::default(),
         }
     }
 

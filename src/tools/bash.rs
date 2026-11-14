@@ -416,6 +416,7 @@ pub(crate) fn test_context(dir: &Path) -> ToolContext {
         paths,
         lsp: Arc::new(crate::tools::lsp::LspService::new()),
         sandbox: None,
+        vision: Default::default(),
     }
 }
 

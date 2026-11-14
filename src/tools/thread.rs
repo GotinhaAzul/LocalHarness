@@ -614,6 +614,7 @@ mod tests {
             paths,
             lsp: Arc::new(crate::tools::lsp::LspService::new()),
             sandbox: None,
+            vision: Default::default(),
         };
         (dir, ctx)
     }

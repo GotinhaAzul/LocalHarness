@@ -478,6 +478,18 @@ pub async fn create_runtime(
         None
     };
 
+    // With a deferred bring-up the server may not be up yet; only an explicit
+    // profile setting counts then.
+    let detected = if profile.vision.is_none() && !deferred_start {
+        probe::detect_vision(provider.as_ref()).await
+    } else {
+        None
+    };
+    let vision = Arc::new(crate::media::VisionSettings::resolve(
+        &config,
+        profile.vision,
+        detected,
+    ));
     let core = Core {
         config,
         paths,
@@ -500,6 +512,7 @@ pub async fn create_runtime(
         system_prompt,
         repo_brief,
         model_profile: profile,
+        vision,
         tool_probe,
         cancel: CancellationToken::new(),
         tool_timeout: Duration::from_secs(660),
@@ -698,6 +711,18 @@ pub async fn rebuild_core(old: &Arc<Core>, mut config: Config) -> Result<Arc<Cor
         Some(repo_brief.as_str()),
     );
     let limits = RunLimits::from(&config.budgets);
+    let detected = if model_profile.vision.is_some() {
+        None
+    } else if same_target {
+        Some(old.vision.native)
+    } else {
+        probe::detect_vision(provider.as_ref()).await
+    };
+    let vision = Arc::new(crate::media::VisionSettings::resolve(
+        &config,
+        model_profile.vision,
+        detected,
+    ));
     Ok(Arc::new(Core {
         config,
         paths: old.paths.clone(),
@@ -720,6 +745,7 @@ pub async fn rebuild_core(old: &Arc<Core>, mut config: Config) -> Result<Arc<Cor
         system_prompt,
         repo_brief,
         model_profile,
+        vision,
         tool_probe,
         cancel: old.cancel.clone(),
         tool_timeout: old.tool_timeout,
@@ -1036,7 +1062,7 @@ mod tests {
         use axum::routing::{get, post};
         let models = || async {
             axum::Json(serde_json::json!({"object": "list", "data": [
-                {"id": "spark26", "object": "model", "owned_by": "localai"},
+                {"id": "qwen3-coder", "object": "model", "owned_by": "localai"},
                 {"id": "gemma", "object": "model", "owned_by": "localai"},
             ]}))
         };
@@ -1119,7 +1145,7 @@ mod tests {
 
         // Switching away and back reuses the detected window.
         let mut other = core.config.clone();
-        other.model.model = "spark26".into();
+        other.model.model = "qwen3-coder".into();
         let spark = rebuild_core(&core, other).await.unwrap();
         assert_eq!(
             spark.effective_window().0,
@@ -1158,7 +1184,7 @@ mod tests {
         let paths = test_paths(dir.path());
         let mut config = Config::builtin();
         config.model.endpoint = format!("http://{address}");
-        config.model.model = "spark26".into();
+        config.model.model = "qwen3-coder".into();
         config.model.context_window = Some(8192);
         let runtime = create_runtime(
             config,
@@ -1256,7 +1282,7 @@ mod tests {
             endpoint,
             ..Default::default()
         };
-        let provider = OpenAiCompatProvider::new(&config, "spark26").unwrap();
+        let provider = OpenAiCompatProvider::new(&config, "qwen3-coder").unwrap();
         let mut profile = crate::config::ModelProfile::default();
         let mut specs = vec![crate::provider::ToolSpec {
             name: "read".into(),
@@ -1347,7 +1373,7 @@ mod tests {
         let paths = test_paths(dir.path());
         let mut config = Config::builtin();
         config.model.endpoint = unreachable_endpoint();
-        config.model.model = "spark26".into();
+        config.model.model = "qwen3-coder".into();
         config.model.context_window = Some(8192);
         config.sandbox = crate::config::SandboxMode::Off;
         config.sandbox_explicit = true;
@@ -1380,7 +1406,7 @@ mod tests {
     async fn failed_start_command_is_reported_without_the_retry_window() {
         let mut config = Config::builtin();
         config.model.endpoint = unreachable_endpoint();
-        config.model.model = "spark26".into();
+        config.model.model = "qwen3-coder".into();
         config.model.start_command = "exit 7".into();
         let provider =
             OpenAiCompatProvider::new(&config.model, config.model.model.clone()).unwrap();
@@ -1417,7 +1443,7 @@ mod tests {
         let paths = test_paths(dir.path());
         let mut config = Config::builtin();
         config.model.endpoint = unreachable_endpoint();
-        config.model.model = "spark26".into();
+        config.model.model = "qwen3-coder".into();
         config.model.start_command = "sleep 30".into();
         config.model.context_window = Some(131_072);
 
@@ -1453,7 +1479,7 @@ mod tests {
         let paths = test_paths(dir.path());
         let mut config = Config::builtin();
         config.model.endpoint = unreachable_endpoint();
-        config.model.model = "spark26".into();
+        config.model.model = "qwen3-coder".into();
         config.model.start_command = "exit 7".into();
         config.model.context_window = Some(131_072);
 
@@ -1506,7 +1532,7 @@ mod tests {
     fn tool_probe(outcome: probe::ToolProbeOutcome, mode: &str) -> probe::ToolProbe {
         probe::ToolProbe {
             outcome,
-            model: "spark26".into(),
+            model: "qwen3-coder".into(),
             build: None,
             mode: mode.into(),
             message: outcome.code().into(),

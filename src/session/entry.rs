@@ -174,23 +174,84 @@ pub struct UserData {
 pub struct Attachment {
     /// Path relative to the working directory, as displayed.
     pub path: String,
-    /// Line-numbered text, exactly as the `read` tool would return it.
+    /// Line-numbered text, exactly as the `read` tool would return it. For
+    /// a described image, the description.
     pub content: String,
+    /// An image sent to a model with vision input; its bytes live in the
+    /// session's artifact store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<ImageRef>,
+    /// The model that described an image for a model without vision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub described_by: Option<String>,
+}
+
+impl Attachment {
+    pub fn file(path: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            content: content.into(),
+            image: None,
+            described_by: None,
+        }
+    }
+}
+
+/// A stored image: artifact id and what the transcript shows instead of
+/// bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageRef {
+    /// Artifact id, `img-N.<ext>`.
+    pub id: String,
+    pub mime: String,
+    pub width: u32,
+    pub height: u32,
+    pub bytes: u64,
+}
+
+impl ImageRef {
+    /// `PNG 1280×720`.
+    pub fn summary(&self) -> String {
+        let format = crate::media::Format::from_mime(&self.mime)
+            .map(|format| format.label())
+            .unwrap_or("image");
+        format!("{format} {}×{}", self.width, self.height)
+    }
 }
 
 impl UserData {
-    /// The message the model sees: the prompt followed by any attachments.
+    /// The message text the model sees: the prompt followed by any
+    /// attachments. Images are referenced here and sent as content parts.
     pub fn model_content(&self) -> String {
         if self.attachments.is_empty() {
             return self.content.clone();
         }
         let mut text = self.content.clone();
-        text.push_str("\n\n[files attached by the user with @mentions; they count as read]");
+        let files = self
+            .attachments
+            .iter()
+            .any(|attachment| attachment.image.is_none() && attachment.described_by.is_none());
+        if files {
+            text.push_str("\n\n[files attached by the user with @mentions; they count as read]");
+        }
         for attachment in &self.attachments {
-            text.push_str(&format!(
-                "\n\n<file path=\"{}\">\n{}\n</file>",
-                attachment.path, attachment.content
-            ));
+            if let Some(model) = &attachment.described_by {
+                text.push_str(&format!(
+                    "\n\n<image path=\"{}\" described_by=\"{model}\">\n{}\n</image>",
+                    attachment.path, attachment.content
+                ));
+            } else if let Some(image) = &attachment.image {
+                text.push_str(&format!(
+                    "\n\n[image attached by the user: {} ({}); it follows this message]",
+                    attachment.path,
+                    image.summary()
+                ));
+            } else {
+                text.push_str(&format!(
+                    "\n\n<file path=\"{}\">\n{}\n</file>",
+                    attachment.path, attachment.content
+                ));
+            }
         }
         text
     }

@@ -27,7 +27,7 @@ impl Tool for ReadTool {
     }
 
     fn description(&self) -> &'static str {
-        "Read a text file with line numbers (default 150 lines, max 800)."
+        "Read a text file with line numbers (default 150 lines, max 800). PNG, JPEG, and WebP images are shown to models with vision input."
     }
 
     fn schema(&self) -> Value {
@@ -51,10 +51,59 @@ impl Tool for ReadTool {
     }
 
     async fn call(&self, ctx: &ToolContext, args: Value) -> ToolResult {
+        if let Ok(raw) = required_str(&args, "path")
+            && let Ok(path) = ctx.resolve(&raw)
+            && crate::media::image::is_image_file(&path)
+        {
+            return read_image(ctx, &raw).await;
+        }
         match run(ctx, &args) {
             Ok(result) => result,
             Err(err) => err,
         }
+    }
+}
+
+/// `read` on an image: the image itself for a vision model (it follows the
+/// tool result as an attachment), a labelled description from
+/// `[vision] model` otherwise, or an error naming how to enable either.
+async fn read_image(ctx: &ToolContext, raw: &str) -> ToolResult {
+    use crate::media::Route;
+    let route = ctx.vision.route();
+    if let Route::Refused(reason) = &route {
+        return ToolResult::err(
+            "IMAGE_UNSUPPORTED",
+            format!("{raw} is an image, and it cannot be shown: {reason}"),
+        );
+    }
+    let (image, loaded, display) = match crate::agent::mentions::store_image(ctx, raw) {
+        Ok(stored) => stored,
+        Err(reason) => return ToolResult::err("IMAGE_FAILED", format!("{raw}: {reason}")),
+    };
+    let summary = loaded.summary();
+    match route {
+        Route::Describe(model) => {
+            let Some(describer) = ctx.vision.describer.as_ref() else {
+                return ToolResult::err("IMAGE_UNSUPPORTED", "no vision model is configured");
+            };
+            let data = crate::media::vision::image_data(&loaded, &display);
+            match crate::media::vision::describe(describer, data, ctx.cancel.clone()).await {
+                Ok(description) => ToolResult::ok(format!(
+                    "{display}: {summary}. Described by {model} (this model has no vision input):\n{description}"
+                ))
+                .with_details(json!({
+                    "path": display,
+                    "described_by": model,
+                    "width": image.width,
+                    "height": image.height,
+                })),
+                Err(reason) => ToolResult::err("IMAGE_FAILED", format!("{display}: {reason}")),
+            }
+        }
+        _ => ToolResult::ok(format!(
+            "{display}: {summary}. The image is attached after the tool results."
+        ))
+        .with_details(json!({ "path": display, "image": image })),
     }
 }
 
@@ -208,6 +257,37 @@ pub(crate) fn split_lines(text: &str) -> Vec<&str> {
 /// Number of logical lines in `text` (a trailing newline is not a line).
 pub(crate) fn line_count(text: &str) -> usize {
     split_lines(text).len()
+}
+
+#[cfg(test)]
+mod image_tests {
+    use super::*;
+    use crate::tools::write::test_context;
+
+    #[tokio::test]
+    async fn vision_models_get_the_image_and_others_a_clear_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("ui.png"),
+            crate::media::image::fixtures::png_with_metadata(),
+        )
+        .unwrap();
+        let mut ctx = test_context(dir.path());
+        let refused = ReadTool.call(&ctx, json!({"path": "ui.png"})).await;
+        assert!(refused.is_error);
+        assert!(refused.content.contains("vision"), "{}", refused.content);
+
+        ctx.vision = std::sync::Arc::new(crate::media::VisionSettings {
+            native: true,
+            ..Default::default()
+        });
+        let shown = ReadTool.call(&ctx, json!({"path": "ui.png"})).await;
+        assert!(!shown.is_error, "{}", shown.content);
+        assert!(shown.content.contains("PNG 3×2"), "{}", shown.content);
+        let details = shown.details.unwrap();
+        let id = details["image"]["id"].as_str().unwrap();
+        assert!(ctx.artifacts.read_image(id).is_ok());
+    }
 }
 
 #[cfg(test)]

@@ -475,7 +475,16 @@ fn build_body(req: &ChatRequest, include_usage: bool) -> Result<Value, ProviderE
         .iter()
         .map(|message| match message {
             ChatMessage::System { content } => json!({"role":"system","content":content}),
-            ChatMessage::User { content } => json!({"role":"user","content":content}),
+            ChatMessage::User { content, images } if images.is_empty() => {
+                json!({"role":"user","content":content})
+            }
+            ChatMessage::User { content, images } => {
+                let mut parts = vec![json!({"type": "text", "text": content})];
+                parts.extend(images.iter().map(|image| {
+                    json!({"type": "image_url", "image_url": {"url": image.data_url()}})
+                }));
+                json!({"role":"user","content":parts})
+            }
             ChatMessage::Assistant {
                 content,
                 tool_calls,
@@ -940,6 +949,7 @@ mod tests {
             system("summary"),
             ChatMessage::User {
                 content: "hi".into(),
+                images: Vec::new(),
             },
             system("state"),
         ];
@@ -948,12 +958,45 @@ mod tests {
         assert!(
             matches!(&merged[0], ChatMessage::System { content } if content == "base\n\nsummary\n\nstate")
         );
-        assert!(matches!(&merged[1], ChatMessage::User { content } if content == "hi"));
+        assert!(matches!(&merged[1], ChatMessage::User { content, .. } if content == "hi"));
         // A system message that follows a non-system one is moved to the front.
         let merged = merge_leading_system(&messages[2..]);
         assert_eq!(merged.len(), 2);
         assert!(matches!(&merged[0], ChatMessage::System { content } if content == "state"));
-        assert!(matches!(&merged[1], ChatMessage::User { content } if content == "hi"));
+        assert!(matches!(&merged[1], ChatMessage::User { content, .. } if content == "hi"));
+    }
+
+    #[test]
+    fn images_are_sent_as_data_url_parts() {
+        let image = crate::provider::ImageData {
+            mime: "image/png".into(),
+            width: 1,
+            height: 1,
+            data: std::sync::Arc::new(b"foo".to_vec()),
+            label: "a.png".into(),
+        };
+        let req = ChatRequest {
+            model: "m".into(),
+            messages: vec![ChatMessage::User {
+                content: "look".into(),
+                images: vec![image],
+            }],
+            tools: vec![],
+            tool_choice: None,
+            parallel_tool_calls: None,
+            temperature: 0.2,
+            top_p: 0.95,
+            max_tokens: 16,
+            stop: vec![],
+            extra_body: None,
+            include_usage: false,
+            reasoning_field: None,
+        };
+        let body = build_body(&req, false).unwrap();
+        let content = &body["messages"][0]["content"];
+        assert_eq!(content[0], json!({"type": "text", "text": "look"}));
+        assert_eq!(content[1]["type"], "image_url");
+        assert_eq!(content[1]["image_url"]["url"], "data:image/png;base64,Zm9v");
     }
 
     #[test]
@@ -963,6 +1006,7 @@ mod tests {
             messages: vec![
                 ChatMessage::User {
                     content: "hi".into(),
+                    images: Vec::new(),
                 },
                 ChatMessage::System {
                     content: "summary".into(),
@@ -1092,7 +1136,7 @@ mod tests {
             endpoint: "http://model-host:8088/v1/".into(),
             ..ModelConfig::default()
         };
-        let p = OpenAiCompatProvider::new(&config, "spark26").unwrap();
+        let p = OpenAiCompatProvider::new(&config, "qwen3-coder").unwrap();
         assert_eq!(p.url(), "http://model-host:8088/v1/chat/completions");
         assert_eq!(p.base_url(), "http://model-host:8088/v1");
     }

@@ -113,12 +113,16 @@ pub struct Sources {
     pub themes: Vec<String>,
     /// Profile name and description.
     pub profiles: Vec<(String, String)>,
-    pub skills: Vec<String>,
-    pub workflows: Vec<String>,
+    /// Skill name and description.
+    pub skills: Vec<(String, String)>,
+    /// Workflow name and description.
+    pub workflows: Vec<(String, String)>,
     /// Session id and a preview of its first prompt.
     pub sessions: Vec<(String, String)>,
     /// Models the endpoint reported the last time it was probed.
     pub models: Vec<String>,
+    /// The configured endpoint, offered first by `/login`.
+    pub endpoint: String,
     pub cwd: PathBuf,
     pub home: Option<PathBuf>,
 }
@@ -127,7 +131,8 @@ pub struct Sources {
 pub fn takes_args(command: &str) -> bool {
     matches!(
         command,
-        "model"
+        "help"
+            | "model"
             | "login"
             | "profile"
             | "theme"
@@ -170,9 +175,14 @@ pub fn complete(
             .copied()
             .take(words.len() - 1 - usize::from(!token.is_empty()))
             .collect();
-        if let Some(completion) =
-            complete_argument(command, &complete_args, token, token_start, sources)
-        {
+        if let Some(completion) = complete_argument(
+            command,
+            &complete_args,
+            token,
+            token_start,
+            sources,
+            commands,
+        ) {
             return Some(completion);
         }
         if command == "export" && complete_args.is_empty() && paths {
@@ -220,6 +230,7 @@ fn complete_argument(
     token: &str,
     start: usize,
     sources: &Sources,
+    commands: &[(&str, &str)],
 ) -> Option<Completion> {
     let plain = |names: &[String], description: &str| -> Vec<Candidate> {
         names
@@ -227,7 +238,25 @@ fn complete_argument(
             .map(|name| Candidate::new(name.clone(), description))
             .collect()
     };
+    let described = |items: &[(String, String)]| -> Vec<Candidate> {
+        items
+            .iter()
+            .map(|(name, description)| Candidate::new(name.clone(), description.clone()))
+            .collect()
+    };
     let choices: Vec<Candidate> = match (command, args) {
+        ("help", []) => commands
+            .iter()
+            .map(|(name, description)| Candidate::new(*name, *description))
+            .collect(),
+        ("login", []) => login_endpoints(&sources.endpoint),
+        // Models are only known for the configured endpoint.
+        ("login", [endpoint])
+            if endpoint.trim_end_matches('/') == sources.endpoint.trim_end_matches('/') =>
+        {
+            plain(&sources.models, "model")
+        }
+        ("login", [_, _]) => vec![Candidate::new("-", "clear the API key")],
         ("theme", []) => {
             let mut choices = vec![Candidate::new("save", "write the current theme to config")];
             choices.extend(plain(&sources.themes, "theme"));
@@ -238,19 +267,25 @@ fn complete_argument(
             .iter()
             .map(|(name, description)| Candidate::new(name.clone(), description.clone()))
             .collect(),
-        ("skill", []) => plain(&sources.skills, "skill"),
-        ("workflow", []) => plain(&sources.workflows, "workflow"),
+        ("skill", []) => described(&sources.skills),
+        ("workflow", []) => described(&sources.workflows),
         ("model", []) => plain(&sources.models, "model"),
-        ("resume", []) => sources
-            .sessions
-            .iter()
-            .map(|(id, preview)| Candidate::new(id.clone(), preview.clone()))
-            .collect(),
+        ("resume", []) => {
+            let mut choices = vec![Candidate::new("last", "the most recent other session")];
+            choices.extend(
+                sources
+                    .sessions
+                    .iter()
+                    .map(|(id, preview)| Candidate::new(id.clone(), preview.clone())),
+            );
+            choices
+        }
         ("trust", []) => vec![Candidate::new(
             "confirm",
             "trust this project for the session",
         )],
         ("sec", []) => vec![
+            Candidate::new("summary", "show the engagement summary"),
             Candidate::new("scope", "add, remove, or clear engagement scope"),
             Candidate::new("report", "write the engagement report"),
         ],
@@ -268,6 +303,29 @@ fn complete_argument(
         token: token.to_string(),
         candidates,
     })
+}
+
+/// `/login` endpoint suggestions: the configured endpoint, then the usual
+/// local engine ports.
+fn login_endpoints(current: &str) -> Vec<Candidate> {
+    const KNOWN: &[(&str, &str)] = &[
+        ("http://127.0.0.1:8080/v1", "llama.cpp server"),
+        ("http://127.0.0.1:11434/v1", "Ollama"),
+        ("http://127.0.0.1:1234/v1", "LM Studio"),
+        ("http://127.0.0.1:8000/v1", "vLLM"),
+        ("http://127.0.0.1:4000/v1", "LiteLLM proxy"),
+    ];
+    let mut choices = Vec::new();
+    let current = current.trim_end_matches('/');
+    if !current.is_empty() {
+        choices.push(Candidate::new(current, "current endpoint"));
+    }
+    for (endpoint, description) in KNOWN {
+        if *endpoint != current {
+            choices.push(Candidate::new(*endpoint, *description));
+        }
+    }
+    choices
 }
 
 /// Prefix matches first (in source order); when nothing matches by prefix,
@@ -475,6 +533,32 @@ mod tests {
         assert!(!values(&completion).contains(&".hidden"));
         let completion = complete("@.h", COMMANDS, &src, true).unwrap();
         assert_eq!(values(&completion), vec![".hidden"]);
+    }
+
+    #[test]
+    fn help_login_and_resume_offer_their_arguments() {
+        let mut src = sources(Path::new("/"));
+        src.endpoint = "http://127.0.0.1:9000/v1".into();
+        src.models = vec!["qwen".into(), "gemma".into()];
+
+        let completion = complete("/help th", COMMANDS, &src, false).unwrap();
+        assert_eq!(values(&completion), vec!["theme"]);
+
+        let completion = complete("/login ", COMMANDS, &src, false).unwrap();
+        assert_eq!(completion.candidates[0].value, "http://127.0.0.1:9000/v1");
+        assert_eq!(completion.candidates[0].description, "current endpoint");
+        assert!(values(&completion).contains(&"http://127.0.0.1:11434/v1"));
+
+        let completion =
+            complete("/login http://127.0.0.1:9000/v1 g", COMMANDS, &src, false).unwrap();
+        assert_eq!(values(&completion), vec!["gemma"]);
+        // Another endpoint's models are unknown.
+        assert!(complete("/login http://other:1/v1 g", COMMANDS, &src, false).is_none());
+        let completion = complete("/login http://other:1/v1 m ", COMMANDS, &src, false).unwrap();
+        assert_eq!(values(&completion), vec!["-"]);
+
+        let completion = complete("/resume ", COMMANDS, &src, false).unwrap();
+        assert_eq!(completion.candidates[0].value, "last");
     }
 
     #[test]

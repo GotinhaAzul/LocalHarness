@@ -241,6 +241,7 @@ fn harness_with_extra(
         system_prompt: "system".into(),
         repo_brief: String::new(),
         model_profile,
+        vision: Default::default(),
         tool_probe: None,
         cancel: CancellationToken::new(),
         tool_timeout: std::time::Duration::from_secs(10),
@@ -1510,7 +1511,7 @@ async fn mentioned_files_reach_the_model_and_count_as_read() {
         .messages
         .iter()
         .find_map(|message| match message {
-            localharness::provider::ChatMessage::User { content } => Some(content.clone()),
+            localharness::provider::ChatMessage::User { content, .. } => Some(content.clone()),
             _ => None,
         })
         .expect("user message");

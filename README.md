@@ -170,9 +170,9 @@ The terminal interface is the default. Tool calls render as cards, diffs and str
 | `/` | slash-command completion |
 | `Tab` / `Shift+Tab` | complete commands, arguments, and paths; move back through choices |
 
-Tab completes the token at the cursor: commands, arguments (themes, profiles, skills, workflows, session ids, models, `/sec` subcommands), and file paths. Ambiguous matches first extend to their shared prefix, then open a picker.
+Tab completes the token at the cursor: commands, arguments (themes, profiles, skills, workflows, session ids, models, `/login` endpoints, `/help` topics, `/sec` subcommands), and file paths. Ambiguous matches first extend to their shared prefix, then open a picker. Every command that chooses from a list — `/model`, `/profile`, `/theme` (with live preview), `/skill`, `/workflow`, `/sec`, `/resume` — opens a filterable menu when run without an argument: type to filter, arrows to move, Enter to pick. Model and profile switches load in the background, so the TUI stays responsive while the server swaps models.
 
-Write `@path` in a prompt to attach a file: `fix the panic in @src/parser.rs`. The file is read through the same path as the `read` tool and appended to your message, so the model can edit it without another read. Up to eight files per prompt, within a quarter of the usable context.
+Write `@path` in a prompt to attach a file: `fix the panic in @src/parser.rs`. The file is read through the same path as the `read` tool and appended to your message, so the model can edit it without another read. Up to eight files per prompt, within a quarter of the usable context. `@shot.png` attaches a screenshot: a model with vision input sees the image, and a text-only model can get a description from a local vision model; the `read` tool opens images too. Images are checked by content, stripped of EXIF, and sent only to local endpoints unless you opt in. See [docs/images.md](docs/images.md).
 
 Slash commands: `/help /quit /login /model /profile /theme /tree /fork /new /resume /sessions /compact /tools /mcp /skill /workflow /sec /trust /export /clear /debug`.
 
@@ -261,6 +261,7 @@ Global config: `~/.config/localharness/config.toml`. A trusted project `.harness
 | [Security](docs/security.md) | Authorization, scope, evidence, findings, PoC replay, sandbox |
 | [External tools](docs/external-tools.md) | Manifest format, protocol, schemas, scope gating |
 | [MCP servers](docs/mcp.md) | stdio and HTTP servers, tool naming, profiles, `lh mcp` |
+| [Images](docs/images.md) | `@image` attachments, vision models, the describer fallback, EXIF and remote rules |
 | [Themes](docs/themes.md) | Semantic tokens, color modes, user themes |
 | [Architecture](ARCHITECTURE.md) | Implementation specification and design decisions |
 

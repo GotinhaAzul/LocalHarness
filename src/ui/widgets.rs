@@ -398,45 +398,119 @@ pub struct ToolsModal {
     pub scroll: usize,
 }
 
-/// Model picker over the endpoint's (or gateway's) `/v1/models` list. Typing
-/// narrows the list with a case-insensitive substring filter.
+/// What choosing a picker row does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PickAction {
+    /// Run this slash command line, for example `/model qwen3`.
+    Run(String),
+    /// Put this text in the prompt so the user can finish it, for example
+    /// `/sec scope add `.
+    Fill(String),
+}
+
+/// One row of a [`PickerModal`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PickItem {
+    pub label: String,
+    pub description: String,
+    pub action: PickAction,
+}
+
+impl PickItem {
+    /// A row that runs `/{command} {label}`.
+    pub fn run(command: &str, label: impl Into<String>, description: impl Into<String>) -> Self {
+        let label = label.into();
+        PickItem {
+            action: PickAction::Run(format!("/{command} {label}")),
+            label,
+            description: description.into(),
+        }
+    }
+}
+
+/// A filterable menu behind every slash command that chooses from a list
+/// (`/model`, `/theme`, `/profile`, `/skill`, `/workflow`, `/sec`). Typing
+/// narrows the list with a case-insensitive match on the label and the
+/// description; arrows move; Enter picks.
 #[derive(Debug, Clone, Default)]
-pub struct ModelsModal {
-    pub items: Vec<String>,
+pub struct PickerModal {
+    /// The command that opened the picker, for example `model`.
+    pub command: String,
+    pub title: String,
+    /// Extra context for the title, for example the endpoint.
+    pub subtitle: String,
+    pub items: Vec<PickItem>,
+    /// Label of the active choice, marked with `*` and preselected.
     pub current: String,
-    pub endpoint: String,
     pub filter: String,
-    /// Index into [`ModelsModal::filtered`].
+    /// Index into [`PickerModal::filtered`].
     pub selected: usize,
     pub scroll: usize,
 }
 
-impl ModelsModal {
-    pub fn new(items: Vec<String>, current: String, endpoint: String) -> Self {
-        let selected = items.iter().position(|item| item == &current).unwrap_or(0);
-        ModelsModal {
+impl PickerModal {
+    pub fn new(
+        command: impl Into<String>,
+        title: impl Into<String>,
+        items: Vec<PickItem>,
+        current: impl Into<String>,
+    ) -> Self {
+        let current = current.into();
+        let selected = items
+            .iter()
+            .position(|item| item.label == current)
+            .unwrap_or(0);
+        PickerModal {
+            command: command.into(),
+            title: title.into(),
+            subtitle: String::new(),
             items,
             current,
-            endpoint,
             filter: String::new(),
             selected,
             scroll: 0,
         }
     }
 
-    pub fn filtered(&self) -> Vec<&str> {
-        let needle = self.filter.to_lowercase();
-        self.items
-            .iter()
-            .filter(|item| needle.is_empty() || item.to_lowercase().contains(&needle))
-            .map(String::as_str)
-            .collect()
+    pub fn with_subtitle(mut self, subtitle: impl Into<String>) -> Self {
+        self.subtitle = subtitle.into();
+        self
     }
 
-    pub fn selected_model(&self) -> Option<String> {
-        self.filtered()
-            .get(self.selected)
-            .map(|model| model.to_string())
+    /// Rows matching the filter: label prefix matches first, then label
+    /// substrings, then description matches.
+    pub fn filtered(&self) -> Vec<&PickItem> {
+        let needle = self.filter.to_lowercase();
+        if needle.is_empty() {
+            return self.items.iter().collect();
+        }
+        let mut ranked: Vec<(u8, &PickItem)> = self
+            .items
+            .iter()
+            .filter_map(|item| {
+                let label = item.label.to_lowercase();
+                let rank = if label.starts_with(&needle) {
+                    0
+                } else if label.contains(&needle) {
+                    1
+                } else if item.description.to_lowercase().contains(&needle) {
+                    2
+                } else {
+                    return None;
+                };
+                Some((rank, item))
+            })
+            .collect();
+        ranked.sort_by_key(|(rank, _)| *rank);
+        ranked.into_iter().map(|(_, item)| item).collect()
+    }
+
+    pub fn selected_item(&self) -> Option<&PickItem> {
+        self.filtered().get(self.selected).copied()
+    }
+
+    pub fn selected_label(&self) -> Option<String> {
+        self.selected_item().map(|item| item.label.clone())
     }
 
     pub fn move_by(&mut self, delta: isize) {
@@ -459,6 +533,17 @@ impl ModelsModal {
         self.selected = 0;
         self.scroll = 0;
     }
+
+    /// Replace the rows (a background refresh), keeping the filter and the
+    /// highlighted row when it still exists.
+    pub fn replace_items(&mut self, items: Vec<PickItem>) {
+        let keep = self.selected_label();
+        self.items = items;
+        let filtered = self.filtered();
+        self.selected = keep
+            .and_then(|label| filtered.iter().position(|item| item.label == label))
+            .unwrap_or(0);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -466,7 +551,7 @@ pub enum ModalData {
     Tree(TreeView),
     Sessions(SessionsModal),
     Tools(ToolsModal),
-    Models(ModelsModal),
+    Picker(PickerModal),
 }
 
 impl ModalData {
@@ -475,16 +560,21 @@ impl ModalData {
             ModalData::Tree(_) => " Session tree ".into(),
             ModalData::Sessions(_) => " Sessions · Enter resume · Esc close ".into(),
             ModalData::Tools(_) => " Tools ".into(),
-            ModalData::Models(view) => {
+            ModalData::Picker(view) => {
                 let shown = view.filtered().len();
                 let filter = if view.filter.is_empty() {
                     "type to filter".to_string()
                 } else {
                     format!("filter: {}", view.filter)
                 };
+                let subtitle = if view.subtitle.is_empty() {
+                    String::new()
+                } else {
+                    format!(" · {}", view.subtitle)
+                };
                 format!(
-                    " Models · {} · {shown}/{} · {filter} · Enter select · Esc close ",
-                    view.endpoint,
+                    " {}{subtitle} · {shown}/{} · {filter} · ↑↓ move · Enter select · Esc close ",
+                    view.title,
                     view.items.len()
                 )
             }
@@ -497,7 +587,7 @@ impl ModalData {
             ModalData::Tree(view) => view.rows.len(),
             ModalData::Sessions(view) => view.items.len(),
             ModalData::Tools(view) => view.items.len(),
-            ModalData::Models(view) => view.filtered().len().max(1),
+            ModalData::Picker(view) => view.filtered().len().max(1),
         }
     }
 
@@ -506,7 +596,7 @@ impl ModalData {
             ModalData::Tree(view) => view.scroll,
             ModalData::Sessions(view) => view.scroll,
             ModalData::Tools(view) => view.scroll,
-            ModalData::Models(view) => view.scroll,
+            ModalData::Picker(view) => view.scroll,
         }
     }
 
@@ -530,7 +620,7 @@ impl ModalData {
                 }
                 view.scroll = view.scroll.min(view.items.len().saturating_sub(height));
             }
-            ModalData::Models(view) => {
+            ModalData::Picker(view) => {
                 let count = view.filtered().len();
                 view.selected = view.selected.min(count.saturating_sub(1));
                 if view.selected < view.scroll {
@@ -549,7 +639,7 @@ impl ModalData {
             ModalData::Tree(view) => tree_lines(view, width, theme),
             ModalData::Sessions(view) => sessions_lines(view, width, theme),
             ModalData::Tools(view) => tools_lines(view, width, theme),
-            ModalData::Models(view) => models_lines(view, width, theme),
+            ModalData::Picker(view) => picker_lines(view, width, theme),
         }
     }
 }
@@ -640,14 +730,25 @@ pub fn sessions_lines(view: &SessionsModal, width: usize, theme: &Theme) -> Vec<
     lines
 }
 
-pub fn models_lines(view: &ModelsModal, width: usize, theme: &Theme) -> Vec<Line<'static>> {
+pub fn picker_lines(view: &PickerModal, width: usize, theme: &Theme) -> Vec<Line<'static>> {
+    let rows = view.filtered();
+    // Align descriptions in a column after the widest label (capped so a
+    // long model id does not push them off screen).
+    let label_width = rows
+        .iter()
+        .map(|item| UnicodeWidthStr::width(item.label.as_str()))
+        .max()
+        .unwrap_or(0)
+        .min(width.saturating_sub(16).clamp(10, 48));
     let mut lines = Vec::new();
-    for (index, model) in view.filtered().into_iter().enumerate() {
-        let current = model == view.current;
+    for (index, item) in rows.into_iter().enumerate() {
+        let current = !view.current.is_empty() && item.label == view.current;
+        let label = clip_end(&item.label, label_width.max(1));
+        let pad = label_width.saturating_sub(UnicodeWidthStr::width(label.as_str()));
         let mut spans = vec![
             Span::styled(if current { "* " } else { "  " }, theme.bold(Role::Accent)),
             Span::styled(
-                clip_end(model, width.saturating_sub(14).max(10)),
+                label,
                 if current {
                     theme.bold(Role::Fg)
                 } else {
@@ -655,8 +756,23 @@ pub fn models_lines(view: &ModelsModal, width: usize, theme: &Theme) -> Vec<Line
                 },
             ),
         ];
+        let mut description = item.description.clone();
         if current {
-            spans.push(Span::styled("  (current)", theme.style(Role::Muted)));
+            description = if description.is_empty() {
+                "(current)".into()
+            } else {
+                format!("{description} (current)")
+            };
+        }
+        if !description.is_empty() {
+            let room = width.saturating_sub(label_width + 6);
+            if room > 3 {
+                spans.push(Span::raw(" ".repeat(pad + 2)));
+                spans.push(Span::styled(
+                    clip_end(&description, room),
+                    theme.style(Role::Muted),
+                ));
+            }
         }
         let mut line = Line::from(spans);
         if index == view.selected {
@@ -667,9 +783,9 @@ pub fn models_lines(view: &ModelsModal, width: usize, theme: &Theme) -> Vec<Line
     if lines.is_empty() {
         lines.push(Line::styled(
             if view.items.is_empty() {
-                "(the endpoint reports no models)"
+                "(nothing to choose from)"
             } else {
-                "(no models match the filter)"
+                "(nothing matches the filter · Backspace to widen)"
             },
             theme.style(Role::Muted),
         ));

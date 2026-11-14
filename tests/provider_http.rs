@@ -101,6 +101,7 @@ fn request() -> ChatRequest {
         model: "test-model".into(),
         messages: vec![ChatMessage::User {
             content: "hi".into(),
+            images: Vec::new(),
         }],
         tools: vec![localharness::provider::ToolSpec {
             name: "read".into(),

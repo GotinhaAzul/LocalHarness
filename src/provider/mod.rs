@@ -11,8 +11,8 @@ use tokio_util::sync::CancellationToken;
 
 pub use openai::OpenAiCompatProvider;
 pub use types::{
-    ChatMessage, ChatRequest, ErrorClass, ProviderError, StreamEvent, StreamItem, ToolCall,
-    ToolSpec, Usage, redact, tools_json, tools_payload,
+    ChatMessage, ChatRequest, ErrorClass, ImageData, ProviderError, StreamEvent, StreamItem,
+    ToolCall, ToolSpec, Usage, redact, tools_json, tools_payload,
 };
 
 /// Server root and OpenAI API base derived from a configured endpoint.
