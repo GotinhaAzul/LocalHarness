@@ -370,14 +370,14 @@ fn id_key(id: &Value) -> String {
 }
 
 fn initialize_result(params: &Value, load_session: bool) -> Value {
-    let client_protocol = params
+    let _client_protocol = params
         .get("protocolVersion")
         .and_then(Value::as_u64)
         .unwrap_or(PROTOCOL_VERSION);
-    // The client disconnects when it does not support the version we return.
-    let protocol = client_protocol.min(PROTOCOL_VERSION);
+    // This server implements v1 only. If the client asks for a newer or older
+    // version, returning 1 tells it exactly what it is talking to.
     json!({
-        "protocolVersion": protocol,
+        "protocolVersion": PROTOCOL_VERSION,
         "agentCapabilities": {
             "loadSession": load_session,
             "promptCapabilities": {
@@ -463,7 +463,7 @@ mod tests {
         let future = initialize_result(&json!({"protocolVersion": 7}), true);
         assert_eq!(future["protocolVersion"], 1);
         let old = initialize_result(&json!({"protocolVersion": 0}), true);
-        assert_eq!(old["protocolVersion"], 0);
+        assert_eq!(old["protocolVersion"], 1);
     }
 
     #[test]

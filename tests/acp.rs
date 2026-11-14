@@ -164,13 +164,19 @@ struct Client {
 
 impl Client {
     async fn spawn(base: &str, root: &std::path::Path) -> Self {
+        Self::spawn_with(base, root, &[]).await
+    }
+
+    async fn spawn_with(base: &str, root: &std::path::Path, extra: &[&str]) -> Self {
         let config_dir = root.parent().unwrap().join("config");
         let data_dir = root.parent().unwrap().join("data");
-        let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_lh"))
+        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_lh"));
+        command
             .arg("--endpoint")
             .arg(base)
             .arg("--model")
             .arg("test-model")
+            .args(extra)
             .arg("acp")
             .current_dir(root)
             .env("LH_CONFIG_DIR", &config_dir)
@@ -184,9 +190,8 @@ impl Client {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .expect("spawn lh acp");
+            .kill_on_drop(true);
+        let mut child = command.spawn().expect("spawn lh acp");
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
         let stderr = Arc::new(Mutex::new(String::new()));
@@ -349,6 +354,25 @@ async fn initialize_and_new_session_negotiate_capabilities() {
     let session_id = client.new_session(2, &root).await;
     assert!(!session_id.is_empty());
 
+    // Loading a session that is already live is a typed refusal rather than
+    // a second runtime fighting over the same session file.
+    let (response, _) = client
+        .request(
+            20,
+            "session/load",
+            json!({
+                "sessionId": session_id,
+                "cwd": root.display().to_string(),
+                "mcpServers": [],
+            }),
+            Permission::Allow,
+        )
+        .await;
+    assert_eq!(
+        response["error"]["data"]["code"], "session_already_loaded",
+        "{response}"
+    );
+
     // An unknown method is a typed method-not-found, not a crash.
     let (response, _) = client
         .request(3, "session/nope", json!({}), Permission::Allow)
@@ -445,6 +469,24 @@ async fn cancel_stops_a_streaming_turn() {
     }
     assert!(saw_text, "the turn should stream before it is cancelled");
     assert_eq!(stop["result"]["stopReason"], "cancelled", "{stop}");
+}
+
+#[tokio::test]
+async fn ephemeral_sessions_get_distinct_ids() {
+    let (base, _fake) = spawn_endpoint(vec![]).await;
+    let (_dir, root) = workdir();
+    let mut client = Client::spawn_with(&base, &root, &["--no-session"]).await;
+    client
+        .request(
+            1,
+            "initialize",
+            json!({"protocolVersion": 1}),
+            Permission::Allow,
+        )
+        .await;
+    let first = client.new_session(2, &root).await;
+    let second = client.new_session(3, &root).await;
+    assert_ne!(first, second, "ephemeral ACP sessions must not share an id");
 }
 
 #[tokio::test]

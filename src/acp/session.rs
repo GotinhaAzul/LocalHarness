@@ -2,6 +2,7 @@
 //! the client permission callback.
 
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, Weak};
 
 use async_trait::async_trait;
@@ -116,7 +117,14 @@ impl Server {
         let runtime = create_runtime(self.session_config(&root), root_paths, options)
             .await
             .map_err(|error| RpcError::internal(format!("cannot create a session: {error:#}")))?;
-        let id = lock_session(&runtime.core).id.clone();
+        let harness_id = lock_session(&runtime.core).id.clone();
+        // Ephemeral sessions all call themselves "ephemeral" in the harness;
+        // give each ACP session a distinct id so the map cannot collide.
+        let id = if self.options.no_session {
+            format!("acp-{}", self.next_request.fetch_add(1, Ordering::SeqCst))
+        } else {
+            harness_id
+        };
         *slot.lock().unwrap_or_else(|poison| poison.into_inner()) = Some(id.clone());
         let session = Arc::new(AcpSession {
             id: id.clone(),
@@ -157,6 +165,13 @@ impl Server {
             return Err(RpcError::invalid_params(format!(
                 "session id {id:?} is not a plain identifier"
             )));
+        }
+        if self.session(id).is_some() {
+            return Err(RpcError {
+                code: -32602,
+                message: format!("session {id:?} is already loaded in this process"),
+                data: json!({"code": "session_already_loaded", "sessionId": id}),
+            });
         }
         let root_paths = Paths::discover(&root)
             .map_err(|error| RpcError::internal(format!("cannot prepare {root:?}: {error}")))?;
