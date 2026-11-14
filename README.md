@@ -167,6 +167,7 @@ The terminal interface is the default. Tool calls render as cards, diffs and str
 | `Up`/`Down` | history when input is empty; otherwise cursor |
 | `PgUp`/`PgDn`, `Home`/`End` | scroll transcript |
 | `Ctrl+R` | toggle reasoning |
+| `Ctrl+L` | redraw the whole screen |
 | `/` | slash-command completion |
 | `Tab` / `Shift+Tab` | complete commands, arguments, and paths; move back through choices |
 

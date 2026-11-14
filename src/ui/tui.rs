@@ -2,7 +2,7 @@
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
-use std::io::{BufRead, BufReader, Stdout};
+use std::io::{BufRead, BufReader, BufWriter, Stdout};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Once};
@@ -12,12 +12,14 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{
-    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+    self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+    EnableFocusChange, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+    MouseEvent, MouseEventKind,
 };
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
-    Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate, EnterAlternateScreen,
+    LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::layout::Rect;
 use serde::Deserialize;
@@ -103,6 +105,7 @@ Keys: Enter send · Shift+Enter / Ctrl+J newline · Esc interrupt or dismiss
 Tab complete commands, arguments, and paths · Shift+Tab previous choice
 @path in a prompt attaches that file for the model
 Ctrl+R show thinking · Ctrl+O expand tool output · Ctrl+T toggle the plan
+Ctrl+L redraw the screen (if it ever looks garbled)
 Scroll: mouse wheel · PgUp/PgDn half page · Shift+Up/Down one line
 Home/End top and bottom (prompt empty) · Ctrl+Home/End anytime · Ctrl+C quit
 Hold Shift while dragging to select text ([ui] mouse = false disables
@@ -114,6 +117,12 @@ const HINTS: &str = "enter send · ⇧enter newline · / commands · tab complet
 /// Shortest gap between two frames while output streams (~60 fps). Input
 /// events draw immediately.
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
+/// Room for a full repaint of a large terminal, so a frame leaves in one
+/// write instead of the many small ones a line-buffered stdout makes (which
+/// shows as tearing over SSH).
+const OUTPUT_BUFFER: usize = 256 * 1024;
+
+type Tty = Terminal<CrosstermBackend<BufWriter<Stdout>>>;
 
 /// Results of work the TUI runs off the event loop so it never freezes.
 enum BgEvent {
@@ -193,7 +202,9 @@ fn restore_terminal() {
         let mut out = std::io::stdout();
         let _ = execute!(
             out,
+            EndSynchronizedUpdate,
             DisableMouseCapture,
+            DisableFocusChange,
             LeaveAlternateScreen,
             DisableBracketedPaste
         );
@@ -207,15 +218,23 @@ impl TerminalGuard {
         install_panic_hook();
         enable_raw_mode().context("cannot enable raw mode")?;
         let mut out = std::io::stdout();
+        // Focus reports let the UI repaint after the terminal was covered
+        // or a multiplexer reattached; terminals without them ignore it.
         let entered = if mouse {
             execute!(
                 out,
                 EnterAlternateScreen,
                 EnableBracketedPaste,
+                EnableFocusChange,
                 EnableMouseCapture
             )
         } else {
-            execute!(out, EnterAlternateScreen, EnableBracketedPaste)
+            execute!(
+                out,
+                EnterAlternateScreen,
+                EnableBracketedPaste,
+                EnableFocusChange
+            )
         };
         if let Err(error) = entered {
             let _ = disable_raw_mode();
@@ -247,7 +266,7 @@ struct WorkflowFile {
 pub async fn run(runtime: Runtime, options: UiOptions) -> Result<()> {
     let mut app = App::new(runtime, options)?;
     let _guard = TerminalGuard::enter(app.config.ui.mouse)?;
-    let backend = CrosstermBackend::new(std::io::stdout());
+    let backend = CrosstermBackend::new(BufWriter::with_capacity(OUTPUT_BUFFER, std::io::stdout()));
     let mut terminal = Terminal::new(backend).context("cannot initialize the terminal")?;
     // Clear directly: `Terminal::clear` queries the cursor position, and a
     // terminal that never answers (some SSH and mobile clients, piped PTYs)
@@ -367,9 +386,9 @@ pub async fn run(runtime: Runtime, options: UiOptions) -> Result<()> {
                     None => std::future::pending::<()>().await,
                 }
             } => {}
-            maybe = git_rx.recv() => {
-                if let Some(status) = maybe {
-                    app.apply_git(status);
+            // A closed channel disables the branch instead of spinning.
+            Some(status) = git_rx.recv() => {
+                if app.apply_git(status) {
                     needs_draw = true;
                 }
             }
@@ -458,6 +477,8 @@ struct App {
     /// The theme to restore when a `/theme` picker previewing others is
     /// dismissed.
     theme_before_preview: Option<String>,
+    /// Clear the screen and repaint every cell on the next frame.
+    repaint: bool,
 }
 
 impl App {
@@ -540,6 +561,7 @@ impl App {
             bg_rx: Some(bg_rx),
             switching: None,
             theme_before_preview: None,
+            repaint: false,
         };
         app.no_color = app.options.no_color;
         app.transcript = Transcript::new(app.config.ui.show_reasoning);
@@ -916,12 +938,39 @@ impl App {
         self.sync_banner();
     }
 
-    fn apply_git(&mut self, status: GitStatus) {
+    /// Returns whether the header changed (the watcher reports every few
+    /// seconds whether or not anything moved).
+    fn apply_git(&mut self, status: GitStatus) -> bool {
+        if self.header.git == status {
+            return false;
+        }
         self.header.git = status;
+        true
     }
 
-    fn draw(&mut self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+    fn draw(&mut self, terminal: &mut Tty) -> Result<()> {
+        // Terminals that support synchronized output (DEC 2026) show the
+        // whole frame at once instead of painting it as bytes arrive; others
+        // ignore the markers. The opening marker is flushed right away so
+        // nothing stays buffered if rendering panics (the restore path ends
+        // the update before leaving the alternate screen).
+        let _ = execute!(terminal.backend_mut(), BeginSynchronizedUpdate);
+        let drawn = self.draw_frame(terminal);
+        let _ = execute!(terminal.backend_mut(), EndSynchronizedUpdate);
+        drawn
+    }
+
+    fn draw_frame(&mut self, terminal: &mut Tty) -> Result<()> {
         let size = terminal.size().context("cannot read the terminal size")?;
+        if std::mem::take(&mut self.repaint) {
+            // Forget what ratatui believes is on screen and clear it, so the
+            // next frame rewrites every cell. Recovers from anything that
+            // drew behind our back. (`Terminal::clear` would query the
+            // cursor position, which stalls on terminals that never answer.)
+            terminal
+                .resize(Rect::new(0, 0, size.width, size.height))
+                .context("cannot repaint the terminal")?;
+        }
         self.last_width = size.width as usize;
         let debug_lines = if self.debug {
             self.debug_lines()
@@ -1492,9 +1541,16 @@ impl App {
     async fn handle_event(&mut self, event: Event) {
         match event {
             Event::Key(key) => self.handle_key(key).await,
-            Event::Paste(text) => self.input.insert_text(&text),
+            // Terminals send CRLF, and copied output can carry escapes;
+            // either would leave the editor's cursor out of step with the
+            // screen.
+            Event::Paste(text) => self.input.insert_text(&crate::sanitize::paste(&text)),
             Event::Mouse(mouse) => self.handle_mouse(mouse),
-            Event::Resize(_, _) => {}
+            // Some terminals reflow the old contents on resize; start clean.
+            Event::Resize(_, _) => self.repaint = true,
+            // The screen may have been redrawn by someone else meanwhile
+            // (a multiplexer reattaching, a terminal restoring a tab).
+            Event::FocusGained => self.repaint = true,
             _ => {}
         }
     }
@@ -1534,6 +1590,11 @@ impl App {
             if self.input.is_empty() && !self.turn_active {
                 self.quit = true;
             }
+            return;
+        }
+
+        if ctrl && matches!(key.code, KeyCode::Char('l') | KeyCode::Char('L')) {
+            self.repaint = true;
             return;
         }
 
@@ -3280,7 +3341,7 @@ impl App {
         }
     }
 
-    async fn shutdown(&mut self, _terminal: &mut Terminal<CrosstermBackend<Stdout>>) {
+    async fn shutdown(&mut self, _terminal: &mut Tty) {
         if self.turn_active {
             self.turn_cancel.cancel();
             if let Some(core) = self.core() {

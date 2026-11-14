@@ -1219,8 +1219,19 @@ cursor = "#c0caf5"
 - Tool cards: border by status, tool name, one-line argument summary, duration,
   output preview, expand key.
 - Errors: red card with code, message, and next action.
-- Streaming: re-render accumulated Markdown at most once per 30 ms. Incomplete
-  fences and lists render as plain text until closed.
+- Streaming: frames are drawn at most every 16 ms. The live reply is split at
+  its last settled block boundary (a blank line before a heading, paragraph,
+  or fence, outside any fence); the head is rendered once and only the tail is
+  re-parsed per frame. Incomplete fences and lists render as plain text until
+  closed.
+- Display safety (`ui/sanitize.rs`): every string that reaches the screen has
+  ANSI escapes stripped, tabs expanded, carriage returns resolved, and
+  width-ambiguous format characters (emoji variation selectors, zero-width
+  joiners, skin-tone modifiers, bidi controls) dropped, so ratatui's idea of
+  each cell matches the terminal's and no stale characters are left behind.
+- Output: frames go through one 256 KiB buffered write wrapped in
+  synchronized-update markers (DEC 2026). `Ctrl+L`, a resize, or regaining
+  focus clears the screen and repaints every cell.
 - Wrapping: pre-wrap styled spans to the viewport width and cache per width so
   scrolling is line-accurate. Long words are broken, not clipped.
 - Scroll: `PgUp`/`PgDn`, `Home`/`End`; auto-follow while streaming unless the
@@ -1250,6 +1261,7 @@ cursor = "#c0caf5"
   cursor within the textarea.
 - `Ctrl+C` cancels the current run; a second `Ctrl+C` quits.
 - `Ctrl+D` quits when the input is empty.
+- `Ctrl+L` redraws the whole screen.
 - Slash commands: `/help`, `/quit`, `/login`, `/model`, `/profile`, `/theme`,
   `/tree`, `/fork`, `/sessions`, `/compact`, `/tools`, `/skill`, `/workflow`,
   `/sec`, `/trust`, `/export`, `/clear`, `/debug`. `/login` validates and saves
@@ -1478,6 +1490,7 @@ src/
     tree.rs               /tree modal
     widgets.rs            header, tool card, diff, input
     render.rs             layout and drawing
+    sanitize.rs           make text safe to paint (escapes, tabs, emoji)
     input.rs              key handling, history, completion
     tui.rs                terminal setup/restore, event loop
   skills/                 bundled red/blue skill text (embedded)

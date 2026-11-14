@@ -16,6 +16,7 @@ pub mod media;
 pub mod paths;
 pub mod provider;
 pub mod sandbox;
+pub mod sanitize;
 pub mod security;
 pub mod session;
 pub mod skills;
