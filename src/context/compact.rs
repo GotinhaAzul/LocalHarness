@@ -10,6 +10,13 @@ pub const COMPACTION_BUDGET_MIN_CHARS: usize = 1200;
 /// A summary may never take more than this share of the usable prompt.
 pub const COMPACTION_MAX_PERCENT: usize = 40;
 pub const LAST_INSTRUCTION_CHARS: usize = 600;
+/// Share of the usable prompt (percent) an automatic compaction may keep as
+/// the verbatim recent exchange.
+pub const TAIL_MAX_PERCENT: usize = 20;
+/// Prefix of every message the harness writes into the user role (gate
+/// continuations, output-recovery nudges). Such a message is never the
+/// user's instruction.
+pub const HARNESS_PREFIX: &str = "[localharness]";
 
 /// Window-derived summary limits: a third of the usable prompt characters,
 /// clamped, plus the hard 40% ceiling.
@@ -69,19 +76,85 @@ struct ThreadInfo {
     facts: Vec<String>,
 }
 
+/// Character budget for the verbatim tail of an automatic compaction.
+pub fn tail_budget(budget: &TokenBudget) -> usize {
+    budget.chars_for(budget.usable_prompt()) * TAIL_MAX_PERCENT / 100
+}
+
+/// The first entry of the most recent exchange that fits in `max_chars`,
+/// for a compaction to keep verbatim after its summary.
+///
+/// Without a tail, a compaction in the middle of a run leaves the model a
+/// summary and nothing it just read, so it re-reads files and re-runs
+/// commands. The tail starts on a user or assistant entry, holds every tool
+/// result with its call, comes only from after the latest compaction, and
+/// never covers the whole context (that would compact nothing).
+pub fn recent_tail_start(session: &Session, max_chars: usize) -> Option<String> {
+    let branch = session.branch_entries();
+    let after = branch
+        .iter()
+        .rposition(|entry| entry.is_compaction())
+        .map_or(0, |pos| pos + 1);
+    let body = &branch[after..];
+    let first_message = body
+        .iter()
+        .position(|entry| matches!(entry.kind, EntryKind::User(_) | EntryKind::Assistant(_)))?;
+    let mut used = 0usize;
+    let mut start = None;
+    for (index, entry) in body.iter().enumerate().rev() {
+        used += entry_char_len(entry);
+        if used > max_chars {
+            break;
+        }
+        if index > first_message
+            && matches!(entry.kind, EntryKind::User(_) | EntryKind::Assistant(_))
+        {
+            start = Some(index);
+        }
+    }
+    let tail = &body[start?..];
+    let calls: std::collections::HashSet<&str> = tail
+        .iter()
+        .filter_map(|entry| entry.assistant())
+        .flat_map(|assistant| assistant.tool_calls.as_deref().unwrap_or_default())
+        .map(|call| call.id.as_str())
+        .collect();
+    let paired = tail.iter().all(|entry| match &entry.kind {
+        EntryKind::ToolResult(result) => calls.contains(result.call_id.as_str()),
+        _ => true,
+    });
+    paired.then(|| tail[0].id.clone())
+}
+
 /// Build a compaction summary for the active branch.
 pub fn build_summary(
     session: &Session,
     findings: Option<&FindingSummary>,
     budget: impl Into<SummaryBudget>,
 ) -> CompactionSummary {
+    build_summary_keeping(session, findings, budget, None)
+}
+
+/// Build a compaction summary for a compaction that keeps the entries from
+/// `keep_from` verbatim. Actions and the last instruction come only from
+/// before the kept range: the model sees the rest as they were.
+pub fn build_summary_keeping(
+    session: &Session,
+    findings: Option<&FindingSummary>,
+    budget: impl Into<SummaryBudget>,
+    keep_from: Option<&str>,
+) -> CompactionSummary {
     let budget = budget.into();
     let branch = session.branch_entries();
+    let kept_at = keep_from.and_then(|id| branch.iter().position(|entry| entry.id == id));
+    let summarized = &branch[..kept_at.unwrap_or(branch.len())];
     let thread = thread_info(session, &branch);
     let changed = changed_files(&branch);
     let verify = verify_status(&branch);
-    let actions = last_actions(session, &branch);
-    let instruction = last_instruction(&branch);
+    let actions = last_actions(session, summarized);
+    // The latest instruction, unless the kept range already shows it.
+    let instruction = last_instruction(&branch)
+        .filter(|_| kept_at.is_none_or(|kept| last_instruction(&branch[kept..]).is_none()));
 
     let mut title = thread
         .title
@@ -93,10 +166,17 @@ pub fn build_summary(
         title = "main".into();
     }
     let title = clip(&title, 100);
-    let objective = thread.objective.clone().unwrap_or_else(|| session.title());
+    let objective = thread
+        .objective
+        .clone()
+        .or_else(|| first_instruction(&branch))
+        .unwrap_or_else(|| session.title());
     let objective = clip(objective.trim(), 400);
 
-    let tokens_before: u64 = branch
+    // What this compaction replaces: the current context, not the whole
+    // branch with every earlier compaction's history.
+    let tokens_before: u64 = session
+        .context_path()
         .iter()
         .map(|entry| entry_char_len(entry))
         .sum::<usize>()
@@ -186,6 +266,9 @@ pub fn build_summary(
                 out.push_str(action);
                 out.push('\n');
             }
+        }
+        if kept_at.is_some() {
+            out.push_str("\n## Recent exchange\nkept verbatim below; continue from it.\n");
         }
         out.truncate(out.trim_end().len());
         out
@@ -307,11 +390,26 @@ fn verify_status(branch: &[&Entry]) -> Option<(bool, usize)> {
     None
 }
 
-fn last_instruction(branch: &[&Entry]) -> Option<String> {
-    branch.iter().rev().find_map(|entry| match &entry.kind {
-        EntryKind::User(user) => Some(user.content.clone()),
+/// User entries the user wrote, oldest first: harness continuations and
+/// nudges are stored in the user role but are not instructions.
+fn user_instructions<'a>(branch: &'a [&'a Entry]) -> impl DoubleEndedIterator<Item = &'a str> {
+    branch.iter().filter_map(|entry| match &entry.kind {
+        EntryKind::User(user) if !user.content.trim_start().starts_with(HARNESS_PREFIX) => {
+            Some(user.content.as_str())
+        }
         _ => None,
     })
+}
+
+fn last_instruction(branch: &[&Entry]) -> Option<String> {
+    user_instructions(branch).next_back().map(str::to_string)
+}
+
+/// The first line of the first user instruction on the branch.
+fn first_instruction(branch: &[&Entry]) -> Option<String> {
+    user_instructions(branch)
+        .find_map(|text| text.lines().map(str::trim).find(|line| !line.is_empty()))
+        .map(str::to_string)
 }
 
 fn last_actions(session: &Session, branch: &[&Entry]) -> Vec<String> {
@@ -359,7 +457,13 @@ fn last_actions(session: &Session, branch: &[&Entry]) -> Vec<String> {
 
 fn entry_char_len(entry: &Entry) -> usize {
     match &entry.kind {
-        EntryKind::User(u) => u.content.len(),
+        EntryKind::User(u) => {
+            u.content.len()
+                + u.attachments
+                    .iter()
+                    .map(|attachment| attachment.content.len())
+                    .sum::<usize>()
+        }
         EntryKind::Assistant(a) => {
             a.content.as_ref().map(|c| c.len()).unwrap_or(0)
                 + a.reasoning.as_ref().map(|r| r.len()).unwrap_or(0)
@@ -478,6 +582,114 @@ mod tests {
         assert!(summary.summary.contains("## Last instruction"));
         assert!(summary.summary.contains("bash(cargo test)"));
         assert!(summary.tokens_before > 0);
+    }
+
+    fn user(session: &mut Session, text: &str) -> String {
+        session
+            .append(EntryKind::User(UserData {
+                attachments: Vec::new(),
+                content: text.into(),
+            }))
+            .unwrap()
+            .id
+            .clone()
+    }
+
+    /// One assistant call and its result; returns the assistant entry id.
+    fn step(session: &mut Session, id: &str, command: &str, output: &str) -> String {
+        let entry = session
+            .append(EntryKind::Assistant(AssistantData {
+                content: None,
+                tool_calls: Some(vec![crate::session::ToolCall {
+                    id: id.into(),
+                    name: "bash".into(),
+                    arguments: json!({ "command": command }),
+                }]),
+                ..AssistantData::default()
+            }))
+            .unwrap();
+        session
+            .append(EntryKind::ToolResult(ToolResultData {
+                call_id: id.into(),
+                content: output.into(),
+                is_error: false,
+                details: None,
+                artifact: None,
+            }))
+            .unwrap();
+        entry.id.clone()
+    }
+
+    #[test]
+    fn tail_starts_on_a_step_boundary_and_never_covers_everything() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = session(dir.path());
+        user(&mut session, "fix the build");
+        let first_step = step(&mut session, "call_1", "cargo build", &"old ".repeat(400));
+        let recent = step(&mut session, "call_2", "cargo test", "2 failed");
+        // Room for the last step only: it starts at its assistant entry, so
+        // the result travels with its call.
+        assert_eq!(
+            recent_tail_start(&session, 200).as_deref(),
+            Some(recent.as_str())
+        );
+        // Room for everything: keeping it all would compact nothing.
+        assert_eq!(
+            recent_tail_start(&session, 100_000).as_deref(),
+            Some(first_step.as_str())
+        );
+        // Room for nothing.
+        assert_eq!(recent_tail_start(&session, 5), None);
+    }
+
+    #[test]
+    fn harness_nudges_are_not_the_last_instruction() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = session(dir.path());
+        user(&mut session, "Rename the config loader");
+        step(&mut session, "call_1", "cargo test", "ok");
+        user(
+            &mut session,
+            "[localharness] verify gate: files changed after the last passing verification.",
+        );
+        let summary = build_summary(&session, None, 4000);
+        assert!(
+            summary
+                .summary
+                .contains("## Last instruction (verbatim)\nRename the config loader"),
+            "{}",
+            summary.summary
+        );
+        assert!(
+            !summary.summary.contains("verify gate"),
+            "{}",
+            summary.summary
+        );
+    }
+
+    #[test]
+    fn a_kept_tail_is_not_repeated_in_the_summary() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = session(dir.path());
+        user(&mut session, "first task");
+        step(&mut session, "call_1", "cargo build", "built");
+        let user_entry = user(&mut session, "now run the tests");
+        let kept = step(&mut session, "call_2", "cargo test", "2 failed");
+        let summary = build_summary_keeping(&session, None, 4000, Some(&kept));
+        let text = &summary.summary;
+        assert!(text.contains("## Recent exchange"), "{text}");
+        assert!(text.contains("bash(cargo build)"), "{text}");
+        assert!(!text.contains("cargo test"), "kept action repeated: {text}");
+        // The latest instruction precedes the tail, so the summary keeps it.
+        assert!(text.contains("now run the tests"), "{text}");
+
+        // An instruction inside the tail is shown there, not in the summary.
+        let summary = build_summary_keeping(&session, None, 4000, Some(&user_entry));
+        assert!(
+            !summary.summary.contains("## Last instruction"),
+            "{}",
+            summary.summary
+        );
     }
 
     #[test]

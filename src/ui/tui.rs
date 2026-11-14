@@ -2525,6 +2525,7 @@ impl App {
                     tokens_before: summary.tokens_before,
                     reason: "manual".into(),
                     thread_id: None,
+                    keep_from: None,
                 }))
                 .map(|_| summary.tokens_before);
             let _ = session.fsync();

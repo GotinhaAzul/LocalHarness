@@ -354,6 +354,7 @@ mod tests {
                 tokens_before: 10,
                 reason: "manual".into(),
                 thread_id: None,
+                keep_from: None,
             }),
         ));
         tree.push(entry(
