@@ -205,7 +205,7 @@ lh --resume 20261107-201500-1234
 }
 ```
 
-The session root is the `cwd` the editor declares, and the path jail is always on. Every tool that can change files or run processes asks the editor first; a denial leaves no side effect, and an approval never widens a harness gate. Terminal access is not advertised and `terminal/*` requests get a typed refusal. See [docs/acp.md](docs/acp.md).
+The session root is the `cwd` the editor declares, and the path jail is always on for file tools. Every tool that can change files or run processes asks the editor first; a denial leaves no side effect, and an approval never widens a harness gate. `bash` and `bg` are processes, so their boundary is the permission prompt plus `--sandbox`. Terminal access is not advertised and a terminal request gets a typed refusal. See [docs/acp.md](docs/acp.md).
 
 ## 05 · Security, when you ask for it
 

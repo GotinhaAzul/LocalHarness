@@ -46,14 +46,16 @@ pub struct AcpOptions {
 
 pub(crate) struct Server {
     config: Config,
-    /// Canonical process working directory. A session rooted elsewhere runs
-    /// without project trust or that project's verify steps.
-    process_root: std::path::PathBuf,
+    /// Paths for the process working directory: config/data roots, the
+    /// `[session] dir` override, and the trust boundary.
+    process_paths: Paths,
     options: AcpOptions,
     out: UnboundedSender<String>,
     pub(crate) sessions: Mutex<HashMap<String, Arc<AcpSession>>>,
     /// Replies to reverse requests we sent (permission prompts).
     pub(crate) pending: Mutex<HashMap<String, oneshot::Sender<Value>>>,
+    /// In-flight prompt request id -> session id, for `$/cancel_request`.
+    pub(crate) prompts: Mutex<HashMap<String, String>>,
     next_request: AtomicU64,
 }
 
@@ -156,11 +158,12 @@ pub async fn run(config: Config, paths: Paths, options: AcpOptions) -> Result<i3
     let writer = tokio::spawn(writer(out_rx));
     let server = Arc::new(Server {
         config,
-        process_root: paths.cwd.clone(),
+        process_paths: paths,
         options,
         out,
         sessions: Mutex::new(HashMap::new()),
         pending: Mutex::new(HashMap::new()),
+        prompts: Mutex::new(HashMap::new()),
         next_request: AtomicU64::new(1),
     });
 
@@ -234,14 +237,26 @@ impl Server {
                 ("initialize", Some(id)) => {
                     self.response(id, initialize_result(&params, !self.options.no_session));
                 }
-                ("session/new", Some(id)) => match self.new_session(params).await {
-                    Ok(result) => self.response(id, result),
-                    Err(error) => self.error(id, error),
-                },
-                ("session/load", Some(id)) => match self.load_session(params).await {
-                    Ok(result) => self.response(id, result),
-                    Err(error) => self.error(id, error),
-                },
+                ("session/new", Some(id)) => {
+                    // Keep the reader free while runtime creation probes the
+                    // endpoint or connects MCP servers.
+                    let server = self.clone();
+                    tokio::spawn(async move {
+                        match server.new_session(params).await {
+                            Ok(result) => server.response(id, result),
+                            Err(error) => server.error(id, error),
+                        }
+                    });
+                }
+                ("session/load", Some(id)) => {
+                    let server = self.clone();
+                    tokio::spawn(async move {
+                        match server.load_session(params).await {
+                            Ok(result) => server.response(id, result),
+                            Err(error) => server.error(id, error),
+                        }
+                    });
+                }
                 ("session/prompt", Some(id)) => match self.start_prompt(id.clone(), params) {
                     Ok(()) => {}
                     Err(error) => self.error(id, error),
@@ -293,9 +308,21 @@ impl Server {
                 }
                 (method, None) => {
                     if method == "$/cancel_request" {
-                        // The client cancels one request by id; prompt turns
-                        // are cancelled through session/cancel.
-                        self.cancel(params);
+                        // The client cancels one request by id. This is the
+                        // protocol-level counterpart of session/cancel.
+                        if let Some(request_id) = params.get("requestId") {
+                            let key = id_key(request_id);
+                            let session_id = self
+                                .prompts
+                                .lock()
+                                .unwrap_or_else(|poison| poison.into_inner())
+                                .remove(&key);
+                            if let Some(session_id) = session_id
+                                && let Some(session) = self.session(&session_id)
+                            {
+                                session.cancel();
+                            }
+                        }
                     }
                 }
             }
@@ -360,7 +387,7 @@ impl Server {
     }
 }
 
-fn id_key(id: &Value) -> String {
+pub(crate) fn id_key(id: &Value) -> String {
     match id {
         // Our own reverse-request ids are strings; a client response echoes
         // them unchanged.

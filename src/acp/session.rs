@@ -79,11 +79,22 @@ impl Server {
     /// client cannot extend the project's trust to an arbitrary directory.
     fn session_config(&self, root: &std::path::Path) -> crate::config::Config {
         let mut config = self.config.clone();
-        if root != self.process_root {
+        if root != self.process_paths.cwd {
             config.trust = false;
             config.verify = crate::config::VerifyConfig::default();
         }
         config
+    }
+
+    /// Paths for a session root, keeping the process's config/data roots and
+    /// `[session] dir` override so ACP and the CLI see the same sessions.
+    fn session_paths(&self, root: &std::path::Path) -> Result<Paths, RpcError> {
+        let mut paths = Paths::discover(root)
+            .map_err(|error| RpcError::internal(format!("cannot prepare {root:?}: {error}")))?;
+        paths.config_dir = self.process_paths.config_dir.clone();
+        paths.data_dir = self.process_paths.data_dir.clone();
+        paths.sessions_dir_override = self.process_paths.sessions_dir_override.clone();
+        Ok(paths)
     }
 
     pub(crate) async fn new_session(self: &Arc<Self>, params: Value) -> Result<Value, RpcError> {
@@ -93,8 +104,7 @@ impl Server {
             .and_then(Value::as_str)
             .ok_or_else(|| RpcError::invalid_params("session/new requires an absolute cwd"))?;
         let root = declared_root(cwd)?;
-        let root_paths = Paths::discover(&root)
-            .map_err(|error| RpcError::internal(format!("cannot prepare {root:?}: {error}")))?;
+        let root_paths = self.session_paths(&root)?;
         let ignored_mcp = params
             .get("mcpServers")
             .and_then(Value::as_array)
@@ -114,7 +124,9 @@ impl Server {
             continue_last: false,
             approver: Some(approver),
         };
-        let runtime = create_runtime(self.session_config(&root), root_paths, options)
+        let session_config = self.session_config(&root);
+        let trusted = session_config.trust;
+        let runtime = create_runtime(session_config, root_paths, options)
             .await
             .map_err(|error| RpcError::internal(format!("cannot create a session: {error:#}")))?;
         let harness_id = lock_session(&runtime.core).id.clone();
@@ -137,20 +149,25 @@ impl Server {
             .unwrap_or_else(|poison| poison.into_inner())
             .insert(id.clone(), session);
 
-        let mut result = json!({"sessionId": id});
+        // Do not pretend client MCP servers were connected; the harness
+        // config owns MCP. `trusted` lets a client see which root policy ran.
+        let mut meta = json!({"trusted": trusted});
         if ignored_mcp > 0 {
-            // Do not pretend these were connected; the harness config owns MCP.
-            result["_meta"] = json!({
-                "localharness": {
-                    "ignoredMcpServers": ignored_mcp,
-                    "note": "client-supplied MCP servers are not connected in this version; configure them in the harness config",
-                }
-            });
+            meta["ignoredMcpServers"] = json!(ignored_mcp);
+            meta["note"] = json!(
+                "client-supplied MCP servers are not connected in this version; configure them in the harness config"
+            );
         }
-        Ok(result)
+        Ok(json!({"sessionId": id, "_meta": {"localharness": meta}}))
     }
 
     pub(crate) async fn load_session(self: &Arc<Self>, params: Value) -> Result<Value, RpcError> {
+        if self.options.no_session {
+            return Err(RpcError::unsupported(
+                "loadSession",
+                "session/load is unavailable with --no-session because nothing was persisted",
+            ));
+        }
         check_additional_directories(&params)?;
         let cwd = params
             .get("cwd")
@@ -173,8 +190,7 @@ impl Server {
                 data: json!({"code": "session_already_loaded", "sessionId": id}),
             });
         }
-        let root_paths = Paths::discover(&root)
-            .map_err(|error| RpcError::internal(format!("cannot prepare {root:?}: {error}")))?;
+        let root_paths = self.session_paths(&root)?;
         let file = root_paths.session_file(id);
         if !file.is_file() {
             return Err(RpcError::unknown_session(id));
@@ -194,7 +210,9 @@ impl Server {
             continue_last: false,
             approver: Some(approver),
         };
-        let runtime = create_runtime(self.config.clone(), root_paths, options)
+        let session_config = self.session_config(&root);
+        let trusted = session_config.trust;
+        let runtime = create_runtime(session_config, root_paths, options)
             .await
             .map_err(|error| {
                 RpcError::internal(format!("cannot load session {id:?}: {error:#}"))
@@ -213,44 +231,101 @@ impl Server {
             .insert(loaded_id.clone(), session.clone());
 
         self.replay(&session);
-        Ok(json!({"_meta": {"localharness": {"sessionId": loaded_id}}}))
+        Ok(json!({
+            "_meta": {"localharness": {"sessionId": loaded_id, "trusted": trusted}}
+        }))
     }
 
-    /// Replay user and assistant text so the editor sees the history it is
-    /// loading. Tool calls and results are not replayed.
+    /// Replay the active branch so the editor sees the history it is loading:
+    /// user and assistant text plus tool calls and their results.
     fn replay(&self, session: &AcpSession) {
-        let entries: Vec<(bool, String)> = {
+        let entries: Vec<EntryKind> = {
             let guard = lock_session(&session.core);
             guard
                 .branch_entries()
                 .into_iter()
-                .filter_map(|entry| match &entry.kind {
-                    EntryKind::User(user) => Some((true, user.content.clone())),
-                    EntryKind::Assistant(assistant) => assistant
+                .map(|entry| entry.kind.clone())
+                .collect()
+        };
+        let mut calls: std::collections::HashMap<String, (String, Value)> =
+            std::collections::HashMap::new();
+        for kind in entries {
+            match kind {
+                EntryKind::User(user) => {
+                    self.notify(
+                        "session/update",
+                        json!({
+                            "sessionId": session.id,
+                            "update": {
+                                "sessionUpdate": "user_message_chunk",
+                                "content": {"type": "text", "text": sanitize::display(&user.content)},
+                            }
+                        }),
+                    );
+                }
+                EntryKind::Assistant(assistant) => {
+                    if let Some(text) = assistant
                         .content
                         .as_deref()
                         .filter(|text| !text.trim().is_empty())
-                        .map(|text| (false, text.to_string())),
-                    _ => None,
-                })
-                .collect()
-        };
-        for (is_user, text) in entries {
-            let update = if is_user {
-                json!({
-                    "sessionUpdate": "user_message_chunk",
-                    "content": {"type": "text", "text": sanitize::display(&text)},
-                })
-            } else {
-                json!({
-                    "sessionUpdate": "agent_message_chunk",
-                    "content": {"type": "text", "text": sanitize::display(&text)},
-                })
-            };
-            self.notify(
-                "session/update",
-                json!({"sessionId": session.id, "update": update}),
-            );
+                    {
+                        self.notify(
+                            "session/update",
+                            json!({
+                                "sessionId": session.id,
+                                "update": {
+                                    "sessionUpdate": "agent_message_chunk",
+                                    "content": {"type": "text", "text": sanitize::display(text)},
+                                }
+                            }),
+                        );
+                    }
+                    for call in assistant.tool_calls.unwrap_or_default() {
+                        self.notify(
+                            "session/update",
+                            json!({
+                                "sessionId": session.id,
+                                "update": {
+                                    "sessionUpdate": "tool_call",
+                                    "toolCallId": call.id,
+                                    "title": sanitize::display(&permission_title(&call.name, &call.arguments, None)).to_string(),
+                                    "name": call.name,
+                                    "kind": tool_kind(&call.name),
+                                    "status": "in_progress",
+                                    "rawInput": sanitize_value(&call.arguments),
+                                }
+                            }),
+                        );
+                        calls.insert(call.id, (call.name, call.arguments));
+                    }
+                }
+                EntryKind::ToolResult(result) => {
+                    if let Some((name, _)) = calls.get(&result.call_id) {
+                        let preview: String = sanitize::display(&result.content)
+                            .to_string()
+                            .chars()
+                            .take(2_000)
+                            .collect();
+                        self.notify(
+                            "session/update",
+                            json!({
+                                "sessionId": session.id,
+                                "update": {
+                                    "sessionUpdate": "tool_call_update",
+                                    "toolCallId": result.call_id,
+                                    "name": name,
+                                    "status": if result.is_error { "failed" } else { "completed" },
+                                    "content": [{
+                                        "type": "content",
+                                        "content": {"type": "text", "text": preview},
+                                    }],
+                                }
+                            }),
+                        );
+                    }
+                }
+                _ => {}
+            }
         }
     }
 
@@ -272,9 +347,14 @@ impl Server {
         let cancel = session.begin()?;
         let server = self.clone();
         let session_id = session.id.clone();
+        let prompt_key = super::id_key(&request_id);
+        self.prompts
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .insert(prompt_key.clone(), session_id.clone());
         tokio::spawn(async move {
             server
-                .drive_turn(session, session_id, request_id, text, cancel)
+                .drive_turn(session, session_id, request_id, prompt_key, text, cancel)
                 .await;
         });
         Ok(())
@@ -285,6 +365,7 @@ impl Server {
         session: Arc<AcpSession>,
         session_id: String,
         request_id: Value,
+        prompt_key: String,
         text: String,
         cancel: CancellationToken,
     ) {
@@ -294,11 +375,33 @@ impl Server {
         let handle = tokio::spawn(async move { run_turn(core, text, tx, cancel_turn).await });
 
         let mut outcome: Option<TurnOutcome> = None;
+        let mut text_stream = StreamText::default();
+        let mut reasoning_stream = StreamText::default();
         while let Some(event) = rx.recv().await {
-            if let AgentEvent::TurnDone(result) = &event {
-                outcome = Some(result.clone());
+            match event {
+                AgentEvent::TextDelta(delta) => {
+                    let text = text_stream.push(&delta);
+                    if !text.is_empty() {
+                        self.send_text(&session_id, "agent_message_chunk", &text);
+                    }
+                }
+                AgentEvent::ReasoningDelta(delta) => {
+                    let text = reasoning_stream.push(&delta);
+                    if !text.is_empty() {
+                        self.send_text(&session_id, "agent_thought_chunk", &text);
+                    }
+                }
+                AgentEvent::TurnDone(result) => outcome = Some(result),
+                other => self.forward_event(&session_id, other),
             }
-            self.forward_event(&session_id, event);
+        }
+        let tail = text_stream.finish();
+        if !tail.is_empty() {
+            self.send_text(&session_id, "agent_message_chunk", &tail);
+        }
+        let reasoning_tail = reasoning_stream.finish();
+        if !reasoning_tail.is_empty() {
+            self.send_text(&session_id, "agent_thought_chunk", &reasoning_tail);
         }
         let outcome = match (outcome, handle.await) {
             (Some(outcome), _) => outcome,
@@ -309,6 +412,28 @@ impl Server {
             },
         };
         session.finish();
+        self.prompts
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .remove(&prompt_key);
+
+        // A provider, session, or panic failure is a protocol error, not a
+        // refusal: the client should be able to retry the same conversation.
+        if outcome.status == TurnStatus::Error {
+            let (code, message) = outcome
+                .error
+                .clone()
+                .unwrap_or_else(|| ("turn_failed".into(), "the turn failed".into()));
+            self.error(
+                request_id,
+                RpcError {
+                    code: -32000,
+                    message: sanitize::display(&message).to_string(),
+                    data: json!({"code": code, "status": "error"}),
+                },
+            );
+            return;
+        }
 
         let stop_reason = stop_reason(outcome.status);
         let mut meta = json!({
@@ -326,28 +451,21 @@ impl Server {
         );
     }
 
+    fn send_text(&self, session_id: &str, kind: &str, text: &str) {
+        self.notify(
+            "session/update",
+            json!({
+                "sessionId": session_id,
+                "update": {
+                    "sessionUpdate": kind,
+                    "content": {"type": "text", "text": text},
+                }
+            }),
+        );
+    }
+
     fn forward_event(&self, session_id: &str, event: AgentEvent) {
         let update = match event {
-            AgentEvent::TextDelta(text) => {
-                let text = sanitize::display(&text);
-                if text.is_empty() {
-                    return;
-                }
-                json!({
-                    "sessionUpdate": "agent_message_chunk",
-                    "content": {"type": "text", "text": text},
-                })
-            }
-            AgentEvent::ReasoningDelta(text) => {
-                let text = sanitize::display(&text);
-                if text.is_empty() {
-                    return;
-                }
-                json!({
-                    "sessionUpdate": "agent_thought_chunk",
-                    "content": {"type": "text", "text": text},
-                })
-            }
             AgentEvent::ToolStarted {
                 call_id,
                 name,
@@ -355,7 +473,12 @@ impl Server {
             } => json!({
                 "sessionUpdate": "tool_call",
                 "toolCallId": call_id,
-                "title": permission_title(&name, &Value::Null, Some(&summary)),
+                "title": sanitize::display(&permission_title(
+                    &name,
+                    &Value::Null,
+                    Some(&summary)
+                ))
+                .to_string(),
                 "name": name,
                 "kind": tool_kind(&name),
                 "status": "in_progress",
@@ -408,6 +531,63 @@ fn lock_session(core: &Core) -> std::sync::MutexGuard<'_, crate::session::Sessio
     core.session
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())
+}
+
+/// Sanitize streamed text without letting an escape sequence split across
+/// two model deltas reach the client as visible garbage.
+#[derive(Default)]
+struct StreamText {
+    pending: String,
+}
+
+impl StreamText {
+    fn push(&mut self, delta: &str) -> String {
+        self.pending.push_str(delta);
+        let split = complete_prefix(&self.pending);
+        let ready = self.pending[..split].to_string();
+        self.pending = self.pending[split..].to_string();
+        sanitize::display(&ready).to_string()
+    }
+
+    /// Flush at the end of a turn. An incomplete escape sequence is dropped
+    /// rather than shown.
+    fn finish(&mut self) -> String {
+        let pending = std::mem::take(&mut self.pending);
+        if pending.is_empty() || complete_prefix(&pending) != pending.len() {
+            return String::new();
+        }
+        sanitize::display(&pending).to_string()
+    }
+}
+
+fn complete_prefix(text: &str) -> usize {
+    let Some(position) = text.rfind('\u{1b}') else {
+        return text.len();
+    };
+    if escape_complete(&text[position..]) {
+        text.len()
+    } else {
+        position
+    }
+}
+
+fn escape_complete(tail: &str) -> bool {
+    let mut chars = tail.chars();
+    if chars.next() != Some('\u{1b}') {
+        return true;
+    }
+    match chars.next() {
+        None => false,
+        // CSI: final byte is 0x40..=0x7e.
+        Some('[') => chars.any(|c| ('\u{40}'..='\u{7e}').contains(&c)),
+        // OSC: BEL or ST terminates.
+        Some(']') => {
+            let rest = &tail[2..];
+            rest.contains('\u{7}') || rest.contains("\u{1b}\\")
+        }
+        // A two-byte escape is complete once the second byte arrived.
+        Some(_) => true,
+    }
 }
 
 fn stop_reason(status: TurnStatus) -> &'static str {
@@ -522,6 +702,11 @@ impl ToolApprover for AcpApprover {
             return ToolApproval::Deny("the ACP session is gone".into());
         };
         let cancel = session.token();
+        if cancel.is_cancelled() {
+            return ToolApproval::Deny(
+                "the turn was cancelled before permission was requested".into(),
+            );
+        }
         let request_id = server.next_request_id();
         let (tx, rx) = oneshot::channel();
         server
@@ -543,7 +728,9 @@ impl ToolApprover for AcpApprover {
             } else {
                 session.root.join(raw)
             };
-            tool_call["locations"] = json!([{"path": path.display().to_string()}]);
+            tool_call["locations"] = json!([{
+                "path": sanitize::display(&path.display().to_string()).to_string(),
+            }]);
         }
         server.send_request(
             request_id.clone(),
@@ -633,5 +820,45 @@ fn tool_kind(name: &str) -> &'static str {
         "bash" | "bg" | "verify" | "test" => "execute",
         "todo" | "thread" | "skill" => "think",
         _ => "other",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn streamed_escapes_are_held_until_complete() {
+        let mut stream = StreamText::default();
+        assert_eq!(stream.push("hello \u{1b}"), "hello ");
+        assert_eq!(stream.push("[31m"), "");
+        assert_eq!(stream.push("red"), "red");
+        assert_eq!(stream.finish(), "");
+    }
+
+    #[test]
+    fn an_unfinished_escape_at_the_end_is_dropped() {
+        let mut stream = StreamText::default();
+        assert_eq!(stream.push("before \u{1b}]0;title"), "before ");
+        assert_eq!(stream.finish(), "", "the payload must not leak as text");
+    }
+
+    #[test]
+    fn complete_osc_and_csi_sequences_are_removed() {
+        let mut stream = StreamText::default();
+        let out = stream.push("a\u{1b}]0;title\u{7}b\u{1b}[2Jc");
+        assert_eq!(out, "abc");
+        assert_eq!(stream.finish(), "");
+    }
+
+    #[test]
+    fn stop_reasons_cover_every_turn_status() {
+        assert_eq!(stop_reason(TurnStatus::Done), "end_turn");
+        assert_eq!(stop_reason(TurnStatus::Cancelled), "cancelled");
+        assert_eq!(stop_reason(TurnStatus::Budget), "max_tokens");
+        assert_eq!(stop_reason(TurnStatus::ContextTruncated), "max_tokens");
+        assert_eq!(stop_reason(TurnStatus::Stalled), "max_turn_requests");
+        assert_eq!(stop_reason(TurnStatus::Blocked), "refusal");
+        assert_eq!(stop_reason(TurnStatus::Error), "refusal");
     }
 }

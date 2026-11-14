@@ -273,6 +273,11 @@ pub async fn run(cli: Cli) -> Result<i32> {
     }
 
     if matches!(&cli.command, Some(Command::Acp)) {
+        if cli.print.is_some() || cli.json || cli.continue_last || cli.resume.is_some() {
+            bail!(
+                "`lh acp` is a stdio server; --print, --json, --continue, and --resume do not apply"
+            );
+        }
         let options = crate::acp::AcpOptions {
             engagement: cli.engagement.clone(),
             // ACP sessions must be resumable; an ephemeral session cannot

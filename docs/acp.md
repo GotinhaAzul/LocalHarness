@@ -58,11 +58,13 @@ the settings; Zed detects the file without a restart.
 | `session/new` | Creates one harness runtime rooted at the absolute `cwd` the client declares. Returns the harness session id. |
 | `session/load` | Reopens a session file under that root and replays user and assistant text as `session/update`. |
 | `session/prompt` | Runs one turn, streams `session/update`, and returns the stop reason when it settles. |
-| `session/cancel` | Cancels the running turn; its response is `cancelled`. |
+| `session/cancel` | A notification that cancels the running turn; the in-flight `session/prompt` response is `cancelled`. |
 
 `session/update` carries `agent_message_chunk`, `agent_thought_chunk`,
 `tool_call`, and `tool_call_update`. Every string is stripped of ANSI and OSC
-control sequences with the same `sanitize::display` used by the TUI.
+control sequences with the same `sanitize::display` used by the TUI. Streamed
+deltas are buffered when an escape sequence straddles two chunks, so its
+payload never reaches the client as visible text.
 
 Stop reasons match the CLI's turn status:
 
@@ -72,10 +74,13 @@ Stop reasons match the CLI's turn status:
 | cancelled | `cancelled` |
 | budget or context truncated | `max_tokens` |
 | stalled | `max_turn_requests` |
-| error or blocked | `refusal` |
+| blocked | `refusal` |
+| error | a JSON-RPC error (`-32000`) |
 
-The response `_meta.localharness` carries the exact harness status and error
-code for clients that want more than the protocol's vocabulary.
+An errored turn is a protocol error rather than `refusal`, so a transient
+endpoint failure does not tell the client to drop the conversation. The exact
+harness status and error code ride in `_meta.localharness` (or the error
+`data`).
 
 ## Roots
 
@@ -97,9 +102,10 @@ arbitrary directory. Launch `lh acp` in the project root (or pass
 
 Every tool call that can change files or run processes asks the client with
 `session/request_permission`: `write`, `edit`, `patch`, `undo`, `bash`, `bg`,
-`verify`, `test`, and external tools. Read-only tools (`read`, `grep`, `glob`,
-`review`, `repo_map`, …) and session-only bookkeeping (`todo`, `thread`) run
-without a prompt.
+`verify`, `test`, and external tools. Only the built-in read and session tools
+(`read`, `grep`, `glob`, `repo_map`, `recall`, `review`, `lsp`, `skill`,
+`todo`, `thread`) run without a prompt; a tool that merely declares itself
+read-only, such as an MCP server, still asks.
 
 The two options are `allow_once` and `reject_once`. A denial is final for that
 call and leaves no filesystem or process side effect: the tool does not run. A
@@ -111,6 +117,11 @@ and cannot be relaxed by the client:
 - the security scope gate still blocks an out-of-scope command;
 - the sandbox, tool allowlist, budget, and settle gates still apply.
 
+`bash` and `bg` are processes, not path arguments: the path jail does not
+confine them. Their boundary is the permission prompt plus the configured
+sandbox (`--sandbox`). Run editors with `--sandbox workspace-write` when the
+client should be able to run commands but not write outside the root.
+
 The decision is per call and is not remembered across calls or turns.
 
 ## Unsupported in this iteration
@@ -118,10 +129,14 @@ The decision is per call and is not remembered across calls or turns.
 These return a typed error with `error.data.code = "unsupported_capability"`
 rather than a silent success:
 
-- `terminal/*` reverse requests (terminal access is not advertised or granted);
-- client `fs/read_text_file` and `fs/write_text_file` requests;
+- terminal access: it is not advertised, the agent never calls `terminal/*`,
+  and a client that sends one of those reverse-request names to the agent gets
+  the typed refusal;
+- `fs/read_text_file` and `fs/write_text_file` sent to the agent (the agent
+  reads and writes through its own tools and path jail);
 - `additionalDirectories`;
 - image and audio prompt blocks, and binary embedded resources.
+- `session/load` when the server was started with `--no-session`.
 
 Client-supplied `mcpServers` are not connected. Configure MCP servers in the
 harness config (`[mcp.<name>]`) instead; `session/new` reports the ignored count
@@ -131,5 +146,7 @@ in `_meta.localharness` rather than claiming they are available.
 
 `tests/acp.rs` drives the real binary over stdio against a scripted endpoint. It
 covers initialization, session creation, a streamed prompt, cancellation,
-session load and replay, root enforcement, a denied permission with no side
-effect, and the typed terminal refusal.
+cancel while a permission is pending, session load and replay, root enforcement
+(absolute paths and symlinks), a denied permission with no side effect, a
+permission gate that is never reached for a denied path, concurrent prompts,
+malformed JSON, sanitization, and the typed terminal refusal.

@@ -26,8 +26,15 @@ const TIMEOUT: Duration = Duration::from_secs(20);
 #[derive(Clone)]
 enum Script {
     Text(String),
-    Tool { name: String, args: Value },
+    /// Content deltas sent as separate SSE frames, so an escape sequence can
+    /// straddle two chunks.
+    Split(Vec<String>),
+    Tool {
+        name: String,
+        args: Value,
+    },
     Slow,
+    Fail,
 }
 
 #[derive(Clone, Default)]
@@ -67,6 +74,17 @@ async fn chat(State(fake): State<Fake>, body: String) -> Response {
             ],
             false,
         ),
+        Script::Split(parts) => {
+            let mut frames: Vec<String> = parts
+                .into_iter()
+                .map(|part| sse(json!({"choices":[{"delta":{"content": part}}]})))
+                .collect();
+            frames.push(sse(
+                json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
+            ));
+            frames.push("data: [DONE]\n\n".to_string());
+            (frames, false)
+        }
         Script::Tool { name, args } => (
             vec![
                 sse(json!({"choices":[{"delta":{"tool_calls":[{
@@ -79,6 +97,18 @@ async fn chat(State(fake): State<Fake>, body: String) -> Response {
             ],
             false,
         ),
+        Script::Fail => {
+            return Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .header(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/json"),
+                )
+                .body(Body::from(
+                    r#"{"error":{"message":"scripted provider failure"}}"#,
+                ))
+                .unwrap();
+        }
         Script::Slow => {
             let mut frames: Vec<String> = (0..200)
                 .map(|index| {
@@ -187,6 +217,8 @@ impl Client {
             .env_remove("LH_API_KEY")
             .env_remove("LH_PROFILE")
             .env_remove("LH_TRUST")
+            .env_remove("LH_NO_SESSION")
+            .env_remove("LH_DEBUG_CONTENT")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -215,7 +247,11 @@ impl Client {
     }
 
     async fn send(&mut self, message: Value) {
-        let mut line = message.to_string();
+        self.send_raw(&message.to_string()).await;
+    }
+
+    async fn send_raw(&mut self, line: &str) {
+        let mut line = line.to_string();
         line.push('\n');
         self.stdin.write_all(line.as_bytes()).await.unwrap();
         self.stdin.flush().await.unwrap();
@@ -382,6 +418,257 @@ async fn initialize_and_new_session_negotiate_capabilities() {
 }
 
 #[tokio::test]
+async fn ansi_and_osc_never_reach_the_client() {
+    let (base, _fake) = spawn_endpoint(vec![
+        Script::Split(vec![
+            "safe \u{1b}".into(),
+            "]0;pwn\u{7}".into(),
+            "done".into(),
+        ]),
+        Script::Tool {
+            name: "write".into(),
+            args: json!({
+                "path": "\u{1b}]0;pwn\u{7}file.txt",
+                "content": "x",
+            }),
+        },
+        Script::Text("finish".into()),
+    ])
+    .await;
+    let (_dir, root) = workdir();
+    let mut client = Client::spawn(&base, &root).await;
+    client
+        .request(
+            1,
+            "initialize",
+            json!({"protocolVersion": 1}),
+            Permission::Allow,
+        )
+        .await;
+    let session = client.new_session(2, &root).await;
+
+    let (response, notifications) = client
+        .request(
+            3,
+            "session/prompt",
+            json!({"sessionId": session, "prompt": [{"type": "text", "text": "go"}]}),
+            Permission::Allow,
+        )
+        .await;
+    assert_eq!(response["result"]["stopReason"], "end_turn", "{response}");
+    let text = updates(&notifications, "agent_message_chunk")
+        .iter()
+        .map(text_of)
+        .collect::<String>();
+    assert!(text.contains("safe"), "{text}");
+    assert!(text.contains("done"), "{text}");
+    assert!(!text.contains('\u{1b}'), "{text}");
+    assert!(!text.contains("pwn"), "{text}");
+
+    let (response, notifications) = client
+        .request(
+            4,
+            "session/prompt",
+            json!({"sessionId": session, "prompt": [{"type": "text", "text": "write"}]}),
+            Permission::Allow,
+        )
+        .await;
+    assert_eq!(response["result"]["stopReason"], "end_turn", "{response}");
+    let serialized = serde_json::to_string(&notifications).unwrap();
+    assert!(!serialized.contains("\u{1b}"), "{serialized}");
+    assert!(!serialized.contains("pwn"), "{serialized}");
+}
+
+#[tokio::test]
+async fn a_foreign_root_is_untrusted_even_when_launched_with_trust() {
+    let (base, _fake) = spawn_endpoint(vec![]).await;
+    let (dir, root) = workdir();
+    let other = dir.path().join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    let mut client = Client::spawn_with(&base, &root, &["--trust"]).await;
+    client
+        .request(
+            1,
+            "initialize",
+            json!({"protocolVersion": 1}),
+            Permission::Allow,
+        )
+        .await;
+
+    let (response, _) = client
+        .request(
+            2,
+            "session/new",
+            json!({"cwd": root.display().to_string(), "mcpServers": []}),
+            Permission::Allow,
+        )
+        .await;
+    assert_eq!(
+        response["result"]["_meta"]["localharness"]["trusted"], true,
+        "{response}"
+    );
+
+    let (response, _) = client
+        .request(
+            3,
+            "session/new",
+            json!({"cwd": other.display().to_string(), "mcpServers": []}),
+            Permission::Allow,
+        )
+        .await;
+    assert_eq!(
+        response["result"]["_meta"]["localharness"]["trusted"], false,
+        "a root outside the process working directory must not inherit trust: {response}"
+    );
+}
+
+#[tokio::test]
+async fn absolute_paths_and_symlinks_cannot_escape_the_root() {
+    let (base, _fake) = spawn_endpoint(vec![
+        Script::Tool {
+            name: "write".into(),
+            args: json!({"path": "/etc/localharness-acp-escape", "content": "nope"}),
+        },
+        Script::Text("one".into()),
+        Script::Tool {
+            name: "write".into(),
+            args: json!({"path": "link/escaped.txt", "content": "nope"}),
+        },
+        Script::Text("two".into()),
+    ])
+    .await;
+    let (dir, root) = workdir();
+    let outside = dir.path().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+    let mut client = Client::spawn(&base, &root).await;
+    client
+        .request(
+            1,
+            "initialize",
+            json!({"protocolVersion": 1}),
+            Permission::Allow,
+        )
+        .await;
+    let session = client.new_session(2, &root).await;
+
+    for id in [3, 4] {
+        let (response, _) = client
+            .request(
+                id,
+                "session/prompt",
+                json!({
+                    "sessionId": session,
+                    "prompt": [{"type": "text", "text": "write outside"}],
+                }),
+                Permission::Allow,
+            )
+            .await;
+        assert_eq!(response["result"]["stopReason"], "end_turn", "{response}");
+    }
+    assert!(!std::path::Path::new("/etc/localharness-acp-escape").exists());
+    assert!(!outside.join("escaped.txt").exists());
+    assert_eq!(
+        client.permissions.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the path gate must refuse before a permission prompt"
+    );
+}
+
+#[tokio::test]
+async fn a_second_prompt_on_one_session_is_rejected() {
+    let (base, _fake) = spawn_endpoint(vec![Script::Slow]).await;
+    let (_dir, root) = workdir();
+    let mut client = Client::spawn(&base, &root).await;
+    client
+        .request(
+            1,
+            "initialize",
+            json!({"protocolVersion": 1}),
+            Permission::Allow,
+        )
+        .await;
+    let session = client.new_session(2, &root).await;
+
+    client
+        .send(json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "session/prompt",
+            "params": {"sessionId": session, "prompt": [{"type": "text", "text": "one"}]},
+        }))
+        .await;
+    client
+        .send(json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "session/prompt",
+            "params": {"sessionId": session, "prompt": [{"type": "text", "text": "two"}]},
+        }))
+        .await;
+
+    loop {
+        let message = client.read().await;
+        if message.get("method").is_none() && message.get("id") == Some(&json!(4)) {
+            assert_eq!(message["error"]["data"]["code"], "session_busy");
+            break;
+        }
+    }
+    client
+        .send(json!({
+            "jsonrpc": "2.0",
+            "method": "session/cancel",
+            "params": {"sessionId": session},
+        }))
+        .await;
+    loop {
+        let message = client.read().await;
+        if message.get("method").is_none() && message.get("id") == Some(&json!(3)) {
+            assert_eq!(message["result"]["stopReason"], "cancelled", "{message}");
+            break;
+        }
+    }
+}
+
+#[tokio::test]
+async fn malformed_json_is_a_parse_error() {
+    let (base, _fake) = spawn_endpoint(vec![]).await;
+    let (_dir, root) = workdir();
+    let mut client = Client::spawn(&base, &root).await;
+    client.send_raw("this is not json").await;
+    let message = client.read().await;
+    assert_eq!(message["error"]["code"], -32700, "{message}");
+}
+
+#[tokio::test]
+async fn a_turn_error_is_a_jsonrpc_error_not_a_refusal() {
+    let (base, _fake) = spawn_endpoint(vec![Script::Fail]).await;
+    let (_dir, root) = workdir();
+    let mut client = Client::spawn(&base, &root).await;
+    client
+        .request(
+            1,
+            "initialize",
+            json!({"protocolVersion": 1}),
+            Permission::Allow,
+        )
+        .await;
+    let session = client.new_session(2, &root).await;
+    let (response, _) = client
+        .request(
+            3,
+            "session/prompt",
+            json!({"sessionId": session, "prompt": [{"type": "text", "text": "go"}]}),
+            Permission::Allow,
+        )
+        .await;
+    assert_eq!(response["error"]["code"], -32000, "{response}");
+    assert_eq!(response["error"]["data"]["status"], "error", "{response}");
+    assert!(response.get("result").is_none(), "{response}");
+}
+
+#[tokio::test]
 async fn a_prompt_streams_text_and_ends_the_turn() {
     let (base, fake) = spawn_endpoint(vec![Script::Text("Hello from ACP".into())]).await;
     let (_dir, root) = workdir();
@@ -487,12 +774,34 @@ async fn ephemeral_sessions_get_distinct_ids() {
     let first = client.new_session(2, &root).await;
     let second = client.new_session(3, &root).await;
     assert_ne!(first, second, "ephemeral ACP sessions must not share an id");
+
+    let (response, _) = client
+        .request(
+            4,
+            "session/load",
+            json!({"sessionId": first, "cwd": root.display().to_string(), "mcpServers": []}),
+            Permission::Allow,
+        )
+        .await;
+    assert_eq!(
+        response["error"]["data"]["code"], "unsupported_capability",
+        "{response}"
+    );
+    assert_eq!(response["error"]["data"]["capability"], "loadSession");
 }
 
 #[tokio::test]
 async fn session_load_replays_the_conversation() {
-    let (base, _fake) = spawn_endpoint(vec![Script::Text("remembered answer".into())]).await;
+    let (base, _fake) = spawn_endpoint(vec![
+        Script::Tool {
+            name: "read".into(),
+            args: json!({"path": "file.txt"}),
+        },
+        Script::Text("remembered answer".into()),
+    ])
+    .await;
     let (_dir, root) = workdir();
+    std::fs::write(root.join("file.txt"), "hello\n").unwrap();
     let mut first = Client::spawn(&base, &root).await;
     first
         .request(
@@ -550,6 +859,66 @@ async fn session_load_replays_the_conversation() {
             .iter()
             .any(|chunk| text_of(chunk) == "remembered answer"),
         "{notifications:?}"
+    );
+}
+
+#[tokio::test]
+async fn cancel_while_waiting_for_permission_leaves_no_side_effect() {
+    let marker = "cancel-marker.txt";
+    let (base, _fake) = spawn_endpoint(vec![
+        Script::Tool {
+            name: "bash".into(),
+            args: json!({"command": format!("touch {marker}")}),
+        },
+        Script::Text("done".into()),
+    ])
+    .await;
+    let (_dir, root) = workdir();
+    let mut client = Client::spawn(&base, &root).await;
+    client
+        .request(
+            1,
+            "initialize",
+            json!({"protocolVersion": 1}),
+            Permission::Allow,
+        )
+        .await;
+    let session = client.new_session(2, &root).await;
+    client
+        .send(json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "session/prompt",
+            "params": {"sessionId": session, "prompt": [{"type": "text", "text": "touch it"}]},
+        }))
+        .await;
+
+    let mut asked = false;
+    let stop;
+    loop {
+        let message = client.read().await;
+        if message.get("method").and_then(Value::as_str) == Some("session/request_permission") {
+            asked = true;
+            assert!(!root.join(marker).exists(), "nothing runs before approval");
+            client
+                .send(json!({
+                    "jsonrpc": "2.0",
+                    "method": "session/cancel",
+                    "params": {"sessionId": session},
+                }))
+                .await;
+            continue;
+        }
+        if message.get("method").is_none() && message.get("id") == Some(&json!(3)) {
+            stop = message;
+            break;
+        }
+    }
+    assert!(asked, "the tool call must have reached the permission gate");
+    assert_eq!(stop["result"]["stopReason"], "cancelled", "{stop}");
+    assert!(
+        !root.join(marker).exists(),
+        "a cancelled permission request must not run the command"
     );
 }
 

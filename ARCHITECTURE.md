@@ -1182,7 +1182,7 @@ input characters. Missing input and unreadable files return prescriptive errors.
 
 ---
 
-## 9. TUI
+## 9. Interfaces: TUI, headless, and ACP
 
 ### 9.1 Layout
 
@@ -1369,17 +1369,24 @@ non-read-only tool call.
   tools run with the path jail on, so `..` and absolute paths outside the root
   are refused. `additionalDirectories` is refused rather than ignored.
 - The permission callback is a `ToolApprover` on `Core`. It runs after the
-  read-first, todo, scope, and path gates and can only deny. An ACP approval
-  never widens policy, and a denial prevents the tool call from running.
+  harness gates and can only deny. An ACP approval never widens policy, and a
+  denial prevents the tool call from running. `bash` and `bg` are process
+  tools, so the path jail does not confine them; the prompt and `--sandbox`
+  are their boundary.
 - Terminal access is not advertised; `terminal/*` and client `fs/*` requests
   return `unsupported_capability`. Prompt image and audio blocks are refused
   for the same reason.
 - Stop reasons map from `TurnStatus`: done → `end_turn`, cancelled →
-  `cancelled`, budget/context → `max_tokens`, stalled →
-  `max_turn_requests`, error/blocked → `refusal`. The exact status and error
-  code ride in `_meta.localharness`.
+  `cancelled`, budget/context → `max_tokens`, stalled → `max_turn_requests`,
+  blocked → `refusal`. A turn error is a JSON-RPC error (`-32000`) so a
+  transient endpoint failure does not make the client drop the conversation;
+  the exact status and code ride in the error data and `_meta.localharness`.
 - Agent text is passed through `sanitize::display` before it reaches the
-  client, so ANSI/OSC sequences cannot reach the editor's renderer.
+  client. Streamed deltas are buffered across chunk boundaries so an escape
+  sequence cannot be split into visible payload, and tool titles, arguments,
+  locations, and previews are sanitized too.
+- `session/new` and `session/load` run in a task so the reader stays free for
+  `session/cancel` and permission replies from other sessions.
 - `tests/acp.rs` drives the binary over stdio against a scripted endpoint.
 
 ---
