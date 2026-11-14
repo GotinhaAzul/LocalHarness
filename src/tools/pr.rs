@@ -181,14 +181,31 @@ pub enum Verification {
     Passed(Vec<String>),
     /// The last verify failed at this step.
     Failed(String),
-    /// Files changed after the last verify.
+    /// Files changed after the last verify, or the commits differ from the
+    /// content it checked.
     Stale,
     /// Verify never ran on this branch.
     Missing,
 }
 
-pub fn verification(session: &Session) -> Verification {
+/// The verification state for the commits at HEAD in `cwd`: a passing
+/// verify counts only when HEAD holds the content it ran against.
+pub fn verification(session: &Session, cwd: &Path) -> Verification {
+    let (result, tree) = recorded_verification(session);
+    match (result, tree) {
+        (Verification::Passed(steps), Some(tree)) if git::head_matches_tree(cwd, &tree) => {
+            Verification::Passed(steps)
+        }
+        (Verification::Passed(_), _) => Verification::Stale,
+        (other, _) => other,
+    }
+}
+
+/// The latest verify on the branch as the session recorded it, with the
+/// content tree it ran against.
+fn recorded_verification(session: &Session) -> (Verification, Option<String>) {
     let mut result = Verification::Missing;
+    let mut tree = None;
     for entry in session.branch_entries() {
         let EntryKind::Custom(custom) = &entry.kind else {
             continue;
@@ -197,6 +214,11 @@ pub fn verification(session: &Session) -> Verification {
             "fs-change" if result != Verification::Missing => result = Verification::Stale,
             "verify-result" => {
                 let passed = custom.payload.get("passed").and_then(Value::as_bool) == Some(true);
+                tree = custom
+                    .payload
+                    .get("tree")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
                 result = if passed {
                     let steps = custom
                         .payload
@@ -225,7 +247,7 @@ pub fn verification(session: &Session) -> Verification {
             _ => {}
         }
     }
-    result
+    (result, tree)
 }
 
 static HOME_PATH: LazyLock<Regex> =
@@ -400,7 +422,7 @@ fn draft(ctx: &ToolContext, config: &GitConfig, args: &Value) -> ToolResult {
         Some(_) => {}
     }
     let verified = match ctx.session.lock() {
-        Ok(session) => verification(&session),
+        Ok(session) => verification(&session, cwd),
         Err(_) => return ToolResult::err("internal", "session lock is poisoned"),
     };
     let override_verify = optional_str(args, "override_verify").filter(|r| !r.trim().is_empty());
@@ -539,13 +561,17 @@ pub fn execute(cwd: &Path, payload: &Map<String, Value>) -> Result<String, Strin
                     "the branch moved since the preview; ask the agent for a new draft".into(),
                 );
             }
+            // Always name the remote and the one branch: a bare `git push`
+            // follows push.default, which can publish other branches too.
             let upstream = git::git(cwd, &["rev-parse", "--abbrev-ref", "@{upstream}"]).ok;
             let remote = text("remote");
-            let push = if upstream {
-                git::git(cwd, &["push"])
-            } else {
-                git::git(cwd, &["push", "-u", &remote, &branch])
-            };
+            let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
+            let mut push_args = vec!["push"];
+            if !upstream {
+                push_args.push("-u");
+            }
+            push_args.extend([remote.as_str(), refspec.as_str()]);
+            let push = git::git(cwd, &push_args);
             if !push.ok {
                 return Err(push.error());
             }
@@ -947,38 +973,121 @@ mod tests {
         );
     }
 
+    fn verify_record(session: &mut Session, payload: Value) {
+        session
+            .append(EntryKind::Custom(crate::session::CustomData {
+                kind: "verify-result".into(),
+                payload: payload.as_object().unwrap().clone(),
+            }))
+            .unwrap();
+    }
+
     #[test]
     fn verification_tracks_the_last_verify_against_file_changes() {
         let dir = tempfile::tempdir().unwrap();
-        let ctx = test_context(dir.path());
+        repo(dir.path());
+        let cwd = dir.path();
+        let ctx = test_context(cwd);
         let mut session = ctx.session.lock().unwrap();
-        assert_eq!(verification(&session), Verification::Missing);
-        let custom = |kind: &str, payload: Value| {
-            EntryKind::Custom(crate::session::CustomData {
-                kind: kind.into(),
-                payload: payload.as_object().unwrap().clone(),
-            })
-        };
-        session
-            .append(custom(
-                "verify-result",
-                json!({"passed": true, "steps": [{"name": "test"}]}),
-            ))
-            .unwrap();
+        assert_eq!(verification(&session, cwd), Verification::Missing);
+        let tree = git::content_tree(cwd).unwrap();
+        verify_record(
+            &mut session,
+            json!({"passed": true, "steps": [{"name": "test"}], "tree": tree}),
+        );
         assert_eq!(
-            verification(&session),
+            verification(&session, cwd),
             Verification::Passed(vec!["test".into()])
         );
         session
-            .append(custom("fs-change", json!({"path": "a"})))
-            .unwrap();
-        assert_eq!(verification(&session), Verification::Stale);
-        session
-            .append(custom(
-                "verify-result",
-                json!({"passed": false, "failed_step": "lint"}),
+            .append(EntryKind::Custom(
+                crate::session::CustomData::new("fs-change").with("path", "a"),
             ))
             .unwrap();
-        assert_eq!(verification(&session), Verification::Failed("lint".into()));
+        assert_eq!(verification(&session, cwd), Verification::Stale);
+        verify_record(
+            &mut session,
+            json!({"passed": false, "failed_step": "lint"}),
+        );
+        assert_eq!(
+            verification(&session, cwd),
+            Verification::Failed("lint".into())
+        );
+        // A pass without a recorded tree cannot vouch for the commits.
+        verify_record(&mut session, json!({"passed": true}));
+        assert_eq!(verification(&session, cwd), Verification::Stale);
+    }
+
+    #[test]
+    fn a_pass_covers_only_the_content_it_checked() {
+        let dir = tempfile::tempdir().unwrap();
+        repo(dir.path());
+        let cwd = dir.path();
+        let ctx = test_context(cwd);
+        let mut session = ctx.session.lock().unwrap();
+        // Verified with a new file and an untracked scratch file on disk.
+        std::fs::write(cwd.join("new.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(cwd.join("scratch.txt"), "notes\n").unwrap();
+        let tree = git::content_tree(cwd).unwrap();
+        // The real index was not touched.
+        assert!(git::staged_files(cwd).is_empty());
+        verify_record(&mut session, json!({"passed": true, "tree": tree}));
+        // Committing what was verified (the scratch file stays untracked).
+        assert!(git::git(cwd, &["add", "new.rs"]).ok);
+        assert!(git::git(cwd, &["commit", "-qm", "Add new"]).ok);
+        assert!(matches!(
+            verification(&session, cwd),
+            Verification::Passed(_)
+        ));
+        // A shell edit after the verify, committed: no fs-change entry, but
+        // the commits no longer match.
+        std::fs::write(cwd.join("a.txt"), "edited by sed\n").unwrap();
+        assert!(git::git(cwd, &["commit", "-qam", "Edit"]).ok);
+        assert_eq!(verification(&session, cwd), Verification::Stale);
+    }
+
+    #[test]
+    fn an_approved_draft_pushes_only_its_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        repo(dir.path());
+        let cwd = dir.path();
+        let origin = tempfile::tempdir().unwrap();
+        assert!(git::git(origin.path(), &["init", "-q", "--bare"]).ok);
+        let url = origin.path().to_string_lossy().to_string();
+        assert!(git::git(cwd, &["remote", "add", "origin", &url]).ok);
+        assert!(git::git(cwd, &["config", "push.default", "matching"]).ok);
+        for branch in ["other", "topic"] {
+            assert!(git::git(cwd, &["switch", "-q", "-c", branch, "main"]).ok);
+            assert!(git::git(cwd, &["push", "-q", "-u", "origin", branch]).ok);
+            std::fs::write(cwd.join(format!("{branch}.txt")), "x\n").unwrap();
+            assert!(git::git(cwd, &["add", "-A"]).ok);
+            assert!(git::git(cwd, &["commit", "-qm", branch]).ok);
+        }
+        let payload = json!({
+            "op": "draft", "title": "t", "body": "b", "base": "main",
+            "branch": "topic", "remote": "origin",
+            "head": git::head(cwd).unwrap(),
+        });
+        // gh cannot create a PR against a local remote; the push comes first.
+        let _ = execute(cwd, payload.as_object().unwrap());
+        let remote_head = |branch: &str| {
+            git::git(
+                origin.path(),
+                &["rev-parse", &format!("refs/heads/{branch}")],
+            )
+            .stdout
+            .trim()
+            .to_string()
+        };
+        assert_eq!(remote_head("topic"), git::head(cwd).unwrap());
+        let other_local = git::git(cwd, &["rev-parse", "other"])
+            .stdout
+            .trim()
+            .to_string();
+        assert_ne!(
+            remote_head("other"),
+            other_local,
+            "an unrelated branch was pushed"
+        );
     }
 }

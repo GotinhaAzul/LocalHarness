@@ -780,12 +780,14 @@ code and, where useful, the exact call shape.
 - `undo` soft-resets the latest commit the harness made, only while HEAD is
   still that commit.
 - `pr draft` refuses on the base branch, with uncommitted changes, with no
-  commits ahead, or without a passing verify after the last file change
-  (unless `override_verify` gives a reason, which goes into the body). The body
+  commits ahead, or without a passing verify that covers the commits: verify
+  records the content tree it ran against, and HEAD must hold exactly that
+  content, so edits made through `bash` count too (unless `override_verify`
+  gives a reason, which goes into the body). The body
   lists the summary, linked issue, commits, diff stat and verification, with
   secrets, the workspace path and home directories removed. `/pr confirm`
-  pushes to the branch's existing remote (never `--force`, never a new remote)
-  and creates a draft PR. There is no merge action.
+  pushes only that branch, by explicit refspec, to the branch's existing
+  remote (never `--force`, never a new remote) and creates a draft PR. There is no merge action.
 - In `bash` and `bg`, `git reset --hard`, `git clean -f`, `git push --force`
   (and `+ref`, `:ref`, `--delete`), `git rebase`, `filter-branch` and
   `git tag -d` are refused with `GIT_DESTRUCTIVE`.

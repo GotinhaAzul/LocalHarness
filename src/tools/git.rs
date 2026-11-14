@@ -207,6 +207,16 @@ fn quote(arg: &str) -> String {
 /// Run `program args` in `cwd` without a terminal prompt; `input` goes to
 /// stdin when given.
 pub fn run(program: &str, cwd: &Path, args: &[&str], input: Option<&str>) -> Run {
+    run_env(program, cwd, args, input, &[])
+}
+
+fn run_env(
+    program: &str,
+    cwd: &Path,
+    args: &[&str],
+    input: Option<&str>,
+    env: &[(&str, &std::ffi::OsStr)],
+) -> Run {
     let command = std::iter::once(program.to_string())
         .chain(args.iter().map(|arg| quote(arg)))
         .collect::<Vec<_>>()
@@ -221,6 +231,7 @@ pub fn run(program: &str, cwd: &Path, args: &[&str], input: Option<&str>) -> Run
         .env("GH_PROMPT_DISABLED", "1")
         .env("GH_NO_UPDATE_NOTIFIER", "1")
         .env("NO_COLOR", "1")
+        .envs(env.iter().copied())
         .stdin(if input.is_some() {
             Stdio::piped()
         } else {
@@ -262,6 +273,72 @@ fn git_line(cwd: &Path, args: &[&str]) -> Option<String> {
     let run = git(cwd, args);
     let line = run.stdout.trim();
     (run.ok && !line.is_empty()).then(|| line.to_string())
+}
+
+/// The tree object of the working directory as it is on disk: tracked and
+/// untracked files, without ignored ones. Built in a throwaway index, so the
+/// real index is untouched. `None` outside a repository.
+pub fn content_tree(cwd: &Path) -> Option<String> {
+    if !is_repo(cwd) {
+        return None;
+    }
+    let real = git_line(
+        cwd,
+        &["rev-parse", "--path-format=absolute", "--git-path", "index"],
+    )?;
+    // A sibling of the real index, removed afterwards.
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    let index = std::path::PathBuf::from(format!(
+        "{real}.localharness-{}-{nonce}",
+        std::process::id()
+    ));
+    // Starting from the real index reuses its stat cache; a missing one (a
+    // repository without commits) just means a slower first add.
+    let _ = std::fs::copy(&real, &index);
+    let env = [("GIT_INDEX_FILE", index.as_os_str())];
+    let add = run_env("git", cwd, &["add", "--all", "--", ":/"], None, &env);
+    let tree = add
+        .ok
+        .then(|| run_env("git", cwd, &["write-tree"], None, &env))
+        .filter(|tree| tree.ok);
+    let _ = std::fs::remove_file(&index);
+    let tree = tree?;
+    let tree = tree.stdout.trim();
+    (!tree.is_empty()).then(|| tree.to_string())
+}
+
+/// Whether HEAD holds exactly the content recorded in `tree`. Files present
+/// in `tree` but not in HEAD are allowed only while they are still on disk
+/// (untracked leftovers that the commit does not carry).
+pub fn head_matches_tree(cwd: &Path, tree: &str) -> bool {
+    let diff = git(
+        cwd,
+        &[
+            "diff-tree",
+            "-r",
+            "--no-renames",
+            "--name-status",
+            "-z",
+            tree,
+            "HEAD",
+        ],
+    );
+    let Some(top) = git_line(cwd, &["rev-parse", "--show-toplevel"]) else {
+        return false;
+    };
+    if !diff.ok {
+        return false;
+    }
+    let top = Path::new(&top);
+    let mut fields = diff.stdout.split('\0').filter(|field| !field.is_empty());
+    while let (Some(status), Some(path)) = (fields.next(), fields.next()) {
+        if status != "D" || !top.join(path).exists() {
+            return false;
+        }
+    }
+    true
 }
 
 pub fn is_repo(cwd: &Path) -> bool {

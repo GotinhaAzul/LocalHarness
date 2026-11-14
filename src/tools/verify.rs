@@ -119,6 +119,14 @@ impl Tool for VerifyTool {
             return ToolResult::err("cancelled", "verify cancelled before its first step");
         }
 
+        // The content the steps run against, so a PR can tell whether its
+        // commits are what passed (edits through the shell leave no trace in
+        // the session).
+        let cwd = ctx.cwd.clone();
+        let tree = tokio::task::spawn_blocking(move || crate::tools::git::content_tree(&cwd))
+            .await
+            .ok()
+            .flatten();
         let mut runs: Vec<StepRun> = Vec::new();
         let mut failed: Option<(String, String, Vec<String>)> = None;
         for step in steps {
@@ -212,6 +220,7 @@ impl Tool for VerifyTool {
                 "passed": passed,
                 "steps": steps,
                 "failed_step": failed_step,
+                "tree": tree,
             }]
         });
         // A failing verify still ran successfully as a tool; keep it a success
