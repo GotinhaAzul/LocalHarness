@@ -81,6 +81,10 @@ fn select_steps<'a>(
 
 #[async_trait]
 impl Tool for VerifyTool {
+    fn preview_tail(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &'static str {
         "verify"
     }

@@ -18,6 +18,7 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::config::LspGate;
+use crate::text::clip;
 use crate::tools::write::{atomic_write, file_mode, record_own_write};
 use crate::tools::{
     Tool, ToolContext, ToolPack, ToolResult, display_path, object_schema, optional_str,
@@ -1354,7 +1355,7 @@ fn render_diagnostics(diagnostics: &[Value]) -> String {
             .lines()
             .next()
             .unwrap_or("");
-        let message = truncate_chars(message, 200);
+        let message = clip(message, 200);
         out.push_str(&format!("{line}:{column} {severity}{code} {message}\n"));
     }
     if diagnostics.len() > MAX_DIAGNOSTICS {
@@ -1363,15 +1364,6 @@ fn render_diagnostics(diagnostics: &[Value]) -> String {
             diagnostics.len() - MAX_DIAGNOSTICS
         ));
     }
-    out
-}
-
-fn truncate_chars(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
-        return text.to_string();
-    }
-    let mut out: String = text.chars().take(max_chars).collect();
-    out.push('…');
     out
 }
 
@@ -1427,7 +1419,7 @@ fn render_edit_diagnostics(server: &str, diagnostics: &[Value]) -> String {
             .unwrap_or("");
         out.push_str(&format!(
             "  {line}:{column} {severity}{code} {}\n",
-            truncate_chars(message, 160)
+            clip(message, 160)
         ));
     }
     if relevant.len() > MAX_EDIT_DIAGNOSTICS {
@@ -1436,7 +1428,7 @@ fn render_edit_diagnostics(server: &str, diagnostics: &[Value]) -> String {
             relevant.len() - MAX_EDIT_DIAGNOSTICS
         ));
     }
-    truncate_chars(&out, MAX_EDIT_DIAGNOSTIC_CHARS)
+    clip(&out, MAX_EDIT_DIAGNOSTIC_CHARS)
 }
 
 // ---------------------------------------------------------------------------

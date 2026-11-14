@@ -352,7 +352,9 @@ continues. Nudges are capped at three per turn.
 usable_prompt = context_window - max_output_tokens - safety_margin
 ```
 
-- `max_output_tokens` defaults to 4096.
+- `max_output_tokens` defaults to 4096 and is capped at a quarter of the
+  window, so a small server window always leaves room for the prompt. The
+  request's `max_tokens` uses the capped value.
 - `safety_margin` is 5% of the context window, minimum 512 tokens.
 - Tool schemas, system prompt, skills index, and state blocks count toward the
   prompt. The serialized `tools` array is measured once when the core is built:
@@ -377,7 +379,10 @@ usable_prompt = context_window - max_output_tokens - safety_margin
   at 8000 characters.
 - Larger output is written to an artifact under the session's artifact
   directory. The tool result contains a short preview plus `[out-N]` and the
-  artifact size.
+  artifact size. Command tools (`bash`, `bg`, `test`, `verify`) preview the
+  first and the last lines, where errors and summaries land, and name the
+  omitted range: `… 380 lines omitted (12-391); recall out-3 12-131 …`.
+  Other tools preview the start.
 - `recall` reads an artifact range, capped at 4000 characters per call.
 - Artifacts are user-readable files with `0700` directories. Retention is
   configurable; default is 30 days.
@@ -761,7 +766,7 @@ code and, where useful, the exact call shape.
 | `write` | 256 KB content |
 | `edit` / `patch` | 256 KB file, 200 diff lines returned |
 | `undo` | 4 MB snapshot; snapshots live as long as session artifacts |
-| `bash` | 600 s maximum, 1 MiB captured, 64 KB preview |
+| `bash` | 600 s maximum, 1 MiB captured plus the last 256 KiB per stream, 64 KB preview (start and end) |
 | `grep` | 200 matches, 5 lines of context |
 | `glob` | 200 paths |
 | `bg` | 4 live processes, 16 MB log per process |
@@ -1224,7 +1229,7 @@ cursor = "#c0caf5"
   or fence, outside any fence); the head is rendered once and only the tail is
   re-parsed per frame. Incomplete fences and lists render as plain text until
   closed.
-- Display safety (`ui/sanitize.rs`): every string that reaches the screen has
+- Display safety (`sanitize.rs`): every string that reaches the screen has
   ANSI escapes stripped, tabs expanded, carriage returns resolved, and
   width-ambiguous format characters (emoji variation selectors, zero-width
   joiners, skin-tone modifiers, bidi controls) dropped, so ratatui's idea of
@@ -1439,6 +1444,8 @@ src/
   config.rs               config load, merge, validation
   paths.rs                config/data/project paths, project id
   git.rs                  branch and dirty status
+  sanitize.rs             text safe to paint or read (escapes, tabs, emoji)
+  text.rs                 shared clipping, one-line, slug, byte excerpts
   provider/
     mod.rs                Provider trait and error types
     openai.rs             OpenAI-compatible client
@@ -1490,9 +1497,13 @@ src/
     tree.rs               /tree modal
     widgets.rs            header, tool card, diff, input
     render.rs             layout and drawing
-    sanitize.rs           make text safe to paint (escapes, tabs, emoji)
     input.rs              key handling, history, completion
-    tui.rs                terminal setup/restore, event loop
+    tui.rs                App state, event loop, drawing, agent events
+    tui/terminal.rs       terminal setup/restore, panic hook
+    tui/keys.rs           keyboard, mouse, paste, modal pickers
+    tui/commands.rs       slash commands
+    tui/support.rs        endpoint probing, themes, workflows, sessions
+    tui/tests.rs          TUI tests, including the screen-drift check
   skills/                 bundled red/blue skill text (embedded)
 ```
 
@@ -1576,6 +1587,12 @@ Build:
 ### 12.3 TUI tests
 
 - `ratatui::backend::TestBackend` at 80x24, 120x40, and 40x12.
+- Screen consistency: the real crossterm output is fed to a `vt100` terminal
+  emulator through 600 random steps of hostile text (escapes, tabs, emoji
+  sequences, flags, CJK, bidi controls), resizes, repaints, scrolling, and
+  pastes. After every frame the emulated screen must match what ratatui drew,
+  no painted cell may hold text the sanitizer would rewrite, and nothing may
+  query the cursor position.
 - Assert header contains cwd, git branch, model, context; context gauge changes
   color at thresholds; `/tree` shows both branches and the active marker;
   theme switch changes cell styles; narrow layout drops fields in the specified

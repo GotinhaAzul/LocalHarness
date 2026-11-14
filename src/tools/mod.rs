@@ -469,6 +469,12 @@ pub trait Tool: Send + Sync {
     fn result_cap(&self) -> Option<usize> {
         None
     }
+    /// Whether an oversized result keeps its end as well as its start in the
+    /// inline preview. True for command output, where the error or summary
+    /// comes last.
+    fn preview_tail(&self) -> bool {
+        false
+    }
     /// Whether runs of this tool append an engagement evidence entry.
     fn evidence_enabled(&self) -> bool {
         false

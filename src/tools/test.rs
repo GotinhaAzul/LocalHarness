@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 use tokio::io::AsyncReadExt;
 use tokio::process::{ChildStderr, ChildStdout, Command};
 
+use crate::text::clip;
 use crate::tools::{
     Tool, ToolContext, ToolPack, ToolResult, display_path, object_schema, optional_str,
     optional_u64,
@@ -25,6 +26,10 @@ pub struct TestTool;
 
 #[async_trait]
 impl Tool for TestTool {
+    fn preview_tail(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &'static str {
         "test"
     }
@@ -120,7 +125,7 @@ impl TestTool {
             content.push_str("\n\n");
             content.push_str(&body);
         }
-        let content = truncate_chars(&content, MAX_RESULT_CHARS);
+        let content = clip(&content, MAX_RESULT_CHARS);
 
         Ok(ToolResult::ok(content).with_details(json!({
             "runner": runner.name(),
@@ -684,15 +689,6 @@ fn summary_line(runner: Runner, output: &RunOutput, cleaned: &str) -> String {
     }
 }
 
-fn truncate_chars(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
-        return text.to_string();
-    }
-    let mut out: String = text.chars().take(max_chars).collect();
-    out.push('…');
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -835,10 +831,13 @@ test a ... ok\ntest b ... FAILED\n\nfailures:\n\n---- b stdout ----\nassertion `
 
     #[test]
     fn result_is_capped() {
+        // Exactly the cap: one more character would push the result over
+        // the harness's archive limit and replace it with a preview.
         let long = "x".repeat(4000);
         assert_eq!(
-            truncate_chars(&long, MAX_RESULT_CHARS).chars().count(),
-            MAX_RESULT_CHARS + 1
+            clip(&long, MAX_RESULT_CHARS).chars().count(),
+            MAX_RESULT_CHARS
         );
+        const { assert!(MAX_RESULT_CHARS <= crate::context::RESULT_CAP_CHARS) };
     }
 }

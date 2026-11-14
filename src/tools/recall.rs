@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 
 use crate::session::ArtifactError;
+use crate::text::clip;
 use crate::tools::{Tool, ToolContext, ToolPack, ToolResult, optional_u64, required_str};
 
 /// Lines read per call, regardless of the requested range.
@@ -21,16 +22,6 @@ fn clean_handle(raw: &str) -> String {
         .trim_end_matches(']')
         .trim()
         .to_string()
-}
-
-fn truncate_chars(text: &str, max: usize) -> String {
-    if text.chars().count() <= max {
-        return text.to_string();
-    }
-    let keep = max.saturating_sub(1);
-    let mut out: String = text.chars().take(keep).collect();
-    out.push('…');
-    out
 }
 
 #[async_trait]
@@ -166,7 +157,7 @@ impl Tool for RecallTool {
                 content.push_str("\n(truncated at the character cap; narrow start/end)");
             }
         }
-        let content = truncate_chars(&content, CHAR_CAP);
+        let content = clip(&content, CHAR_CAP);
         ToolResult::ok(content).with_details(json!({
             "artifact": handle,
             "start": slice.start_line,
