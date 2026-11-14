@@ -1,16 +1,27 @@
-//! Run budgets, wall clock, and stall detection.
+//! Run checkpoints, wall clock, and stall detection.
+//!
+//! Tool-call, model-call, and wall-clock limits are checkpoints, not hard
+//! stops. When one is reached and the run produced new information, a file
+//! change, or a passing verification recently, the allowance is renewed and
+//! the turn continues. Only a checkpoint with no recent progress — or the
+//! exact-repetition guards — ends the turn. This lets a real long task run as
+//! long as it keeps making progress without letting a looping model do so.
 
+use std::collections::HashSet;
+use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
 use crate::config::BudgetConfig;
 
 #[derive(Debug, Clone)]
 pub struct RunLimits {
+    /// Checkpoint interval, not a hard cap.
     pub max_tool_calls: u32,
+    /// Checkpoint interval, not a hard cap.
     pub max_model_calls: u32,
+    /// Checkpoint interval, not a hard cap.
     pub max_wall: Duration,
     pub stall_calls: u32,
-    pub wrap_up_at: f32,
     pub verify_attempts: u32,
 }
 
@@ -21,7 +32,6 @@ impl From<&BudgetConfig> for RunLimits {
             max_model_calls: config.max_model_calls.max(1),
             max_wall: Duration::from_secs(u64::from(config.max_wall_minutes.max(1)) * 60),
             stall_calls: config.stall_calls.max(1),
-            wrap_up_at: config.wrap_up_at.clamp(0.1, 1.0),
             verify_attempts: config.verify_attempts,
         }
     }
@@ -37,24 +47,7 @@ pub enum StopReason {
 }
 
 impl StopReason {
-    pub fn message(&self) -> &'static str {
-        match self {
-            StopReason::ToolBudget => {
-                "tool-call budget exhausted; finish with the current evidence, or start a new turn to continue"
-            }
-            StopReason::ModelBudget => {
-                "model-call budget exhausted; summarize what is done and what remains"
-            }
-            StopReason::WallClock => {
-                "wall-clock budget exhausted; summarize what is done and what remains"
-            }
-            StopReason::Stalled => {
-                "the last calls produced no new information or file change; stop and report the last known state, or change approach in a new turn"
-            }
-            StopReason::Cancelled => "cancelled by the user",
-        }
-    }
-
+    /// Code recorded in the session and the headless JSON stream.
     pub fn code(&self) -> &'static str {
         match self {
             StopReason::ToolBudget => "budget_tools",
@@ -64,15 +57,60 @@ impl StopReason {
             StopReason::Cancelled => "cancelled",
         }
     }
+
+    pub fn message(&self) -> &'static str {
+        match self {
+            StopReason::ToolBudget => {
+                "the tool-call checkpoint found no recent progress; the run is repeating without changing anything"
+            }
+            StopReason::ModelBudget => {
+                "the model-call checkpoint found no recent progress; the run is repeating without changing anything"
+            }
+            StopReason::WallClock => {
+                "the wall-clock checkpoint found no recent progress; the run is repeating without changing anything"
+            }
+            StopReason::Stalled => {
+                "the last calls produced no new information or file change; stop and report the last known state, or change approach in a new turn"
+            }
+            StopReason::Cancelled => "cancelled by the user",
+        }
+    }
+}
+
+/// Result of asking a checkpoint whether the turn may continue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BudgetCheck {
+    /// Not at a checkpoint yet.
+    Ok,
+    /// The checkpoint was reached while the run was still productive; the
+    /// allowance was renewed and the turn continues.
+    Renewed(StopReason),
+    /// The checkpoint was reached with no recent progress. This is the only
+    /// budget outcome that ends a turn.
+    Exhausted(StopReason),
 }
 
 #[derive(Debug)]
 pub struct RunProgress {
     pub limits: RunLimits,
+    /// Wall clock for the whole turn, used for reporting only.
     pub started_at: Instant,
+    /// Cumulative counters for reporting and messages.
     pub tool_calls: u32,
     pub model_calls: u32,
-    pub wrapped_up: bool,
+    /// Current checkpoint allowance.
+    epoch_tool_calls: u32,
+    epoch_model_calls: u32,
+    epoch_started_at: Instant,
+    /// How many times a productive checkpoint renewed the allowance.
+    pub renewals: u32,
+    /// Cumulative tool-call index of the last result that produced usable new
+    /// information, a file change, or a passing verification.
+    last_progress_call: Option<u32>,
+    last_progress_at: Option<Instant>,
+    /// Result digests already seen this turn. A repeated result is not new
+    /// information even when the call arguments differ.
+    seen_results: HashSet<u64>,
     pub stall: StallTracker,
     pub settle_continuations: u32,
     pub verify_attempts: u32,
@@ -83,19 +121,28 @@ pub struct RunProgress {
     pub output_recoveries: u32,
     /// Whether the user was told that tool calls are arriving as text.
     pub text_calls_noticed: bool,
-    /// Whether the exact tokenizer check already forced a compaction.
+    /// Whether the exact tokenizer check already forced a compaction. Reset
+    /// after every successful model reply so a later context fill can check
+    /// again.
     pub presend_compaction_used: bool,
 }
 
 impl RunProgress {
     pub fn new(limits: RunLimits) -> Self {
         let stall_calls = limits.stall_calls;
+        let now = Instant::now();
         Self {
             limits,
-            started_at: Instant::now(),
+            started_at: now,
             tool_calls: 0,
             model_calls: 0,
-            wrapped_up: false,
+            epoch_tool_calls: 0,
+            epoch_model_calls: 0,
+            epoch_started_at: now,
+            renewals: 0,
+            last_progress_call: None,
+            last_progress_at: None,
+            seen_results: HashSet::new(),
             stall: StallTracker::new(stall_calls),
             settle_continuations: 0,
             verify_attempts: 0,
@@ -112,47 +159,75 @@ impl RunProgress {
         self.started_at.elapsed()
     }
 
-    /// Stop reason that prevents another model call, if any.
-    pub fn stop_before_model(&self) -> Option<StopReason> {
-        if self.model_calls >= self.limits.max_model_calls {
-            return Some(StopReason::ModelBudget);
+    /// Check the model-call and wall-clock checkpoint before a model call.
+    pub fn model_checkpoint(&mut self) -> BudgetCheck {
+        let model_hit = self.epoch_model_calls >= self.limits.max_model_calls;
+        let wall_hit = self.epoch_started_at.elapsed() >= self.limits.max_wall;
+        if !model_hit && !wall_hit {
+            return BudgetCheck::Ok;
         }
-        if self.elapsed() >= self.limits.max_wall {
-            return Some(StopReason::WallClock);
+        if model_hit {
+            if self.recent_call_progress() {
+                return self.renew(StopReason::ModelBudget);
+            }
+            return BudgetCheck::Exhausted(StopReason::ModelBudget);
         }
-        None
+        if self.recent_time_progress() {
+            self.renew(StopReason::WallClock)
+        } else {
+            BudgetCheck::Exhausted(StopReason::WallClock)
+        }
     }
 
     pub fn model_call_started(&mut self) {
         self.model_calls += 1;
+        self.epoch_model_calls += 1;
     }
 
-    /// Whether the remaining tool budget covers `n` more calls.
-    pub fn tools_available(&self, n: u32) -> bool {
-        self.tool_calls + n <= self.limits.max_tool_calls
+    /// Check the tool-call checkpoint before a batch of `n` calls. A batch is
+    /// allowed to cross the checkpoint: the allowance is renewed first when
+    /// the run is productive.
+    pub fn tool_checkpoint(&mut self, n: u32) -> BudgetCheck {
+        if self.epoch_tool_calls.saturating_add(n) <= self.limits.max_tool_calls {
+            return BudgetCheck::Ok;
+        }
+        if self.recent_call_progress() {
+            self.renew(StopReason::ToolBudget)
+        } else {
+            BudgetCheck::Exhausted(StopReason::ToolBudget)
+        }
     }
 
-    pub fn record_tool_result(&mut self, fingerprint: &str, changed_file: bool, verified_ok: bool) {
+    /// Record a tool result. `result` is the content shown to the model; a
+    /// result content that was already seen this turn is a repeat, not new
+    /// information, even when the call arguments differ.
+    pub fn record_tool_result(
+        &mut self,
+        fingerprint: &str,
+        result: &str,
+        is_error: bool,
+        changed_file: bool,
+        verified_ok: bool,
+    ) {
         self.tool_calls += 1;
+        self.epoch_tool_calls += 1;
         self.stall.observe(fingerprint, changed_file, verified_ok);
+        let novel = !is_error && self.seen_results.insert(result_digest(result));
+        if changed_file || verified_ok || novel {
+            self.last_progress_call = Some(self.tool_calls);
+            self.last_progress_at = Some(Instant::now());
+        }
     }
 
     pub fn stalled(&self) -> bool {
         self.stall.stalled()
     }
 
-    /// True once, when the wrap-up threshold is crossed.
-    pub fn should_wrap_up(&mut self) -> bool {
-        if self.wrapped_up {
-            return false;
-        }
-        let tool_ratio = f32::from(self.tool_calls as u16) / self.limits.max_tool_calls as f32;
-        let model_ratio = f32::from(self.model_calls as u16) / self.limits.max_model_calls as f32;
-        if tool_ratio >= self.limits.wrap_up_at || model_ratio >= self.limits.wrap_up_at {
-            self.wrapped_up = true;
-            return true;
-        }
-        false
+    /// A successful reply breaks a context-error episode: the next compaction
+    /// or context retry gets its own allowance.
+    pub fn recovered_context(&mut self) {
+        self.context_retry_used = false;
+        self.presend_compaction_used = false;
     }
 
     /// At most two settle continuations per turn, shared by verify and todo.
@@ -160,15 +235,70 @@ impl RunProgress {
         self.settle_continuations < 2
     }
 
-    pub fn wrap_up_message(&self) -> String {
+    /// Message for a checkpoint that ended the turn.
+    pub fn checkpoint_message(&self, reason: StopReason) -> String {
+        let window = self.limits.stall_calls;
+        let no_progress = format!(
+            "no new result, file change, or passing verification in the last {window} call(s)"
+        );
+        match reason {
+            StopReason::ToolBudget => format!(
+                "tool-call checkpoint: {} calls in this allowance, {no_progress}. The run is repeating without progress; summarize the last known state or start a new turn with a different approach.",
+                self.epoch_tool_calls
+            ),
+            StopReason::ModelBudget => format!(
+                "model-call checkpoint: {} model calls in this allowance, {no_progress}. The run is repeating without progress; summarize the last known state or start a new turn with a different approach.",
+                self.epoch_model_calls
+            ),
+            StopReason::WallClock => format!(
+                "wall-clock checkpoint: {} minutes in this allowance, no new result, file change, or passing verification. The run is repeating without progress; summarize the last known state or start a new turn with a different approach.",
+                self.limits.max_wall.as_secs() / 60
+            ),
+            StopReason::Stalled => {
+                "the last calls produced no new information or file change; stop and report the last known state, or change approach in a new turn".into()
+            }
+            StopReason::Cancelled => "cancelled by the user".into(),
+        }
+    }
+
+    /// User-facing notice when a productive checkpoint renews the allowance.
+    pub fn renewal_message(&self, trigger: StopReason) -> String {
         format!(
-            "[localharness] budget: {} of {} tool calls and {} of {} model calls used. Wrap up now: finish the current step, run verification if configured, and report what changed and what remains. Do not start new exploration.",
+            "budget checkpoint renewed ({}): {} tool calls, {} model calls, {} min used; the run is still producing new results or file changes, so the turn continues.",
+            trigger.code(),
             self.tool_calls,
-            self.limits.max_tool_calls,
             self.model_calls,
-            self.limits.max_model_calls
+            self.elapsed().as_secs() / 60
         )
     }
+
+    fn recent_call_progress(&self) -> bool {
+        self.last_progress_call
+            .is_some_and(|at| self.tool_calls.saturating_sub(at) < self.limits.stall_calls)
+    }
+
+    fn recent_time_progress(&self) -> bool {
+        let window = (self.limits.max_wall / 2).max(Duration::from_secs(60));
+        self.last_progress_at
+            .is_some_and(|at| at.elapsed() < window)
+    }
+
+    fn renew(&mut self, trigger: StopReason) -> BudgetCheck {
+        self.epoch_tool_calls = 0;
+        self.epoch_model_calls = 0;
+        self.epoch_started_at = Instant::now();
+        self.renewals += 1;
+        // A renewal must be earned again by new work in the next allowance.
+        self.last_progress_call = None;
+        self.last_progress_at = None;
+        BudgetCheck::Renewed(trigger)
+    }
+}
+
+fn result_digest(result: &str) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    result.hash(&mut hasher);
+    hasher.finish()
 }
 
 #[derive(Debug)]
@@ -220,34 +350,122 @@ mod tests {
             max_model_calls: 4,
             max_wall: Duration::from_secs(600),
             stall_calls: 3,
-            wrap_up_at: 0.8,
             verify_attempts: 2,
         }
     }
 
+    fn progress_with_one_result(progress: &mut RunProgress, result: &str) {
+        progress.record_tool_result(result, result, false, false, false);
+    }
+
     #[test]
-    fn model_and_tool_caps_are_enforced() {
+    fn productive_model_checkpoint_renews() {
         let mut progress = RunProgress::new(limits());
-        assert!(progress.stop_before_model().is_none());
         for _ in 0..4 {
             progress.model_call_started();
         }
-        assert_eq!(progress.stop_before_model(), Some(StopReason::ModelBudget));
-        for _ in 0..10 {
-            progress.record_tool_result("f", false, false);
+        progress_with_one_result(&mut progress, "new facts");
+        assert_eq!(
+            progress.model_checkpoint(),
+            BudgetCheck::Renewed(StopReason::ModelBudget)
+        );
+        assert_eq!(progress.renewals, 1);
+        assert_eq!(progress.model_calls, 4, "cumulative remains for reporting");
+        assert_eq!(progress.epoch_model_calls, 0);
+        assert_eq!(progress.model_checkpoint(), BudgetCheck::Ok);
+    }
+
+    #[test]
+    fn checkpoint_without_progress_stops() {
+        let mut progress = RunProgress::new(limits());
+        for _ in 0..4 {
+            progress.model_call_started();
         }
-        assert!(!progress.tools_available(1));
-        assert!(progress.tools_available(0));
+        assert_eq!(
+            progress.model_checkpoint(),
+            BudgetCheck::Exhausted(StopReason::ModelBudget)
+        );
+        assert_eq!(progress.renewals, 0);
+    }
+
+    #[test]
+    fn repeated_results_are_not_progress() {
+        let mut progress = RunProgress::new(limits());
+        progress.record_tool_result("a", "same", false, false, false);
+        for index in 1..6 {
+            progress.record_tool_result(&format!("call-{index}"), "same", false, false, false);
+        }
+        // Four model calls after five repeats of the same result.
+        for _ in 0..4 {
+            progress.model_call_started();
+        }
+        assert_eq!(
+            progress.model_checkpoint(),
+            BudgetCheck::Exhausted(StopReason::ModelBudget)
+        );
+    }
+
+    #[test]
+    fn stale_progress_does_not_renew() {
+        let mut progress = RunProgress::new(limits());
+        progress_with_one_result(&mut progress, "useful");
+        for index in 0..6 {
+            progress.record_tool_result(
+                &format!("noise-{index}"),
+                &format!("noise-{index}"),
+                true,
+                false,
+                false,
+            );
+        }
+        for _ in 0..4 {
+            progress.model_call_started();
+        }
+        assert_eq!(
+            progress.model_checkpoint(),
+            BudgetCheck::Exhausted(StopReason::ModelBudget)
+        );
+    }
+
+    #[test]
+    fn tool_checkpoint_renews_for_a_productive_batch() {
+        let mut progress = RunProgress::new(limits());
+        for calls in 0..9 {
+            progress_with_one_result(&mut progress, &format!("result {calls}"));
+        }
+        assert_eq!(
+            progress.tool_checkpoint(2),
+            BudgetCheck::Renewed(StopReason::ToolBudget)
+        );
+        assert_eq!(progress.epoch_tool_calls, 0);
+        // The batch itself may cross the new checkpoint.
+        assert_eq!(
+            progress.tool_checkpoint(20),
+            BudgetCheck::Exhausted(StopReason::ToolBudget)
+        );
+    }
+
+    #[test]
+    fn file_change_is_progress_even_when_the_result_repeats() {
+        let mut progress = RunProgress::new(limits());
+        progress.record_tool_result("f", "ok", false, true, false);
+        for _ in 0..4 {
+            progress.model_call_started();
+        }
+        assert_eq!(
+            progress.model_checkpoint(),
+            BudgetCheck::Renewed(StopReason::ModelBudget)
+        );
     }
 
     #[test]
     fn stall_needs_consecutive_identical_fingerprints() {
         let mut progress = RunProgress::new(limits());
-        progress.record_tool_result("same", false, false);
-        progress.record_tool_result("same", false, false);
-        progress.record_tool_result("same", false, false);
+        progress.record_tool_result("same", "r", false, false, false);
+        progress.record_tool_result("same", "r", false, false, false);
+        progress.record_tool_result("same", "r", false, false, false);
         assert!(progress.stalled());
-        progress.record_tool_result("different", false, false);
+        progress.record_tool_result("different", "r", false, false, false);
         assert!(!progress.stalled());
     }
 
@@ -255,19 +473,9 @@ mod tests {
     fn file_change_resets_stall() {
         let mut progress = RunProgress::new(limits());
         for _ in 0..2 {
-            progress.record_tool_result("same", false, false);
+            progress.record_tool_result("same", "r", false, false, false);
         }
-        progress.record_tool_result("same", true, false);
+        progress.record_tool_result("same", "r", false, true, false);
         assert!(!progress.stalled());
-    }
-
-    #[test]
-    fn wrap_up_fires_once_at_threshold() {
-        let mut progress = RunProgress::new(limits());
-        for _ in 0..8 {
-            progress.record_tool_result("f", false, false);
-        }
-        assert!(progress.should_wrap_up());
-        assert!(!progress.should_wrap_up());
     }
 }

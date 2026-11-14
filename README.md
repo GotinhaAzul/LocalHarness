@@ -36,7 +36,7 @@ Most coding agents are a prompt, a tool loop, and a lot of trust. LocalHarness m
 |---|---|
 | An edit before the file was read | `edit`, `write`, and `patch` refuse until the file has been read in this session. |
 | “I ran the tests” | `verify` executes the configured steps and records the result before the turn can settle. |
-| The same tool call, forever | Loop, stall, tool-call, and wall-clock budgets stop the turn and report why. |
+| The same tool call, forever | Loop and stall guards stop a run that repeats. Budget checkpoints renew while the work is still producing new results, so long tasks are not cut short. |
 | A context window that quietly dies | Budgeted compaction, archived tool output, and `recall` for exact excerpts. |
 | A finding that sounds convincing | Evidence entries with hashes; declared PoC steps are replayed and confirmed or rejected. |
 | A shell with your whole home directory | `--sandbox` and `--path-jail` narrow the process and file boundaries. |
@@ -114,7 +114,7 @@ PASS  cargo  42 passed (3.1 s)
 - **Plan before the third mutation.** `todo` is free for two edits or two files, then a plan is required.
 - **Verify before settle.** After changes, configured steps run; a real failure blocks the turn.
 - **Review after verify.** The `review` pass checks the diff for secrets, debug statements, lockfiles, deletion-heavy changes, and source changes without tests.
-- **Stop the loop.** Repeat, stall, tool, and wall-clock budgets end a runaway turn with a status, not a silent bill.
+- **Stop the loop, not the work.** Loop and stall guards end a repeating run with a status, not a silent bill. Budget checkpoints renew while the run is still producing new results.
 - **Name the next action.** Every error tells the model what to do instead of leaving it to guess.
 
 ## 02 · Tools that know the codebase

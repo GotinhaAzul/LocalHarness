@@ -1047,7 +1047,10 @@ impl App {
                         self.set_notice("turn cancelled", Role::Warning);
                     }
                     TurnStatus::Budget => {
-                        self.set_notice("turn stopped: budget exhausted", Role::Warning);
+                        self.set_notice(
+                            "turn stopped: checkpoint reached with no progress",
+                            Role::Warning,
+                        );
                     }
                     TurnStatus::Stalled => {
                         self.set_notice("turn stopped: stalled", Role::Warning);

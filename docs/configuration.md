@@ -56,12 +56,15 @@ redact = true                   # redact secret values before persistence
 artifact_retention_days = 30
 
 [budgets]
+# Checkpoints, not hard caps. When one is reached and the run produced a new
+# result, a file change, or a passing verify within the last `stall_calls`
+# calls, the allowance renews and the turn keeps going. A checkpoint with no
+# recent progress, the loop guard, and the stall guard stop the turn.
 max_tool_calls = 120
 max_model_calls = 40
 max_wall_minutes = 30
 stall_calls = 12
 verify_attempts = 2
-wrap_up_at = 0.8
 
 [prompt]
 identity = ""                   # replaces the built-in one-line identity

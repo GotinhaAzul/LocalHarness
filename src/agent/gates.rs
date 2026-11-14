@@ -8,9 +8,10 @@ use crate::tools::ToolResult;
 use super::limits::RunProgress;
 
 /// Signature-based loop detection over recent calls. It only trips on genuine
-/// repetition: four identical calls in a row, or an exact 2-4 call cycle
+/// repetition: four identical calls in a row, or an exact 2-8 call cycle
 /// repeated four times in a row. Legitimate multi-step work (edit A, verify,
-/// edit B, verify, edit A, verify) must not trip it.
+/// edit B, verify, edit A, verify) must not trip it: an exact argument cycle
+/// means nothing changed in between, and a file change clears the history.
 #[derive(Debug)]
 pub struct LoopGuard {
     history: VecDeque<String>,
@@ -59,7 +60,7 @@ impl LoopGuard {
             };
         }
 
-        for period in 2..=4 {
+        for period in 2..=8 {
             if self.history.len() < period * 4 {
                 continue;
             }
@@ -356,6 +357,22 @@ mod tests {
             let mut tripped = false;
             tripped |= matches!(guard.check_and_record("a"), LoopDecision::Tripped { .. });
             tripped |= matches!(guard.check_and_record("b"), LoopDecision::Tripped { .. });
+            if cycle < 4 {
+                assert!(!tripped, "cycle {cycle} must not trip the guard");
+            } else {
+                assert!(tripped, "the fourth repetition must trip the guard");
+            }
+        }
+    }
+
+    #[test]
+    fn loop_guard_trips_on_four_repetitions_of_a_longer_cycle() {
+        let mut guard = LoopGuard::new();
+        for cycle in 1..=4 {
+            let mut tripped = false;
+            for call in ["a", "b", "c", "d", "e"] {
+                tripped |= matches!(guard.check_and_record(call), LoopDecision::Tripped { .. });
+            }
             if cycle < 4 {
                 assert!(!tripped, "cycle {cycle} must not trip the guard");
             } else {

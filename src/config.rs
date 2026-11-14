@@ -649,12 +649,17 @@ impl Default for SessionConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct BudgetConfig {
+    /// Tool-call checkpoint interval. Productive runs renew; a run with no
+    /// new result or file change in the last `stall_calls` calls stops.
     pub max_tool_calls: u32,
+    /// Model-call checkpoint interval, with the same renewal rule.
     pub max_model_calls: u32,
+    /// Wall-clock checkpoint interval, with the same renewal rule.
     pub max_wall_minutes: u32,
+    /// Consecutive identical calls and the no-progress window used by the
+    /// checkpoints.
     pub stall_calls: u32,
     pub verify_attempts: u32,
-    pub wrap_up_at: f32,
 }
 
 impl Default for BudgetConfig {
@@ -665,7 +670,6 @@ impl Default for BudgetConfig {
             max_wall_minutes: 30,
             stall_calls: 12,
             verify_attempts: 2,
-            wrap_up_at: 0.8,
         }
     }
 }

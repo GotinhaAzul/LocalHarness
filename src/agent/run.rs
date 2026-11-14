@@ -19,7 +19,7 @@ use crate::tools::{ToolResult, display_path};
 
 use super::calls::CallLedger;
 use super::gates::{self, LoopDecision, LoopGuard, SettleDecision};
-use super::limits::{RunProgress, StopReason};
+use super::limits::{BudgetCheck, RunProgress, StopReason};
 use super::{AgentEvent, AgentState, Core};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -314,7 +314,7 @@ async fn run_loop(
     let read_available = core.tools.iter().any(|tool| tool.name() == "read");
     let mut pending_compaction = false;
     let mut call_ledger = CallLedger::from_session(&core.session.lock().expect("session lock"));
-    let mut compacted_this_turn = false;
+    let mut compacted_since_model_call = false;
     let mut invalid_tool_calls = 0u32;
     let mut one_call_reminded = false;
 
@@ -332,17 +332,19 @@ async fn run_loop(
             });
             return TurnOutcome::ok(TurnStatus::Cancelled);
         }
-        if let Some(reason) = progress.stop_before_model() {
-            append_error(&core.session, reason.code(), reason.message(), true);
-            let _ = tx.send(AgentEvent::Error {
-                code: reason.code().into(),
-                message: reason.message().into(),
-                recoverable: true,
-            });
-            return TurnOutcome::ok(match reason {
-                StopReason::Stalled => TurnStatus::Stalled,
-                _ => TurnStatus::Budget,
-            });
+        match progress.model_checkpoint() {
+            BudgetCheck::Ok => {}
+            BudgetCheck::Renewed(reason) => report_renewal(core.as_ref(), tx, &progress, reason),
+            BudgetCheck::Exhausted(reason) => {
+                let message = progress.checkpoint_message(reason);
+                append_error(&core.session, reason.code(), &message, true);
+                let _ = tx.send(AgentEvent::Error {
+                    code: reason.code().into(),
+                    message: message.clone(),
+                    recoverable: true,
+                });
+                return TurnOutcome::ok(TurnStatus::Budget);
+            }
         }
         if progress.stalled() {
             append_error(
@@ -356,13 +358,6 @@ async fn run_loop(
                 message: StopReason::Stalled.message().into(),
             });
             return TurnOutcome::ok(TurnStatus::Stalled);
-        }
-        if progress.should_wrap_up() {
-            let message = progress.wrap_up_message();
-            if let Err(err) = append_user(&core.session, &message) {
-                return TurnOutcome::error("session_write", err.to_string());
-            }
-            let _ = tx.send(AgentEvent::Notice(message));
         }
 
         // Assemble context, compacting deterministically at 80% of the usable
@@ -403,9 +398,6 @@ async fn run_loop(
         let force_compact = pending_compaction;
         pending_compaction = false;
         if force_compact || budget.exceeds_compaction_threshold(assembled.estimated_tokens) {
-            if compacted_this_turn {
-                return end_budget_context(core, tx, &budget, &assembled, static_prompt);
-            }
             let _ = tx.send(AgentEvent::State(AgentState::Compact));
             match compact(
                 &core.session,
@@ -418,7 +410,7 @@ async fn run_loop(
                 &budget,
             ) {
                 Ok((summary, tokens_before)) => {
-                    compacted_this_turn = true;
+                    compacted_since_model_call = true;
                     let _ = tx.send(AgentEvent::Compacted {
                         summary: summary.clone(),
                         tokens_before,
@@ -438,9 +430,10 @@ async fn run_loop(
                     {
                         return end_context_truncated(core, tx, &budget, exact);
                     }
-                    // One compaction is the whole allowance for a turn. If the
-                    // fixed prompt plus the trimmed summary still cannot fit,
-                    // another pass would only rewrite the same bytes.
+                    // A compaction that still leaves the fixed prompt and the
+                    // trimmed summary over the threshold cannot converge by
+                    // rewriting the same bytes. Running out of room again
+                    // later, after new work, is allowed to compact again.
                     if budget.exceeds_compaction_threshold(assembled.estimated_tokens) {
                         return end_budget_context(core, tx, &budget, &assembled, static_prompt);
                     }
@@ -481,7 +474,7 @@ async fn run_loop(
             if let Some(exact) = exact
                 && exact > budget.usable_prompt()
             {
-                if !progress.presend_compaction_used && !compacted_this_turn {
+                if !progress.presend_compaction_used && !compacted_since_model_call {
                     progress.presend_compaction_used = true;
                     pending_compaction = true;
                     let _ = tx.send(AgentEvent::Notice(format!(
@@ -654,6 +647,10 @@ async fn run_loop(
             return TurnOutcome::ok(TurnStatus::ContextTruncated);
         }
         let mut assistant = assistant;
+        // A successful reply means the current context fits. A later fill can
+        // compact or retry on its own allowance instead of a per-turn budget.
+        compacted_since_model_call = false;
+        progress.recovered_context();
         let recovery = recover_output(core, &mut assistant, &mut progress, &mut call_ledger);
         if let Some(notice) = recovery.notice {
             let _ = tx.send(AgentEvent::Notice(notice));
@@ -744,30 +741,30 @@ async fn run_loop(
         }
 
         let calls = assistant.tool_calls.clone().unwrap_or_default();
-        if !progress.tools_available(calls.len() as u32) {
-            for call in &calls {
-                append_tool_result(
-                    &core.session,
-                    call,
-                    &ToolResult::err(
-                        "budget_tools",
-                        "tool-call budget exhausted; this call did not run",
-                    ),
-                    None,
-                );
+        match progress.tool_checkpoint(calls.len() as u32) {
+            BudgetCheck::Ok => {}
+            BudgetCheck::Renewed(reason) => report_renewal(core.as_ref(), tx, &progress, reason),
+            BudgetCheck::Exhausted(reason) => {
+                for call in &calls {
+                    append_tool_result(
+                        &core.session,
+                        call,
+                        &ToolResult::err(
+                            "budget_tools",
+                            "the turn stopped at a no-progress checkpoint; this call did not run",
+                        ),
+                        None,
+                    );
+                }
+                let message = progress.checkpoint_message(reason);
+                append_error(&core.session, reason.code(), &message, true);
+                let _ = tx.send(AgentEvent::Error {
+                    code: reason.code().into(),
+                    message,
+                    recoverable: true,
+                });
+                return TurnOutcome::ok(TurnStatus::Budget);
             }
-            append_error(
-                &core.session,
-                StopReason::ToolBudget.code(),
-                StopReason::ToolBudget.message(),
-                true,
-            );
-            let _ = tx.send(AgentEvent::Error {
-                code: StopReason::ToolBudget.code().into(),
-                message: StopReason::ToolBudget.message().into(),
-                recoverable: true,
-            });
-            return TurnOutcome::ok(TurnStatus::Budget);
         }
 
         let _ = tx.send(AgentEvent::State(AgentState::ToolBatch));
@@ -825,26 +822,20 @@ async fn run_loop(
         if batch.end_turn {
             if let Some(request) = batch.thread_split {
                 let mut compacted = false;
-                if !compacted_this_turn {
-                    let findings = core.findings_summary();
-                    match compact_with_reason(
-                        &core.session,
-                        findings.as_ref(),
-                        "thread_split",
-                        &budget,
-                    ) {
-                        Ok((summary, tokens_before)) => {
-                            compacted = true;
-                            let _ = tx.send(AgentEvent::Compacted {
-                                summary,
-                                tokens_before,
-                            });
-                        }
-                        Err(err) => {
-                            let _ = tx.send(AgentEvent::Notice(format!(
-                                "thread compaction failed: {err}"
-                            )));
-                        }
+                let findings = core.findings_summary();
+                match compact_with_reason(&core.session, findings.as_ref(), "thread_split", &budget)
+                {
+                    Ok((summary, tokens_before)) => {
+                        compacted = true;
+                        let _ = tx.send(AgentEvent::Compacted {
+                            summary,
+                            tokens_before,
+                        });
+                    }
+                    Err(err) => {
+                        let _ = tx.send(AgentEvent::Notice(format!(
+                            "thread compaction failed: {err}"
+                        )));
                     }
                 }
                 if let Some(kickoff) = request.kickoff {
@@ -852,10 +843,9 @@ async fn run_loop(
                 }
                 let _ = tx.send(AgentEvent::Notice(if compacted {
                     "thread split: context compacted; the old branch remains in /tree".into()
-                } else if compacted_this_turn {
-                    "thread split: context was already compacted this turn; the old branch remains in /tree".into()
                 } else {
-                    "thread split: context compaction failed; the old branch remains in /tree".into()
+                    "thread split: context compaction failed; the old branch remains in /tree"
+                        .into()
                 }));
                 return TurnOutcome::ok(TurnStatus::Done);
             }
@@ -933,8 +923,8 @@ fn static_prompt_failure(
     Some(("budget_static".to_string(), message))
 }
 
-/// End a turn that cannot converge after its one compaction. The message
-/// names the fixed overhead so the user can shrink the profile or window.
+/// End a turn that cannot converge after a compaction. The message names the
+/// fixed overhead so the user can shrink the profile or window.
 fn end_budget_context(
     core: &Core,
     tx: &UnboundedSender<AgentEvent>,
@@ -954,7 +944,7 @@ fn end_budget_context(
     let (largest_name, largest) = static_prompt.largest();
     let suggested = budget.context_window.max(8192);
     let message = format!(
-        "one compaction did not bring the prompt under the {} token threshold: ~{} tokens remain ({:.0}% of the {} usable prompt). The remaining cost is static overhead: system prompt ~{} tokens, tool schemas ~{} tokens, repository brief ~{} tokens ({} total; largest: {} at {}), plus the compaction summary and state block. Compaction cannot remove it. Raise the engine context (llama.cpp --ctx-size {suggested}; Ollama OLLAMA_CONTEXT_LENGTH={suggested}; vLLM --max-model-len {suggested}), use a smaller profile, lower [model] max_output_tokens, or run /new.",
+        "compaction did not bring the prompt under the {} token threshold: ~{} tokens remain ({:.0}% of the {} usable prompt). The remaining cost is static overhead: system prompt ~{} tokens, tool schemas ~{} tokens, repository brief ~{} tokens ({} total; largest: {} at {}), plus the compaction summary and state block. Compaction cannot remove it. Raise the engine context (llama.cpp --ctx-size {suggested}; Ollama OLLAMA_CONTEXT_LENGTH={suggested}; vLLM --max-model-len {suggested}), use a smaller profile, lower [model] max_output_tokens, or run /new.",
         budget.compaction_threshold(),
         assembled.estimated_tokens,
         budget.percent(assembled.estimated_tokens),
@@ -1950,7 +1940,13 @@ async fn execute_batch(
         }
 
         let fingerprint = fingerprint(&call.name, &raw, &tool_result.content);
-        progress.record_tool_result(&fingerprint, changed, verified_ok);
+        progress.record_tool_result(
+            &fingerprint,
+            &tool_result.content,
+            tool_result.is_error,
+            changed,
+            verified_ok,
+        );
         if changed || verified_ok {
             // A file change or a passing verification is real progress; the
             // loop guard must not count calls from before it.
@@ -2086,6 +2082,28 @@ fn append_assistant(
         .expect("session lock")
         .append(EntryKind::Assistant(assistant))?;
     Ok(())
+}
+
+/// A productive checkpoint renewed the allowance. This is bookkeeping for the
+/// user, not a message to the model: the turn simply keeps going.
+fn report_renewal(
+    core: &Core,
+    tx: &UnboundedSender<AgentEvent>,
+    progress: &RunProgress,
+    trigger: StopReason,
+) {
+    append_custom(
+        &core.session,
+        "budget-renewal",
+        json!({
+            "trigger": trigger.code(),
+            "renewals": progress.renewals,
+            "tool_calls": progress.tool_calls,
+            "model_calls": progress.model_calls,
+            "elapsed_secs": progress.elapsed().as_secs(),
+        }),
+    );
+    let _ = tx.send(AgentEvent::Notice(progress.renewal_message(trigger)));
 }
 
 fn append_custom(session: &crate::tools::SessionHandle, kind: &str, payload: Value) {

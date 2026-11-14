@@ -231,7 +231,8 @@ States: `Idle`, `AssembleContext`, `Compact`, `StreamModel`, `ToolBatch`,
    - execute with a timeout;
    - cap, archive, and append the result;
    - update budgets, stall, and verify state.
-8. If the budget allows and the model asked for tools, go to 2.
+8. If the checkpoint allows and the model asked for tools, go to 2. A
+   productive checkpoint renews its allowance instead of ending the turn.
 9. Settle gates may inject a synthetic message and continue. Caps apply.
 10. Mark the turn done; flush and fsync the session.
 
@@ -287,9 +288,9 @@ observable.
 | Read-before-edit | `edit`/`patch` on an existing file require a prior `read` with a matching stat stamp (`mtime`, size). `write` also requires full-line coverage of the existing file, or an explicit `overwrite: true`; a result capped by the result or batch limit marks coverage incomplete. A changed file requires a re-read. Creation is allowed. A successful `edit`/`patch`/`write` re-stamps only the file it wrote, so consecutive edits need no re-read while any outside change still does. |
 | Scope gate | Security-sensitive commands are checked against the user-set engagement scope. No scope blocks with `SEC_SCOPE` and the `/sec scope add` call. Best-effort, not a sandbox. |
 | Sandbox | When `--sandbox` is set, `bash` and `bg` run in a bubblewrap namespace (or the Landlock fallback): read-only root, hidden `$HOME`, private `/tmp`, no network, and `.git` read-only in `workspace-write`. Startup fails closed when no backend exists; a per-command wrap failure returns `SANDBOX_UNAVAILABLE`. Commands never fall back to an unsandboxed run. |
-| Loop guard | Signature is tool name plus canonical arguments. Four identical calls in a row, or an exact 2-4 call cycle repeated four times, blocks the call and ends the turn with a recovery instruction. A file change or a passing verification clears the history, so long multi-step work does not trip it. No automatic session replacement in v1. |
+| Loop guard | Signature is tool name plus canonical arguments. Four identical calls in a row, or an exact 2-8 call cycle repeated four times, blocks the call and ends the turn with a recovery instruction. A file change or a passing verification clears the history, so long multi-step work does not trip it. No automatic session replacement in v1. |
 | Interactive command guard | Blocks `vim`, `less`, `top`, `htop`, `watch`, `nano`, `ssh` without a command, and similar TTY-only invocations. |
-| Budget | Caps tool calls, model calls, and wall clock. At 80% of the cap, inject a wrap-up instruction. |
+| Budget checkpoint | Tool calls, model calls, and wall clock are checked at 120 calls, 40 model calls, and 30 minutes. A checkpoint that finds a new result, a file change, or a passing verify within the last `stall_calls` calls renews the allowance and the turn continues. A checkpoint with no recent progress ends the turn and reports why. |
 | Stall | Twelve consecutive calls with no new result fingerprint, no file change, and no successful verify. Ends the turn with the last known state. |
 | Todo gate | After two mutations or edits touching two files, the run is multi-step and requires a plan. The final task requires a fresh passing verify when verification is configured. |
 | Verify gate | Successful mutations newer than the last passing verify are unverified. Continue up to two times with a verify instruction, then record the unverified state and allow settle. |
@@ -310,8 +311,9 @@ Guards are inert when their required tool is absent from the active profile.
 - Ctrl+C cancels the model request and the running tool, appends a cancellable
   error entry if useful, and returns the TUI to idle. The session remains
   consistent and resumable.
-- The model loop has a hard cap (`max_model_calls`, default 40) to prevent an
-  infinite tool loop.
+- The model loop checks tool, model, and wall-clock checkpoints. A productive
+  run renews each allowance; only a checkpoint with no recent progress, the
+  loop guard, or the stall guard ends the turn.
 
 ### 3.6 Settlement
 
@@ -429,9 +431,10 @@ instruction.
 
 Never trim the active objective or title.
 
-Only one compaction runs per turn. If the estimate is still over the threshold
-after it, the turn ends with a `budget_context` diagnostic naming the static
-overhead instead of compacting again.
+Compaction runs whenever the estimate crosses the threshold again after new
+work. If the estimate is still over the threshold immediately after a
+compaction, the turn ends with a `budget_context` diagnostic naming the static
+overhead instead of compacting the same bytes again.
 
 A compaction entry is a node on the branch. Context assembly starts after the
 latest compaction on the path. The compaction entry itself is not a message;
@@ -1354,12 +1357,11 @@ dir = ""                        # default data dir
 no_session = false
 
 [budgets]
-max_tool_calls = 120
-max_model_calls = 40
-max_wall_minutes = 30
+max_tool_calls = 120            # checkpoint interval; productive runs renew
+max_model_calls = 40            # checkpoint interval; productive runs renew
+max_wall_minutes = 30           # checkpoint interval; productive runs renew
 stall_calls = 12
 verify_attempts = 2
-wrap_up_at = 0.8
 
 [prompt]
 identity = ""                  # replaces the built-in one-line identity

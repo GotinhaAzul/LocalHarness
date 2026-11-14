@@ -1226,6 +1226,118 @@ async fn model_budget_stops_before_another_call() {
 }
 
 #[tokio::test]
+async fn productive_long_task_renews_a_checkpoint_and_finishes() {
+    let dir = tempfile::tempdir().unwrap();
+    for name in ["a.rs", "b.rs", "c.rs"] {
+        std::fs::write(dir.path().join(name), format!("// {name}\n")).unwrap();
+    }
+    let mut harness = harness(
+        dir.path(),
+        vec![
+            tool_script("read", json!({"path":"a.rs"})),
+            tool_script("read", json!({"path":"b.rs"})),
+            tool_script("read", json!({"path":"c.rs"})),
+            text_script("done"),
+        ],
+        &["read"],
+    );
+    let mut config = harness.core.config.clone();
+    // Two calls per allowance: the third read must renew, not stop.
+    config.budgets.max_tool_calls = 2;
+    config.budgets.max_model_calls = 100;
+    let mut core = Arc::try_unwrap(harness.core).unwrap_or_else(|_| panic!("sole owner"));
+    core.config = config;
+    core.limits = localharness::agent::RunLimits::from(&core.config.budgets);
+    harness.core = Arc::new(core);
+
+    let (outcome, events) = run(&harness, "read three files").await;
+    assert_eq!(outcome.status, TurnStatus::Done);
+    assert_eq!(harness.provider.requests.lock().unwrap().len(), 4);
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Notice(message) if message.contains("checkpoint renewed")
+        )),
+        "missing renewal notice"
+    );
+    let session = harness.session.lock().unwrap();
+    assert!(session.branch_entries().iter().any(
+        |entry| matches!(&entry.kind, EntryKind::Custom(custom) if custom.kind == "budget-renewal")
+    ));
+}
+
+#[tokio::test]
+async fn long_task_without_progress_stops_at_the_checkpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut harness = harness(
+        dir.path(),
+        vec![
+            tool_script("read", json!({"path":"missing-1.rs"})),
+            tool_script("read", json!({"path":"missing-2.rs"})),
+            tool_script("read", json!({"path":"missing-3.rs"})),
+            text_script("should not be called"),
+        ],
+        &["read"],
+    );
+    let mut config = harness.core.config.clone();
+    config.budgets.max_tool_calls = 2;
+    config.budgets.max_model_calls = 100;
+    let mut core = Arc::try_unwrap(harness.core).unwrap_or_else(|_| panic!("sole owner"));
+    core.config = config;
+    core.limits = localharness::agent::RunLimits::from(&core.config.budgets);
+    harness.core = Arc::new(core);
+
+    let (outcome, _) = run(&harness, "loop on missing files").await;
+    assert_eq!(outcome.status, TurnStatus::Budget);
+    assert_eq!(harness.provider.requests.lock().unwrap().len(), 3);
+    let results = tool_results(&harness.session);
+    assert_eq!(results.len(), 3);
+    assert!(
+        results[2].contains("did not run"),
+        "the blocked call needs a result: {results:?}"
+    );
+    let session = harness.session.lock().unwrap();
+    assert!(
+        session.branch_entries().iter().any(
+            |entry| matches!(&entry.kind, EntryKind::Error(data) if data.code == "budget_tools")
+        )
+    );
+}
+
+#[tokio::test]
+async fn a_long_turn_can_compact_more_than_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut scripts = Vec::new();
+    for index in 0..24 {
+        let name = format!("file-{index}.rs");
+        std::fs::write(
+            dir.path().join(&name),
+            format!("// {name}\n{}", "let x = 1;\n".repeat(220)),
+        )
+        .unwrap();
+        scripts.push(tool_script("read", json!({"path": name})));
+    }
+    scripts.push(bare_text_script("done"));
+    let mut harness = harness(dir.path(), scripts, &["read"]);
+    let mut core = Arc::try_unwrap(harness.core).unwrap_or_else(|_| panic!("sole owner"));
+    core.budget = TokenBudget::new(8192, 1024);
+    harness.core = Arc::new(core);
+
+    let (outcome, _) = run(&harness, "read every file").await;
+    assert_eq!(outcome.status, TurnStatus::Done, "outcome: {outcome:?}");
+    let session = harness.session.lock().unwrap();
+    let compactions = session
+        .branch_entries()
+        .iter()
+        .filter(|entry| entry.is_compaction())
+        .count();
+    assert!(
+        compactions >= 2,
+        "a long turn must compact again after new work, got {compactions}"
+    );
+}
+
+#[tokio::test]
 async fn oversized_context_compacts_before_the_model_call() {
     let dir = tempfile::tempdir().unwrap();
     let mut harness = harness(dir.path(), vec![text_script("after compaction")], &["read"]);
