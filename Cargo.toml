@@ -39,7 +39,7 @@ regex = "1"
 ipnet = "2"
 ignore = "0.4"
 globset = "0.4"
-similar = "2"
+similar = "3"
 nix = { version = "0.30", features = ["signal", "process"] }
 fs2 = "0.4"
 tracing = "0.1"
