@@ -75,6 +75,9 @@ struct TurnContext {
     tokenize: bool,
     /// A window or Ollama-default warning discovered by the refresh.
     notice: Option<String>,
+    /// The window is a default or a trained maximum, not what the server
+    /// reported or the config pinned.
+    window_guessed: bool,
 }
 
 /// Run one turn to settlement. Appends everything to the session branch;
@@ -125,7 +128,9 @@ pub async fn run_turn(
             let _ = tx.send(AgentEvent::Notice(notice.clone()));
         });
     }
-    if let Some((code, message)) = static_prompt_failure(&turn.static_prompt, &turn.budget) {
+    if let Some((code, message)) =
+        static_prompt_failure(&turn.static_prompt, &turn.budget, turn.window_guessed)
+    {
         let _ = tx.send(AgentEvent::Error {
             code: code.clone(),
             message: message.clone(),
@@ -215,6 +220,7 @@ async fn prepare_turn_context(core: &Core, startup_pending: bool) -> TurnContext
         budget = budget.shrunk_to(known_window);
     }
     let refresh = startup_pending || !source.is_reliable();
+    let mut window_guessed = !source.is_reliable();
     let mut static_prompt = core.static_prompt;
     let mut tool_specs_cost = core.tool_specs_cost;
     let mut tokenize = core.tokenize;
@@ -235,6 +241,7 @@ async fn prepare_turn_context(core: &Core, startup_pending: bool) -> TurnContext
                 .unwrap_or(truth.effective);
             if window > 0 {
                 budget = budget.resized_to(window, core.config.model.max_output_tokens);
+                window_guessed = false;
                 core.remember_window(window);
                 if core.window_notice.is_none() {
                     notice = crate::app::window_notice(Some(&truth), configured);
@@ -280,6 +287,7 @@ async fn prepare_turn_context(core: &Core, startup_pending: bool) -> TurnContext
         tool_specs_cost,
         tokenize,
         notice,
+        window_guessed,
     }
 }
 
@@ -297,6 +305,7 @@ async fn run_loop(
         tool_specs_cost,
         tokenize,
         notice: _,
+        window_guessed,
     } = turn;
     let detected = core
         .detected_window
@@ -312,7 +321,7 @@ async fn run_loop(
     if known_window > 0 && known_window < budget.context_window {
         budget = budget.shrunk_to(known_window);
     }
-    if let Some((code, message)) = static_prompt_failure(&static_prompt, &budget) {
+    if let Some((code, message)) = static_prompt_failure(&static_prompt, &budget, window_guessed) {
         append_error(&core.session, &code, &message, false);
         let _ = tx.send(AgentEvent::Error {
             code: code.clone(),
@@ -522,7 +531,9 @@ async fn run_loop(
             parallel_tool_calls: core.model_profile.parallel_tool_calls,
             temperature: core.config.model.temperature,
             top_p: core.config.model.top_p,
-            max_tokens: core.config.model.max_output_tokens,
+            // The budget's reservation, capped to the window: asking for more
+            // than the window holds makes some servers reject the request.
+            max_tokens: budget.max_output_tokens,
             stop: core.model_profile.stop.clone(),
             extra_body: core
                 .model_profile
@@ -919,6 +930,7 @@ fn context_window_event(
 fn static_prompt_failure(
     static_prompt: &StaticPrompt,
     budget: &TokenBudget,
+    window_guessed: bool,
 ) -> Option<(String, String)> {
     let static_prompt = *static_prompt;
     let usable = budget.usable_prompt();
@@ -926,7 +938,7 @@ fn static_prompt_failure(
         return None;
     }
     let (largest_name, largest) = static_prompt.largest();
-    let message = format!(
+    let mut message = format!(
         "the static prompt cannot fit the model window: system prompt ~{} tokens + tool schemas ~{} + repository brief ~{} = {} tokens, but only {} of the {} token window are usable for input ({} reserved for output, {} safety margin). The request would be cut before your first message. Largest contributor: {} ({} tokens). Use the minimal profile, raise the engine context (llama.cpp --ctx-size {}; Ollama OLLAMA_CONTEXT_LENGTH={}; vLLM --max-model-len {}), or lower [model] max_output_tokens.",
         static_prompt.system,
         static_prompt.tools,
@@ -942,6 +954,14 @@ fn static_prompt_failure(
         budget.context_window.max(8192),
         budget.context_window.max(8192),
     );
+    // When the server never reported its window, the likeliest fix is to
+    // state it, not to shrink the prompt.
+    if window_guessed {
+        message.push_str(&format!(
+            " The server did not report its context size, so {} tokens is a guess; if the model is served with more, set [model] context_window to that value.",
+            budget.context_window
+        ));
+    }
     Some(("budget_static".to_string(), message))
 }
 
@@ -2427,6 +2447,21 @@ fn compact_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn static_refusal_names_a_guessed_window() {
+        let prompt = crate::context::budget::StaticPrompt::new(2000, 1000, 100);
+        let budget = TokenBudget::new(4096, 4096);
+        let (code, guessed) = static_prompt_failure(&prompt, &budget, true).expect("refused");
+        assert_eq!(code, "budget_static");
+        assert!(guessed.contains("1024 reserved for output"), "{guessed}");
+        assert!(guessed.contains("set [model] context_window"), "{guessed}");
+        let (_, measured) = static_prompt_failure(&prompt, &budget, false).expect("refused");
+        assert!(!measured.contains("context_window"), "{measured}");
+        // A prompt that fits the capped reservation is not refused.
+        let small = crate::context::budget::StaticPrompt::new(1000, 400, 40);
+        assert!(static_prompt_failure(&small, &budget, true).is_none());
+    }
     use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;

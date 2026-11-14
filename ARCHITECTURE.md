@@ -352,7 +352,9 @@ continues. Nudges are capped at three per turn.
 usable_prompt = context_window - max_output_tokens - safety_margin
 ```
 
-- `max_output_tokens` defaults to 4096.
+- `max_output_tokens` defaults to 4096 and is capped at a quarter of the
+  window, so a small server window always leaves room for the prompt. The
+  request's `max_tokens` uses the capped value.
 - `safety_margin` is 5% of the context window, minimum 512 tokens.
 - Tool schemas, system prompt, skills index, and state blocks count toward the
   prompt. The serialized `tools` array is measured once when the core is built:

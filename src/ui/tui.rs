@@ -1354,6 +1354,9 @@ impl App {
         self.refresh_session_blocks();
         match outcome {
             Some(outcome) => {
+                // An exact error (for example `budget_static`) is the notice;
+                // the generic status text below must not replace it.
+                let has_error = outcome.error.is_some();
                 if let Some((code, message)) = outcome.error {
                     self.transcript
                         .push_note("error", format!("{code}: {message}"), true);
@@ -1364,6 +1367,7 @@ impl App {
                     TurnStatus::Cancelled => {
                         self.set_notice("turn cancelled", Role::Warning);
                     }
+                    TurnStatus::Budget if has_error => {}
                     TurnStatus::Budget => {
                         self.set_notice(
                             "turn stopped: checkpoint reached with no progress",
