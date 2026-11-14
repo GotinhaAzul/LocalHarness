@@ -37,6 +37,8 @@ use crate::ui::UiOptions;
 use crate::ui::complete::{self, Completion};
 use crate::ui::input::InputState;
 use crate::ui::render::{self, ActivityData, Transcript};
+
+mod git_commands;
 use crate::ui::theme::{Role, Theme};
 use crate::ui::tree::TreeView;
 use crate::ui::widgets::{
@@ -59,6 +61,8 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("resume", "resume a previous session"),
     ("sessions", "list and switch sessions"),
     ("compact", "append a deterministic compaction"),
+    ("commit", "review, edit, or approve the staged commit"),
+    ("pr", "review or approve a pending pull request action"),
     ("tools", "show the active tools"),
     ("mcp", "show MCP server status"),
     ("skill", "pick a skill and append its instructions"),
@@ -85,6 +89,8 @@ fn command_usage(name: &str) -> &'static str {
             "/sec [summary|report|scope add|remove <target>|scope clear]   (no argument: pick)"
         }
         "trust" => "/trust [confirm]",
+        "commit" => "/commit [confirm|cancel|edit <message>]   (no argument: show or draft)",
+        "pr" => "/pr [confirm|cancel]   (no argument: show the pending action)",
         "export" => "/export [path]",
         _ => "",
     }
@@ -93,7 +99,7 @@ fn command_usage(name: &str) -> &'static str {
 const HELP: &str = "\
 Commands: /help [command] /quit /login [endpoint] [model] [api-key] /model [name]
 /profile [name] /theme [name|save] /tree /fork /new /resume [id|last] /sessions
-/compact /tools /mcp
+/compact /tools /mcp /commit [confirm|cancel|edit <message>] /pr [confirm|cancel]
 /skill [name] /workflow [name] /sec [...] /trust [confirm] /export [path]
 /clear /debug
 A command that chooses from a list opens a picker when run without an
@@ -1932,6 +1938,8 @@ impl App {
             "resume" => self.command_resume(rest).await,
             "sessions" => self.command_sessions(),
             "compact" => self.command_compact(),
+            "commit" => self.command_commit(rest).await,
+            "pr" => self.command_pr(rest).await,
             "tools" => self.command_tools(),
             "mcp" => self.command_mcp(),
             "skill" => self.command_skill(rest),

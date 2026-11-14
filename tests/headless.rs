@@ -43,9 +43,11 @@ async fn chat(State(fake): State<Fake>, body: String) -> Response {
                     })
                     .sum()
             })
-            .unwrap_or(0)
-            + value["tools"].to_string().len();
-        (chars / 4).max(1)
+            .unwrap_or(0);
+        // Tool schemas are JSON, which real tokenizers split at about 2.6
+        // characters per token (the harness's own JSON estimate).
+        let tools = value["tools"].to_string().len();
+        (chars / 4 + tools * 10 / 26).max(1)
     };
     let frames = format!(
         concat!(

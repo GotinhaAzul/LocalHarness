@@ -616,7 +616,7 @@ deletes entries.
 
 ### 6.1 Built-in tool surface
 
-Twenty-three tools. Static per model call. The default `coding` profile includes
+Twenty-six tools. Static per model call. The default `coding` profile includes
 core and coding; `full` adds the security pack.
 
 | Pack | Tool | Purpose |
@@ -638,6 +638,8 @@ core and coding; `full` adds the security pack.
 | Coding | `repo_map` | Cached file and symbol outline |
 | Coding | `test` | One file or one test; first failure only |
 | Coding | `review` | Working-tree stats, risks, hunks |
+| Coding | `git` | status, diff, log, blame, stage, commit (preview gate), branch, worktree, undo |
+| Coding | `pr` | Draft PR (preview and verify gates), CI checks, review, comment via `gh` |
 | Security | `surface` | Read hosts, ports, services, URLs, technologies |
 | Security | `evidence` | List, show, verify the evidence chain |
 | Security | `detect` | Validate/run Sigma-subset rules, map hits to findings |
@@ -753,6 +755,41 @@ code and, where useful, the exact call shape.
 - `iocs` extracts URLs, domains, IPv4/IPv6, SHA-256/SHA-1/MD5, emails, and CVEs.
   Output is defanged by default. File scans cap at 2,000,000 characters.
 
+### 6.2a Git and pull requests
+
+`git` and `pr` (coding pack) replace improvised `git`/`gh` in `bash`:
+
+- Read-only actions (`status`, `diff`, `log`, `blame`, `commit_message`, `pr
+  checks`, `pr review`) run directly. With `--sandbox read-only` they are all
+  `git` can do.
+- `stage` takes paths inside the workspace and refuses credential-shaped files
+  (`.env`, `*.pem`, `*.key`, token files).
+- `commit` commits only what is staged and never passes `--no-verify`. It
+  refuses an empty stage, a subject over `[git] subject_max`, a body that lists
+  files instead of a reason, and staged lines that add a secret-shaped value.
+  Under `[git] commit = "ask"` (default) it records a preview and the user runs
+  `/commit confirm`; the commit happens only while the staged diff and HEAD
+  still match the preview.
+- `commit_message` reads the last 20 subjects, reports the dominant style
+  (Conventional Commits, `area:` prefix, or sentence case) and drafts a
+  deterministic subject; the model writes the final message. No generated-by
+  trailer is added.
+- `branch switch` refuses dirty tracked files unless `stash: true`;
+  `worktree add` removes the directory it created when `git worktree add`
+  fails, and `worktree remove` never forces.
+- `undo` soft-resets the latest commit the harness made, only while HEAD is
+  still that commit.
+- `pr draft` refuses on the base branch, with uncommitted changes, with no
+  commits ahead, or without a passing verify after the last file change
+  (unless `override_verify` gives a reason, which goes into the body). The body
+  lists the summary, linked issue, commits, diff stat and verification, with
+  secrets, the workspace path and home directories removed. `/pr confirm`
+  pushes to the branch's existing remote (never `--force`, never a new remote)
+  and creates a draft PR. There is no merge action.
+- In `bash` and `bg`, `git reset --hard`, `git clean -f`, `git push --force`
+  (and `+ref`, `:ref`, `--delete`), `git rebase`, `filter-branch` and
+  `git tag -d` are refused with `GIT_DESTRUCTIVE`.
+
 ### 6.3 Hard limits
 
 | Item | Limit |
@@ -772,6 +809,7 @@ code and, where useful, the exact call shape.
 | post-edit diagnostics | 8 entries, 1200 chars |
 | `test` | 600 s maximum, 2500-char result |
 | `review` | 400 diff lines default, 12 findings |
+| `git` | commit subject 72 chars (`[git] subject_max`), 20 subjects for style, 200 log entries |
 | `finding` | 50 per engagement, 2000-char evidence, 50 PoC steps |
 | `evidence` | 20,000 entries, 4 MiB per artifact |
 | `surface` | 10,000 assets |
@@ -1252,7 +1290,10 @@ cursor = "#c0caf5"
 - `Ctrl+D` quits when the input is empty.
 - Slash commands: `/help`, `/quit`, `/login`, `/model`, `/profile`, `/theme`,
   `/tree`, `/fork`, `/sessions`, `/compact`, `/tools`, `/skill`, `/workflow`,
-  `/sec`, `/trust`, `/export`, `/clear`, `/debug`. `/login` validates and saves
+  `/sec`, `/trust`, `/commit`, `/pr`, `/export`, `/clear`, `/debug`. `/commit`
+  and `/pr` show, edit, approve (`confirm`) or drop (`cancel`) what the `git`
+  and `pr` tools previewed; `/commit` alone drafts a message from the staged
+  diff without a model. `/login` validates and saves
   the endpoint/model/key; `/model` lists endpoint models and switches the
   session.
 - Slash completion shows a filtered popup with descriptions. `Tab` completes

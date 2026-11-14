@@ -19,7 +19,7 @@
 </p>
 
 <p align="center">
-  <code>24 built-in tools</code> · <code>3 packs</code> · <code>1 binary</code> · <code>0 telemetry</code>
+  <code>26 built-in tools</code> · <code>3 packs</code> · <code>1 binary</code> · <code>0 telemetry</code>
 </p>
 
 ---
@@ -174,7 +174,7 @@ Tab completes the token at the cursor: commands, arguments (themes, profiles, sk
 
 Write `@path` in a prompt to attach a file: `fix the panic in @src/parser.rs`. The file is read through the same path as the `read` tool and appended to your message, so the model can edit it without another read. Up to eight files per prompt, within a quarter of the usable context. `@shot.png` attaches a screenshot: a model with vision input sees the image, and a text-only model can get a description from a local vision model; the `read` tool opens images too. Images are checked by content, stripped of EXIF, and sent only to local endpoints unless you opt in. See [docs/images.md](docs/images.md).
 
-Slash commands: `/help /quit /login /model /profile /theme /tree /fork /new /resume /sessions /compact /tools /mcp /skill /workflow /sec /trust /export /clear /debug`.
+Slash commands: `/help /quit /login /model /profile /theme /tree /fork /new /resume /sessions /compact /tools /mcp /skill /workflow /sec /trust /commit /pr /export /clear /debug`.
 
 ### Headless
 
