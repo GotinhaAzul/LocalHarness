@@ -862,6 +862,7 @@ async fn a_turn_after_compaction_keeps_system_messages_leading() {
             tokens_before: 1000,
             reason: "test".into(),
             thread_id: None,
+            keep_from: None,
         }))
         .unwrap();
 
@@ -1335,6 +1336,58 @@ async fn a_long_turn_can_compact_more_than_once() {
     assert!(
         compactions >= 2,
         "a long turn must compact again after new work, got {compactions}"
+    );
+}
+
+#[tokio::test]
+async fn an_automatic_compaction_keeps_the_latest_step_verbatim() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut scripts = Vec::new();
+    for index in 0..24 {
+        let name = format!("file-{index}.rs");
+        std::fs::write(
+            dir.path().join(&name),
+            format!("// {name}\n{}", "let x = 1;\n".repeat(220)),
+        )
+        .unwrap();
+        scripts.push(tool_script("read", json!({"path": name})));
+    }
+    scripts.push(bare_text_script("done"));
+    let mut harness = harness(dir.path(), scripts, &["read"]);
+    let mut core = Arc::try_unwrap(harness.core).unwrap_or_else(|_| panic!("sole owner"));
+    core.budget = TokenBudget::new(16_384, 1024);
+    harness.core = Arc::new(core);
+
+    let (outcome, _) = run(&harness, "read every file").await;
+    assert_eq!(outcome.status, TurnStatus::Done, "outcome: {outcome:?}");
+    let session = harness.session.lock().unwrap();
+    let kept = session
+        .branch_entries()
+        .iter()
+        .filter(
+            |entry| matches!(&entry.kind, EntryKind::Compaction(data) if data.keep_from.is_some()),
+        )
+        .count();
+    assert!(kept >= 1, "an automatic compaction must keep a recent tail");
+    drop(session);
+    // The request right after a compaction still carries a tool result, so
+    // the model does not have to re-read what it just read.
+    let requests = harness.provider.requests.lock().unwrap();
+    let after_compaction = requests
+        .iter()
+        .find(|request| {
+            matches!(
+                request.messages.first(),
+                Some(ChatMessage::System { content }) if content.contains("deterministic compaction")
+            )
+        })
+        .expect("a request after compaction");
+    assert!(
+        after_compaction
+            .messages
+            .iter()
+            .any(|message| matches!(message, ChatMessage::Tool { .. })),
+        "the kept tail must reach the model"
     );
 }
 

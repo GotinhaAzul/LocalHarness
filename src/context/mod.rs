@@ -85,26 +85,44 @@ pub fn assemble(
         }
     }
 
-    if had_compaction
-        && let Some(state) = state_block
-        && !state.trim().is_empty()
-    {
-        messages.push(ChatMessage::System {
-            content: state.to_string(),
-        });
-    }
-
     // Folding keeps the logical order (base, summaries in path order, state)
     // while guaranteeing at most one system message, at the front.
     let messages = fold_system_messages(messages);
 
     let char_count = messages.iter().map(|m| m.char_len()).sum();
     let estimated_tokens = budget.estimate_messages(&messages);
-    AssembledContext {
+    let mut assembled = AssembledContext {
         messages,
         estimated_tokens,
         char_count,
+    };
+    if had_compaction && let Some(state) = state_block {
+        attach_state(&mut assembled, state, budget);
     }
+    assembled
+}
+
+/// Append the post-compaction state block to the leading system message and
+/// update the counts by the difference, so a fixed term a caller already
+/// added (tool schemas) is kept. Lets a caller size the state block from a
+/// finished assembly instead of assembling (and loading images) twice.
+pub fn attach_state(assembled: &mut AssembledContext, state: &str, budget: &TokenBudget) {
+    if state.trim().is_empty() {
+        return;
+    }
+    let Some(system) = assembled.messages.first_mut() else {
+        return;
+    };
+    let before = system.char_len();
+    let ChatMessage::System { content } = system else {
+        return;
+    };
+    content.push_str("\n\n");
+    content.push_str(state);
+    let after = system.char_len();
+    assembled.char_count = assembled.char_count + after - before;
+    assembled.estimated_tokens = assembled.estimated_tokens + budget.estimate_char_len(after)
+        - budget.estimate_char_len(before);
 }
 
 /// Move every system message's content into one leading system turn, keeping
@@ -677,6 +695,7 @@ mod tests {
                 tokens_before: 100,
                 reason: "auto".into(),
                 thread_id: None,
+                keep_from: None,
             }))
             .unwrap();
         session
@@ -699,6 +718,37 @@ mod tests {
     }
 
     #[test]
+    fn attaching_state_later_matches_assembling_with_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = session(dir.path());
+        session
+            .append(EntryKind::Compaction(CompactionData {
+                summary: "[localharness] summary".into(),
+                tokens_before: 100,
+                reason: "auto".into(),
+                thread_id: None,
+                keep_from: None,
+            }))
+            .unwrap();
+        session
+            .append(EntryKind::User(UserData {
+                attachments: Vec::new(),
+                content: "new ".repeat(50),
+            }))
+            .unwrap();
+        let budget = TokenBudget::new(32768, 4096);
+        let at_once = assemble("system", &session, Some("STATE block"), &budget);
+        let mut later = assemble("system", &session, None, &budget);
+        attach_state(&mut later, "STATE block", &budget);
+        assert_eq!(
+            format!("{:?}", later.messages),
+            format!("{:?}", at_once.messages)
+        );
+        assert_eq!(later.char_count, at_once.char_count);
+        assert_eq!(later.estimated_tokens, at_once.estimated_tokens);
+    }
+
+    #[test]
     fn compacted_tool_turns_keep_the_system_message_leading() {
         let dir = tempfile::tempdir().unwrap();
         let mut session = session(dir.path());
@@ -714,6 +764,7 @@ mod tests {
                 tokens_before: 100,
                 reason: "auto".into(),
                 thread_id: None,
+                keep_from: None,
             }))
             .unwrap();
         session

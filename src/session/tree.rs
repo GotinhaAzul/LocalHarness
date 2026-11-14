@@ -147,10 +147,23 @@ impl SessionTree {
             return Vec::new();
         };
         let path = self.path_to(&leaf);
-        match path.iter().rposition(|e| e.is_compaction()) {
-            Some(pos) => path[pos..].to_vec(),
-            None => path,
+        let Some(pos) = path.iter().rposition(|e| e.is_compaction()) else {
+            return path;
+        };
+        // The summary comes first, then the recent exchange the compaction
+        // kept verbatim (it precedes the compaction entry on the branch),
+        // then everything after it. A kept range that crosses an older
+        // compaction would replay that summary too, so it is ignored.
+        let mut context = vec![path[pos]];
+        if let EntryKind::Compaction(compaction) = &path[pos].kind
+            && let Some(keep) = compaction.keep_from.as_deref()
+            && let Some(start) = path[..pos].iter().position(|e| e.id == keep)
+            && !path[start..pos].iter().any(|e| e.is_compaction())
+        {
+            context.extend_from_slice(&path[start..pos]);
         }
+        context.extend_from_slice(&path[pos + 1..]);
+        context
     }
 
     /// Direct children in file order, excluding checkout markers.
@@ -443,6 +456,7 @@ mod tests {
                     tokens_before: 10,
                     reason: "auto".into(),
                     thread_id: None,
+                    keep_from: None,
                 }),
             ),
             user(3, Some("e2"), "new"),
@@ -451,5 +465,48 @@ mod tests {
         let ctx = tree.context_path();
         assert_eq!(ctx.len(), 2);
         assert!(ctx[0].is_compaction());
+    }
+
+    fn compaction(seq: u64, parent: &str, keep_from: Option<&str>) -> Entry {
+        entry(
+            seq,
+            Some(parent),
+            EntryKind::Compaction(CompactionData {
+                summary: "s".into(),
+                tokens_before: 10,
+                reason: "auto".into(),
+                thread_id: None,
+                keep_from: keep_from.map(str::to_string),
+            }),
+        )
+    }
+
+    #[test]
+    fn context_path_replays_the_kept_tail_after_the_summary() {
+        let entries = vec![
+            user(1, None, "old"),
+            user(2, Some("e1"), "recent"),
+            assistant_with_calls(3, Some("e2"), 1),
+            result(4, "e3", "call_0"),
+            compaction(5, "e4", Some("e2")),
+            user(6, Some("e5"), "after"),
+        ];
+        let (tree, _) = SessionTree::from_entries(entries);
+        let ids: Vec<&str> = tree.context_path().iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, ["e5", "e2", "e3", "e4", "e6"]);
+    }
+
+    #[test]
+    fn a_kept_tail_never_crosses_an_older_compaction() {
+        let entries = vec![
+            user(1, None, "old"),
+            compaction(2, "e1", None),
+            user(3, Some("e2"), "mid"),
+            compaction(4, "e3", Some("e1")),
+            user(5, Some("e4"), "after"),
+        ];
+        let (tree, _) = SessionTree::from_entries(entries);
+        let ids: Vec<&str> = tree.context_path().iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, ["e4", "e5"]);
     }
 }

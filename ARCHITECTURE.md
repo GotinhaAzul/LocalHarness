@@ -440,6 +440,21 @@ A compaction entry is a node on the branch. Context assembly starts after the
 latest compaction on the path. The compaction entry itself is not a message;
 its summary becomes the first system message.
 
+An automatic compaction keeps the most recent exchange verbatim: the entry's
+`keep_from` names the first kept entry, and assembly replays the summary, then
+the kept entries, then everything after the compaction. The kept range fits
+20% of the usable prompt, starts on a user or assistant entry so every tool
+result travels with its call, comes only from after the previous compaction,
+and never covers the whole context. The summary then omits what the range
+shows (its actions, and the last instruction when it is inside the range). If
+the kept range leaves the context over the threshold, the loop compacts again
+without it before reporting `budget_context`. Compactions after a provider
+context error, `/compact`, and `thread split` keep nothing.
+
+Messages the harness writes in the user role (gate continuations, recovery
+nudges) start with `[localharness]` and are never taken as the last
+instruction or the objective.
+
 ### 4.5 Threads
 
 `thread split` closes the current thread, records a brief, and at settle writes

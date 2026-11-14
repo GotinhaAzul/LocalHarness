@@ -9,7 +9,9 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 
-use crate::context::compact::{FindingSummary, build_summary, summary_budget};
+use crate::context::compact::{
+    FindingSummary, build_summary_keeping, recent_tail_start, summary_budget, tail_budget,
+};
 use crate::context::{self, BATCH_CAP_CHARS, StaticPrompt, TokenBudget, ToolSpecCost, cap_result};
 use crate::provider::{ChatMessage, ChatRequest, ErrorClass, ProviderError, StreamEvent, Usage};
 use crate::session::{
@@ -376,65 +378,49 @@ async fn run_loop(
         // Assemble context, compacting deterministically at 80% of the usable
         // prompt (or after a provider context error).
         let _ = tx.send(AgentEvent::State(AgentState::AssembleContext));
-        let mut assembled = context::assemble(
-            &core.system_prompt,
-            &core.session.lock().expect("session lock"),
-            None,
-            &budget,
-        );
         let findings = core.findings_summary();
-        let state = context::state_block(
-            &core.session.lock().expect("session lock"),
-            findings.as_ref(),
-            budget.percent(assembled.estimated_tokens),
-        );
-        // A compaction on the branch means the state block must be attached.
-        // Detect it from the session, not from the assembled system text:
-        // after system merging the summary lives inside messages[0].
-        let had_compaction = core
-            .session
-            .lock()
-            .expect("session lock")
-            .branch_entries()
-            .iter()
-            .any(|entry| matches!(entry.kind, EntryKind::Compaction(_)));
-        if had_compaction {
-            assembled = context::assemble(
-                &core.system_prompt,
-                &core.session.lock().expect("session lock"),
-                Some(&state),
-                &budget,
-            );
-        }
-        account_tools(tool_specs_cost, &mut assembled);
+        let mut assembled = assemble_context(core, &budget, findings.as_ref(), tool_specs_cost);
 
         let force_compact = pending_compaction;
         pending_compaction = false;
         if force_compact || budget.exceeds_compaction_threshold(assembled.estimated_tokens) {
             let _ = tx.send(AgentEvent::State(AgentState::Compact));
-            match compact(
+            // A provider rejection or an exact over-count means the estimate
+            // was wrong: keep no tail there, only on a routine compaction.
+            let reason = if force_compact {
+                "context_error"
+            } else {
+                "auto"
+            };
+            let mut result = compact_session(
                 &core.session,
                 findings.as_ref(),
-                if force_compact {
-                    "context_error"
-                } else {
-                    "auto"
-                },
+                reason,
                 &budget,
-            ) {
-                Ok((summary, tokens_before)) => {
+                !force_compact,
+            );
+            if let Ok(compacted) = &result {
+                assembled = assemble_context(core, &budget, findings.as_ref(), tool_specs_cost);
+                // The kept exchange is optional; drop it before declaring
+                // that compaction cannot converge.
+                if compacted.kept_tail
+                    && budget.exceeds_compaction_threshold(assembled.estimated_tokens)
+                {
+                    result =
+                        compact_session(&core.session, findings.as_ref(), reason, &budget, false);
+                    if result.is_ok() {
+                        assembled =
+                            assemble_context(core, &budget, findings.as_ref(), tool_specs_cost);
+                    }
+                }
+            }
+            match result {
+                Ok(compacted) => {
                     compacted_since_model_call = true;
                     let _ = tx.send(AgentEvent::Compacted {
-                        summary: summary.clone(),
-                        tokens_before,
+                        summary: compacted.summary,
+                        tokens_before: compacted.tokens_before,
                     });
-                    assembled = context::assemble(
-                        &core.system_prompt,
-                        &core.session.lock().expect("session lock"),
-                        Some(&state),
-                        &budget,
-                    );
-                    account_tools(tool_specs_cost, &mut assembled);
                     // The exact count is the hard gate; check it before
                     // declaring the compaction unable to converge.
                     if tokenize
@@ -845,13 +831,19 @@ async fn run_loop(
             if let Some(request) = batch.thread_split {
                 let mut compacted = false;
                 let findings = core.findings_summary();
-                match compact_with_reason(&core.session, findings.as_ref(), "thread_split", &budget)
-                {
-                    Ok((summary, tokens_before)) => {
+                // A split exists to start fresh: keep no tail.
+                match compact_session(
+                    &core.session,
+                    findings.as_ref(),
+                    "thread_split",
+                    &budget,
+                    false,
+                ) {
+                    Ok(compacted_entry) => {
                         compacted = true;
                         let _ = tx.send(AgentEvent::Compacted {
-                            summary,
-                            tokens_before,
+                            summary: compacted_entry.summary,
+                            tokens_before: compacted_entry.tokens_before,
                         });
                     }
                     Err(err) => {
@@ -2237,6 +2229,33 @@ fn tokenize_text(messages: &[ChatMessage], tools_json: &str) -> String {
     out
 }
 
+/// The provider context for the next request: the active branch, the tool
+/// schema cost, and the state block when the context starts at a compaction
+/// summary. One assembly per call; the state block is sized from it.
+fn assemble_context(
+    core: &Core,
+    budget: &TokenBudget,
+    findings: Option<&FindingSummary>,
+    tool_specs_cost: ToolSpecCost,
+) -> crate::context::AssembledContext {
+    let session = core.session.lock().expect("session lock");
+    let mut assembled = context::assemble(&core.system_prompt, &session, None, budget);
+    account_tools(tool_specs_cost, &mut assembled);
+    if session
+        .context_path()
+        .first()
+        .is_some_and(|entry| entry.is_compaction())
+    {
+        let state = context::state_block(
+            &session,
+            findings,
+            budget.percent(assembled.estimated_tokens),
+        );
+        context::attach_state(&mut assembled, &state, budget);
+    }
+    assembled
+}
+
 fn account_tools(cost: ToolSpecCost, assembled: &mut crate::context::AssembledContext) {
     assembled.char_count += cost.chars;
     assembled.estimated_tokens = assembled.estimated_tokens.saturating_add(cost.tokens);
@@ -2378,32 +2397,34 @@ fn collect_json_strings(value: &Value, out: &mut Vec<String>) {
     }
 }
 
-fn compact(
-    session: &crate::tools::SessionHandle,
-    findings: Option<&FindingSummary>,
-    reason: &str,
-    budget: &TokenBudget,
-) -> anyhow::Result<(String, u64)> {
-    compact_session(session, findings, reason, budget)
+/// A compaction written to the session.
+struct Compacted {
+    summary: String,
+    tokens_before: u64,
+    /// The recent exchange was kept verbatim after the summary.
+    kept_tail: bool,
 }
 
-fn compact_with_reason(
-    session: &crate::tools::SessionHandle,
-    findings: Option<&FindingSummary>,
-    reason: &str,
-    budget: &TokenBudget,
-) -> anyhow::Result<(String, u64)> {
-    compact_session(session, findings, reason, budget)
-}
-
+/// Write a deterministic compaction entry. With `keep_tail`, the most recent
+/// exchange that fits [`tail_budget`] stays verbatim after the summary, so a
+/// mid-run compaction does not erase what the model just read.
 fn compact_session(
     session: &crate::tools::SessionHandle,
     findings: Option<&FindingSummary>,
     reason: &str,
     budget: &TokenBudget,
-) -> anyhow::Result<(String, u64)> {
+    keep_tail: bool,
+) -> anyhow::Result<Compacted> {
     let mut session = session.lock().expect("session lock");
-    let summary = build_summary(&session, findings, summary_budget(budget));
+    let keep_from = keep_tail
+        .then(|| recent_tail_start(&session, tail_budget(budget)))
+        .flatten();
+    let summary = build_summary_keeping(
+        &session,
+        findings,
+        summary_budget(budget),
+        keep_from.as_deref(),
+    );
     let thread_id = session
         .latest_custom_on_path("thread-state")
         .and_then(|entry| match &entry.kind {
@@ -2419,9 +2440,14 @@ fn compact_session(
         tokens_before: summary.tokens_before,
         reason: reason.to_string(),
         thread_id,
+        keep_from: keep_from.clone(),
     }))?;
     session.fsync()?;
-    Ok((summary.summary, summary.tokens_before))
+    Ok(Compacted {
+        summary: summary.summary,
+        tokens_before: summary.tokens_before,
+        kept_tail: keep_from.is_some(),
+    })
 }
 
 #[cfg(test)]
