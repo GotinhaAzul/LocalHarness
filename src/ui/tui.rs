@@ -479,6 +479,9 @@ struct App {
     theme_before_preview: Option<String>,
     /// Clear the screen and repaint every cell on the next frame.
     repaint: bool,
+    /// The last frame as drawn, for tests that check the screen.
+    #[cfg(test)]
+    last_frame: Option<ratatui::buffer::Buffer>,
 }
 
 impl App {
@@ -562,6 +565,8 @@ impl App {
             switching: None,
             theme_before_preview: None,
             repaint: false,
+            #[cfg(test)]
+            last_frame: None,
         };
         app.no_color = app.options.no_color;
         app.transcript = Transcript::new(app.config.ui.show_reasoning);
@@ -948,7 +953,11 @@ impl App {
         true
     }
 
-    fn draw(&mut self, terminal: &mut Tty) -> Result<()> {
+    fn draw<B>(&mut self, terminal: &mut Terminal<B>) -> Result<()>
+    where
+        B: ratatui::backend::Backend + std::io::Write,
+        B::Error: Send + Sync + 'static,
+    {
         // Terminals that support synchronized output (DEC 2026) show the
         // whole frame at once instead of painting it as bytes arrive; others
         // ignore the markers. The opening marker is flushed right away so
@@ -960,8 +969,16 @@ impl App {
         drawn
     }
 
-    fn draw_frame(&mut self, terminal: &mut Tty) -> Result<()> {
-        let size = terminal.size().context("cannot read the terminal size")?;
+    fn draw_frame<B>(&mut self, terminal: &mut Terminal<B>) -> Result<()>
+    where
+        B: ratatui::backend::Backend + std::io::Write,
+        B::Error: Send + Sync + 'static,
+    {
+        // Pick up a size change now, so the layout below matches the frame.
+        terminal
+            .autoresize()
+            .context("cannot read the terminal size")?;
+        let size = terminal.get_frame().area();
         if std::mem::take(&mut self.repaint) {
             // Forget what ratatui believes is on screen and clear it, so the
             // next frame rewrites every cell. Recovers from anything that
@@ -1030,7 +1047,7 @@ impl App {
         let transcript = &self.transcript;
         let input = &self.input.textarea;
 
-        terminal
+        let _completed = terminal
             .draw(|frame| {
                 let scene = render::Scene {
                     header: header.clone(),
@@ -1049,6 +1066,10 @@ impl App {
                 render::draw(frame, &scene, &self.theme);
             })
             .context("cannot draw the TUI")?;
+        #[cfg(test)]
+        {
+            self.last_frame = Some(_completed.buffer.clone());
+        }
         Ok(())
     }
 
@@ -4209,6 +4230,243 @@ mod tests {
         )
         .unwrap();
         (dir, app)
+    }
+
+    /// A terminal emulator fed exactly the bytes the TUI writes, compared
+    /// with the frame ratatui believes it drew. Any disagreement is a stale
+    /// or misplaced character on a real screen.
+    struct EmulatedScreen {
+        terminal: Terminal<SizedBackend>,
+        output: SharedOutput,
+        parser: vt100::Parser,
+    }
+
+    /// The real crossterm backend writing into `SharedOutput`, with a size
+    /// set by the test instead of read from a tty. Querying the cursor fails
+    /// the test: real terminals may never answer, so the TUI must not ask.
+    struct SizedBackend {
+        inner: CrosstermBackend<SharedOutput>,
+        size: ratatui::layout::Size,
+    }
+
+    impl std::io::Write for SizedBackend {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            std::io::Write::write(&mut self.inner, bytes)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            std::io::Write::flush(&mut self.inner)
+        }
+    }
+
+    impl ratatui::backend::Backend for SizedBackend {
+        type Error = std::io::Error;
+        fn draw<'a, I>(&mut self, content: I) -> std::io::Result<()>
+        where
+            I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
+        {
+            self.inner.draw(content)
+        }
+        fn hide_cursor(&mut self) -> std::io::Result<()> {
+            self.inner.hide_cursor()
+        }
+        fn show_cursor(&mut self) -> std::io::Result<()> {
+            self.inner.show_cursor()
+        }
+        fn get_cursor_position(&mut self) -> std::io::Result<ratatui::layout::Position> {
+            panic!("the TUI queried the cursor position; a silent terminal would stall here")
+        }
+        fn set_cursor_position<P: Into<ratatui::layout::Position>>(
+            &mut self,
+            position: P,
+        ) -> std::io::Result<()> {
+            self.inner.set_cursor_position(position)
+        }
+        fn clear(&mut self) -> std::io::Result<()> {
+            self.inner.clear()
+        }
+        fn clear_region(&mut self, clear_type: ratatui::backend::ClearType) -> std::io::Result<()> {
+            self.inner.clear_region(clear_type)
+        }
+        fn size(&self) -> std::io::Result<ratatui::layout::Size> {
+            Ok(self.size)
+        }
+        fn window_size(&mut self) -> std::io::Result<ratatui::backend::WindowSize> {
+            Ok(ratatui::backend::WindowSize {
+                columns_rows: self.size,
+                pixels: ratatui::layout::Size::default(),
+            })
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            ratatui::backend::Backend::flush(&mut self.inner)
+        }
+    }
+
+    /// Bytes written to the "terminal", readable by the test.
+    #[derive(Clone, Default)]
+    struct SharedOutput(std::rc::Rc<RefCell<Vec<u8>>>);
+
+    impl std::io::Write for SharedOutput {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.borrow_mut().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl EmulatedScreen {
+        fn new(width: u16, height: u16) -> Self {
+            let output = SharedOutput::default();
+            let terminal = Terminal::new(SizedBackend {
+                inner: CrosstermBackend::new(output.clone()),
+                size: ratatui::layout::Size::new(width, height),
+            })
+            .unwrap();
+            let parser = vt100::Parser::new(
+                std::num::NonZeroU16::new(height).unwrap(),
+                std::num::NonZeroU16::new(width).unwrap(),
+                0,
+            );
+            EmulatedScreen {
+                terminal,
+                output,
+                parser,
+            }
+        }
+
+        /// The window changes size; the TUI notices on its next frame.
+        fn resize(&mut self, width: u16, height: u16) {
+            self.terminal.backend_mut().size = ratatui::layout::Size::new(width, height);
+            self.parser.screen_mut().set_size(
+                std::num::NonZeroU16::new(height).unwrap(),
+                std::num::NonZeroU16::new(width).unwrap(),
+            );
+        }
+
+        /// Draw one frame and check the emulated screen against it.
+        fn frame(&mut self, app: &mut App, step: &str) {
+            if let Err(error) = app.draw(&mut self.terminal) {
+                panic!("{step}: draw failed: {error:#}");
+            }
+            let bytes = std::mem::take(&mut *self.output.0.borrow_mut());
+            self.parser.process(&bytes);
+            let frame = app.last_frame.as_ref().expect("a drawn frame");
+            let area = frame.area;
+            for y in 0..area.height {
+                let mut expected = String::new();
+                let mut emulated = String::new();
+                let mut skip = 0;
+                for x in 0..area.width {
+                    let cell = &frame[(x, y)];
+                    let symbol = cell.symbol();
+                    // Everything painted must be free of text the terminal
+                    // could measure differently.
+                    assert!(
+                        !crate::sanitize::needs_cleaning(symbol),
+                        "{step}: unsafe text {symbol:?} painted at ({x}, {y})"
+                    );
+                    if skip > 0 {
+                        skip -= 1;
+                    } else {
+                        expected.push_str(symbol);
+                        skip = unicode_width::UnicodeWidthStr::width(symbol).saturating_sub(1);
+                    }
+                    let cell = self.parser.screen().cell(y, x).expect("cell");
+                    if !cell.is_wide_continuation() {
+                        let contents = cell.contents();
+                        emulated.push_str(if contents.is_empty() { " " } else { contents });
+                    }
+                }
+                assert_eq!(
+                    emulated.trim_end(),
+                    expected.trim_end(),
+                    "{step}: row {y} differs from what ratatui drew"
+                );
+            }
+        }
+    }
+
+    /// Text models and tools really produce, chosen to break width
+    /// assumptions: escapes, tabs, carriage returns, emoji sequences, CJK,
+    /// combining marks, bidi controls, and Markdown that reflows.
+    const HOSTILE: &[&str] = &[
+        "plain words and more words ",
+        "\u{26a0}\u{fe0f} warning ",
+        "\u{1f468}\u{200d}\u{1f4bb} dev ",
+        "\u{1f44d}\u{1f3fd} ",
+        "\u{1f1e7}\u{1f1f7} flag ",
+        "\t tabbed\t",
+        "\u{1b}[1;31mred\u{1b}[0m ",
+        "\u{1b}]8;;https://example.com\u{7}link\u{1b}]8;;\u{7} ",
+        "progress 10%\rprogress 90%",
+        "日本語のテキスト ",
+        "e\u{301}cole ",
+        "\u{200b}zero\u{feff}width ",
+        "\u{202e}reversed\u{202c} ",
+        "\n",
+        "\n\n",
+        "\n\n## Heading ✅\n\n",
+        "\n\n```rust\nfn main() {\n\tlet x = \"日本\";\n}\n```\n\n",
+        "\n- item one\n- item two\n",
+        "\n| a | b |\n|---|---|\n| 日本 | \u{26a0}\u{fe0f} |\n",
+        "averyveryveryveryveryveryveryveryveryveryveryveryveryveryveryverylongword ",
+        "\r\n",
+    ];
+
+    #[tokio::test]
+    async fn screen_never_drifts_from_what_ratatui_drew() {
+        let (_dir, mut app) = test_app().await;
+        let mut screen = EmulatedScreen::new(72, 24);
+        screen.frame(&mut app, "first frame");
+        // A tiny deterministic generator: reproducible without a dependency.
+        let mut seed: u64 = 0x5eed_1234_abcd_0001;
+        let mut next = move |bound: usize| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 33) as usize) % bound
+        };
+        app.transcript
+            .begin_turn("check the hostile text \u{26a0}\u{fe0f}\t\u{1b}[1mnow\u{1b}[0m");
+        let mut tools = 0;
+        for step in 0..600 {
+            let piece = HOSTILE[next(HOSTILE.len())];
+            let label = format!("step {step} after {piece:?}");
+            match next(20) {
+                0 => {
+                    tools += 1;
+                    let id = format!("t{tools}");
+                    app.transcript.tool_started(&id, "bash", piece);
+                    screen.frame(&mut app, &label);
+                    let preview: String = (0..4).map(|_| HOSTILE[next(HOSTILE.len())]).collect();
+                    app.transcript
+                        .tool_finished(&id, "bash", next(2) == 0, 1200, &preview, None);
+                }
+                1 => app.set_notice(piece, Role::Warning),
+                2 => app.handle_event(Event::Paste(piece.to_string())).await,
+                3 => {
+                    app.handle_event(Event::Key(KeyEvent::new(
+                        KeyCode::Char('l'),
+                        KeyModifiers::CONTROL,
+                    )))
+                    .await
+                }
+                4 => {
+                    let (width, height) = [(72, 24), (40, 12), (100, 30), (61, 17)][next(4)];
+                    screen.resize(width, height);
+                    app.handle_event(Event::Resize(width, height)).await;
+                }
+                5 => app.transcript.scroll_up(1 + next(10)),
+                6 => app.transcript.scroll_down(1 + next(10)),
+                7 if next(4) == 0 => {
+                    app.transcript.finish_turn();
+                    app.transcript.begin_turn(piece);
+                }
+                _ => app.transcript.text_delta(piece),
+            }
+            screen.frame(&mut app, &label);
+        }
     }
 
     #[tokio::test]

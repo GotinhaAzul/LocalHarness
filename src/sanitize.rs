@@ -14,6 +14,9 @@
 //!   modifiers: terminals and multiplexers (tmux in particular) disagree with
 //!   `unicode-width` about how wide the resulting cluster is.
 //! - Bidirectional controls, which can reorder the rest of the line.
+//! - Flags (regional-indicator pairs): ratatui measures a pair as one
+//!   2-column cluster, terminals that draw each indicator separately use 4.
+//!   They are shown as their letters (🇧🇷 → `BR`).
 //!
 //! [`display`] rewrites these into plain, predictable text and borrows the
 //! input untouched when there is nothing to change, so it is cheap to call on
@@ -32,7 +35,13 @@ pub const TAB_WIDTH: usize = 4;
 
 /// Whether `ch` needs rewriting before it can be painted.
 fn is_unsafe(ch: char) -> bool {
-    ch != '\n' && (ch.is_control() || is_invisible(ch))
+    ch != '\n' && (ch.is_control() || is_invisible(ch) || regional_letter(ch).is_some())
+}
+
+/// The letter a regional indicator stands for (U+1F1E6 is A).
+fn regional_letter(ch: char) -> Option<char> {
+    let offset = (ch as u32).checked_sub(0x1F1E6)?;
+    (offset < 26).then(|| char::from(b'A' + offset as u8))
 }
 
 /// Format and presentation characters that are dropped for display.
@@ -82,7 +91,7 @@ fn clean(text: &str, expand_tabs: bool, drop_invisible: bool) -> Cow<'_, str> {
         '\n' => false,
         '\t' => expand_tabs,
         ch if ch.is_control() => true,
-        ch => drop_invisible && is_invisible(ch),
+        ch => drop_invisible && (is_invisible(ch) || regional_letter(ch).is_some()),
     };
     if !text.chars().any(drop) {
         return Cow::Borrowed(text);
@@ -126,6 +135,10 @@ fn clean(text: &str, expand_tabs: bool, drop_invisible: bool) -> Cow<'_, str> {
             '\u{1b}' => skip_escape(&mut chars),
             '\u{9b}' => skip_csi(&mut chars),
             '\u{9d}' => skip_string(&mut chars),
+            ch if drop_invisible && regional_letter(ch).is_some() => {
+                out.push(regional_letter(ch).unwrap_or('?'));
+                column += 1;
+            }
             ch if drop(ch) => {}
             ch => {
                 out.push(ch);
@@ -231,6 +244,7 @@ mod tests {
         assert_eq!(display("👍\u{1f3fd}"), "👍");
         assert_eq!(display("\u{feff}text\u{200b}"), "text");
         assert_eq!(display("a\u{202e}b"), "ab");
+        assert_eq!(display("\u{1f1e7}\u{1f1f7} flag"), "BR flag");
     }
 
     #[test]

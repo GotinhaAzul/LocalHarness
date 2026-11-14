@@ -1581,6 +1581,12 @@ Build:
 ### 12.3 TUI tests
 
 - `ratatui::backend::TestBackend` at 80x24, 120x40, and 40x12.
+- Screen consistency: the real crossterm output is fed to a `vt100` terminal
+  emulator through 600 random steps of hostile text (escapes, tabs, emoji
+  sequences, flags, CJK, bidi controls), resizes, repaints, scrolling, and
+  pastes. After every frame the emulated screen must match what ratatui drew,
+  no painted cell may hold text the sanitizer would rewrite, and nothing may
+  query the cursor position.
 - Assert header contains cwd, git branch, model, context; context gauge changes
   color at thresholds; `/tree` shows both branches and the active marker;
   theme switch changes cell styles; narrow layout drops fields in the specified
