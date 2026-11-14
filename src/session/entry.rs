@@ -296,6 +296,11 @@ pub struct CompactionData {
     pub reason: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thread_id: Option<String>,
+    /// First entry of the recent exchange kept verbatim after the summary.
+    /// It lies on the branch before this compaction entry; `None` (and every
+    /// session written before this field existed) keeps nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_from: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

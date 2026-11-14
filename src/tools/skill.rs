@@ -294,6 +294,7 @@ mod tests {
                 summary: "s".into(),
                 tokens_before: 10,
                 thread_id: None,
+                keep_from: None,
             }))
             .unwrap();
         let after = SkillTool.call(&ctx, json!({"name": "security-red"})).await;
