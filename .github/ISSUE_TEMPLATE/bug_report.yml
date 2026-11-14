@@ -1,0 +1,116 @@
+name: Bug report
+description: Something is broken or behaves differently than the documentation says.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        A bug in the harness, the TUI, or the tool protocol belongs here.
+        **A vulnerability does not** — use [private reporting](https://github.com/GotinhaAzul/LocalHarness/security/advisories/new) instead.
+
+        Redact bearer tokens, client names, and anything under NDA before you paste.
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Preflight
+      options:
+        - label: I searched existing issues and this is not a duplicate.
+          required: true
+        - label: This reproduces on the latest `main`.
+          required: true
+        - label: Everything below is free of secrets, tokens, and client data.
+          required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `lh --version`. Add the commit if you built from source.
+      placeholder: "lh 0.1.0 (339650a)"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: engine
+    attributes:
+      label: Inference engine
+      options:
+        - llama.cpp
+        - Ollama
+        - vLLM
+        - LM Studio
+        - LiteLLM or another gateway
+        - Remote OpenAI-compatible endpoint
+        - No endpoint (TUI, config, or CLI behavior)
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: model
+    attributes:
+      label: Model
+      description: The model id as configured, and the quant if it matters.
+      placeholder: "Qwen3.5-35B-A3B-Q4_K_M"
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - Linux x86_64
+        - Linux aarch64
+        - macOS
+        - Windows or WSL
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Smallest sequence that shows it. Include the flags, the profile, and any `.harness/` config that matters.
+      placeholder: |
+        1. `lh --profile security --sandbox`
+        2. ask for ...
+        3. the tool call ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What the docs or the tool schema say should happen, and where that is stated.
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: What happened instead. Paste the exact error, not a paraphrase.
+    validations:
+      required: true
+
+  - type: textarea
+    id: doctor
+    attributes:
+      label: "`lh doctor` output"
+      description: Paste `lh doctor` (or `lh doctor --json`) when the engine, the context window, or tool calling is involved.
+      render: text
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Relevant output from `lh --debug`. Trim to the failing turn.
+      render: text
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: Related issues, a bisect result, or why you think it started.

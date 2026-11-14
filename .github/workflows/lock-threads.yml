@@ -1,0 +1,36 @@
+name: Lock settled threads
+
+# Closed issues attract drive-by replies months later. Lock them once the
+# conversation has had time to settle, and unlock one by hand if it matters.
+on:
+  schedule:
+    - cron: "23 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  issues: write
+  pull-requests: write
+  contents: read
+
+concurrency:
+  group: lock-threads
+  cancel-in-progress: true
+
+jobs:
+  lock:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Lock issues closed more than 30 days ago
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          cutoff=$(date -u -d '30 days ago' +%Y-%m-%d)
+          gh issue list --state closed --limit 200 \
+            --search "closed:<$cutoff" \
+            --json number,locked \
+            --jq '.[] | select(.locked | not) | .number' |
+          while read -r number; do
+            gh issue lock "$number" --reason resolved
+          done

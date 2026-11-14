@@ -278,7 +278,7 @@ No test requires a real model or network. [ARCHITECTURE.md](ARCHITECTURE.md) is 
 
 ## Contributing
 
-Issues and pull requests are welcome. Run the checks above before opening a PR. Changes to the loop, a gate, or the tool protocol should come with a test that fails without the change; read [ARCHITECTURE.md](ARCHITECTURE.md) first.
+Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a PR. The short version: run the checks above, bring a test for anything that changes the loop, a gate, or the tool protocol, and settle the issue before writing the patch. Report vulnerabilities through [SECURITY.md](SECURITY.md), never in a public issue.
 
 ## License
 
