@@ -10,7 +10,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 
 use crate::context::compact::{FindingSummary, build_summary, summary_budget};
-use crate::context::{self, BATCH_CAP_CHARS, StaticPrompt, TokenBudget, ToolSpecCost, cap_result};
+use crate::context::{self, BATCH_CAP_CHARS, StaticPrompt, TokenBudget, ToolSpecCost};
 use crate::provider::{ChatMessage, ChatRequest, ErrorClass, ProviderError, StreamEvent, Usage};
 use crate::session::{
     AssistantData, CompactionData, CustomData, EntryKind, ToolCall, ToolResultData, UserData,
@@ -1857,7 +1857,14 @@ async fn execute_batch(
                 original_chars: content_chars,
                 truncated: false,
             },
-            _ => cap_result(&ctx.artifacts, &result.content),
+            _ => {
+                let preview = if tool.as_deref().is_some_and(|tool| tool.preview_tail()) {
+                    context::Preview::HeadTail
+                } else {
+                    context::Preview::Head
+                };
+                context::cap_result_with(&ctx.artifacts, &result.content, preview)
+            }
         };
         if cap_override.is_none() && batch_chars + capped.content.chars().count() > BATCH_CAP_CHARS
         {

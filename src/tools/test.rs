@@ -25,6 +25,10 @@ pub struct TestTool;
 
 #[async_trait]
 impl Tool for TestTool {
+    fn preview_tail(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &'static str {
         "test"
     }

@@ -379,7 +379,10 @@ usable_prompt = context_window - max_output_tokens - safety_margin
   at 8000 characters.
 - Larger output is written to an artifact under the session's artifact
   directory. The tool result contains a short preview plus `[out-N]` and the
-  artifact size.
+  artifact size. Command tools (`bash`, `bg`, `test`, `verify`) preview the
+  first and the last lines, where errors and summaries land, and name the
+  omitted range: `… 380 lines omitted (12-391); recall out-3 12-131 …`.
+  Other tools preview the start.
 - `recall` reads an artifact range, capped at 4000 characters per call.
 - Artifacts are user-readable files with `0700` directories. Retention is
   configurable; default is 30 days.
@@ -763,7 +766,7 @@ code and, where useful, the exact call shape.
 | `write` | 256 KB content |
 | `edit` / `patch` | 256 KB file, 200 diff lines returned |
 | `undo` | 4 MB snapshot; snapshots live as long as session artifacts |
-| `bash` | 600 s maximum, 1 MiB captured, 64 KB preview |
+| `bash` | 600 s maximum, 1 MiB captured plus the last 256 KiB per stream, 64 KB preview (start and end) |
 | `grep` | 200 matches, 5 lines of context |
 | `glob` | 200 paths |
 | `bg` | 4 live processes, 16 MB log per process |

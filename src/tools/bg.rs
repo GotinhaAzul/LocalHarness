@@ -415,6 +415,10 @@ impl BgTool {
 
 #[async_trait]
 impl Tool for BgTool {
+    fn preview_tail(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &'static str {
         "bg"
     }
