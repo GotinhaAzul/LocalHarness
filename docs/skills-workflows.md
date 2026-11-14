@@ -190,9 +190,16 @@ message = "Push the branch and open a draft PR?"
 ```
 
 Each `[[step]]` has an `id`, `run` (`prompt` or `approval`), and either inline
-`prompt` text or `prompt_file` relative to the TOML. Steps cannot name a
-profile, tools, or skills: the workflow-level fields are the only policy, and
-the engine has no code evaluator.
+`prompt` text or `prompt_file` relative to the TOML. Prompt files must stay
+inside the workflow's directory: absolute paths, `.`/`..`, and symlinks that
+leave it are rejected. Steps cannot name a profile, tools, or skills: the
+workflow-level fields are the only policy, and the engine has no code
+evaluator. An approval step takes a `message` only; `prompt`, `require`, and
+`retry` are configuration errors on a gate.
+
+`lh workflow run` loads and validates the workflow's `skills` and prepends
+their instructions to the first prompt step. The TUI does the same by adding
+labeled user entries when it starts the workflow.
 
 **Conditions** read a fixed fact set: `changed_files`, `open_tasks`,
 `last_exit`, `steps_completed`, and `last_verify` (`pass`, `fail`, `none`).
@@ -211,10 +218,13 @@ results, todo state, and the last `bash` exit code.
 | `require = { verify = "pass" }` | the step's own `verify` result passed (`fail` also accepted) |
 | `require = { artifact = "out/report.md" }` | that file exists and is non-empty |
 
-**Retries** are bounded: `retry = 2` allows three attempts total, and every
-attempt is recorded. A failed turn or an unmet requirement consumes an attempt;
-when the last one fails, the run ends with `workflow_step_failed` and names the
-step and the reason. An approval step is not retried.
+**Retries** are bounded: `retry = 2` allows three attempts in one invocation,
+and every attempt is recorded with its cumulative count in the journal. A
+failed turn or an unmet requirement consumes an attempt; when the last one
+fails, the run ends with `workflow_step_failed` and prints the step and the
+reason. A crash leaves the step pending and `--resume` continues its remaining
+budget; an explicit `--resume` after a failure starts a fresh budget for that
+invocation. An approval step is not retried.
 
 **Approval gates** print the question and read one line from stdin; `y` or
 `yes` accepts, anything else denies (EOF denies). The decision and timestamp
@@ -223,16 +233,23 @@ are written to the journal. A denial ends the run with
 
 **Artifacts** can be declared per step or at the top level with
 `artifacts = ["out/report.md"]`. Every one must exist as a non-empty file when
-its step finishes (or when the workflow finishes, for the top-level list),
-otherwise the run ends with `workflow_artifact_missing` before reporting
-success. Paths must be relative and cannot contain `..`, so a workflow cannot
-declare a file outside the working directory.
+its step finishes, and every artifact belonging to a completed step is checked
+again before the workflow reports success, so a later step cannot delete an
+earlier output. A missing artifact ends the run with
+`workflow_artifact_missing` and names it. Paths must be relative, cannot
+contain `.`/`..`, and must still resolve inside the working directory after
+symlinks.
 
-**Resume** is stored in `<data>/sessions/<project>/workflows/<name>.json`. Every
-step transition is written atomically. `lh workflow run <name> --resume` skips
-steps already completed or skipped and starts at the first step that is
-pending or failed; it also reopens the recorded session so the model keeps its
-context. `--json` emits one JSON event per line, including each attempt.
+**Resume** is stored in `<data>/sessions/<project>/workflows/<name>.json` with
+`0600` permissions in a `0700` directory. Every step transition is written
+atomically. Each record carries a hash of the step definition: a step whose
+prompt, condition, requirement, retry, or artifacts changed is rerun instead of
+being skipped by id. `lh workflow run <name> --resume` skips unchanged steps
+already completed or skipped and starts at the first step that is pending or
+failed; it also reopens the recorded session so the model keeps its context.
+If that session file is gone, the run warns and starts a new session. `--json`
+emits one JSON event per line, including each attempt and the terminal failure.
+`--no-session` keeps the journal in memory and writes nothing.
 
 Success means: every executed step met its requirement and every declared
 artifact exists. The harness still applies the same gates inside each step's

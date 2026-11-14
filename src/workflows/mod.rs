@@ -11,7 +11,7 @@
 pub mod engine;
 pub mod runner;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::LazyLock;
 
 use serde::Deserialize;
@@ -137,6 +137,34 @@ fn parse(name: &str, raw: &str) -> WorkflowSpec {
 }
 
 impl WorkflowSpec {
+    /// Validate every named skill and return the text the CLI prepends to the
+    /// first prompt step. The TUI loads skills itself; the CLI sends the same
+    /// instructions in the prompt.
+    pub fn skill_preamble(&self, index: &crate::skills::SkillIndex) -> Result<String, String> {
+        let mut out = String::new();
+        for name in &self.skills {
+            let Some(skill) = index.get(name) else {
+                return Err(format!(
+                    "workflow {} uses unknown skill {name:?}; available: {}",
+                    self.name,
+                    index.names().join(", ")
+                ));
+            };
+            out.push_str(&format!(
+                "[skill: {}]\n\n{}\n\n",
+                skill.name,
+                skill.instructions_text()
+            ));
+        }
+        if !out.is_empty() && !self.steps.iter().any(|step| !step.is_approval()) {
+            return Err(format!(
+                "workflow {} names skills but has no prompt step to load them into",
+                self.name
+            ));
+        }
+        Ok(out)
+    }
+
     /// Apply this workflow's profile and exact tool allowlist to a config.
     /// Steps cannot call this; only the workflow-level fields are considered.
     pub fn apply_to_config(&self, config: &mut crate::config::Config) -> Result<(), String> {
@@ -181,6 +209,41 @@ pub fn load_file(path: &Path) -> Result<WorkflowSpec, String> {
         .map_err(|error| format!("invalid workflow {}: {error}", path.display()))
 }
 
+/// Read a prompt file that must stay under the workflow's directory. Absolute
+/// paths, `.`/`..` segments, and symlinks that leave the directory are
+/// rejected, so a workflow cannot pull arbitrary files into a prompt.
+fn read_prompt(base: &Path, reference: &str, what: &str) -> Result<String, String> {
+    let relative = Path::new(reference);
+    if relative.is_absolute() {
+        return Err(format!(
+            "{what} {reference:?} must be relative to the workflow file"
+        ));
+    }
+    for component in relative.components() {
+        if !matches!(component, std::path::Component::Normal(_)) {
+            return Err(format!(
+                "{what} {reference:?} must not contain . or .. segments"
+            ));
+        }
+    }
+    let base = base
+        .canonicalize()
+        .map_err(|error| format!("cannot resolve {}: {error}", base.display()))?;
+    let target = base.join(relative);
+    let real = target
+        .canonicalize()
+        .map_err(|error| format!("cannot read {what} {}: {error}", target.display()))?;
+    if !real.starts_with(&base) {
+        return Err(format!(
+            "{what} {reference:?} resolves outside {}",
+            base.display()
+        ));
+    }
+    std::fs::read_to_string(&real)
+        .map(|text| text.trim().to_string())
+        .map_err(|error| format!("cannot read {what} {}: {error}", real.display()))
+}
+
 fn build_spec(
     fallback_name: &str,
     file: WorkflowFile,
@@ -200,17 +263,7 @@ fn build_spec(
                 let dir = dir.ok_or_else(|| {
                     format!("workflow {name} has no directory to resolve {reference:?}")
                 })?;
-                let path = if Path::new(reference).is_absolute() {
-                    PathBuf::from(reference)
-                } else {
-                    dir.join(reference)
-                };
-                std::fs::read_to_string(&path)
-                    .map_err(|error| {
-                        format!("cannot read workflow prompt {}: {error}", path.display())
-                    })?
-                    .trim()
-                    .to_string()
+                read_prompt(dir, reference, "workflow prompt")?
             }
             None => String::new(),
         },
@@ -259,19 +312,27 @@ fn build_spec(
                 let dir = dir.ok_or_else(|| {
                     format!("step {id:?} uses prompt_file, which a bundled workflow cannot do")
                 })?;
-                let path = if Path::new(reference).is_absolute() {
-                    PathBuf::from(reference)
-                } else {
-                    dir.join(reference)
-                };
-                std::fs::read_to_string(&path).map_err(|error| {
-                    format!("cannot read step {id:?} prompt {}: {error}", path.display())
-                })?
+                read_prompt(dir, reference, &format!("step {id:?} prompt"))?
             }
             (None, None) => String::new(),
         };
         let message = step.message;
         let require = parse_requirement(&id, step.require)?;
+        if run == StepRun::Approval {
+            if require != Requirement::None {
+                return Err(format!(
+                    "approval step {id:?} cannot use require; a gate has no tool or verify result"
+                ));
+            }
+            if step.retry > 0 {
+                return Err(format!(
+                    "approval step {id:?} cannot retry; ask again with a new run"
+                ));
+            }
+            if !prompt.trim().is_empty() {
+                return Err(format!("approval step {id:?} uses message, not prompt"));
+            }
+        }
         let (condition, prompt, artifacts) = engine::validate_step(
             &id,
             run,
@@ -297,10 +358,11 @@ fn build_spec(
     for artifact in &file.artifacts {
         engine::validate_artifact(artifact).map_err(|error| format!("workflow {name}: {error}"))?;
     }
-    if file.artifacts.len() > engine::MAX_ARTIFACTS {
+    let total_artifacts =
+        file.artifacts.len() + steps.iter().map(|step| step.artifacts.len()).sum::<usize>();
+    if total_artifacts > engine::MAX_ARTIFACTS {
         return Err(format!(
-            "workflow {name} declares {} artifacts; the maximum is {}",
-            file.artifacts.len(),
+            "workflow {name} declares {total_artifacts} artifacts; the maximum is {}",
             engine::MAX_ARTIFACTS
         ));
     }
@@ -396,6 +458,16 @@ pub fn resolve(
     trust: bool,
     name: &str,
 ) -> Result<WorkflowSpec, String> {
+    if name.is_empty()
+        || name.len() > 128
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(format!(
+            "invalid workflow name {name:?}; use letters, digits, - or _"
+        ));
+    }
     let global = paths.workflows_dir().join(format!("{name}.toml"));
     if global.is_file() {
         return load_file(&global);
@@ -684,6 +756,94 @@ profile = "shell"
                 "{error:?} does not mention {needle}"
             );
         }
+    }
+
+    #[test]
+    fn prompt_files_cannot_leave_the_workflow_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let workflows = dir.path().join("workflows");
+        std::fs::create_dir_all(workflows.join("prompts")).unwrap();
+        std::fs::write(dir.path().join("secret.md"), "secret\n").unwrap();
+        std::fs::write(workflows.join("prompts/ok.md"), "ok\n").unwrap();
+
+        std::fs::write(
+            workflows.join("escape.toml"),
+            "name = \"escape\"\nprompt = \"../secret.md\"\n",
+        )
+        .unwrap();
+        let error = load_file(&workflows.join("escape.toml")).unwrap_err();
+        assert!(error.contains("must not contain"), "{error}");
+
+        std::fs::write(
+            workflows.join("absolute.toml"),
+            "name = \"absolute\"\nprompt = \"/etc/passwd\"\n",
+        )
+        .unwrap();
+        let error = load_file(&workflows.join("absolute.toml")).unwrap_err();
+        assert!(error.contains("must be relative"), "{error}");
+
+        std::fs::write(
+            workflows.join("step.toml"),
+            "name = \"step\"\n[[step]]\nid = \"x\"\nprompt_file = \"../secret.md\"\n",
+        )
+        .unwrap();
+        let error = load_file(&workflows.join("step.toml")).unwrap_err();
+        assert!(error.contains("must not contain"), "{error}");
+
+        std::fs::write(
+            workflows.join("ok.toml"),
+            "name = \"ok\"\nprompt = \"prompts/ok.md\"\n",
+        )
+        .unwrap();
+        assert_eq!(load_file(&workflows.join("ok.toml")).unwrap().prompt, "ok");
+    }
+
+    #[test]
+    fn workflow_names_cannot_be_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut paths = crate::paths::Paths::discover(dir.path()).unwrap();
+        paths.config_dir = dir.path().join("config");
+        for name in ["../../outside", "/tmp/outside", "a/b", ".", ".."] {
+            let error = resolve(&paths, false, name).unwrap_err();
+            assert!(error.contains("invalid workflow name"), "{name:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn approval_steps_reject_prompt_require_and_retry() {
+        for (raw, needle) in [
+            (
+                "name = \"d\"\n[[step]]\nid = \"x\"\nrun = \"approval\"\nmessage = \"ok?\"\nrequire = { verify = \"pass\" }",
+                "cannot use require",
+            ),
+            (
+                "name = \"d\"\n[[step]]\nid = \"x\"\nrun = \"approval\"\nmessage = \"ok?\"\nretry = 1",
+                "cannot retry",
+            ),
+            (
+                "name = \"d\"\n[[step]]\nid = \"x\"\nrun = \"approval\"\nmessage = \"ok?\"\nprompt = \"text\"",
+                "uses message",
+            ),
+        ] {
+            let error = load_str(raw).unwrap_err();
+            assert!(
+                error.contains(needle),
+                "{error:?} does not mention {needle}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_skill_preamble_validates_every_name() {
+        let mut spec = load_str("name = \"demo\"\n[[step]]\nid = \"x\"\nprompt = \"p\"").unwrap();
+        let index = crate::skills::bundled();
+        assert!(spec.skill_preamble(&index).unwrap().is_empty());
+        spec.skills = vec!["test-repair".into()];
+        let text = spec.skill_preamble(&index).unwrap();
+        assert!(text.starts_with("[skill: test-repair]"), "{text}");
+        spec.skills = vec!["does-not-exist".into()];
+        let error = spec.skill_preamble(&index).unwrap_err();
+        assert!(error.contains("unknown skill"), "{error}");
     }
 
     #[test]

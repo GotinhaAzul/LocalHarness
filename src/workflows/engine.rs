@@ -431,6 +431,10 @@ pub struct RunOptions {
     /// Session created for this run, stored for resume.
     pub session_id: Option<String>,
     pub session_file: Option<PathBuf>,
+    /// Write the journal to disk. `--no-session` keeps it in memory.
+    pub persist: bool,
+    /// Redact secret-shaped values before they reach the journal.
+    pub redact: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -447,6 +451,10 @@ pub struct StepRecord {
     pub id: String,
     pub status: StepState,
     pub attempts: u32,
+    /// Hash of the step definition. A changed step is not treated as
+    /// completed on resume.
+    #[serde(default)]
+    pub fingerprint: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
     pub started_at: String,
@@ -522,6 +530,7 @@ impl Journal {
                 id: id.to_string(),
                 status: StepState::Pending,
                 attempts: 0,
+                fingerprint: String::new(),
                 detail: None,
                 started_at: now(),
                 finished_at: None,
@@ -538,19 +547,40 @@ impl Journal {
     }
 
     pub fn save(&mut self, path: &Path) -> Result<(), String> {
+        use std::io::Write;
         self.updated_at = now();
         let Some(parent) = path.parent() else {
             return Err(format!("{} has no parent directory", path.display()));
         };
         std::fs::create_dir_all(parent)
             .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+        }
         let tmp = path.with_extension("json.tmp");
         let body = serde_json::to_vec_pretty(self)
             .map_err(|error| format!("cannot encode workflow state: {error}"))?;
-        std::fs::write(&tmp, body)
+        let mut file = {
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            options
+                .open(&tmp)
+                .map_err(|error| format!("cannot write {}: {error}", tmp.display()))?
+        };
+        file.write_all(&body)
             .map_err(|error| format!("cannot write {}: {error}", tmp.display()))?;
-        std::fs::rename(&tmp, path)
-            .map_err(|error| format!("cannot replace {}: {error}", path.display()))?;
+        drop(file);
+        if let Err(error) = std::fs::rename(&tmp, path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("cannot replace {}: {error}", path.display()));
+        }
         Ok(())
     }
 }
@@ -644,11 +674,8 @@ pub async fn execute(
     executor: &mut dyn StepExecutor,
     on_event: &mut dyn FnMut(&Event),
 ) -> RunReport {
+    let redactor = crate::security::redact::Redactor::new(options.redact);
     let mut events = Vec::new();
-    let mut emit = |event: Event| {
-        on_event(&event);
-        events.push(event);
-    };
 
     let mut journal = if options.resume && options.journal_path.is_file() {
         match Journal::load(&options.journal_path) {
@@ -660,16 +687,27 @@ pub async fn execute(
                     journal.workflow,
                     spec.name
                 );
-                return fail(
-                    journal,
-                    events,
-                    WorkflowFailure {
-                        code: "workflow_state_mismatch",
+                // Never overwrite another workflow's resume state.
+                let failure = WorkflowFailure {
+                    code: "workflow_state_mismatch",
+                    step: None,
+                    message,
+                };
+                let mut events = events;
+                push(
+                    &mut events,
+                    on_event,
+                    Event::Failure {
+                        code: failure.code.to_string(),
                         step: None,
-                        message,
+                        message: redactor.redact_owned(&failure.message),
                     },
-                    &options.journal_path,
                 );
+                return RunReport {
+                    journal: Journal::new(&spec.name),
+                    events,
+                    failure: Some(failure),
+                };
             }
             Err(message) => {
                 return fail(
@@ -680,7 +718,9 @@ pub async fn execute(
                         step: None,
                         message,
                     },
-                    &options.journal_path,
+                    &options,
+                    &redactor,
+                    on_event,
                 );
             }
         }
@@ -698,31 +738,61 @@ pub async fn execute(
         journal.session_file = Some(session_file.display().to_string());
     }
     let mut facts = journal.facts.clone();
+    facts.steps_completed = count_completed(&journal);
+    journal.facts = facts.clone();
 
-    emit(Event::WorkflowStarted {
-        workflow: spec.name.clone(),
-        steps: spec.steps.len(),
-        resumed: options.resume,
-    });
-    if let Err(message) = journal.save(&options.journal_path) {
+    push(
+        &mut events,
+        on_event,
+        Event::WorkflowStarted {
+            workflow: spec.name.clone(),
+            steps: spec.steps.len(),
+            resumed: options.resume,
+        },
+    );
+    if let Err(message) = save_state(&mut journal, &options) {
         return fail(
             journal,
             events,
             state_failure(message),
-            &options.journal_path,
+            &options,
+            &redactor,
+            on_event,
         );
     }
 
     for step in &spec.steps {
-        let resumable = journal.step(&step.id).is_some_and(|record| {
-            matches!(record.status, StepState::Completed | StepState::Skipped)
-        });
-        if options.resume && resumable {
-            emit(Event::StepSkipped {
-                step: step.id.clone(),
-                reason: "completed in an earlier run".into(),
-            });
+        let fingerprint = step_fingerprint(step);
+        let prior = journal.step(&step.id).cloned();
+        let unchanged = prior
+            .as_ref()
+            .is_some_and(|record| record.fingerprint == fingerprint);
+        if options.resume
+            && unchanged
+            && prior.as_ref().is_some_and(|record| {
+                matches!(record.status, StepState::Completed | StepState::Skipped)
+            })
+        {
+            push(
+                &mut events,
+                on_event,
+                Event::StepSkipped {
+                    step: step.id.clone(),
+                    reason: "completed in an earlier run".into(),
+                },
+            );
             continue;
+        }
+
+        // A changed definition (or a fresh run) starts with a fresh budget.
+        {
+            let record = journal.ensure_step(&step.id);
+            record.fingerprint = fingerprint.clone();
+            if !unchanged {
+                record.attempts = 0;
+                record.status = StepState::Pending;
+                record.detail = None;
+            }
         }
 
         if step
@@ -734,52 +804,100 @@ pub async fn execute(
             record.status = StepState::Skipped;
             record.detail = Some("condition was false".into());
             record.finished_at = Some(now());
-            if let Err(message) = journal.save(&options.journal_path) {
+            facts.steps_completed = count_completed(&journal);
+            journal.facts = facts.clone();
+            if let Err(message) = save_state(&mut journal, &options) {
                 return fail(
                     journal,
                     events,
                     state_failure(message),
-                    &options.journal_path,
+                    &options,
+                    &redactor,
+                    on_event,
                 );
             }
-            emit(Event::StepSkipped {
-                step: step.id.clone(),
-                reason: "condition was false".into(),
-            });
+            push(
+                &mut events,
+                on_event,
+                Event::StepSkipped {
+                    step: step.id.clone(),
+                    reason: "condition was false".into(),
+                },
+            );
             continue;
         }
 
         if step.is_approval() {
             let message = step.message.clone().unwrap_or_default();
-            emit(Event::ApprovalRequested {
-                step: step.id.clone(),
-                message: message.clone(),
-            });
+            push(
+                &mut events,
+                on_event,
+                Event::ApprovalRequested {
+                    step: step.id.clone(),
+                    message: message.clone(),
+                },
+            );
             let decision = executor.approve(step).await;
             journal.approvals.push(ApprovalRecord {
                 step: step.id.clone(),
                 decision,
                 at: now(),
             });
-            emit(Event::ApprovalRecorded {
-                step: step.id.clone(),
-                decision,
-            });
+            push(
+                &mut events,
+                on_event,
+                Event::ApprovalRecorded {
+                    step: step.id.clone(),
+                    decision,
+                },
+            );
             match decision {
                 Approval::Accepted => {
+                    if let Some(reason) = missing_artifacts(&step.artifacts, &options.cwd) {
+                        let record = journal.ensure_step(&step.id);
+                        record.status = StepState::Failed;
+                        record.attempts = 1;
+                        record.detail = Some("accepted, but an artifact is missing".into());
+                        record.finished_at = Some(now());
+                        journal.facts = facts.clone();
+                        return fail(
+                            journal,
+                            events,
+                            WorkflowFailure {
+                                code: "workflow_artifact_missing",
+                                step: Some(step.id.clone()),
+                                message: reason,
+                            },
+                            &options,
+                            &redactor,
+                            on_event,
+                        );
+                    }
+                    for artifact in &step.artifacts {
+                        push(
+                            &mut events,
+                            on_event,
+                            Event::ArtifactChecked {
+                                artifact: artifact.clone(),
+                                ok: true,
+                            },
+                        );
+                    }
                     let record = journal.ensure_step(&step.id);
                     record.status = StepState::Completed;
                     record.attempts = 1;
                     record.detail = Some("accepted".into());
                     record.finished_at = Some(now());
-                    facts.steps_completed += 1;
+                    facts.steps_completed = count_completed(&journal);
                     journal.facts = facts.clone();
-                    if let Err(message) = journal.save(&options.journal_path) {
+                    if let Err(message) = save_state(&mut journal, &options) {
                         return fail(
                             journal,
                             events,
                             state_failure(message),
-                            &options.journal_path,
+                            &options,
+                            &redactor,
+                            on_event,
                         );
                     }
                 }
@@ -789,6 +907,7 @@ pub async fn execute(
                     record.attempts = 1;
                     record.detail = Some("denied".into());
                     record.finished_at = Some(now());
+                    journal.facts = facts.clone();
                     return fail(
                         journal,
                         events,
@@ -797,56 +916,90 @@ pub async fn execute(
                             step: Some(step.id.clone()),
                             message: message.clone(),
                         },
-                        &options.journal_path,
+                        &options,
+                        &redactor,
+                        on_event,
                     );
                 }
                 Approval::Cancelled => {
                     let record = journal.ensure_step(&step.id);
                     record.status = StepState::Pending;
                     record.detail = Some("cancelled".into());
-                    return cancel(
-                        journal,
-                        events,
-                        Some(step.id.clone()),
-                        &options.journal_path,
-                    );
+                    return cancel(journal, events, Some(step.id.clone()), &options, on_event);
                 }
             }
             continue;
         }
 
-        let mut attempt = 0;
+        // A step left Pending by a crash continues its budget. A Failed step
+        // is only resumed by a human `--resume`, which starts a fresh budget
+        // for this invocation; the journal keeps the cumulative attempt count.
+        let mut attempt = if options.resume
+            && unchanged
+            && prior
+                .as_ref()
+                .is_some_and(|record| record.status == StepState::Pending)
+        {
+            prior.as_ref().map(|record| record.attempts).unwrap_or(0)
+        } else {
+            0
+        };
+        if attempt > step.retry {
+            let record = journal.ensure_step(&step.id);
+            record.status = StepState::Failed;
+            record.finished_at = Some(now());
+            journal.facts = facts.clone();
+            return fail(
+                journal,
+                events,
+                WorkflowFailure {
+                    code: "workflow_step_failed",
+                    step: Some(step.id.clone()),
+                    message: format!(
+                        "retry budget exhausted after {attempt} attempt{}; change the step or start a new run",
+                        if attempt == 1 { "" } else { "s" }
+                    ),
+                },
+                &options,
+                &redactor,
+                on_event,
+            );
+        }
+
         let mut previous: Option<String> = None;
         loop {
             attempt += 1;
-            emit(Event::StepStarted {
-                step: step.id.clone(),
-                attempt,
-            });
+            push(
+                &mut events,
+                on_event,
+                Event::StepStarted {
+                    step: step.id.clone(),
+                    attempt,
+                },
+            );
             {
                 let record = journal.ensure_step(&step.id);
                 record.attempts = record.attempts.saturating_add(1);
+                record.fingerprint = fingerprint.clone();
             }
-            if let Err(message) = journal.save(&options.journal_path) {
+            if let Err(message) = save_state(&mut journal, &options) {
                 return fail(
                     journal,
                     events,
                     state_failure(message),
-                    &options.journal_path,
+                    &options,
+                    &redactor,
+                    on_event,
                 );
             }
 
             let report = executor.prompt(step, attempt, previous.as_deref()).await;
             facts = report.facts.clone();
+            facts.steps_completed = count_completed(&journal);
 
             let unmet = match &report.status {
                 StepStatus::Cancelled => {
-                    return cancel(
-                        journal,
-                        events,
-                        Some(step.id.clone()),
-                        &options.journal_path,
-                    );
+                    return cancel(journal, events, Some(step.id.clone()), &options, on_event);
                 }
                 StepStatus::Failed { code, message } => Some(format!("{code}: {message}")),
                 StepStatus::Succeeded => requirement_failure(step, &report, &options.cwd),
@@ -861,47 +1014,64 @@ pub async fn execute(
             match (unmet, artifact_failure) {
                 (None, None) => {
                     for artifact in &step.artifacts {
-                        emit(Event::ArtifactChecked {
-                            artifact: artifact.clone(),
-                            ok: true,
-                        });
+                        push(
+                            &mut events,
+                            on_event,
+                            Event::ArtifactChecked {
+                                artifact: artifact.clone(),
+                                ok: true,
+                            },
+                        );
                     }
                     let record = journal.ensure_step(&step.id);
                     record.status = StepState::Completed;
-                    record.detail = report.detail.clone();
+                    record.detail = report
+                        .detail
+                        .as_deref()
+                        .map(|detail| redactor.redact_owned(detail));
                     record.finished_at = Some(now());
-                    facts.steps_completed += 1;
+                    facts.steps_completed = count_completed(&journal);
                     journal.facts = facts.clone();
-                    if let Err(message) = journal.save(&options.journal_path) {
+                    if let Err(message) = save_state(&mut journal, &options) {
                         return fail(
                             journal,
                             events,
                             state_failure(message),
-                            &options.journal_path,
+                            &options,
+                            &redactor,
+                            on_event,
                         );
                     }
-                    emit(Event::StepSucceeded {
-                        step: step.id.clone(),
-                        attempts: attempt,
-                    });
+                    push(
+                        &mut events,
+                        on_event,
+                        Event::StepSucceeded {
+                            step: step.id.clone(),
+                            attempts: attempt,
+                        },
+                    );
                     break;
                 }
                 (unmet, artifact) => {
                     let reason = unmet
                         .or(artifact)
                         .unwrap_or_else(|| "step requirement unmet".into());
-                    if attempt <= step.retry {
-                        emit(Event::StepRetry {
-                            step: step.id.clone(),
-                            attempt,
-                            reason: reason.clone(),
-                        });
+                    if attempt < step.retry + 1 {
+                        push(
+                            &mut events,
+                            on_event,
+                            Event::StepRetry {
+                                step: step.id.clone(),
+                                attempt,
+                                reason: reason.clone(),
+                            },
+                        );
                         previous = Some(reason);
                         continue;
                     }
                     let record = journal.ensure_step(&step.id);
                     record.status = StepState::Failed;
-                    record.detail = Some(reason.clone());
+                    record.detail = Some(redactor.redact_owned(&reason));
                     record.finished_at = Some(now());
                     journal.facts = facts.clone();
                     return fail(
@@ -912,45 +1082,120 @@ pub async fn execute(
                             step: Some(step.id.clone()),
                             message: reason,
                         },
-                        &options.journal_path,
+                        &options,
+                        &redactor,
+                        on_event,
                     );
                 }
             }
         }
     }
 
-    for artifact in &spec.artifacts {
-        emit(Event::ArtifactChecked {
-            artifact: artifact.clone(),
-            ok: artifact_ok(&options.cwd, artifact),
-        });
+    // Every artifact that belongs to a completed step must still exist, and
+    // top-level artifacts are checked last. A later step cannot delete an
+    // earlier step's declared output and still report success.
+    let mut required: Vec<String> = spec.artifacts.clone();
+    for step in &spec.steps {
+        if journal
+            .step(&step.id)
+            .is_some_and(|record| record.status == StepState::Completed)
+        {
+            required.extend(step.artifacts.iter().cloned());
+        }
     }
-    if let Some(failure) = missing_artifacts(&spec.artifacts, &options.cwd) {
-        let failure = WorkflowFailure {
-            code: "workflow_artifact_missing",
-            step: None,
-            message: failure,
-        };
-        return fail(journal, events, failure, &options.journal_path);
+    let mut seen = std::collections::HashSet::new();
+    required.retain(|artifact| seen.insert(artifact.clone()));
+    let missing: Vec<&String> = required
+        .iter()
+        .filter(|artifact| !artifact_ok(&options.cwd, artifact))
+        .collect();
+    for artifact in &required {
+        push(
+            &mut events,
+            on_event,
+            Event::ArtifactChecked {
+                artifact: artifact.clone(),
+                ok: artifact_ok(&options.cwd, artifact),
+            },
+        );
+    }
+    if !missing.is_empty() {
+        let names: Vec<&str> = missing.iter().map(|name| name.as_str()).collect();
+        return fail(
+            journal,
+            events,
+            WorkflowFailure {
+                code: "workflow_artifact_missing",
+                step: None,
+                message: format!("declared artifacts missing or empty: {}", names.join(", ")),
+            },
+            &options,
+            &redactor,
+            on_event,
+        );
     }
 
     journal.status = RunState::Completed;
     journal.facts = facts;
-    if let Err(message) = journal.save(&options.journal_path) {
+    if let Err(message) = save_state(&mut journal, &options) {
         return fail(
             journal,
             events,
             state_failure(message),
-            &options.journal_path,
+            &options,
+            &redactor,
+            on_event,
         );
     }
-    emit(Event::WorkflowFinished {
-        status: RunState::Completed,
-    });
+    push(
+        &mut events,
+        on_event,
+        Event::WorkflowFinished {
+            status: RunState::Completed,
+        },
+    );
     RunReport {
         journal,
         events,
         failure: None,
+    }
+}
+
+fn count_completed(journal: &Journal) -> u64 {
+    journal
+        .steps
+        .iter()
+        .filter(|record| record.status == StepState::Completed)
+        .count() as u64
+}
+
+/// Hash the fields that decide what a step does. A resumed step whose
+/// definition changed is rerun instead of being skipped by id alone.
+pub(crate) fn step_fingerprint(step: &StepSpec) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(format!(
+        "{:?}|{}|{}|{:?}|{:?}|{}|{:?}",
+        step.run,
+        step.prompt,
+        step.message.as_deref().unwrap_or(""),
+        step.when,
+        step.require,
+        step.retry,
+        step.artifacts
+    ));
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn save_state(journal: &mut Journal, options: &RunOptions) -> Result<(), String> {
+    if options.persist {
+        journal.save(&options.journal_path)
+    } else {
+        Ok(())
     }
 }
 
@@ -1003,11 +1248,21 @@ fn requirement_failure(step: &StepSpec, report: &StepReport, cwd: &Path) -> Opti
     }
 }
 
-/// True when the artifact exists under `cwd` and is a non-empty file.
+/// True when the artifact exists under `cwd`, is a non-empty file, and still
+/// resolves inside `cwd` after symlinks.
 pub fn artifact_ok(cwd: &Path, name: &str) -> bool {
-    let path = cwd.join(name);
-    path.is_file()
-        && std::fs::metadata(&path)
+    if validate_artifact(name).is_err() {
+        return false;
+    }
+    let Ok(root) = cwd.canonicalize() else {
+        return false;
+    };
+    let Ok(real) = cwd.join(name).canonicalize() else {
+        return false;
+    };
+    real.starts_with(&root)
+        && real.is_file()
+        && std::fs::metadata(&real)
             .map(|meta| meta.len() > 0)
             .unwrap_or(false)
 }
@@ -1037,20 +1292,32 @@ fn state_failure(message: String) -> WorkflowFailure {
     }
 }
 
+fn push(events: &mut Vec<Event>, on_event: &mut dyn FnMut(&Event), event: Event) {
+    on_event(&event);
+    events.push(event);
+}
+
 fn fail(
     mut journal: Journal,
     mut events: Vec<Event>,
-    failure: WorkflowFailure,
-    journal_path: &Path,
+    mut failure: WorkflowFailure,
+    options: &RunOptions,
+    redactor: &crate::security::redact::Redactor,
+    on_event: &mut dyn FnMut(&Event),
 ) -> RunReport {
+    failure.message = redactor.redact_owned(&failure.message);
     journal.status = RunState::Failed;
     journal.failure = Some(failure.to_string());
-    let _ = journal.save(journal_path);
-    events.push(Event::Failure {
-        code: failure.code.to_string(),
-        step: failure.step.clone(),
-        message: failure.message.clone(),
-    });
+    let _ = save_state(&mut journal, options);
+    push(
+        &mut events,
+        on_event,
+        Event::Failure {
+            code: failure.code.to_string(),
+            step: failure.step.clone(),
+            message: failure.message.clone(),
+        },
+    );
     RunReport {
         journal,
         events,
@@ -1060,17 +1327,21 @@ fn fail(
 
 fn cancel(
     mut journal: Journal,
-    events: Vec<Event>,
+    mut events: Vec<Event>,
     step: Option<String>,
-    journal_path: &Path,
+    options: &RunOptions,
+    on_event: &mut dyn FnMut(&Event),
 ) -> RunReport {
     journal.status = RunState::Cancelled;
     journal.failure = Some("workflow cancelled".into());
-    let _ = journal.save(journal_path);
-    let mut events = events;
-    events.push(Event::WorkflowFinished {
-        status: RunState::Cancelled,
-    });
+    let _ = save_state(&mut journal, options);
+    push(
+        &mut events,
+        on_event,
+        Event::WorkflowFinished {
+            status: RunState::Cancelled,
+        },
+    );
     RunReport {
         journal,
         events,
@@ -1212,12 +1483,20 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    enum Action {
+        /// Remove a file on the Nth prompt call (1-based).
+        Remove { path: PathBuf, at: usize },
+    }
+
     struct Fake {
         /// One report per prompt attempt, in order. Exhausted means success.
         reports: Vec<StepReport>,
         calls: Vec<(String, u32, Option<String>)>,
         approvals: Vec<Approval>,
         approval_calls: Vec<String>,
+        actions: Vec<Action>,
+        prompts: usize,
     }
 
     impl Fake {
@@ -1227,7 +1506,14 @@ mod tests {
                 calls: Vec::new(),
                 approvals,
                 approval_calls: Vec::new(),
+                actions: Vec::new(),
+                prompts: 0,
             }
+        }
+
+        fn with_action(mut self, action: Action) -> Self {
+            self.actions.push(action);
+            self
         }
     }
 
@@ -1241,6 +1527,17 @@ mod tests {
         ) -> StepReport {
             self.calls
                 .push((step.id.clone(), attempt, previous.map(str::to_string)));
+            self.prompts += 1;
+            if self.actions.first().is_some_and(
+                |action| matches!(action, Action::Remove { at, .. } if *at == self.prompts),
+            ) {
+                let action = self.actions.remove(0);
+                match action {
+                    Action::Remove { path, .. } => {
+                        let _ = std::fs::remove_file(path);
+                    }
+                }
+            }
             if self.reports.is_empty() {
                 StepReport::succeeded(Facts::default())
             } else {
@@ -1271,6 +1568,8 @@ mod tests {
             resume,
             session_id: Some("s1".into()),
             session_file: None,
+            persist: true,
+            redact: false,
         }
     }
 
@@ -1628,6 +1927,218 @@ mod tests {
         assert_eq!(facts.last_verify, VerifyState::Pass);
         assert_eq!(facts.open_tasks, 1);
         assert_eq!(Facts::verify_since(&session, 0), VerifyState::Pass);
+    }
+
+    #[tokio::test]
+    async fn a_resume_file_for_another_workflow_is_left_alone() {
+        let (dir, path) = temp_journal();
+        let mut other = Journal::new("other");
+        other.status = RunState::Completed;
+        other.save(&path).unwrap();
+        let mut fake = Fake::new(vec![], vec![]);
+        let spec = spec(vec![prompt_step("one", 0, Requirement::None)], vec![]);
+        let report = execute(
+            &spec,
+            options(path.clone(), dir.path(), true),
+            &mut fake,
+            &mut |_| {},
+        )
+        .await;
+        assert_eq!(report.failure.unwrap().code, "workflow_state_mismatch");
+        let untouched = Journal::load(&path).unwrap();
+        assert_eq!(untouched.workflow, "other");
+        assert_eq!(untouched.status, RunState::Completed);
+    }
+
+    #[tokio::test]
+    async fn steps_completed_counts_finished_steps_across_prompt_reports() {
+        let (dir, path) = temp_journal();
+        let mut third = prompt_step("three", 0, Requirement::None);
+        third.when = Some(Condition::parse("steps_completed >= 2").unwrap());
+        let spec = spec(
+            vec![
+                prompt_step("one", 0, Requirement::None),
+                prompt_step("two", 0, Requirement::None),
+                third,
+            ],
+            vec![],
+        );
+        let mut fake = Fake::new(vec![], vec![]);
+        let report = execute(
+            &spec,
+            options(path.clone(), dir.path(), false),
+            &mut fake,
+            &mut |_| {},
+        )
+        .await;
+        assert!(report.failure.is_none(), "{:?}", report.failure);
+        assert_eq!(
+            fake.calls
+                .iter()
+                .map(|(id, _, _)| id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["one", "two", "three"],
+            "the third step must see steps_completed >= 2"
+        );
+        let journal = Journal::load(&path).unwrap();
+        assert_eq!(journal.facts.steps_completed, 3);
+        assert_eq!(journal.step("three").unwrap().status, StepState::Completed);
+    }
+
+    #[tokio::test]
+    async fn a_changed_step_is_not_skipped_on_resume() {
+        let (dir, path) = temp_journal();
+        let first = approval_step("push");
+        let workflow = spec(vec![first.clone()], vec![]);
+        let mut fake = Fake::new(vec![], vec![Approval::Accepted]);
+        let report = execute(
+            &workflow,
+            options(path.clone(), dir.path(), false),
+            &mut fake,
+            &mut |_| {},
+        )
+        .await;
+        assert!(report.failure.is_none());
+
+        // Same id, different question: the gate must be asked again.
+        let mut changed = first;
+        changed.message = Some("Push to production?".into());
+        let workflow = spec(vec![changed], vec![]);
+        let mut fake = Fake::new(vec![], vec![Approval::Denied]);
+        let report = execute(
+            &workflow,
+            options(path.clone(), dir.path(), true),
+            &mut fake,
+            &mut |_| {},
+        )
+        .await;
+        assert_eq!(fake.approval_calls, vec!["push"]);
+        assert_eq!(report.failure.unwrap().code, "workflow_approval_denied");
+        assert_eq!(Journal::load(&path).unwrap().approvals.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_pending_step_from_a_crash_keeps_its_retry_budget() {
+        let (dir, path) = temp_journal();
+        let step = prompt_step("one", 0, Requirement::None);
+        let mut journal = Journal::new("release");
+        {
+            let record = journal.ensure_step("one");
+            record.status = StepState::Pending;
+            record.attempts = 1;
+            record.fingerprint = step_fingerprint(&step);
+        }
+        journal.save(&path).unwrap();
+        let mut fake = Fake::new(vec![], vec![]);
+        let report = execute(
+            &spec(vec![step], vec![]),
+            options(path, dir.path(), true),
+            &mut fake,
+            &mut |_| {},
+        )
+        .await;
+        assert!(fake.calls.is_empty(), "the budget is already exhausted");
+        let failure = report.failure.unwrap();
+        assert_eq!(failure.code, "workflow_step_failed");
+        assert!(failure.message.contains("retry budget exhausted"));
+    }
+
+    #[tokio::test]
+    async fn a_step_artifact_removed_by_a_later_step_fails_the_run() {
+        let (dir, path) = temp_journal();
+        let output = dir.path().join("out.txt");
+        std::fs::write(&output, "report\n").unwrap();
+        let mut first = prompt_step("one", 0, Requirement::None);
+        first.artifacts = vec!["out.txt".into()];
+        let spec = spec(
+            vec![first, prompt_step("two", 0, Requirement::None)],
+            vec![],
+        );
+        let mut fake = Fake::new(vec![], vec![]).with_action(Action::Remove {
+            path: output,
+            at: 2,
+        });
+        // The first step's artifact check passes; the second prompt attempt
+        // removes it before the final check.
+        let report = execute(
+            &spec,
+            options(path, dir.path(), false),
+            &mut fake,
+            &mut |_| {},
+        )
+        .await;
+        let failure = report.failure.unwrap();
+        assert_eq!(failure.code, "workflow_artifact_missing");
+        assert!(failure.message.contains("out.txt"));
+    }
+
+    #[tokio::test]
+    async fn an_approval_step_checks_its_declared_artifact() {
+        let (dir, path) = temp_journal();
+        let mut gate = approval_step("push");
+        gate.artifacts = vec!["out/report.md".into()];
+        let mut fake = Fake::new(vec![], vec![Approval::Accepted]);
+        let report = execute(
+            &spec(vec![gate], vec![]),
+            options(path, dir.path(), false),
+            &mut fake,
+            &mut |_| {},
+        )
+        .await;
+        let failure = report.failure.unwrap();
+        assert_eq!(failure.code, "workflow_artifact_missing");
+        assert_eq!(failure.step.as_deref(), Some("push"));
+    }
+
+    #[tokio::test]
+    async fn no_session_keeps_the_journal_in_memory() {
+        let (dir, path) = temp_journal();
+        let spec = spec(vec![prompt_step("one", 0, Requirement::None)], vec![]);
+        let mut fake = Fake::new(vec![], vec![]);
+        let mut options = options(path.clone(), dir.path(), false);
+        options.persist = false;
+        let report = execute(&spec, options, &mut fake, &mut |_| {}).await;
+        assert!(report.failure.is_none());
+        assert!(!path.exists(), "the journal must not be written");
+        assert!(!path.with_extension("json.tmp").exists());
+    }
+
+    #[tokio::test]
+    async fn journal_details_are_redacted_when_requested() {
+        let (dir, path) = temp_journal();
+        let mut report = StepReport::succeeded(Facts::default());
+        report.detail = Some("remote: ghp_0123456789abcdefghijklmnopqrstuvwxyz".into());
+        let mut fake = Fake::new(vec![report], vec![]);
+        let mut options = options(path.clone(), dir.path(), false);
+        options.redact = true;
+        let report = execute(
+            &spec(vec![prompt_step("one", 0, Requirement::None)], vec![]),
+            options,
+            &mut fake,
+            &mut |_| {},
+        )
+        .await;
+        assert!(report.failure.is_none());
+        let stored = Journal::load(&path).unwrap();
+        let detail = stored.step("one").unwrap().detail.clone().unwrap();
+        assert!(!detail.contains("ghp_0123456789"), "{detail}");
+        assert!(detail.contains("[REDACTED:github"), "{detail}");
+    }
+
+    #[test]
+    fn an_artifact_symlink_outside_the_root_is_not_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("work");
+        std::fs::create_dir_all(root.join("out")).unwrap();
+        let outside = dir.path().join("outside.txt");
+        std::fs::write(&outside, "secret\n").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, root.join("out/report.md")).unwrap();
+        #[cfg(unix)]
+        assert!(!artifact_ok(&root, "out/report.md"));
+        // A real file inside the root is still accepted.
+        std::fs::write(root.join("out/real.md"), "ok\n").unwrap();
+        assert!(artifact_ok(&root, "out/real.md"));
     }
 
     #[test]

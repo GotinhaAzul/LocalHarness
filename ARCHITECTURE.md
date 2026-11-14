@@ -909,17 +909,24 @@ message = "Push the branch?"
   `steps_completed`, and `last_verify`, through `<fact> <op> <value>` clauses
   joined by `and`. An unknown fact or operator is a configuration error.
 - Requirements are `tool` (with an optional `exit`), `verify`, or `artifact`.
-  A failed turn or unmet requirement consumes one of `retry + 1` attempts; the
-  last failure ends the run with `workflow_step_failed` and names the step.
+  A failed turn or unmet requirement consumes one of the `retry + 1` attempts
+  in an invocation; the last failure ends the run with
+  `workflow_step_failed` and prints the step and reason. A crash leaves the
+  step pending and resume continues its remaining budget.
 - An approval step blocks on stdin, records accept/deny in the journal, and
   cannot be retried. Denial ends the run with `workflow_approval_denied`.
-- Declared artifacts are relative, non-empty files checked before success;
-  `..` and absolute paths are rejected.
-- The journal is written atomically after every transition under
-  `<data>/sessions/<project>/workflows/<name>.json`; `--resume` skips completed
-  and skipped steps and reopens the recorded session.
+- Declared artifacts are relative, non-empty files checked after their step
+  and again before success; `..`, absolute paths, and symlinks that leave the
+  working directory are rejected.
+- Prompt files must stay inside the workflow directory.
+- The journal carries a step fingerprint and is written atomically with `0600`
+  permissions under `<data>/sessions/<project>/workflows/<name>.json`.
+  `--resume` skips unchanged completed or skipped steps, reruns a changed step,
+  and reopens the recorded session. `--no-session` keeps the journal in memory.
 - A step cannot select tools, skills, or a profile. The engine evaluates no
   code, and the turn inside a step still goes through every gate.
+- `lh workflow run` loads the workflow's named skills into the first prompt
+  step after validating them.
 
 `lh workflow list` prints bundled, global, and trusted project workflows.
 

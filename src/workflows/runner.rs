@@ -227,19 +227,24 @@ impl StepExecutor for AgentExecutor {
             let _ = std::io::stderr().flush();
         }
         let mut line = String::new();
-        tokio::select! {
-            _ = self.cancel.cancelled() => Approval::Cancelled,
-            read = self.stdin.read_line(&mut line) => {
-                match read {
-                    Ok(0) | Err(_) => Approval::Denied,
-                    Ok(_) => {
-                        let answer = line.trim().to_ascii_lowercase();
-                        if matches!(answer.as_str(), "y" | "yes") {
-                            Approval::Accepted
-                        } else {
-                            Approval::Denied
-                        }
-                    }
+        let read = tokio::select! {
+            biased;
+            _ = self.cancel.cancelled() => return Approval::Cancelled,
+            read = self.stdin.read_line(&mut line) => read,
+        };
+        // A signal can interrupt the pending read; that is a cancellation,
+        // not a denial. Check the token before interpreting the result.
+        if self.cancel.is_cancelled() {
+            return Approval::Cancelled;
+        }
+        match read {
+            Ok(0) | Err(_) => Approval::Denied,
+            Ok(_) => {
+                let answer = line.trim().to_ascii_lowercase();
+                if matches!(answer.as_str(), "y" | "yes") {
+                    Approval::Accepted
+                } else {
+                    Approval::Denied
                 }
             }
         }

@@ -654,29 +654,51 @@ async fn run_workflow_command(
             let mut run_config = config.clone();
             spec.apply_to_config(&mut run_config)
                 .map_err(anyhow::Error::msg)?;
+            let skills = crate::skills::SkillIndex::load(paths, run_config.trust);
+            let preamble = spec.skill_preamble(&skills).map_err(anyhow::Error::msg)?;
+            if !preamble.is_empty()
+                && let Some(step) = spec.steps.iter_mut().find(|step| !step.is_approval())
+            {
+                step.prompt = format!("{preamble}{}", step.prompt);
+            }
 
             let journal_path = paths
                 .project_sessions_dir()
                 .join("workflows")
                 .join(format!("{}.json", crate::text::slug(name, '-')));
-            let resume_session = if *resume {
+            let resume_journal = if *resume {
                 if !journal_path.is_file() {
                     bail!(
                         "no saved run for {name:?} at {}; run it without --resume to start one",
                         journal_path.display()
                     );
                 }
-                crate::workflows::engine::Journal::load(&journal_path)
-                    .map_err(anyhow::Error::msg)?
-                    .session_file
-                    .map(PathBuf::from)
-                    .filter(|path| path.is_file())
+                Some(
+                    crate::workflows::engine::Journal::load(&journal_path)
+                        .map_err(|error| anyhow::anyhow!("cannot resume {name:?}: {error}"))?,
+                )
             } else {
                 None
             };
+            let recorded_session_missing = resume_journal
+                .as_ref()
+                .and_then(|journal| journal.session_file.as_deref())
+                .is_some_and(|path| !std::path::Path::new(path).is_file());
+            if recorded_session_missing {
+                eprintln!(
+                    "[workflow] the recorded session file is gone; continuing with a fresh session"
+                );
+            }
+            let resume_session = resume_journal
+                .as_ref()
+                .and_then(|journal| journal.session_file.as_ref())
+                .map(PathBuf::from)
+                .filter(|path| path.is_file());
             if run_config.session.no_session && *resume {
                 bail!("--no-session cannot be combined with --resume");
             }
+            let redact = run_config.session.redact;
+            let persist = !run_config.session.no_session;
             let options = RuntimeOptions {
                 path_jail,
                 engagement,
@@ -687,7 +709,30 @@ async fn run_workflow_command(
                 approver: None,
             };
             let runtime = create_runtime(run_config, paths.clone(), options).await?;
-            let needs_model = spec.steps.iter().any(|step| !step.is_approval());
+            // A resumed run only needs a model for a step that will actually
+            // execute: a completed or skipped unchanged step does not.
+            let needs_model = spec.steps.iter().any(|step| {
+                if step.is_approval() {
+                    return false;
+                }
+                if !*resume {
+                    return true;
+                }
+                let Some(record) = resume_journal
+                    .as_ref()
+                    .and_then(|journal| journal.step(&step.id))
+                else {
+                    return true;
+                };
+                let unchanged =
+                    record.fingerprint == crate::workflows::engine::step_fingerprint(step);
+                !(unchanged
+                    && matches!(
+                        record.status,
+                        crate::workflows::engine::StepState::Completed
+                            | crate::workflows::engine::StepState::Skipped
+                    ))
+            });
             if needs_model && !runtime.core.logged_in() {
                 bail!(
                     "no model is selected. Start the inference server and pass --model (or set LH_MODEL), or run `/login` in the TUI."
@@ -700,11 +745,6 @@ async fn run_workflow_command(
                     (Some(session.id.clone()), session.path.clone())
                 }
             };
-            if *resume && session_file.is_none() {
-                eprintln!(
-                    "[workflow] the earlier session file is gone; continuing with a fresh session"
-                );
-            }
             let cancel = CancellationToken::new();
             let signal = cancel.clone();
             tokio::spawn(async move {
@@ -723,6 +763,8 @@ async fn run_workflow_command(
                 resume: *resume,
                 session_id,
                 session_file,
+                persist,
+                redact,
             };
             let mut on_event = |event: &crate::workflows::engine::Event| {
                 print_workflow_event(event, *json);
