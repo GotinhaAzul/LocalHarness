@@ -784,15 +784,27 @@ pub async fn execute(
             continue;
         }
 
-        // A changed definition (or a fresh run) starts with a fresh budget.
+        // Everything that reaches this point is about to run. Mark it
+        // Pending before any work so a crash during a fresh run cannot leave
+        // a stale Completed record from an earlier invocation.
         {
             let record = journal.ensure_step(&step.id);
             record.fingerprint = fingerprint.clone();
+            record.status = StepState::Pending;
+            record.detail = None;
             if !unchanged {
                 record.attempts = 0;
-                record.status = StepState::Pending;
-                record.detail = None;
             }
+        }
+        if let Err(message) = save_state(&mut journal, &options) {
+            return fail(
+                journal,
+                events,
+                state_failure(message),
+                &options,
+                &redactor,
+                on_event,
+            );
         }
 
         if step
