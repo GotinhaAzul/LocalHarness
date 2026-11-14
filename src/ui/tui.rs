@@ -48,6 +48,7 @@ use crate::workflows::{self, WorkflowSpec};
 
 /// Slash commands with one-line descriptions for the completion popup.
 mod commands;
+mod git_commands;
 mod keys;
 mod support;
 mod terminal;
@@ -70,6 +71,8 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("resume", "resume a previous session"),
     ("sessions", "list and switch sessions"),
     ("compact", "append a deterministic compaction"),
+    ("commit", "review, edit, or approve the staged commit"),
+    ("pr", "review or approve a pending pull request action"),
     ("tools", "show the active tools"),
     ("mcp", "show MCP server status"),
     ("skill", "pick a skill and append its instructions"),
@@ -96,6 +99,8 @@ fn command_usage(name: &str) -> &'static str {
             "/sec [summary|report|scope add|remove <target>|scope clear]   (no argument: pick)"
         }
         "trust" => "/trust [confirm]",
+        "commit" => "/commit [confirm|cancel|edit <message>]   (no argument: show or draft)",
+        "pr" => "/pr [confirm|cancel]   (no argument: show the pending action)",
         "export" => "/export [path]",
         _ => "",
     }
@@ -104,7 +109,7 @@ fn command_usage(name: &str) -> &'static str {
 const HELP: &str = "\
 Commands: /help [command] /quit /login [endpoint] [model] [api-key] /model [name]
 /profile [name] /theme [name|save] /tree /fork /new /resume [id|last] /sessions
-/compact /tools /mcp
+/compact /tools /mcp /commit [confirm|cancel|edit <message>] /pr [confirm|cancel]
 /skill [name] /workflow [name] /sec [...] /trust [confirm] /export [path]
 /clear /debug
 A command that chooses from a list opens a picker when run without an

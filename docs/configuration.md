@@ -74,6 +74,11 @@ file = ""                       # or a Markdown file, relative to the config dir
 [lsp]
 gate = "warn"                   # off | warn | block (see below)
 
+[git]
+commit = "ask"                  # ask: /commit confirm approves; allow: commit at once
+pr = "ask"                      # ask: /pr confirm approves drafts and comments
+subject_max = 72                # longest accepted commit subject
+
 # `coding` is the built-in default. `full` adds the security pack; `security`
 # and `minimal` narrow it further. `strict` and `shell` are weak-model presets.
 [profile.coding]
@@ -173,6 +178,17 @@ more reliably with commands than with JSON calls. The output contract is:
 `short_tool_schemas = true` removes property descriptions from the request and
 shortens each tool description. It changes only what the model sees; argument
 validation still uses the full schema.
+
+## Git approval
+
+The `git` tool's `commit` and the `pr` tool's `draft` and `comment` change
+history or publish. With the default `ask`, the tool records a preview in the
+session and stops; the user reviews it in the TUI and approves with
+`/commit confirm` or `/pr confirm` (`/commit edit <message>` replaces the
+message; `\n` starts a new line; `cancel` drops either). A commit is made only
+while the staged diff still matches the preview. `allow` runs the action at
+once and suits unattended runs; headless `--print` has no way to approve, so
+`ask` leaves the preview unapplied there.
 
 ## LSP gate
 

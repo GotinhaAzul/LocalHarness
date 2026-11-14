@@ -23,6 +23,8 @@ pub struct Config {
     pub budgets: BudgetConfig,
     pub prompt: PromptConfig,
     pub lsp: LspConfig,
+    /// Commit and pull-request approval for the `git` and `pr` tools.
+    pub git: GitConfig,
     /// Profile used when neither `--profile` nor `LH_PROFILE` is set.
     pub default_profile: String,
     #[serde(rename = "profile")]
@@ -776,6 +778,40 @@ impl McpServerConfig {
     }
 }
 
+/// `[git]`: who approves the high-consequence git actions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GitConfig {
+    /// `git commit` from the model: `ask` waits for `/commit confirm` in the
+    /// TUI; `allow` commits at once (unattended runs).
+    pub commit: GitApproval,
+    /// Draft PRs and PR comments: `ask` waits for `/pr confirm`.
+    pub pr: GitApproval,
+    /// Longest accepted commit subject, in characters.
+    pub subject_max: usize,
+}
+
+impl Default for GitConfig {
+    fn default() -> Self {
+        Self {
+            commit: GitApproval::Ask,
+            pr: GitApproval::Ask,
+            subject_max: 72,
+        }
+    }
+}
+
+/// Whether a git action runs at once or waits for the user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum GitApproval {
+    /// Record a preview; the user approves it with a slash command.
+    #[default]
+    Ask,
+    /// Run immediately.
+    Allow,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LspConfig {
@@ -1042,6 +1078,18 @@ mod tests {
                 .unwrap_or_else(|error| panic!("{name}: {error}"));
             assert!(!selected.is_empty(), "{name} selects no tools");
         }
+    }
+
+    #[test]
+    fn git_approval_defaults_to_ask() {
+        let cfg = Config::builtin();
+        assert_eq!(cfg.git.commit, GitApproval::Ask);
+        assert_eq!(cfg.git.pr, GitApproval::Ask);
+        assert_eq!(cfg.git.subject_max, 72);
+        let parsed: Config = toml::from_str("[git]\ncommit = \"allow\"\n").expect("allow is valid");
+        assert_eq!(parsed.git.commit, GitApproval::Allow);
+        assert_eq!(parsed.git.pr, GitApproval::Ask);
+        assert!(toml::from_str::<Config>("[git]\ncommit = \"yes\"\n").is_err());
     }
 
     #[test]

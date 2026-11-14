@@ -1,4 +1,4 @@
-//! Built-in tool surface: 24 static tools in three packs, plus the registry.
+//! Built-in tool surface: 26 static tools in three packs, plus the registry.
 
 pub mod attack_path;
 pub mod bash;
@@ -7,11 +7,13 @@ pub mod detect;
 pub mod edit;
 pub mod evidence;
 pub mod finding;
+pub mod git;
 pub mod glob;
 pub mod grep;
 pub mod iocs;
 pub mod lsp;
 pub mod patch;
+pub mod pr;
 pub mod read;
 pub mod recall;
 pub mod repo_map;
@@ -572,6 +574,8 @@ impl ToolRegistry {
             Arc::new(lsp::LspTool::with_service(lsp)),
             Arc::new(test::TestTool),
             Arc::new(review::ReviewTool),
+            Arc::new(git::GitTool::default()),
+            Arc::new(pr::PrTool::default()),
             Arc::new(surface::SurfaceTool),
             Arc::new(evidence::EvidenceTool),
             Arc::new(detect::DetectTool),
@@ -582,6 +586,12 @@ impl ToolRegistry {
             registry.register(tool);
         }
         registry
+    }
+
+    /// Apply `[git]` approval settings to the `git` and `pr` tools.
+    pub fn configure_git(&mut self, config: &crate::config::GitConfig) {
+        self.register(Arc::new(git::GitTool::new(config.clone())));
+        self.register(Arc::new(pr::PrTool::new(config.clone())));
     }
 
     /// Resolve packs plus explicit tool names. Unknown names are errors that
@@ -912,7 +922,7 @@ mod tests {
         let registry = ToolRegistry::builtin();
         assert_eq!(
             registry.names().len(),
-            24,
+            26,
             "update docs when the built-in surface changes: {:?}",
             registry.names()
         );

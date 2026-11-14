@@ -356,8 +356,9 @@ pub async fn create_runtime(
         }
     }
 
-    let registry = ToolRegistry::builtin();
+    let mut registry = ToolRegistry::builtin();
     registry.lsp().set_gate(config.lsp.gate);
+    registry.configure_git(&config.git);
     let mcp = Arc::new(crate::mcp::McpManager::new());
     let (tools, mcp_warnings) = select_tools(&registry, &config, &paths, &mcp).await?;
     session.warnings.extend(mcp_warnings);
@@ -651,8 +652,9 @@ pub async fn rebuild_core(old: &Arc<Core>, mut config: Config) -> Result<Arc<Cor
     } else {
         Default::default()
     };
-    let registry = ToolRegistry::builtin();
+    let mut registry = ToolRegistry::builtin();
     registry.lsp().set_gate(config.lsp.gate);
+    registry.configure_git(&config.git);
     let (tools, mcp_warnings) = select_tools(&registry, &config, &old.paths, &old.mcp).await?;
     if !mcp_warnings.is_empty() {
         for warning in &mcp_warnings {

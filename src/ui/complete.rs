@@ -141,6 +141,8 @@ pub fn takes_args(command: &str) -> bool {
             | "workflow"
             | "sec"
             | "trust"
+            | "commit"
+            | "pr"
             | "export"
     )
 }
@@ -284,6 +286,15 @@ fn complete_argument(
             "confirm",
             "trust this project for the session",
         )],
+        ("commit", []) => vec![
+            Candidate::new("confirm", "commit the previewed changes"),
+            Candidate::new("edit", "replace the commit message"),
+            Candidate::new("cancel", "drop the commit preview"),
+        ],
+        ("pr", []) => vec![
+            Candidate::new("confirm", "carry out the pending pull request action"),
+            Candidate::new("cancel", "drop the pending pull request action"),
+        ],
         ("sec", []) => vec![
             Candidate::new("summary", "show the engagement summary"),
             Candidate::new("scope", "add, remove, or clear engagement scope"),

@@ -145,6 +145,9 @@ impl BashTool {
         if let Err(message) = gate {
             return ToolResult::err("SEC_SCOPE", message);
         }
+        if let Some(message) = crate::tools::git::destructive_git(&command) {
+            return ToolResult::err("GIT_DESTRUCTIVE", message);
+        }
 
         if ctx.is_cancelled() {
             return cancelled_result();

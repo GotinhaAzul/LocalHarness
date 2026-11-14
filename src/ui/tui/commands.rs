@@ -40,6 +40,8 @@ impl App {
             "resume" => self.command_resume(rest).await,
             "sessions" => self.command_sessions(),
             "compact" => self.command_compact(),
+            "commit" => self.command_commit(rest).await,
+            "pr" => self.command_pr(rest).await,
             "tools" => self.command_tools(),
             "mcp" => self.command_mcp(),
             "skill" => self.command_skill(rest),
