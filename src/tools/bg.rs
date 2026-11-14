@@ -330,6 +330,9 @@ impl BgTool {
                 );
             }
         };
+        // Dev servers and watchers color their output and redraw spinners;
+        // resolve that before counting lines.
+        let raw = crate::sanitize::terminal_output(&raw).into_owned();
         let raw = ctx.artifacts.redact_owned(&raw);
         let body = tail_chars(&last_lines(&raw, lines), MAX_LOG_CHARS);
         let body = if body.is_empty() {

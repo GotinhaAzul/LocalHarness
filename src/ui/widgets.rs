@@ -135,6 +135,10 @@ pub fn middle_truncate(text: &str, max: usize) -> String {
 
 /// Clip from the end to at most `max` display columns.
 pub fn clip_end(text: &str, max: usize) -> String {
+    // Everything clipped here is painted; keep it free of text that would
+    // desynchronize the screen (escapes, tabs, emoji selectors).
+    let text = crate::sanitize::display(text);
+    let text = text.as_ref();
     if UnicodeWidthStr::width(text) <= max {
         return text.to_string();
     }
