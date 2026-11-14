@@ -4,10 +4,12 @@ pub mod archive;
 pub mod budget;
 pub mod compact;
 
-use crate::provider::{ChatMessage, ToolCall};
+use crate::provider::{ChatMessage, ImageData, ToolCall};
 use std::collections::HashMap;
 
-use crate::session::{AssistantData, Entry, EntryKind, Session, ToolResultData};
+use crate::session::{
+    ArtifactStore, AssistantData, Entry, EntryKind, ImageRef, Session, ToolResultData,
+};
 
 pub use archive::{
     BATCH_CAP_CHARS, CappedContent, RECALL_CAP_CHARS, RESULT_CAP_CHARS, cap_batch, cap_result,
@@ -52,12 +54,30 @@ pub fn assemble(
                 });
             }
             EntryKind::User(user) => {
-                messages.push(ChatMessage::User {
-                    content: user.model_content(),
-                });
+                let mut content = user.model_content();
+                let mut images = Vec::new();
+                // A described image went in as text; only native ones carry
+                // pixels.
+                for attachment in &user.attachments {
+                    if let Some(image) = &attachment.image
+                        && attachment.described_by.is_none()
+                    {
+                        match load_image(&session.artifacts, image, &attachment.path) {
+                            Ok(data) => images.push(data),
+                            Err(note) => content.push_str(&format!("\n{note}")),
+                        }
+                    }
+                }
+                messages.push(ChatMessage::User { content, images });
             }
             EntryKind::Assistant(assistant) => {
-                push_assistant(&mut messages, assistant, entry.seq, &results);
+                push_assistant(
+                    &mut messages,
+                    assistant,
+                    entry.seq,
+                    &results,
+                    &session.artifacts,
+                );
             }
             EntryKind::ToolResult(_) => {
                 // Emitted with the assistant message that requested it.
@@ -250,11 +270,40 @@ pub fn validate_tool_pairs(session: &Session) -> Result<(), ToolPairError> {
     Ok(())
 }
 
+/// Image bytes for a stored reference, or a note when they are gone (for
+/// example after artifact retention removed them).
+fn load_image(store: &ArtifactStore, image: &ImageRef, label: &str) -> Result<ImageData, String> {
+    store
+        .read_image(&image.id)
+        .map(|data| ImageData {
+            mime: image.mime.clone(),
+            width: image.width,
+            height: image.height,
+            data,
+            label: label.to_string(),
+        })
+        .map_err(|error| format!("[image {label} is no longer available: {error}]"))
+}
+
+/// The image a tool returned (`read` on an image for a vision model), as
+/// recorded in the result's details.
+pub fn tool_image(result: &ToolResultData) -> Option<(ImageRef, String)> {
+    let details = result.details.as_ref()?;
+    let image: ImageRef = serde_json::from_value(details.get("image")?.clone()).ok()?;
+    let path = details
+        .get("path")
+        .and_then(|path| path.as_str())
+        .unwrap_or(&image.id)
+        .to_string();
+    Some((image, path))
+}
+
 fn push_assistant(
     messages: &mut Vec<ChatMessage>,
     assistant: &AssistantData,
     seq: u64,
     results: &ToolResults<'_>,
+    artifacts: &ArtifactStore,
 ) {
     let tool_calls: Vec<ToolCall> = assistant
         .tool_calls
@@ -274,17 +323,40 @@ fn push_assistant(
         content: assistant.content.clone(),
         tool_calls: tool_calls.clone(),
     });
+    // Chat APIs carry images only in user messages, so images returned by
+    // tools follow the batch's tool messages in one user message.
+    let mut images = Vec::new();
+    let mut notes = Vec::new();
     for call in &tool_calls {
-        let content = match results.after(&call.id, seq) {
+        let result = results.after(&call.id, seq);
+        let content = match result {
             Some(result) => result.content.clone(),
             None => format!(
                 "[cancelled] no result was recorded for {}; the step was interrupted",
                 call.name
             ),
         };
+        if let Some((image, path)) = result.and_then(tool_image) {
+            match load_image(artifacts, &image, &path) {
+                Ok(data) => {
+                    notes.push(format!("{path} ({})", image.summary()));
+                    images.push(data);
+                }
+                Err(note) => notes.push(note),
+            }
+        }
         messages.push(ChatMessage::Tool {
             call_id: call.id.clone(),
             content,
+        });
+    }
+    if !notes.is_empty() {
+        messages.push(ChatMessage::User {
+            content: format!(
+                "[image content returned by the read tool: {}]",
+                notes.join(", ")
+            ),
+            images,
         });
     }
 }
@@ -370,6 +442,73 @@ mod tests {
             true,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn images_become_content_parts_after_text_and_tool_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = session(dir.path());
+        let png = crate::media::image::fixtures::png_with_metadata();
+        let image = |id: String| ImageRef {
+            id,
+            mime: "image/png".into(),
+            width: 3,
+            height: 2,
+            bytes: 10,
+        };
+        let pasted = image(session.artifacts.write_image(&png, "png").unwrap());
+        session
+            .append(EntryKind::User(UserData {
+                content: "why is this broken".into(),
+                attachments: vec![Attachment {
+                    path: "shot.png".into(),
+                    content: String::new(),
+                    image: Some(pasted),
+                    described_by: None,
+                }],
+            }))
+            .unwrap();
+        let read = image(session.artifacts.write_image(&png, "png").unwrap());
+        session
+            .append(EntryKind::Assistant(AssistantData {
+                tool_calls: Some(vec![crate::session::ToolCall {
+                    id: "c1".into(),
+                    name: "read".into(),
+                    arguments: json!({"path": "ui.png"}),
+                }]),
+                ..AssistantData::default()
+            }))
+            .unwrap();
+        session
+            .append(EntryKind::ToolResult(ToolResultData {
+                call_id: "c1".into(),
+                content: "ui.png: PNG 3×2".into(),
+                is_error: false,
+                details: Some(json!({"path": "ui.png", "image": read})),
+                artifact: None,
+            }))
+            .unwrap();
+        let budget = TokenBudget::new(32_768, 1024);
+        let assembled = assemble("system", &session, None, &budget);
+        let roles: Vec<&str> = assembled.messages.iter().map(|m| m.role()).collect();
+        assert_eq!(roles, vec!["system", "user", "assistant", "tool", "user"]);
+        match &assembled.messages[1] {
+            ChatMessage::User { content, images } => {
+                assert!(content.contains("image attached by the user: shot.png (PNG 3×2)"));
+                assert_eq!(images.len(), 1);
+                assert_eq!(images[0].data.as_slice(), png.as_slice());
+            }
+            other => panic!("{other:?}"),
+        }
+        match &assembled.messages[4] {
+            ChatMessage::User { content, images } => {
+                assert!(content.contains("ui.png (PNG 3×2)"), "{content}");
+                assert_eq!(images.len(), 1);
+            }
+            other => panic!("{other:?}"),
+        }
+        // Images are costed, not counted as base64.
+        assert!(assembled.char_count > 2 * 64 * 3);
     }
 
     #[test]
@@ -555,7 +694,7 @@ mod tests {
         assert_eq!(assembled.messages.len(), 2); // system, user
         assert!(matches!(
             &assembled.messages[1],
-            ChatMessage::User { content } if content == "new"
+            ChatMessage::User { content, .. } if content == "new"
         ));
     }
 

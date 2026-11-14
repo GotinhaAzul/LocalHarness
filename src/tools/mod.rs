@@ -158,6 +158,8 @@ pub struct ToolContext {
     pub lsp: Arc<lsp::LspService>,
     /// OS sandbox for `bash` and `bg`. `None` means unsandboxed.
     pub sandbox: Option<Arc<crate::sandbox::Sandbox>>,
+    /// How images reach the model; `read` uses it for image files.
+    pub vision: Arc<crate::media::VisionSettings>,
 }
 
 impl ToolContext {

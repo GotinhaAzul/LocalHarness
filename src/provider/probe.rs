@@ -29,6 +29,8 @@ pub struct LlamaProps {
     pub slots: Option<u32>,
     /// Server build string when the build reports one.
     pub build_info: Option<String>,
+    /// `modalities.vision`: the loaded model has a vision projector.
+    pub vision: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -377,6 +379,23 @@ fn lmstudio_entry<'a>(value: &'a serde_json::Value, model: &str) -> Option<&'a s
         .or_else(|| items.first())
 }
 
+/// Whether the served model accepts images, from llama.cpp `/props`
+/// (`modalities.vision`). `None` when the server does not say, or when a
+/// gateway's `/props` may describe a different model than the selected one.
+pub async fn detect_vision(provider: &dyn Provider) -> Option<bool> {
+    let timeout = Duration::from_secs(2);
+    let props = tokio::time::timeout(timeout, llama_props(provider))
+        .await
+        .ok()?
+        .ok()?;
+    let vision = props.vision?;
+    let models = tokio::time::timeout(timeout, list_models_with_timeout(provider, timeout))
+        .await
+        .ok()?
+        .ok()?;
+    props_match(&props, provider.model(), &models).then_some(vision)
+}
+
 /// `GET /props` on llama.cpp.
 pub async fn llama_props(provider: &dyn Provider) -> Result<LlamaProps, ProviderError> {
     let (_, urls) = client_and_urls(provider)?;
@@ -407,12 +426,14 @@ pub async fn llama_props(provider: &dyn Provider) -> Result<LlamaProps, Provider
         .as_str()
         .or_else(|| value["version"].as_str())
         .map(str::to_string);
+    let vision = value["modalities"]["vision"].as_bool();
     Ok(LlamaProps {
         n_ctx,
         model_path,
         chat_template,
         slots,
         build_info,
+        vision,
     })
 }
 

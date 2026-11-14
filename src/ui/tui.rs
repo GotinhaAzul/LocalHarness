@@ -1,5 +1,6 @@
 //! Interactive TUI event loop, slash commands, and terminal lifecycle.
 
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Stdout};
 use std::path::{Path, PathBuf};
@@ -16,11 +17,11 @@ use ratatui::crossterm::event::{
 };
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::layout::Rect;
 use serde::Deserialize;
-use tokio::sync::mpsc::{self, UnboundedReceiver};
+use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 
 use crate::agent::{AgentEvent, AgentState, Core, TurnOutcome, TurnStatus};
@@ -39,8 +40,8 @@ use crate::ui::render::{self, ActivityData, Transcript};
 use crate::ui::theme::{Role, Theme};
 use crate::ui::tree::TreeView;
 use crate::ui::widgets::{
-    FooterData, HeaderData, ModalData, ModelsModal, SessionItem, SessionsModal, ToolItem,
-    ToolsModal, clip_end,
+    FooterData, HeaderData, ModalData, PickAction, PickItem, PickerModal, SessionItem,
+    SessionsModal, ToolItem, ToolsModal, clip_end,
 };
 use crate::workflows::{self, WorkflowSpec};
 
@@ -50,8 +51,8 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("quit", "exit LocalHarness"),
     ("model", "pick a model from the endpoint or gateway"),
     ("login", "configure the endpoint, model, and API key"),
-    ("profile", "switch the tool profile"),
-    ("theme", "list, apply, or save a theme"),
+    ("profile", "pick the tool profile"),
+    ("theme", "pick a theme (live preview) or save it"),
     ("tree", "browse and checkout the session tree"),
     ("fork", "checkout the latest assistant step"),
     ("new", "start a fresh session"),
@@ -60,23 +61,45 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("compact", "append a deterministic compaction"),
     ("tools", "show the active tools"),
     ("mcp", "show MCP server status"),
-    ("skill", "append a skill's instructions"),
-    ("workflow", "start a workflow on a new branch"),
-    ("sec", "engagement scope, summary, or report"),
+    ("skill", "pick a skill and append its instructions"),
+    ("workflow", "pick a workflow to start on a new branch"),
+    ("sec", "engagement summary, scope, or report"),
     ("trust", "show the trust state"),
     ("export", "write the branch as Markdown"),
     ("clear", "clear the transcript view"),
     ("debug", "toggle the debug panel"),
 ];
 
-const HELP: &str = "\
-Commands: /help /quit /login [endpoint] [model] [api-key] /model [name]
-/profile <name> /theme [name|save] /tree /fork /new /resume [id] /sessions
-/compact /tools /mcp
-/skill <name> /workflow <name> /sec ... /trust [confirm] /export [path]
-/clear /debug
+/// Argument syntax per command, for `/help <command>`.
+fn command_usage(name: &str) -> &'static str {
+    match name {
+        "help" => "/help [command]",
+        "model" => "/model [name]   (no name: pick from a list)",
+        "login" => "/login [endpoint] [model] [api-key|-]   (no arguments: show status)",
+        "profile" => "/profile [name]   (no name: pick from a list)",
+        "theme" => "/theme [name|save]   (no name: pick with live preview)",
+        "resume" => "/resume [id|last]   (no id: pick from a list)",
+        "skill" => "/skill [name]   (no name: pick from a list)",
+        "workflow" => "/workflow [name]   (no name: pick from a list)",
+        "sec" => {
+            "/sec [summary|report|scope add|remove <target>|scope clear]   (no argument: pick)"
+        }
+        "trust" => "/trust [confirm]",
+        "export" => "/export [path]",
+        _ => "",
+    }
+}
 
-Keys: Enter send · Shift+Enter / Ctrl+J newline · Esc interrupt
+const HELP: &str = "\
+Commands: /help [command] /quit /login [endpoint] [model] [api-key] /model [name]
+/profile [name] /theme [name|save] /tree /fork /new /resume [id|last] /sessions
+/compact /tools /mcp
+/skill [name] /workflow [name] /sec [...] /trust [confirm] /export [path]
+/clear /debug
+A command that chooses from a list opens a picker when run without an
+argument: type to filter, arrows to move, Enter to pick.
+
+Keys: Enter send · Shift+Enter / Ctrl+J newline · Esc interrupt or dismiss
 Tab complete commands, arguments, and paths · Shift+Tab previous choice
 @path in a prompt attaches that file for the model
 Ctrl+R show thinking · Ctrl+O expand tool output · Ctrl+T toggle the plan
@@ -87,6 +110,40 @@ mouse capture).";
 
 /// Footer hints while idle.
 const HINTS: &str = "enter send · ⇧enter newline · / commands · tab complete · @file attach · ctrl+r thinking · ctrl+o output";
+
+/// Shortest gap between two frames while output streams (~60 fps). Input
+/// events draw immediately.
+const FRAME_INTERVAL: Duration = Duration::from_millis(16);
+
+/// Results of work the TUI runs off the event loop so it never freezes.
+enum BgEvent {
+    /// A `/v1/models` listing for `endpoint`.
+    Models {
+        endpoint: String,
+        result: std::result::Result<Vec<String>, String>,
+    },
+    /// A core rebuilt for a model or profile switch.
+    Rebuilt {
+        switch: Switch,
+        result: std::result::Result<Arc<Core>, String>,
+    },
+}
+
+/// A config switch running in the background.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Switch {
+    Model(String),
+    Profile(String),
+}
+
+impl Switch {
+    fn label(&self) -> String {
+        match self {
+            Switch::Model(name) => format!("Switching to {name}…"),
+            Switch::Profile(name) => format!("Loading profile {name}…"),
+        }
+    }
+}
 
 /// Lines per mouse-wheel notch.
 const WHEEL_LINES: usize = 3;
@@ -192,9 +249,10 @@ pub async fn run(runtime: Runtime, options: UiOptions) -> Result<()> {
     let _guard = TerminalGuard::enter(app.config.ui.mouse)?;
     let backend = CrosstermBackend::new(std::io::stdout());
     let mut terminal = Terminal::new(backend).context("cannot initialize the terminal")?;
-    // Some terminals (and piped PTYs) cannot answer a cursor-position query;
-    // a failed clear must not abort the session.
-    let _ = terminal.clear();
+    // Clear directly: `Terminal::clear` queries the cursor position, and a
+    // terminal that never answers (some SSH and mobile clients, piped PTYs)
+    // stalls startup for two seconds. A failed clear must not abort.
+    let _ = execute!(std::io::stdout(), Clear(ClearType::All));
 
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<Event>();
     std::thread::spawn(move || {
@@ -218,6 +276,13 @@ pub async fn run(runtime: Runtime, options: UiOptions) -> Result<()> {
     let git_cwd = app.cwd_path();
     tokio::spawn(git::watch(git_cwd, git_tx));
 
+    // Warm the model list so `/model <Tab>` and the picker are instant.
+    app.spawn_models_refresh();
+    let mut bg_rx = app
+        .bg_rx
+        .take()
+        .context("background channel already taken")?;
+
     let mut ticker = tokio::time::interval(Duration::from_millis(100));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -225,11 +290,42 @@ pub async fn run(runtime: Runtime, options: UiOptions) -> Result<()> {
     let mut sigterm =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
 
+    // Frames are drawn on demand: immediately after input, at most every
+    // FRAME_INTERVAL while output streams, and not at all while idle.
+    let mut needs_draw = true;
+    let mut urgent = true;
+    let mut last_draw = Instant::now();
     while !app.quit {
-        app.draw(&mut terminal)?;
+        if needs_draw && (urgent || last_draw.elapsed() >= FRAME_INTERVAL) {
+            app.draw(&mut terminal)?;
+            last_draw = Instant::now();
+            needs_draw = false;
+            urgent = false;
+        }
+        let frame_due =
+            needs_draw.then(|| tokio::time::Instant::from_std(last_draw + FRAME_INTERVAL));
 
         let mut agent_rx = app.agent_rx.take();
         tokio::select! {
+            // Keys first: typing must never wait behind a burst of tokens.
+            biased;
+            maybe = event_rx.recv() => {
+                match maybe {
+                    Some(ev) => {
+                        app.handle_event(ev).await;
+                        // Apply everything already queued (a paste, key
+                        // repeat) before drawing once.
+                        while !app.quit
+                            && let Ok(ev) = event_rx.try_recv()
+                        {
+                            app.handle_event(ev).await;
+                        }
+                    }
+                    None => app.quit = true,
+                }
+                needs_draw = true;
+                urgent = true;
+            }
             maybe = async {
                 match &mut agent_rx {
                     Some(rx) => rx.recv().await,
@@ -240,20 +336,41 @@ pub async fn run(runtime: Runtime, options: UiOptions) -> Result<()> {
                     Some(event) => app.handle_agent_event(event),
                     None => app.finish_turn(None),
                 }
+                // Coalesce the deltas that arrived meanwhile into one frame.
+                let mut drained = 0;
+                while app.turn_active && drained < 4096 {
+                    let Some(rx) = agent_rx.as_mut() else { break };
+                    match rx.try_recv() {
+                        Ok(event) => app.handle_agent_event(event),
+                        Err(_) => break,
+                    }
+                    drained += 1;
+                }
                 if !app.turn_active {
                     agent_rx = None;
                 }
+                needs_draw = true;
             }
-            maybe = event_rx.recv() => {
-                match maybe {
-                    Some(ev) => app.handle_event(ev).await,
-                    None => app.quit = true,
+            Some(event) = bg_rx.recv() => {
+                app.handle_bg(event).await;
+                needs_draw = true;
+                urgent = true;
+            }
+            _ = ticker.tick() => {
+                if app.on_tick() {
+                    needs_draw = true;
                 }
             }
-            _ = ticker.tick() => app.on_tick(),
+            _ = async {
+                match frame_due {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => {}
             maybe = git_rx.recv() => {
                 if let Some(status) = maybe {
                     app.apply_git(status);
+                    needs_draw = true;
                 }
             }
             _ = async {
@@ -329,6 +446,18 @@ struct App {
     show_plan: bool,
     /// What slash-command arguments can complete to.
     completion_sources: complete::Sources,
+    /// The last completion, keyed by the text before the cursor and whether
+    /// the popup was opened, so frames do not recompute (or re-list
+    /// directories) while nothing changed.
+    completion_cache: RefCell<Option<(String, bool, Option<Completion>)>>,
+    /// Background work reports here; the event loop takes the receiver.
+    bg_tx: UnboundedSender<BgEvent>,
+    bg_rx: Option<UnboundedReceiver<BgEvent>>,
+    /// A model or profile switch in flight.
+    switching: Option<Switch>,
+    /// The theme to restore when a `/theme` picker previewing others is
+    /// dismissed.
+    theme_before_preview: Option<String>,
 }
 
 impl App {
@@ -369,6 +498,7 @@ impl App {
             trust,
             window_guess: !runtime.core.effective_window().1.is_reliable(),
         };
+        let (bg_tx, bg_rx) = mpsc::unbounded_channel();
         let mut app = App {
             runtime: Some(runtime),
             options,
@@ -405,6 +535,11 @@ impl App {
             plan: Vec::new(),
             show_plan: true,
             completion_sources: complete::Sources::default(),
+            completion_cache: RefCell::new(None),
+            bg_tx,
+            bg_rx: Some(bg_rx),
+            switching: None,
+            theme_before_preview: None,
         };
         app.no_color = app.options.no_color;
         app.transcript = Transcript::new(app.config.ui.show_reasoning);
@@ -469,18 +604,130 @@ impl App {
             .iter()
             .map(|(name, data)| (name.clone(), data.description.clone().unwrap_or_default()))
             .collect();
-        sources.skills = SkillIndex::load(&paths, trust)
-            .advertised_for(&crate::tools::active_packs(&runtime.core.tools))
-            .names()
+        sources.skills = skill_choices(&paths, trust, &runtime.core.tools);
+        sources.workflows = available_workflows(&paths, trust)
             .into_iter()
-            .map(str::to_string)
+            .map(|name| {
+                let description = workflow_description(&name);
+                (name, description)
+            })
             .collect();
-        sources.workflows = available_workflows(&paths, trust);
+        sources.endpoint = runtime.core.config.model.endpoint.clone();
         if sessions {
             sources.sessions = scan_sessions(&paths)
                 .into_iter()
                 .map(|item| (item.id, item.preview))
                 .collect();
+        }
+        self.completion_cache.replace(None);
+    }
+
+    /// List the endpoint's models off the event loop; the result lands in
+    /// [`App::handle_bg`].
+    fn spawn_models_refresh(&self) {
+        let Some(core) = self.core() else {
+            return;
+        };
+        let config = core.config.model.clone();
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            let result = probe_endpoint_models(&config)
+                .await
+                .map_err(|error| error.to_string());
+            let _ = tx.send(BgEvent::Models {
+                endpoint: config.endpoint,
+                result,
+            });
+        });
+    }
+
+    async fn handle_bg(&mut self, event: BgEvent) {
+        match event {
+            BgEvent::Models { endpoint, result } => {
+                let current = self
+                    .core()
+                    .map(|core| core.config.model.endpoint.clone())
+                    .unwrap_or_default();
+                let Ok(models) = result else {
+                    return;
+                };
+                if endpoint != current {
+                    return;
+                }
+                self.completion_sources.models = models.clone();
+                self.completion_cache.replace(None);
+                if let Some(ModalData::Picker(view)) = &mut self.modal
+                    && view.command == "model"
+                {
+                    view.replace_items(model_items(&models));
+                }
+            }
+            BgEvent::Rebuilt { switch, result } => {
+                self.switching = None;
+                let core = match result {
+                    Ok(core) => core,
+                    Err(error) => {
+                        let what = match &switch {
+                            Switch::Model(_) => "model change",
+                            Switch::Profile(_) => "profile change",
+                        };
+                        self.set_notice(format!("{what} failed: {error}"), Role::Error);
+                        return;
+                    }
+                };
+                self.apply_core(core);
+                self.refresh_completion_sources(false);
+                match switch {
+                    Switch::Model(name) => {
+                        let window = self
+                            .core()
+                            .map(|core| {
+                                format!(
+                                    " · context {} ({})",
+                                    crate::ui::widgets::format_tokens(core.effective_window().0),
+                                    core.effective_window().1.label()
+                                )
+                            })
+                            .unwrap_or_default();
+                        self.set_notice(format!("model: {name}{window}"), Role::Success);
+                    }
+                    Switch::Profile(name) => {
+                        self.set_notice(format!("profile: {name}"), Role::Success);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Rebuild the core for `config` in the background so the TUI keeps
+    /// drawing and taking keys while the server loads a model or probes.
+    fn spawn_rebuild(&mut self, switch: Switch, config: Config) {
+        let Some(old) = self.core().cloned() else {
+            return;
+        };
+        let tx = self.bg_tx.clone();
+        self.set_notice(switch.label(), Role::Muted);
+        self.switching = Some(switch.clone());
+        tokio::spawn(async move {
+            let result = app::rebuild_core(&old, config)
+                .await
+                .map_err(|error| format!("{error:#}"));
+            let _ = tx.send(BgEvent::Rebuilt { switch, result });
+        });
+    }
+
+    /// Wait for background switches to land (tests drive the app without
+    /// the event loop).
+    #[cfg(test)]
+    async fn settle(&mut self) {
+        while self.switching.is_some() {
+            let Some(rx) = self.bg_rx.as_mut() else {
+                break;
+            };
+            let Some(event) = rx.recv().await else {
+                break;
+            };
+            self.handle_bg(event).await;
         }
     }
 
@@ -488,13 +735,18 @@ impl App {
     /// nothing useful to show.
     fn current_completion(&self) -> Option<Completion> {
         let before = self.input.before_cursor();
-        complete::complete(
-            &before,
-            COMMANDS,
-            &self.completion_sources,
-            self.input.popup_open(),
-        )
-        .filter(|completion| !completion.is_settled())
+        let popup = self.input.popup_open();
+        if let Some((text, open, cached)) = self.completion_cache.borrow().as_ref()
+            && *text == before
+            && *open == popup
+        {
+            return cached.clone();
+        }
+        let completion = complete::complete(&before, COMMANDS, &self.completion_sources, popup)
+            .filter(|completion| !completion.is_settled());
+        self.completion_cache
+            .replace(Some((before, popup, completion.clone())));
+        completion
     }
 
     fn accept_candidate(&mut self, completion: &Completion, index: usize) {
@@ -681,8 +933,10 @@ impl App {
         let busy = self.turn_active;
         self.input.set_placeholder(if busy {
             "the agent is working · esc to interrupt"
+        } else if self.switching.is_some() {
+            "switching · type ahead, Enter sends when ready"
         } else {
-            "ask anything · @file attaches · / for commands"
+            "ask anything · @file attaches · / for commands · tab completes"
         });
         let text_width = size.width.saturating_sub(render::PROMPT_WIDTH + 1) as usize;
         let rects = render::split_with(
@@ -698,7 +952,7 @@ impl App {
             .set_viewport(rects.transcript.height as usize);
         let show_reasoning = self.config.ui.show_reasoning;
         self.transcript
-            .prepare(self.last_width, &self.theme, show_reasoning, false);
+            .prepare(self.last_width, &self.theme, show_reasoning);
         self.input.apply_theme(&self.theme);
         self.input
             .fit_viewport(text_width as u16, rects.input.height.saturating_sub(2));
@@ -775,10 +1029,16 @@ impl App {
 
     /// The live status line: what the agent is doing right now.
     fn activity(&self) -> Option<ActivityData> {
-        if !self.turn_active {
-            return None;
-        }
         let spinner = SPINNER[self.spinner % SPINNER.len()];
+        if !self.turn_active {
+            return self.switching.as_ref().map(|switch| ActivityData {
+                spinner,
+                label: switch.label(),
+                detail: String::new(),
+                meta: "the prompt stays editable".into(),
+                role: Role::Accent,
+            });
+        }
         let elapsed = self
             .turn_started
             .map(|at| at.elapsed().as_secs())
@@ -933,14 +1193,23 @@ impl App {
         ]
     }
 
-    fn on_tick(&mut self) {
-        self.spinner = (self.spinner + 1) % SPINNER.len();
+    /// Advance timers. Returns whether anything visible changed, so an idle
+    /// TUI does not redraw ten times a second.
+    fn on_tick(&mut self) -> bool {
+        let animating = self.turn_active || self.switching.is_some();
+        if animating {
+            self.spinner = (self.spinner + 1) % SPINNER.len();
+        }
+        let warnings = self.warnings_seen;
         self.sync_session_warnings();
+        let mut changed = animating || warnings != self.warnings_seen;
         if let Some((_, _, at)) = &self.notice
             && at.elapsed() > Duration::from_secs(8)
         {
             self.notice = None;
+            changed = true;
         }
+        let before = (self.tok_s, self.header.completion);
         let now = Instant::now();
         while let Some((at, _)) = self.token_events.front() {
             if now.duration_since(*at) > Duration::from_secs(3) {
@@ -962,11 +1231,7 @@ impl App {
         };
         self.header.tok_s = self.tok_s;
         self.header.completion = self.completion_tokens;
-        if self.transcript.is_dirty() && self.last_width > 0 {
-            let show_reasoning = self.config.ui.show_reasoning;
-            self.transcript
-                .prepare(self.last_width, &self.theme, show_reasoning, false);
-        }
+        changed || before != (self.tok_s, self.header.completion) || self.transcript.is_dirty()
     }
 
     fn record_tokens(&mut self, tokens: u64) {
@@ -982,6 +1247,14 @@ impl App {
             return;
         }
         if text.trim().is_empty() {
+            return;
+        }
+        if let Some(switch) = &self.switching {
+            let label = switch.label();
+            self.set_notice(
+                format!("{label} send again when it finishes"),
+                Role::Warning,
+            );
             return;
         }
         let Some(runtime) = &self.runtime else {
@@ -1028,12 +1301,8 @@ impl App {
         self.agent_rx = None;
         self.agent_task = None;
         self.transcript.finish_turn();
+        // Also syncs the session file.
         self.refresh_session_blocks();
-        if let Some(runtime) = &self.runtime
-            && let Ok(mut session) = runtime.session.lock()
-        {
-            let _ = session.fsync();
-        }
         match outcome {
             Some(outcome) => {
                 if let Some((code, message)) = outcome.error {
@@ -1316,6 +1585,13 @@ impl App {
             KeyCode::Esc => {
                 if self.turn_active {
                     self.cancel_turn();
+                } else if self.input.text().trim_start().starts_with('/')
+                    && !self.input.text().contains('\n')
+                {
+                    // Abandon a half-typed command (and its popup).
+                    self.input.set_text("");
+                } else if self.input.popup_open() {
+                    self.input.reset_completion();
                 }
                 return;
             }
@@ -1376,7 +1652,11 @@ impl App {
                     let value = completion.candidates[index].value.clone();
                     self.input.replace_before_cursor(completion.start, &value);
                 }
-                let idle = !self.turn_active;
+                // While a switch loads, prose stays in the prompt (commands
+                // still run) so nothing typed ahead is lost.
+                let command = self.input.text().trim_start().starts_with('/');
+                let waiting = self.switching.is_some() && !command;
+                let idle = !self.turn_active && !waiting;
                 match self.input.submit(idle) {
                     Some(text) => {
                         let trimmed = text.trim().to_string();
@@ -1385,6 +1665,17 @@ impl App {
                         } else if !trimmed.is_empty() {
                             self.start_turn(text);
                         }
+                    }
+                    None if waiting => {
+                        let label = self
+                            .switching
+                            .as_ref()
+                            .map(Switch::label)
+                            .unwrap_or_default();
+                        self.set_notice(
+                            format!("{label} press Enter again when it finishes"),
+                            Role::Warning,
+                        );
                     }
                     None if !idle => {
                         self.set_notice(
@@ -1447,7 +1738,8 @@ impl App {
         let mut target: Option<String> = None;
         let mut focus_input = false;
         let mut switch: Option<PathBuf> = None;
-        let mut pick_model: Option<String> = None;
+        let mut picked: Option<PickAction> = None;
+        let mut preview_theme: Option<String> = None;
 
         match &mut modal {
             ModalData::Tree(view) => match key.code {
@@ -1510,25 +1802,44 @@ impl App {
                 }
                 _ => {}
             },
-            // Letters feed the filter, so navigation is arrows/PgUp/PgDn only.
-            ModalData::Models(view) => match key.code {
-                KeyCode::Esc => close = true,
-                KeyCode::Up => view.move_by(-1),
-                KeyCode::Down => view.move_by(1),
-                KeyCode::PageUp => view.move_by(-15),
-                KeyCode::PageDown => view.move_by(15),
-                KeyCode::Home => view.move_by(isize::MIN / 2),
-                KeyCode::End => view.move_by(isize::MAX / 2),
-                KeyCode::Backspace => view.pop_filter(),
-                KeyCode::Enter => pick_model = view.selected_model(),
-                KeyCode::Char(ch)
-                    if !key.modifiers.contains(KeyModifiers::CONTROL)
-                        && !key.modifiers.contains(KeyModifiers::ALT) =>
-                {
-                    view.push_filter(ch);
+            // Letters feed the filter, so navigation is arrows, Tab, and
+            // PgUp/PgDn; Ctrl+P/N and Ctrl+K/J also move.
+            ModalData::Picker(view) => {
+                let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                match key.code {
+                    KeyCode::Esc => {
+                        // Esc clears a filter first, then closes.
+                        if view.filter.is_empty() {
+                            close = true;
+                        } else {
+                            view.filter.clear();
+                            view.selected = 0;
+                            view.scroll = 0;
+                        }
+                    }
+                    KeyCode::Up | KeyCode::BackTab => view.move_by(-1),
+                    KeyCode::Down | KeyCode::Tab => view.move_by(1),
+                    KeyCode::Char('p' | 'k') if ctrl => view.move_by(-1),
+                    KeyCode::Char('n' | 'j') if ctrl => view.move_by(1),
+                    KeyCode::PageUp => view.move_by(-15),
+                    KeyCode::PageDown => view.move_by(15),
+                    KeyCode::Home => view.move_by(isize::MIN / 2),
+                    KeyCode::End => view.move_by(isize::MAX / 2),
+                    KeyCode::Backspace => view.pop_filter(),
+                    KeyCode::Enter => picked = view.selected_item().map(|item| item.action.clone()),
+                    KeyCode::Char(ch) if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) => {
+                        view.push_filter(ch);
+                    }
+                    _ => {}
                 }
-                _ => {}
-            },
+                // The theme picker previews the highlighted theme live.
+                if view.command == "theme" && !close && picked.is_none() {
+                    preview_theme = view
+                        .selected_item()
+                        .filter(|item| item.label != "save")
+                        .map(|item| item.label.clone());
+                }
+            }
         }
 
         if let Some(target) = target {
@@ -1554,14 +1865,31 @@ impl App {
             return;
         }
 
-        if let Some(model) = pick_model {
+        if let Some(action) = picked {
             self.modal = None;
-            self.switch_model(&model).await;
+            match action {
+                PickAction::Run(command) => {
+                    // A confirmed theme keeps the preview's base for `save`.
+                    self.theme_before_preview = None;
+                    self.run_command(&command).await;
+                }
+                PickAction::Fill(text) => {
+                    self.restore_previewed_theme();
+                    self.input.set_text(&text);
+                }
+            }
             return;
+        }
+
+        if let Some(name) = preview_theme
+            && name != self.theme.name
+        {
+            self.apply_theme_named(&name);
         }
 
         if close {
             self.modal = None;
+            self.restore_previewed_theme();
         } else {
             modal.ensure_visible(15);
             self.modal = Some(modal);
@@ -1583,8 +1911,16 @@ impl App {
             return;
         }
 
+        if self.switching.is_some() && matches!(name, "model" | "login" | "profile") {
+            self.set_notice(
+                "a switch is still loading; try again when it finishes",
+                Role::Warning,
+            );
+            return;
+        }
+
         match name {
-            "help" => self.transcript.push_note("help", HELP, false),
+            "help" => self.command_help(rest),
             "quit" => self.quit = true,
             "model" => self.command_model(rest).await,
             "login" => self.command_login(rest).await,
@@ -1620,6 +1956,39 @@ impl App {
         self.refresh_completion_sources(matches!(name, "new" | "resume" | "sessions"));
     }
 
+    fn command_help(&mut self, topic: &str) {
+        let topic = topic.trim().trim_start_matches('/');
+        if topic.is_empty() {
+            self.transcript.push_note("help", HELP, false);
+            return;
+        }
+        match COMMANDS.iter().find(|(name, _)| *name == topic) {
+            Some((name, description)) => {
+                let usage = match command_usage(name) {
+                    "" => format!("/{name}"),
+                    usage => usage.to_string(),
+                };
+                self.transcript.push_note(
+                    "help",
+                    format!("/{name} — {description}\nusage: {usage}"),
+                    false,
+                );
+            }
+            None => self.unknown_command(topic),
+        }
+    }
+
+    /// Open a picker modal, or say there is nothing to pick.
+    fn open_picker(&mut self, picker: PickerModal, empty: &str) {
+        if picker.items.is_empty() {
+            self.set_notice(empty.to_string(), Role::Muted);
+            return;
+        }
+        let mut modal = ModalData::Picker(picker);
+        modal.ensure_visible(15);
+        self.modal = Some(modal);
+    }
+
     fn unknown_command(&mut self, name: &str) {
         let available: Vec<String> = COMMANDS
             .iter()
@@ -1638,76 +2007,77 @@ impl App {
 
     async fn command_model(&mut self, name: &str) {
         let name = name.trim();
-        if name.is_empty() {
-            let Some(core) = self.core().cloned() else {
+        if !name.is_empty() {
+            if name.split_whitespace().count() != 1 {
+                self.set_notice("usage: /model <name>", Role::Error);
                 return;
-            };
-            let current = core.provider.model().to_string();
-            // An interactive picker when the endpoint (or a gateway in front
-            // of several engines) lists models; the text listing otherwise.
-            if let Ok(models) = probe_endpoint_models(&core.config.model).await
-                && !models.is_empty()
-            {
+            }
+            self.switch_model(name).await;
+            return;
+        }
+        let Some(core) = self.core().cloned() else {
+            return;
+        };
+        let current = if core.logged_in() {
+            core.provider.model().to_string()
+        } else {
+            String::new()
+        };
+        let endpoint = core.config.model.endpoint.clone();
+        // A warm list (probed at startup or by the last picker) opens the
+        // picker at once; a refresh lands in the open picker.
+        if !self.completion_sources.models.is_empty() {
+            let picker = PickerModal::new(
+                "model",
+                "Models",
+                model_items(&self.completion_sources.models),
+                current,
+            )
+            .with_subtitle(endpoint);
+            self.open_picker(picker, "the endpoint reports no models");
+            self.spawn_models_refresh();
+            return;
+        }
+        match probe_endpoint_models(&core.config.model).await {
+            Ok(models) if !models.is_empty() => {
                 self.completion_sources.models = models.clone();
-                let current = if core.logged_in() {
-                    current
-                } else {
-                    String::new()
-                };
-                let mut modal = ModalData::Models(ModelsModal::new(
-                    models,
-                    current,
-                    core.config.model.endpoint.clone(),
-                ));
-                modal.ensure_visible(15);
-                self.modal = Some(modal);
-                return;
+                self.completion_cache.replace(None);
+                let picker = PickerModal::new("model", "Models", model_items(&models), current)
+                    .with_subtitle(endpoint);
+                self.open_picker(picker, "the endpoint reports no models");
             }
-            let mut lines = vec![
-                format!("endpoint: {}", core.config.model.endpoint),
-                format!(
-                    "model: {}",
-                    if core.logged_in() {
-                        current.as_str()
-                    } else {
-                        "(not set)"
-                    }
-                ),
-            ];
-            match probe_endpoint_models(&core.config.model).await {
-                Ok(models) if models.is_empty() => {
-                    lines.push("available models: (the endpoint reports none)".into());
-                    lines.push("load a model, then run /model again".into());
-                }
-                Ok(models) => {
-                    lines.push("available models:".into());
-                    for model in &models {
-                        if model == &current {
-                            lines.push(format!("  {model}  (current)"));
+            result => {
+                let mut lines = vec![
+                    format!("endpoint: {endpoint}"),
+                    format!(
+                        "model: {}",
+                        if current.is_empty() {
+                            "(not set)"
                         } else {
-                            lines.push(format!("  {model}"));
+                            current.as_str()
                         }
+                    ),
+                ];
+                match result {
+                    Ok(_) => {
+                        lines.push("available models: (the endpoint reports none)".into());
+                        lines.push("load a model, then run /model again".into());
                     }
-                    lines.push("switch with /model <name>".into());
+                    Err(error) => {
+                        lines.push(format!("cannot list models: {error}"));
+                        lines.push(
+                            "start the server, or run /login <endpoint> [model] [api-key]".into(),
+                        );
+                    }
                 }
-                Err(error) => {
-                    lines.push(format!("cannot list models: {error}"));
-                    lines.push(
-                        "start the server, or run /login <endpoint> [model] [api-key]".into(),
-                    );
-                }
+                self.transcript.push_note("models", lines.join("\n"), false);
             }
-            self.transcript.push_note("models", lines.join("\n"), false);
-            return;
         }
-        if name.split_whitespace().count() != 1 {
-            self.set_notice("usage: /model <name>", Role::Error);
-            return;
-        }
-        self.switch_model(name).await;
     }
 
-    /// Switch the active model for this session; the saved config is untouched.
+    /// Switch the active model for this session; the saved config is
+    /// untouched. The rebuild (which may wait for the server to load the
+    /// model) runs in the background.
     async fn switch_model(&mut self, name: &str) {
         if self
             .core()
@@ -1716,25 +2086,9 @@ impl App {
             self.set_notice(format!("model: {name} (unchanged)"), Role::Muted);
             return;
         }
-        let previous = self.config.clone();
-        self.config.model.model = name.to_string();
-        let config = self.config.clone();
-        if let Err(error) = self.rebuild_core_with(config).await {
-            self.config = previous;
-            self.set_notice(format!("model change failed: {error}"), Role::Error);
-            return;
-        }
-        let window = self
-            .core()
-            .map(|core| {
-                format!(
-                    " · context {} ({})",
-                    crate::ui::widgets::format_tokens(core.effective_window().0),
-                    core.effective_window().1.label()
-                )
-            })
-            .unwrap_or_default();
-        self.set_notice(format!("model: {name}{window}"), Role::Success);
+        let mut config = self.config.clone();
+        config.model.model = name.to_string();
+        self.spawn_rebuild(Switch::Model(name.to_string()), config);
     }
 
     async fn command_login(&mut self, rest: &str) {
@@ -1885,15 +2239,25 @@ impl App {
 
     async fn command_profile(&mut self, name: &str) {
         if name.is_empty() {
-            let mut lines = Vec::new();
-            for (profile, data) in &self.config.profiles {
-                lines.push(format!(
-                    "{profile}: {}",
-                    data.description.as_deref().unwrap_or("")
-                ));
-            }
-            self.transcript
-                .push_note("profiles", lines.join("\n"), false);
+            let items = self
+                .config
+                .profiles
+                .iter()
+                .map(|(profile, data)| {
+                    PickItem::run(
+                        "profile",
+                        profile.clone(),
+                        data.description.clone().unwrap_or_default(),
+                    )
+                })
+                .collect();
+            let picker = PickerModal::new(
+                "profile",
+                "Profiles",
+                items,
+                self.config.profile_name().to_string(),
+            );
+            self.open_picker(picker, "no profiles are configured");
             return;
         }
         if !self.config.profiles.contains_key(name) {
@@ -1905,15 +2269,13 @@ impl App {
             self.set_notice(message, Role::Error);
             return;
         }
-        let previous = self.config.clone();
-        self.config.profile_name = name.to_string();
-        let config = self.config.clone();
-        if let Err(error) = self.rebuild_core_with(config).await {
-            self.config = previous;
-            self.set_notice(format!("profile change failed: {error}"), Role::Error);
+        if self.config.profile_name() == name {
+            self.set_notice(format!("profile: {name} (unchanged)"), Role::Muted);
             return;
         }
-        self.set_notice(format!("profile: {name}"), Role::Success);
+        let mut config = self.config.clone();
+        config.profile_name = name.to_string();
+        self.spawn_rebuild(Switch::Profile(name.to_string()), config);
     }
 
     async fn rebuild_core_with(&mut self, config: Config) -> Result<()> {
@@ -1921,6 +2283,12 @@ impl App {
             bail!("no runtime");
         };
         let core = app::rebuild_core(&old, config).await?;
+        self.apply_core(core);
+        Ok(())
+    }
+
+    /// Install a rebuilt core and refresh everything derived from it.
+    fn apply_core(&mut self, core: Arc<Core>) {
         if let Some(runtime) = &mut self.runtime {
             runtime.core = core.clone();
         }
@@ -1935,7 +2303,29 @@ impl App {
         self.used_tokens = estimate_used(&core);
         self.header.used = self.used_tokens;
         self.sync_banner();
-        Ok(())
+    }
+
+    fn apply_theme_named(&mut self, name: &str) {
+        let Some(paths) = self.core().map(|core| core.paths.clone()) else {
+            return;
+        };
+        self.theme = Theme::load(
+            name,
+            &paths.themes_dir(),
+            self.config.ui.color_mode,
+            self.no_color,
+        );
+        self.config.ui.theme = name.to_string();
+        self.input.apply_theme(&self.theme);
+    }
+
+    /// Undo a `/theme` picker's live preview when it closes without a pick.
+    fn restore_previewed_theme(&mut self) {
+        if let Some(name) = self.theme_before_preview.take()
+            && name != self.theme.name
+        {
+            self.apply_theme_named(&name);
+        }
     }
 
     fn command_theme(&mut self, argument: &str) {
@@ -1945,16 +2335,20 @@ impl App {
         let paths = runtime.core.paths.clone();
         match argument {
             "" => {
-                let names = available_theme_names(&paths);
-                self.transcript.push_note(
-                    "themes",
-                    format!(
-                        "current: {}\navailable: {}\nuse /theme <name> or /theme save",
-                        self.theme.name,
-                        names.join(", ")
-                    ),
-                    false,
+                let current = self.theme.name.clone();
+                let mut items = vec![PickItem::run(
+                    "theme",
+                    "save",
+                    format!("write {current} to the config"),
+                )];
+                items.extend(
+                    available_theme_names(&paths)
+                        .into_iter()
+                        .map(|name| PickItem::run("theme", name, "")),
                 );
+                self.theme_before_preview = Some(current.clone());
+                let picker = PickerModal::new("theme", "Themes · live preview", items, current);
+                self.open_picker(picker, "no themes found");
             }
             "save" => {
                 let path = paths.config_file();
@@ -1979,14 +2373,7 @@ impl App {
                     );
                     return;
                 }
-                self.theme = Theme::load(
-                    name,
-                    &paths.themes_dir(),
-                    self.config.ui.color_mode,
-                    self.no_color,
-                );
-                self.config.ui.theme = name.to_string();
-                self.input.apply_theme(&self.theme);
+                self.apply_theme_named(name);
                 self.set_notice(format!("theme: {name}"), Role::Success);
             }
         }
@@ -2203,9 +2590,12 @@ impl App {
         let skills = SkillIndex::load(&runtime.core.paths, self.config.trust);
         let advertised = skills.advertised_for(&crate::tools::active_packs(&runtime.core.tools));
         if name.is_empty() {
-            let names: Vec<&str> = advertised.names();
-            self.transcript
-                .push_note("skills", format!("available: {}", names.join(", ")), false);
+            let items = skill_choices(&runtime.core.paths, self.config.trust, &runtime.core.tools)
+                .into_iter()
+                .map(|(name, description)| PickItem::run("skill", name, description))
+                .collect();
+            let picker = PickerModal::new("skill", "Skills · appends instructions", items, "");
+            self.open_picker(picker, "no skills are available in this profile");
             return;
         }
         let Some(skill) = skills.get(name) else {
@@ -2253,16 +2643,16 @@ impl App {
         let paths = runtime.core.paths.clone();
         let trust = self.config.trust;
         if name.is_empty() {
-            let names = available_workflows(&paths, trust);
-            self.transcript.push_note(
-                "workflows",
-                if names.is_empty() {
-                    format!("no workflows in {}", paths.workflows_dir().display())
-                } else {
-                    format!("available: {}", names.join(", "))
-                },
-                false,
-            );
+            let items = available_workflows(&paths, trust)
+                .into_iter()
+                .map(|name| {
+                    let description = workflow_description(&name);
+                    PickItem::run("workflow", name, description)
+                })
+                .collect();
+            let picker = PickerModal::new("workflow", "Workflows · starts a branch", items, "");
+            let empty = format!("no workflows in {}", paths.workflows_dir().display());
+            self.open_picker(picker, &empty);
             return;
         }
         let global = paths.workflows_dir().join(format!("{name}.toml"));
@@ -2424,6 +2814,39 @@ impl App {
         let security = runtime.core.security.clone();
         let parts: Vec<&str> = rest.split_whitespace().collect();
         if parts.is_empty() {
+            let fill = |label: &str, description: &str, text: &str| PickItem {
+                label: label.into(),
+                description: description.into(),
+                action: PickAction::Fill(text.into()),
+            };
+            let picker = PickerModal::new(
+                "sec",
+                "Security",
+                vec![
+                    PickItem::run("sec", "summary", "show the engagement summary"),
+                    PickItem::run("sec", "report", "write the engagement report"),
+                    fill(
+                        "scope add",
+                        "add a target to scope (type it next)",
+                        "/sec scope add ",
+                    ),
+                    fill(
+                        "scope remove",
+                        "remove a target from scope (type it next)",
+                        "/sec scope remove ",
+                    ),
+                    PickItem {
+                        label: "scope clear".into(),
+                        description: "clear the scope".into(),
+                        action: PickAction::Run("/sec scope clear".into()),
+                    },
+                ],
+                "",
+            );
+            self.open_picker(picker, "");
+            return;
+        }
+        if parts == ["summary"] {
             let summary = match security.lock() {
                 Ok(state) => state.summary(),
                 Err(poison) => poison.into_inner().summary(),
@@ -2562,7 +2985,7 @@ impl App {
     fn command_sec_usage(&mut self) {
         self.transcript.push_note(
             "security",
-            "usage:\n/sec\n/sec scope add|remove <target>\n/sec scope clear\n/sec report",
+            "usage:\n/sec  (pick from a list)\n/sec summary\n/sec scope add|remove <target>\n/sec scope clear\n/sec report",
             false,
         );
     }
@@ -3066,6 +3489,43 @@ fn load_workflow_file(path: &Path) -> std::result::Result<WorkflowSpec, String> 
     })
 }
 
+/// Picker rows for the endpoint's models.
+fn model_items(models: &[String]) -> Vec<PickItem> {
+    models
+        .iter()
+        .map(|model| PickItem::run("model", model.clone(), ""))
+        .collect()
+}
+
+/// Skills the active tools advertise, with their descriptions.
+fn skill_choices(
+    paths: &crate::paths::Paths,
+    trust: bool,
+    tools: &[Arc<dyn crate::tools::Tool>],
+) -> Vec<(String, String)> {
+    let index = SkillIndex::load(paths, trust);
+    let advertised = index.advertised_for(&crate::tools::active_packs(tools));
+    advertised
+        .names()
+        .into_iter()
+        .map(|name| {
+            let description = advertised
+                .get(name)
+                .map(|skill| skill.description.clone())
+                .unwrap_or_default();
+            (name.to_string(), description)
+        })
+        .collect()
+}
+
+/// One-line description of a bundled workflow (file workflows are only read
+/// when run).
+fn workflow_description(name: &str) -> String {
+    workflows::get(name)
+        .and_then(|workflow| workflow.description.clone())
+        .unwrap_or_default()
+}
+
 fn available_workflows(paths: &crate::paths::Paths, trust: bool) -> Vec<String> {
     let mut names = Vec::new();
     let mut scan = |dir: &Path| {
@@ -3232,7 +3692,7 @@ mod tests {
     ) -> Terminal<TestBackend> {
         let mut transcript = Transcript::new(false);
         transcript.set_viewport(height as usize);
-        transcript.prepare(width as usize, &theme, false, true);
+        transcript.prepare(width as usize, &theme, false);
         let input = TextArea::new(vec![String::new()]);
         let footer = FooterData {
             hints: "Enter send".into(),
@@ -3456,6 +3916,11 @@ mod tests {
         assert_eq!(app.config.model.context_window, None);
 
         app.switch_model("big").await;
+        // The rebuild runs in the background; the TUI stays live meanwhile.
+        assert!(app.switching.is_some());
+        assert!(app.activity().is_some_and(|a| a.label.contains("big")));
+        app.settle().await;
+        assert!(app.switching.is_none());
         assert_eq!(app.header.model, "big");
         assert_eq!(app.header.window, 131072);
         assert_eq!(app.core().unwrap().budget.context_window, 131072);
@@ -3474,28 +3939,55 @@ mod tests {
     }
 
     #[test]
-    fn models_modal_filters_and_clamps_selection() {
-        let mut view = ModelsModal::new(
-            vec![
-                "openai/gpt-x".into(),
-                "anthropic/claude".into(),
-                "local/qwen3".into(),
-            ],
+    fn picker_filters_ranks_and_clamps_selection() {
+        let models: Vec<String> = vec![
+            "openai/gpt-x".into(),
+            "anthropic/claude".into(),
             "local/qwen3".into(),
-            "http://gw".into(),
-        );
-        assert_eq!(view.selected_model().as_deref(), Some("local/qwen3"));
+        ];
+        let mut view = PickerModal::new("model", "Models", model_items(&models), "local/qwen3")
+            .with_subtitle("http://gw");
+        assert_eq!(view.selected_label().as_deref(), Some("local/qwen3"));
         view.push_filter('A');
         view.push_filter('n');
-        assert_eq!(view.filtered(), vec!["anthropic/claude"]);
+        let labels: Vec<&str> = view.filtered().iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, vec!["anthropic/claude"]);
         view.move_by(5);
-        assert_eq!(view.selected_model().as_deref(), Some("anthropic/claude"));
+        assert_eq!(
+            view.selected_item().map(|item| item.action.clone()),
+            Some(PickAction::Run("/model anthropic/claude".into()))
+        );
         view.push_filter('z');
-        assert!(view.selected_model().is_none());
+        assert!(view.selected_item().is_none());
         view.pop_filter();
         view.pop_filter();
         view.pop_filter();
         assert_eq!(view.filtered().len(), 3);
+
+        // Label prefixes rank above substrings and description matches.
+        let mut view = PickerModal::new(
+            "x",
+            "X",
+            vec![
+                PickItem::run("x", "dark-blue", ""),
+                PickItem::run("x", "plain", "a dark look"),
+                PickItem::run("x", "darker", ""),
+            ],
+            "",
+        );
+        view.push_filter('d');
+        view.push_filter('a');
+        view.push_filter('r');
+        let labels: Vec<&str> = view.filtered().iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, vec!["dark-blue", "darker", "plain"]);
+
+        // A refresh keeps the highlighted row.
+        view.move_by(1);
+        view.replace_items(vec![
+            PickItem::run("x", "darker", ""),
+            PickItem::run("x", "dark-blue", ""),
+        ]);
+        assert_eq!(view.selected_label().as_deref(), Some("darker"));
     }
 
     #[test]
@@ -3616,6 +4108,124 @@ mod tests {
         let mut app = App::new(runtime, options()).unwrap();
         assert!(app.input.history_prev());
         assert_eq!(app.input.text(), "remember me");
+    }
+
+    async fn test_app() -> (tempfile::TempDir, App) {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("work");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let paths = crate::paths::Paths {
+            config_dir: dir.path().join("config"),
+            data_dir: dir.path().join("data"),
+            cwd,
+            project_id: "test".into(),
+            sessions_dir_override: None,
+        };
+        let mut config = Config::builtin();
+        config.model.endpoint = model_endpoint(&["m"]).await;
+        config.model.model = "m".into();
+        let runtime = app::create_runtime(
+            config,
+            paths,
+            RuntimeOptions {
+                no_session: true,
+                ..RuntimeOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        let app = App::new(
+            runtime,
+            UiOptions {
+                no_color: true,
+                trust: false,
+                skills: SkillIndex::bundled(),
+            },
+        )
+        .unwrap();
+        (dir, app)
+    }
+
+    #[tokio::test]
+    async fn list_commands_open_pickers_and_pick_without_typing() {
+        let (_dir, mut app) = test_app().await;
+        let enter = key(KeyCode::Enter);
+
+        // /theme previews as the highlight moves; Esc restores.
+        let original = app.theme.name.clone();
+        app.input.set_text("/theme");
+        app.handle_key(enter).await;
+        assert!(matches!(&app.modal, Some(ModalData::Picker(v)) if v.command == "theme"));
+        app.handle_modal_key(key(KeyCode::Down)).await;
+        assert_ne!(app.theme.name, original, "moving previews the theme");
+        app.handle_modal_key(key(KeyCode::Esc)).await;
+        assert!(app.modal.is_none());
+        assert_eq!(app.theme.name, original, "Esc restores the theme");
+
+        // Filtering and Enter applies the pick.
+        app.command_theme("");
+        for ch in "gruvbox-d".chars() {
+            app.handle_modal_key(key(KeyCode::Char(ch))).await;
+        }
+        app.handle_modal_key(enter).await;
+        assert!(app.modal.is_none());
+        assert_eq!(app.theme.name, "gruvbox-dark");
+
+        // /profile lists profiles with the current one preselected.
+        app.command_profile("").await;
+        match &app.modal {
+            Some(ModalData::Picker(view)) => {
+                assert!(view.items.len() > 1);
+                assert_eq!(
+                    view.selected_label().as_deref(),
+                    Some(app.config.profile_name())
+                );
+            }
+            _ => panic!("expected the profile picker"),
+        }
+        app.modal = None;
+
+        // /sec: summary runs directly; scope add fills the prompt.
+        app.command_sec("");
+        for ch in "scope add".chars() {
+            app.handle_modal_key(key(KeyCode::Char(ch))).await;
+        }
+        app.handle_modal_key(enter).await;
+        assert!(app.modal.is_none());
+        assert_eq!(app.input.text(), "/sec scope add ");
+        app.input.set_text("");
+
+        // /skill lists the skills the profile's packs advertise.
+        let mut full = app.config.clone();
+        full.profile_name = "full".into();
+        app.rebuild_core_with(full).await.unwrap();
+        app.command_skill("");
+        match &app.modal {
+            Some(ModalData::Picker(view)) => {
+                assert!(!view.items.is_empty());
+                assert!(view.items.iter().all(|item| item.action
+                    == PickAction::Run(format!("/skill {}", item.label))
+                    && !item.description.is_empty()));
+            }
+            _ => panic!("expected the skill picker"),
+        }
+        app.modal = None;
+
+        // /help <command> explains one command.
+        app.command_help("theme");
+        app.transcript.prepare(120, &app.theme, false);
+        let notes = format!("{:?}", app.transcript.lines());
+        assert!(notes.contains("live preview"), "{notes}");
+
+        // Esc abandons a half-typed command.
+        app.input.set_text("/the");
+        app.handle_key(key(KeyCode::Esc)).await;
+        assert!(app.input.is_empty());
+
+        // Idle ticks do not ask for frames; a running switch animates.
+        app.notice = None;
+        app.transcript.prepare(80, &app.theme, false);
+        assert!(!app.on_tick());
     }
 
     #[tokio::test]
@@ -3751,9 +4361,10 @@ mod tests {
         // with the current model preselected.
         app.command_model("").await;
         match &app.modal {
-            Some(ModalData::Models(view)) => {
-                assert_eq!(view.items, vec!["alpha".to_string(), "beta".to_string()]);
-                assert_eq!(view.selected_model().as_deref(), Some("beta"));
+            Some(ModalData::Picker(view)) => {
+                let labels: Vec<&str> = view.items.iter().map(|i| i.label.as_str()).collect();
+                assert_eq!(labels, vec!["alpha", "beta"]);
+                assert_eq!(view.selected_label().as_deref(), Some("beta"));
             }
             _ => panic!("expected the models picker"),
         }
@@ -3763,6 +4374,7 @@ mod tests {
         }
         app.handle_modal_key(key(KeyCode::Enter)).await;
         assert!(app.modal.is_none());
+        app.settle().await;
         assert_eq!(app.header.model, "alpha");
         // The picker switch lasts for the session; the saved config keeps beta.
         let saved = std::fs::read_to_string(&config_path).unwrap();

@@ -39,7 +39,9 @@ Values: `#rgb`, `#rrggbb`, ANSI names (`red`, `bright_blue`, ...),
 `indexed:0..255`, and `default`.
 
 `color_mode = "auto" | "truecolor" | "256" | "16"` controls conversion. Auto
-detects `COLORTERM` and `TERM`; `NO_COLOR` disables color. `/theme <name>`
-applies for the session; `/theme save` writes `[ui] theme` to the global config.
+detects `COLORTERM` and `TERM`; `NO_COLOR` disables color. `/theme` opens a
+picker that previews each theme as you move (Esc restores the previous one);
+`/theme <name>` applies for the session; `/theme save` writes `[ui] theme` to
+the global config.
 Status is never conveyed by color alone: labels and glyphs accompany every
 color.

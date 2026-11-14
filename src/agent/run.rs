@@ -140,12 +140,25 @@ pub async fn run_turn(
     // `@path` mentions attach file snapshots, within a quarter of the
     // usable prompt so one message cannot crowd out the conversation.
     let attachment_budget = turn.budget.chars_for(turn.budget.usable_prompt() / 4);
-    let mentions = super::mentions::resolve(&core.tool_context(), &user_text, attachment_budget);
+    let mentions =
+        super::mentions::resolve(&core.tool_context(), &user_text, attachment_budget).await;
     if !mentions.attachments.is_empty() {
-        let names: Vec<&str> = mentions
+        let names: Vec<String> = mentions
             .attachments
             .iter()
-            .map(|attachment| attachment.path.as_str())
+            .map(
+                |attachment| match (&attachment.image, &attachment.described_by) {
+                    (Some(image), Some(model)) => {
+                        format!(
+                            "{} ({}, described by {model})",
+                            attachment.path,
+                            image.summary()
+                        )
+                    }
+                    (Some(image), None) => format!("{} ({})", attachment.path, image.summary()),
+                    _ => attachment.path.clone(),
+                },
+            )
             .collect();
         let _ = tx.send(AgentEvent::Notice(format!("attached {}", names.join(", "))));
     }
@@ -488,9 +501,18 @@ async fn run_loop(
             }
         }
 
+        // Pixels go only to a model with vision input on an allowed
+        // endpoint; anything else sees a placeholder (for example after a
+        // switch to a text-only model mid-session).
+        let mut messages = assembled.messages.clone();
+        if !core.vision.native {
+            ChatMessage::strip_images(&mut messages, "the current model has no vision input");
+        } else if let Some(reason) = &core.vision.blocked {
+            ChatMessage::strip_images(&mut messages, reason);
+        }
         let request = ChatRequest {
             model: core.provider.model().to_string(),
-            messages: assembled.messages.clone(),
+            messages,
             tools: core.tool_specs.clone(),
             tool_choice: core
                 .model_profile
@@ -2124,6 +2146,17 @@ async fn exact_prompt_tokens(
     assembled: &crate::context::AssembledContext,
 ) -> Option<u32> {
     let text = tokenize_text(&assembled.messages, &core.tool_specs_json);
+    // `/tokenize` only sees text; images are added at their estimate.
+    let images: usize = assembled
+        .messages
+        .iter()
+        .map(|message| match message {
+            ChatMessage::User { images, .. } => {
+                images.iter().map(|image| image.estimated_tokens()).sum()
+            }
+            _ => 0,
+        })
+        .sum();
     tokio::time::timeout(
         std::time::Duration::from_secs(2),
         crate::provider::probe::token_count(core.provider.as_ref(), &text),
@@ -2131,7 +2164,7 @@ async fn exact_prompt_tokens(
     .await
     .ok()
     .flatten()
-    .map(|tokens| tokens.min(u32::MAX as usize) as u32)
+    .map(|tokens| (tokens + images).min(u32::MAX as usize) as u32)
 }
 
 /// Stop a turn whose rendered prompt cannot fit even after compaction.
@@ -2175,7 +2208,7 @@ fn tokenize_text(messages: &[ChatMessage], tools_json: &str) -> String {
         out.push_str(message.role());
         out.push_str(": ");
         match message {
-            ChatMessage::System { content } | ChatMessage::User { content } => {
+            ChatMessage::System { content } | ChatMessage::User { content, .. } => {
                 out.push_str(content);
             }
             ChatMessage::Assistant {
@@ -2511,6 +2544,7 @@ mod tests {
             system_prompt,
             repo_brief: String::new(),
             model_profile: ModelProfile::default(),
+            vision: Default::default(),
             tool_probe: None,
             cancel: CancellationToken::new(),
             tool_timeout: std::time::Duration::from_secs(10),

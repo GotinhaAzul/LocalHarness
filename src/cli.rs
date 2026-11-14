@@ -90,6 +90,15 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub no_color: bool,
 
+    /// Allow sending images to an endpoint that is not loopback or on a
+    /// private network (same as `[vision] allow_remote = true`).
+    #[arg(long, global = true)]
+    pub allow_remote_images: bool,
+
+    /// Send images with their EXIF/XMP metadata instead of stripping it.
+    #[arg(long, global = true)]
+    pub keep_exif: bool,
+
     /// Keep artifacts and skip retention cleanup.
     #[arg(long, conflicts_with = "clean_artifacts")]
     pub keep_artifacts: bool,
@@ -214,6 +223,12 @@ pub async fn run(cli: Cli) -> Result<i32> {
     }
     if cli.keep_artifacts {
         config.session.keep_artifacts = true;
+    }
+    if cli.allow_remote_images {
+        config.vision.allow_remote = true;
+    }
+    if cli.keep_exif {
+        config.vision.keep_exif = true;
     }
     if cli.clean_artifacts {
         config.session.clean_artifacts = true;

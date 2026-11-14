@@ -2,7 +2,6 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use ratatui::Frame;
@@ -164,12 +163,25 @@ pub struct Transcript {
     turn: Vec<Block>,
     live_user: Option<Block>,
     live_assistant: Option<Block>,
+    /// Wrapped lines: the stable prefix (banner, session, notes) followed by
+    /// the live turn. Only the turn is rebuilt while a reply streams.
     lines: Vec<Line<'static>>,
+    /// How many of `lines` belong to the stable prefix.
+    prefix_len: usize,
+    /// Rendered lines per finished block of `turn`, reused across frames.
+    turn_cache: Vec<Option<Vec<Line<'static>>>>,
+    /// Rendered `live_user`, reused while the reply streams.
+    live_user_cache: Option<Vec<Line<'static>>>,
     built_width: usize,
+    /// Identifies the theme the cached lines were styled with.
+    built_theme: String,
     show_reasoning: bool,
     expand_tools: bool,
+    /// Something changed in the stable prefix (or layout), so everything is
+    /// rebuilt.
     dirty: bool,
-    last_build: Option<Instant>,
+    /// Only the live turn changed.
+    tail_dirty: bool,
     pub scroll: usize,
     pub follow: bool,
     pub new_output: bool,
@@ -186,11 +198,15 @@ impl Transcript {
             live_user: None,
             live_assistant: None,
             lines: Vec::new(),
+            prefix_len: 0,
+            turn_cache: Vec::new(),
+            live_user_cache: None,
             built_width: 0,
+            built_theme: String::new(),
             show_reasoning,
             expand_tools: false,
             dirty: true,
-            last_build: None,
+            tail_dirty: true,
             scroll: 0,
             follow: true,
             new_output: false,
@@ -256,11 +272,13 @@ impl Transcript {
 
     pub fn begin_turn(&mut self, user_text: &str) {
         self.turn.clear();
+        self.turn_cache.clear();
         self.live_assistant = None;
         self.live_user = Some(Block::user(user_text));
+        self.live_user_cache = None;
         self.follow = true;
         self.new_output = false;
-        self.mark_dirty();
+        self.mark_tail_dirty();
     }
 
     pub fn text_delta(&mut self, delta: &str) {
@@ -273,7 +291,7 @@ impl Transcript {
         if let BlockKind::Assistant { text, .. } = &mut block.kind {
             text.push_str(delta);
         }
-        self.mark_dirty();
+        self.mark_tail_dirty();
     }
 
     pub fn reasoning_delta(&mut self, delta: &str) {
@@ -286,7 +304,7 @@ impl Transcript {
         if let BlockKind::Assistant { reasoning, .. } = &mut block.kind {
             reasoning.get_or_insert_with(String::new).push_str(delta);
         }
-        self.mark_dirty();
+        self.mark_tail_dirty();
     }
 
     fn flush_live_assistant(&mut self) {
@@ -308,7 +326,7 @@ impl Transcript {
             String::new(),
             None,
         ));
-        self.mark_dirty();
+        self.mark_tail_dirty();
     }
 
     pub fn tool_finished(
@@ -325,10 +343,14 @@ impl Transcript {
         } else {
             ToolStatus::Ok
         };
-        let existing = self.turn.iter_mut().rev().find(|block| {
+        let existing = self.turn.iter().rposition(|block| {
             matches!(&block.kind, BlockKind::Tool { call_id: Some(id), .. } if id == call_id)
         });
-        if let Some(block) = existing {
+        if let Some(index) = existing {
+            if let Some(slot) = self.turn_cache.get_mut(index) {
+                *slot = None;
+            }
+            let block = &mut self.turn[index];
             if let BlockKind::Tool {
                 status: slot,
                 duration_ms: duration,
@@ -353,43 +375,54 @@ impl Transcript {
                 artifact,
             ));
         }
-        self.mark_dirty();
+        self.mark_tail_dirty();
     }
 
     pub fn turn_error(&mut self, code: &str, message: &str) {
         self.turn.push(Block::error(code, message));
-        self.mark_dirty();
+        self.mark_tail_dirty();
     }
 
     pub fn turn_note(&mut self, title: &str, body: &str, is_error: bool) {
         self.turn.push(Block::note(title, body, is_error));
-        self.mark_dirty();
+        self.mark_tail_dirty();
     }
 
     pub fn finish_turn(&mut self) {
         self.turn.clear();
+        self.turn_cache.clear();
         self.live_user = None;
+        self.live_user_cache = None;
         self.live_assistant = None;
-        self.mark_dirty();
+        self.mark_tail_dirty();
     }
 
+    /// The stable prefix changed: rebuild everything on the next frame.
     pub fn mark_dirty(&mut self) {
         self.dirty = true;
+        self.tail_dirty = true;
+        if !self.follow {
+            self.new_output = true;
+        }
+    }
+
+    /// Only the live turn changed: the prefix lines are reused.
+    fn mark_tail_dirty(&mut self) {
+        self.tail_dirty = true;
         if !self.follow {
             self.new_output = true;
         }
     }
 
     pub fn is_dirty(&self) -> bool {
-        self.dirty
+        self.dirty || self.tail_dirty
     }
 
-    pub fn last_build(&self) -> Option<Instant> {
-        self.last_build
-    }
-
-    /// Rebuild wrapped lines when dirty, at most once per 30 ms.
-    pub fn prepare(&mut self, width: usize, theme: &Theme, show_reasoning: bool, force: bool) {
+    /// Rebuild wrapped lines when anything changed. The stable prefix is only
+    /// re-rendered when it (or the width, theme, or display switches)
+    /// changed; while a reply streams only the live turn is rebuilt, and the
+    /// turn's finished blocks come from a per-block cache.
+    pub fn prepare(&mut self, width: usize, theme: &Theme, show_reasoning: bool) {
         if width == 0 {
             return;
         }
@@ -397,52 +430,81 @@ impl Transcript {
             self.show_reasoning = show_reasoning;
             self.dirty = true;
         }
-        if !self.dirty && width == self.built_width {
+        let theme_key = theme_key(theme);
+        if width != self.built_width || theme_key != self.built_theme {
+            self.dirty = true;
+        }
+        if !self.dirty && !self.tail_dirty {
             return;
         }
-        if !force
-            && let Some(last) = self.last_build
-            && last.elapsed() < Duration::from_millis(30)
-        {
-            return;
-        }
-        let mut ordered: Vec<(&Block, bool)> = Vec::new();
-        let mut extra = self.extra.iter().peekable();
-        for (index, block) in self.session.iter().enumerate() {
-            while let Some((_, note)) = extra.next_if(|(anchor, _)| *anchor <= index) {
-                ordered.push((note, false));
-            }
-            ordered.push((block, false));
-        }
-        ordered.extend(extra.map(|(_, note)| (note, false)));
-        // The live user message precedes the turn's tool and text blocks.
-        ordered.extend(self.live_user.iter().map(|block| (block, false)));
-        ordered.extend(self.turn.iter().map(|block| (block, false)));
-        ordered.extend(self.live_assistant.iter().map(|block| (block, true)));
         let opts = RenderOpts {
             show_reasoning: self.show_reasoning,
             expand_tools: self.expand_tools,
             live: false,
         };
-        let mut lines = Vec::new();
-        if let Some(banner) = &self.banner {
-            lines.extend(render_block(banner, width, theme, opts));
+        if self.dirty {
+            let mut lines = Vec::new();
+            if let Some(banner) = &self.banner {
+                lines.extend(render_block(banner, width, theme, opts));
+            }
+            let mut extra = self.extra.iter().peekable();
+            let push = |lines: &mut Vec<Line<'static>>, block: &Block| {
+                if !lines.is_empty() {
+                    lines.push(Line::raw(""));
+                }
+                lines.extend(render_block(block, width, theme, opts));
+            };
+            for (index, block) in self.session.iter().enumerate() {
+                while let Some((_, note)) = extra.next_if(|(anchor, _)| *anchor <= index) {
+                    push(&mut lines, note);
+                }
+                push(&mut lines, block);
+            }
+            for (_, note) in extra {
+                push(&mut lines, note);
+            }
+            self.prefix_len = lines.len();
+            self.lines = lines;
+            self.turn_cache.clear();
+            self.live_user_cache = None;
+        } else {
+            self.lines.truncate(self.prefix_len);
         }
-        for (block, live) in ordered {
+
+        // The live user message precedes the turn's tool and text blocks.
+        let mut lines = std::mem::take(&mut self.lines);
+        let separate = |lines: &mut Vec<Line<'static>>| {
             if !lines.is_empty() {
                 lines.push(Line::raw(""));
             }
+        };
+        if let Some(user) = &self.live_user {
+            let rendered = self
+                .live_user_cache
+                .get_or_insert_with(|| render_block(user, width, theme, opts));
+            separate(&mut lines);
+            lines.extend(rendered.iter().cloned());
+        }
+        self.turn_cache.resize(self.turn.len(), None);
+        for (block, cached) in self.turn.iter().zip(self.turn_cache.iter_mut()) {
+            let rendered = cached.get_or_insert_with(|| render_block(block, width, theme, opts));
+            separate(&mut lines);
+            lines.extend(rendered.iter().cloned());
+        }
+        if let Some(block) = &self.live_assistant {
+            separate(&mut lines);
             lines.extend(render_block(
                 block,
                 width,
                 theme,
-                RenderOpts { live, ..opts },
+                RenderOpts { live: true, ..opts },
             ));
         }
         self.lines = lines;
         self.built_width = width;
+        self.built_theme = theme_key;
         self.dirty = false;
-        self.last_build = Some(Instant::now());
+        self.tail_dirty = false;
         if self.follow {
             self.scroll = self.max_scroll();
         } else {
@@ -528,8 +590,23 @@ pub fn blocks_from_session_after(session: &Session, floor_seq: u64) -> Vec<Block
                     done.push_into(&mut blocks);
                 }
                 recap = Some(TurnRecap::new(entry.ts));
+                // Images show as name and size, never bytes.
+                let mut text = data.content.clone();
+                for attachment in &data.attachments {
+                    if let Some(image) = &attachment.image {
+                        let how = match &attachment.described_by {
+                            Some(model) => format!(" · described by {model}"),
+                            None => String::new(),
+                        };
+                        text.push_str(&format!(
+                            "\n[image {} · {}{how}]",
+                            attachment.path,
+                            image.summary()
+                        ));
+                    }
+                }
                 blocks.push(Block {
-                    kind: BlockKind::User(data.content.clone()),
+                    kind: BlockKind::User(text),
                     ts: Some(entry.ts),
                 });
             }
@@ -713,6 +790,16 @@ fn preview_text(text: &str, max_chars: usize, max_lines: usize) -> String {
 }
 
 /// Render a slice of blocks into wrapped lines. Public for tests.
+/// Cache key for the theme the transcript was styled with.
+fn theme_key(theme: &Theme) -> String {
+    format!(
+        "{}:{:?}:{:?}",
+        theme.name,
+        theme.color(Role::Fg),
+        theme.color(Role::Accent)
+    )
+}
+
 pub fn blocks_to_lines(
     blocks: &[Block],
     width: usize,
@@ -1521,13 +1608,16 @@ pub fn draw(frame: &mut Frame, scene: &Scene<'_>, theme: &Theme) {
     let rects = split_with(area, scene.layout_spec(area.width));
 
     if rects.transcript.height > 0 {
-        let scroll = scene
-            .transcript
-            .scroll_for(rects.transcript.height as usize);
-        frame.render_widget(
-            Paragraph::new(scene.transcript.lines().to_vec()).scroll((scroll as u16, 0)),
-            rects.transcript,
-        );
+        // Hand the widget only the visible window: the transcript is already
+        // wrapped, so cloning (and scrolling through) every line each frame
+        // is wasted work, and a `u16` scroll offset overflows on long
+        // sessions.
+        let height = rects.transcript.height as usize;
+        let scroll = scene.transcript.scroll_for(height);
+        let all = scene.transcript.lines();
+        let start = scroll.min(all.len());
+        let end = (start + height).min(all.len());
+        frame.render_widget(Paragraph::new(all[start..end].to_vec()), rects.transcript);
         render_scroll_badge(frame, scene.transcript, rects.transcript, theme);
     }
 
@@ -1970,7 +2060,7 @@ mod tests {
         transcript.text_delta("Looking.");
         transcript.tool_started("c1", "read", "src/lib.rs");
         transcript.set_viewport(40);
-        transcript.prepare(80, &theme, false, true);
+        transcript.prepare(80, &theme, false);
         let text = joined(transcript.lines());
         let user = text.find("fix the bug").unwrap();
         let tool = text.find("Read src/lib.rs").unwrap();
@@ -1985,7 +2075,7 @@ mod tests {
         transcript.set_session(vec![Block::user("first")]);
         transcript.push_note("help", "the help text", false);
         transcript.set_session(vec![Block::user("first"), Block::user("second")]);
-        transcript.prepare(80, &theme, false, true);
+        transcript.prepare(80, &theme, false);
         let text = joined(transcript.lines());
         let note = text.find("the help text").unwrap();
         assert!(text.find("first").unwrap() < note);
@@ -2065,7 +2155,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         let rects = split(frame_area(&terminal), 1, 0);
         transcript.set_viewport(rects.transcript.height as usize);
-        transcript.prepare(80, &theme, false, true);
+        transcript.prepare(80, &theme, false);
         terminal
             .draw(|frame| {
                 let scene = Scene {
@@ -2098,7 +2188,7 @@ mod tests {
         let input = TextArea::new(vec![String::new()]);
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
         transcript.set_viewport(10);
-        transcript.prepare(100, &theme, false, true);
+        transcript.prepare(100, &theme, false);
         terminal
             .draw(|frame| {
                 let scene = Scene {
@@ -2169,5 +2259,119 @@ mod tests {
             out.push('\n');
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod perf_bench {
+    use super::*;
+    use std::time::Instant;
+
+    pub(crate) fn big_session(turns: usize) -> Vec<Block> {
+        let mut blocks = Vec::new();
+        for n in 0..turns {
+            blocks.push(Block::user(format!(
+                "please fix bug number {n} in the parser"
+            )));
+            blocks.push(Block::tool(
+                Some(format!("c{n}")),
+                "read",
+                "src/lib.rs",
+                ToolStatus::Ok,
+                Some(12),
+                "fn main() {}\nline two\nline three\nline four",
+                None,
+            ));
+            blocks.push(Block::assistant(format!(
+                "## Fix {n}\n\nHere is the **change** with `code` and a list:\n\n- one\n- two\n- three\n\n```rust\nfn parse(input: &str) -> Result<Ast, Error> {{\n    let tokens = lex(input)?;\n    let mut parser = Parser::new(tokens);\n    parser.expression()\n}}\n```\n\nThat should resolve it. {}", "lorem ipsum dolor sit amet ".repeat(20)), Some("thinking about it".into())));
+        }
+        blocks
+    }
+
+    fn text(lines: &[Line<'static>]) -> String {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The incremental rebuild must paint exactly what a from-scratch build
+    /// paints, through streaming, tool updates, notes, and a width change.
+    #[test]
+    fn incremental_prepare_matches_a_full_rebuild() {
+        let theme = Theme::bundled("default");
+        let fresh = |t: &Transcript, width: usize| {
+            let mut copy = Transcript::new(false);
+            copy.session = t.session.clone();
+            copy.extra = t.extra.clone();
+            copy.banner = t.banner.clone();
+            copy.turn = t.turn.clone();
+            copy.live_user = t.live_user.clone();
+            copy.live_assistant = t.live_assistant.clone();
+            copy.expand_tools = t.expand_tools;
+            copy.prepare(width, &theme, false);
+            text(copy.lines())
+        };
+        let mut t = Transcript::new(false);
+        t.set_session(big_session(3));
+        t.prepare(80, &theme, false);
+        assert_eq!(text(t.lines()), fresh(&t, 80));
+
+        t.begin_turn("next question");
+        t.prepare(80, &theme, false);
+        t.text_delta("thinking out **loud**");
+        t.prepare(80, &theme, false);
+        assert_eq!(text(t.lines()), fresh(&t, 80));
+        t.tool_started("t1", "bash", "cargo test");
+        t.prepare(80, &theme, false);
+        t.tool_finished("t1", "bash", false, 1500, "ok\n3 passed", None);
+        t.prepare(80, &theme, false);
+        assert!(text(t.lines()).contains("3 passed"));
+        assert_eq!(text(t.lines()), fresh(&t, 80));
+        t.push_note("note", "a local note", false);
+        t.text_delta("more text");
+        t.prepare(80, &theme, false);
+        assert_eq!(text(t.lines()), fresh(&t, 80));
+        t.prepare(50, &theme, false);
+        assert_eq!(text(t.lines()), fresh(&t, 50));
+        t.finish_turn();
+        t.prepare(50, &theme, false);
+        assert_eq!(text(t.lines()), fresh(&t, 50));
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_transcript_prepare() {
+        let theme = Theme::bundled("default");
+        let mut transcript = Transcript::new(false);
+        transcript.set_session(big_session(200));
+        transcript.set_viewport(40);
+        let start = Instant::now();
+        transcript.prepare(120, &theme, false);
+        let full = start.elapsed();
+        let start = Instant::now();
+        for _ in 0..20 {
+            transcript.text_delta("more streamed text ");
+            transcript.prepare(120, &theme, false);
+        }
+        let per_delta = start.elapsed() / 20;
+        // The frame hands the widget only the visible window.
+        let start = Instant::now();
+        for _ in 0..20 {
+            let lines = transcript.lines();
+            let top = lines.len().saturating_sub(40);
+            let _ = Paragraph::new(lines[top..].to_vec());
+        }
+        let per_clone = start.elapsed() / 20;
+        eprintln!(
+            "lines={} full={full:?} per_delta_rebuild={per_delta:?} per_frame_window={per_clone:?}",
+            transcript.lines().len()
+        );
     }
 }

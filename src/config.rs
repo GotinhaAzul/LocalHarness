@@ -32,6 +32,8 @@ pub struct Config {
     pub verify: VerifyConfig,
     /// Model Context Protocol servers, keyed by server name (`[mcp.<name>]`).
     pub mcp: BTreeMap<String, McpServerConfig>,
+    /// Image attachments and the optional describing model (`[vision]`).
+    pub vision: VisionConfig,
     /// Runtime selection, set from CLI or environment.
     #[serde(skip)]
     pub profile_name: String,
@@ -835,6 +837,9 @@ pub struct ModelProfile {
     pub extra_body: Option<toml::Value>,
     /// Hint for tool schema style; the harness always sends JSON schema.
     pub native_tools: Option<bool>,
+    /// The model accepts images as content parts. `None` asks the server
+    /// (llama.cpp `/props`), else assumes text only.
+    pub vision: Option<bool>,
 }
 
 impl Default for ModelProfile {
@@ -852,6 +857,7 @@ impl Default for ModelProfile {
             stop: vec![],
             extra_body: None,
             native_tools: None,
+            vision: None,
         }
     }
 }
@@ -863,6 +869,40 @@ impl ModelProfile {
 
     pub fn short_tool_schemas(&self) -> bool {
         self.short_tool_schemas.unwrap_or(false)
+    }
+}
+
+/// `[vision]`: how images reach a model.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VisionConfig {
+    /// Model that describes images for a model without vision input. Empty
+    /// disables the fallback.
+    pub model: String,
+    /// Endpoint for `model`; empty uses `[model] endpoint`.
+    pub endpoint: String,
+    /// API key for `endpoint`; empty reuses `[model] api_key` when the
+    /// endpoint is shared.
+    pub api_key: String,
+    /// Allow sending images to an endpoint that is not loopback or on a
+    /// private network.
+    pub allow_remote: bool,
+    /// Largest image accepted, in bytes.
+    pub max_bytes: u64,
+    /// Send images with their EXIF/XMP metadata instead of stripping it.
+    pub keep_exif: bool,
+}
+
+impl Default for VisionConfig {
+    fn default() -> Self {
+        Self {
+            model: String::new(),
+            endpoint: String::new(),
+            api_key: String::new(),
+            allow_remote: false,
+            max_bytes: crate::media::image::DEFAULT_MAX_BYTES,
+            keep_exif: false,
+        }
     }
 }
 

@@ -62,6 +62,8 @@ pub struct Core {
     /// static prompt can be re-measured after tokenizer calibration.
     pub repo_brief: String,
     pub model_profile: ModelProfile,
+    /// How images reach this model (native, described, or refused).
+    pub vision: Arc<crate::media::VisionSettings>,
     /// Last forced-tool conformance result for this model/build. `None` when
     /// the probe could not run (server down or a deferred start).
     pub tool_probe: Option<crate::provider::probe::ToolProbe>,
@@ -257,6 +259,7 @@ impl Core {
             paths: self.paths.clone(),
             lsp: self.registry.lsp(),
             sandbox: self.sandbox.clone(),
+            vision: self.vision.clone(),
         }
     }
 

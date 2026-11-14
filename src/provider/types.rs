@@ -47,6 +47,43 @@ pub fn tools_json(tools: &[ToolSpec]) -> String {
     serde_json::to_string(&tools_payload(tools)).unwrap_or_default()
 }
 
+/// An image sent as an OpenAI `image_url` content part.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageData {
+    pub mime: String,
+    pub width: u32,
+    pub height: u32,
+    /// Shared so cloning a request does not copy pixels.
+    pub data: std::sync::Arc<Vec<u8>>,
+    /// Where the image came from, for placeholders (`shot.png`).
+    pub label: String,
+}
+
+impl ImageData {
+    pub fn data_url(&self) -> String {
+        format!(
+            "data:{};base64,{}",
+            self.mime,
+            crate::media::image::base64(&self.data)
+        )
+    }
+
+    /// Rough prompt cost: vision encoders spend about one token per 28×28
+    /// patch, within the bounds most servers resize to.
+    pub fn estimated_tokens(&self) -> usize {
+        let patches = (self.width.div_ceil(28) as usize) * (self.height.div_ceil(28) as usize);
+        patches.clamp(64, 1600)
+    }
+
+    /// Text that stands in for the image where pixels cannot go.
+    pub fn placeholder(&self, reason: &str) -> String {
+        format!(
+            "[image {} ({}×{}) omitted: {reason}]",
+            self.label, self.width, self.height
+        )
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum ChatMessage {
     System {
@@ -54,6 +91,8 @@ pub enum ChatMessage {
     },
     User {
         content: String,
+        /// Images that follow the text, for models with vision input.
+        images: Vec<ImageData>,
     },
     Assistant {
         content: Option<String>,
@@ -66,6 +105,27 @@ pub enum ChatMessage {
 }
 
 impl ChatMessage {
+    /// A text-only user message.
+    pub fn user(content: impl Into<String>) -> Self {
+        ChatMessage::User {
+            content: content.into(),
+            images: Vec::new(),
+        }
+    }
+
+    /// Replace every image with a text placeholder (for a model or endpoint
+    /// that must not receive pixels).
+    pub fn strip_images(messages: &mut [ChatMessage], reason: &str) {
+        for message in messages {
+            if let ChatMessage::User { content, images } = message {
+                for image in images.drain(..) {
+                    content.push('\n');
+                    content.push_str(&image.placeholder(reason));
+                }
+            }
+        }
+    }
+
     pub fn role(&self) -> &'static str {
         match self {
             ChatMessage::System { .. } => "system",
@@ -78,7 +138,16 @@ impl ChatMessage {
     /// Rough character count used before an exact tokenizer is available.
     pub fn char_len(&self) -> usize {
         match self {
-            ChatMessage::System { content } | ChatMessage::User { content } => content.len(),
+            ChatMessage::System { content } => content.len(),
+            // Images are costed in tokens; ~3.5 characters per token keeps
+            // them on the same scale as text.
+            ChatMessage::User { content, images } => {
+                content.len()
+                    + images
+                        .iter()
+                        .map(|image| image.estimated_tokens() * 7 / 2)
+                        .sum::<usize>()
+            }
             ChatMessage::Assistant {
                 content,
                 tool_calls,
