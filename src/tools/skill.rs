@@ -313,23 +313,66 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn coding_pack_lists_and_loads_its_skills() {
+    async fn three_coding_tasks_load_only_their_skills() {
+        const PACK: &[&str] = &[
+            "test-repair",
+            "code-review",
+            "refactor",
+            "dependency-upgrade",
+            "perf-profile",
+            "incident-triage",
+            "release-notes",
+            "issue-to-pr",
+        ];
         let dir = tempfile::tempdir().unwrap();
-        let mut ctx = context(dir.path(), false);
-        ctx.packs = vec!["core".into(), "coding".into()];
 
-        let listed = SkillTool.call(&ctx, json!({})).await;
-        assert!(listed.content.contains("test-repair"), "{}", listed.content);
-        assert!(listed.content.contains("code-review"), "{}", listed.content);
+        // The coding index carries the whole pack and no security skill.
+        let mut coding = context(dir.path(), false);
+        coding.packs = vec!["core".into(), "coding".into()];
+        let listed = SkillTool.call(&coding, json!({})).await;
+        for name in PACK {
+            assert!(
+                listed.content.contains(name),
+                "missing {name}: {}",
+                listed.content
+            );
+        }
         assert!(
             !listed.content.contains("security-red"),
             "the security pack is off, so its skills must stay out of the list"
         );
 
-        let loaded = SkillTool.call(&ctx, json!({"name": "test-repair"})).await;
+        // Task 1: repair a failing test.
+        let loaded = SkillTool
+            .call(&coding, json!({"name": "test-repair"}))
+            .await;
         assert!(!loaded.is_error, "{}", loaded.content);
         assert!(loaded.content.starts_with("[skill: test-repair]"));
         assert!(loaded.content.contains("Stop and"));
+
+        // Task 2: review a diff.
+        let loaded = SkillTool
+            .call(&coding, json!({"name": "code-review"}))
+            .await;
+        assert!(!loaded.is_error, "{}", loaded.content);
+        assert!(loaded.content.starts_with("[skill: code-review]"));
+
+        // Task 3: a security-only session keeps the coding pack out of its
+        // index while the security skills are present.
+        let mut security = context(dir.path(), false);
+        security.packs = vec!["core".into(), "security".into()];
+        let listed = SkillTool.call(&security, json!({})).await;
+        assert!(
+            listed.content.contains("security-blue"),
+            "{}",
+            listed.content
+        );
+        for name in PACK {
+            assert!(
+                !listed.content.contains(name),
+                "{name} must stay out of a security-only index"
+            );
+        }
     }
 
     #[tokio::test]

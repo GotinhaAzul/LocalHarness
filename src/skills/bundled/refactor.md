@@ -18,8 +18,8 @@ Before touching code, list what must stay true:
 - ordering, timing, and side effects that are observable;
 - edge cases the current tests do not cover but users rely on.
 
-Put the list in the task notes or a `todo` plan. This is the standard the
-refactor is reviewed against.
+Put the list in a `todo` plan; the harness requires one after the second edit.
+This is the standard the refactor is reviewed against.
 
 ## 2. Get a baseline
 
@@ -27,8 +27,8 @@ Run `verify` on the unchanged tree. Record the command and result. If the suite
 is already red, stop: fixing the baseline is a separate task, and you cannot
 distinguish your breakage from the existing one.
 
-Check for uncommitted work with `bash git status` before editing. Do not mix a
-refactor into someone else's unfinished change.
+Check for uncommitted work with `bash` (`{"command":"git status"}`) before
+editing. Do not mix a refactor into someone else's unfinished change.
 
 ## 3. Small, mechanical steps
 
@@ -40,9 +40,11 @@ One move at a time:
 - replace a repeated block;
 - delete now-dead code.
 
-For renames, use `lsp` (`{"action":"rename", ...}`) so every reference moves
-with the definition. Use `grep` to confirm no string-based or dynamic
-references remain. For manual edits, `read` first, then `patch`.
+For renames, ask `lsp` for `{"action":"references"}` and
+`{"action":"definition"}` at the symbol, then `read` and `patch` every site it
+names. There is no rename action: enumeration plus explicit edits is what the
+harness can verify. Use `grep` to confirm no string-based or dynamic
+references remain.
 
 Do not combine a rename with a logic change, and do not reformat untouched
 files. A reviewer should be able to see that each step is provably safe.
@@ -56,7 +58,10 @@ After each move:
 3. Run `verify` at the end of a group of related moves.
 
 If a step breaks a test, do not "fix it forward" inside the refactor. Revert
-with `undo` or `git checkout -- <path>` and re-plan the step.
+with `undo` and the file's path; it refuses when the file changed after the
+harness wrote it. Only use `bash` with `git diff -- <path>` first when you
+need to discard a change the harness did not make, and never discard work you
+did not create.
 
 ## 5. Across a boundary
 

@@ -84,7 +84,7 @@ condition that means "stop and ask".
 | --- | --- |
 | `test-repair` | A failing test or a red suite: reproduce, classify, one hypothesis, smallest fix, exact test then suite |
 | `code-review` | A diff, pull request, or pre-handback self-review: scope, correctness, security, tests, compatibility, severity, verdict |
-| `refactor` | A behavior-preserving restructure: behavior contract, green baseline, small moves, `lsp` rename, verify each step |
+| `refactor` | A behavior-preserving restructure: behavior contract, green baseline, small moves, `lsp` reference enumeration, verify each step |
 | `dependency-upgrade` | A version bump or CVE fix: changelog, breaking changes, one package, adapt, test, rollback |
 | `perf-profile` | A slowness report: one metric, baseline, profile before optimizing, one change, re-measure |
 | `incident-triage` | An alert or outage: UTC timeline, symptom vs cause, recent changes, mitigate before root cause |

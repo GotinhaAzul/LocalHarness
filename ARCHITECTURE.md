@@ -34,7 +34,7 @@ work.
 - [6. Tools and packs](#6-tools-and-packs)
 - [7. Extensibility](#7-extensibility)
 - [8. Security model](#8-security-model)
-- [9. TUI](#9-tui)
+- [9. Interfaces: TUI, headless, and ACP](#9-tui)
 - [10. Configuration and storage](#10-configuration-and-storage)
 - [11. Module layout and dependencies](#11-module-layout-and-dependencies)
 - [12. Testing and verification](#12-testing-and-verification)
@@ -1350,6 +1350,31 @@ exits with the turn status. `--json` emits newline-delimited events for
 scripting. The same core and session code is used. This is not a second
 implementation.
 
+### 9.8 Agent Client Protocol
+
+`lh acp` serves ACP v1 over stdio: newline-delimited JSON-RPC 2.0 on stdin and
+stdout, with logs kept in the log file. It exposes `initialize`, `session/new`,
+`session/load`, `session/prompt`, and `session/cancel`, streams
+`session/update`, and sends `session/request_permission` before every
+non-read-only tool call.
+
+- Each session owns one `Core` rooted at the client's absolute `cwd`; file
+  tools run with the path jail on, so `..` and absolute paths outside the root
+  are refused. `additionalDirectories` is refused rather than ignored.
+- The permission callback is a `ToolApprover` on `Core`. It runs after the
+  read-first, todo, scope, and path gates and can only deny. An ACP approval
+  never widens policy, and a denial prevents the tool call from running.
+- Terminal access is not advertised; `terminal/*` and client `fs/*` requests
+  return `unsupported_capability`. Prompt image and audio blocks are refused
+  for the same reason.
+- Stop reasons map from `TurnStatus`: done → `end_turn`, cancelled →
+  `cancelled`, budget/context → `max_tokens`, stalled →
+  `max_turn_requests`, error/blocked → `refusal`. The exact status and error
+  code ride in `_meta.localharness`.
+- Agent text is passed through `sanitize::display` before it reaches the
+  client, so ANSI/OSC sequences cannot reach the editor's renderer.
+- `tests/acp.rs` drives the binary over stdio against a scripted endpoint.
+
 ---
 
 ## 10. Configuration and storage
@@ -1546,6 +1571,9 @@ src/
     tui/commands.rs       slash commands
     tui/support.rs        endpoint probing, themes, workflows, sessions
     tui/tests.rs          TUI tests, including the screen-drift check
+  acp/
+    mod.rs                JSON-RPC loop, capabilities, reverse requests
+    session.rs            roots, turns, updates, permission callback
   skills/                 bundled red/blue and coding skill text (embedded)
   workflows/
     mod.rs                workflow schema, validation, bundled set, loader

@@ -68,7 +68,8 @@ If a test fails, return to the cause instead of weakening the assertion.
 
 ## 6. Self-review the diff
 
-Run `review` and read the full diff with fresh eyes. Check:
+Run `review` and read the diff it returns with fresh eyes. It caps the output;
+use `bash` with `git diff` for any part it marks truncated. Check:
 
 - every acceptance criterion is met and testable;
 - no debug output, secrets, commented-out code, or unrelated formatting;

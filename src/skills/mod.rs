@@ -628,6 +628,7 @@ mod tests {
     #[test]
     fn coding_skills_name_only_tools_the_pack_has() {
         let index = bundled();
+        let registry = crate::tools::ToolRegistry::builtin();
         // Security-only tools are not in the coding pack; a coding skill that
         // tells the model to call one would name a tool it cannot use.
         let security_only = [
@@ -637,6 +638,19 @@ mod tests {
             "evidence",
             "detect",
             "attack_path",
+        ];
+        let backticked = regex::Regex::new(r"`([a-z][a-z0-9_]*)`").unwrap();
+        let action = regex::Regex::new(r#"\{"action":"([a-z_]+)"\}"#).unwrap();
+        let lsp_actions = [
+            "outline",
+            "definition",
+            "references",
+            "diagnostics",
+            "hover",
+        ];
+        let harness_tools = [
+            "read", "write", "edit", "patch", "undo", "bash", "grep", "glob", "todo", "skill",
+            "verify", "recall", "thread", "bg", "repo_map", "lsp", "test", "review",
         ];
         for name in CODING_PACK {
             let skill = index.get(name).unwrap();
@@ -648,13 +662,39 @@ mod tests {
             }
             assert!(!skill.body.contains("save_finding"));
             assert!(!skill.body.contains("verify_finding"));
+            // Every backticked identifier that is a harness tool must exist.
+            // Other identifiers are commands, paths, or file names.
+            for capture in backticked.captures_iter(&skill.body) {
+                let token = &capture[1];
+                if harness_tools.contains(&token) {
+                    assert!(
+                        registry.get(token).is_some(),
+                        "{name} names missing tool {token}"
+                    );
+                }
+            }
+            // `lsp` is read-only and has no rename action; validate every
+            // action example so the skill cannot drift from the schema.
+            if skill.body.contains("`lsp`") {
+                for capture in action.captures_iter(&skill.body) {
+                    assert!(
+                        lsp_actions.contains(&&capture[1]),
+                        "{name} names unsupported lsp action {}",
+                        &capture[1]
+                    );
+                }
+                assert!(
+                    !skill.body.contains("\"rename\"") && !skill.body.contains("lsp` rename"),
+                    "{name} still promises an lsp rename"
+                );
+            }
         }
     }
 
     #[test]
-    fn coding_pack_smoke_test_loads_only_when_relevant() {
-        // Three tasks: repair a failing test, review a diff, triage an alert.
+    fn coding_pack_index_follows_active_packs() {
         // The index is filtered by active packs; an explicit load still works.
+        // The tool-level three-task smoke test lives in tools::skill.
         let index = bundled();
         let coding = index.advertised_for(&["core".into(), "coding".into()]);
         assert!(coding.get("test-repair").is_some());

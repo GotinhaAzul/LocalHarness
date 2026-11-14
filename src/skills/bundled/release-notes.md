@@ -34,8 +34,7 @@ For each commit or merged pull request, record:
 - whether it needs a migration or manual step.
 
 Read the diff when the message is unclear. Do not infer a feature from a commit
-title alone. `release-notes` may summarize a breaking change only after reading
-the change.
+title alone. Summarize a breaking change only after reading the change.
 
 ## 3. Classify
 

@@ -94,6 +94,9 @@ pub struct Core {
     pub startup: Option<StartupGate>,
     /// MCP server connections, shared across core rebuilds.
     pub mcp: Arc<crate::mcp::McpManager>,
+    /// Optional frontend approval gate for tool calls (ACP). It runs after
+    /// the harness gates and can only deny.
+    pub approver: Option<Arc<dyn crate::tools::ToolApprover>>,
 }
 
 /// One-time endpoint bring-up that outlives the launch path. The TUI opens

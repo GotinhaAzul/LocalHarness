@@ -1330,6 +1330,7 @@ impl App {
             no_redact: !config.session.redact,
             resume: target.clone(),
             continue_last: false,
+            approver: None,
         };
         match app::create_runtime(config.clone(), paths.clone(), options).await {
             Ok(runtime) => {
@@ -1353,6 +1354,7 @@ impl App {
                     no_redact: !config.session.redact,
                     resume: old_resume,
                     continue_last: false,
+                    approver: None,
                 };
                 match app::create_runtime(config, paths, options).await {
                     Ok(runtime) => {

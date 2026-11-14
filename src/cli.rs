@@ -144,6 +144,8 @@ pub enum Command {
         #[command(subcommand)]
         action: WorkflowCommand,
     },
+    /// Serve the Agent Client Protocol v1 on stdio for editor integrations.
+    Acp,
 }
 
 #[derive(Debug, clap::Subcommand)]
@@ -270,6 +272,16 @@ pub async fn run(cli: Cli) -> Result<i32> {
         init_logging(&paths, false);
     }
 
+    if matches!(&cli.command, Some(Command::Acp)) {
+        let options = crate::acp::AcpOptions {
+            engagement: cli.engagement.clone(),
+            // ACP sessions must be resumable; an ephemeral session cannot
+            // be loaded later, so the capability is not advertised.
+            no_session: config.session.no_session,
+            no_redact: !config.session.redact,
+        };
+        return crate::acp::run(config, paths, options).await;
+    }
     if let Some(Command::Doctor { json, fix }) = &cli.command {
         return run_doctor(&config, &paths, *json, *fix).await;
     }
@@ -317,6 +329,7 @@ pub async fn run(cli: Cli) -> Result<i32> {
         no_redact: !config.session.redact,
         resume,
         continue_last: cli.continue_last,
+        approver: None,
     };
 
     let runtime = create_runtime(config.clone(), paths.clone(), options).await?;
@@ -671,6 +684,7 @@ async fn run_workflow_command(
                 no_redact: !run_config.session.redact,
                 resume: resume_session,
                 continue_last: false,
+                approver: None,
             };
             let runtime = create_runtime(run_config, paths.clone(), options).await?;
             let needs_model = spec.steps.iter().any(|step| !step.is_approval());

@@ -1801,6 +1801,22 @@ async fn execute_batch(
                         }
                     }
 
+                    // The frontend (ACP) may add its own approval gate. It
+                    // runs after every harness gate and can only deny: an
+                    // allow never restores a failed read, scope, or path check.
+                    if !result.is_error
+                        && let Some(approver) = &core.approver
+                        && let crate::tools::ToolApproval::Deny(message) = approver
+                            .approve(
+                                call,
+                                &args,
+                                tool.as_ref().is_some_and(|tool| tool.read_only()),
+                            )
+                            .await
+                    {
+                        result = ToolResult::err("permission_denied", message);
+                    }
+
                     if result.is_error {
                         // Keep the failure and skip execution.
                     } else {
@@ -2562,6 +2578,7 @@ mod tests {
         let static_prompt =
             crate::app::measure_static_prompt(&budget, &system_prompt, tool_specs_cost, Some(""));
         Core {
+            approver: None,
             config,
             paths: paths.clone(),
             provider: Arc::new(ProbeProvider {
