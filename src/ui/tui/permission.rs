@@ -122,7 +122,10 @@ impl App {
         let mode = self.core()?.permissions.mode();
         match mode {
             PermissionMode::Ask => None,
-            PermissionMode::Plan => Some(("plan mode: read-only tools only".into(), Role::Warning)),
+            PermissionMode::Plan => Some((
+                "plan mode · /plan approve to apply · /plan exit to discard".into(),
+                Role::Warning,
+            )),
             PermissionMode::Yolo => Some(("yolo: no approvals".into(), Role::Error)),
             other => Some((format!("mode: {}", other.label()), Role::Muted)),
         }

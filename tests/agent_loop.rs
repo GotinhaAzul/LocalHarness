@@ -2057,6 +2057,18 @@ fn workflow_config(tools: &[&str]) -> Config {
     config
 }
 
+fn plan_entries(session: &SessionHandle) -> Vec<serde_json::Map<String, serde_json::Value>> {
+    let session = session.lock().unwrap();
+    session
+        .branch_entries()
+        .into_iter()
+        .filter_map(|entry| match &entry.kind {
+            EntryKind::Custom(custom) if custom.kind == "plan" => Some(custom.payload.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
 #[tokio::test]
 async fn a_deny_rule_blocks_git_push_even_when_a_workflow_lists_bash() {
     use localharness::policy::RuleAction;
@@ -2181,4 +2193,142 @@ async fn an_ask_with_no_frontend_is_denied_and_the_turn_continues() {
     assert!(result.contains("[DENIED]"), "{result}");
     assert!(result.contains("cannot ask"), "{result}");
     assert!(result.contains("--yolo"), "{result}");
+}
+
+#[tokio::test]
+async fn plan_mode_refuses_every_mutation_at_dispatch() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+    let harness = harness_in_mode(
+        dir.path(),
+        vec![
+            tool_script("read", json!({"path": "a.txt"})),
+            parallel_tool_script(&[
+                ("write", json!({"path": "a.txt", "content": "two\n"})),
+                ("edit", json!({"path": "a.txt", "old": "one", "new": "two"})),
+                (
+                    "patch",
+                    json!({"path": "a.txt", "anchor": "one", "replacement": "two"}),
+                ),
+                ("undo", json!({"path": "a.txt"})),
+                ("bash", json!({"command": "git commit -am wip"})),
+                ("bash", json!({"command": "git push origin main"})),
+                ("git", json!({"action": "commit", "message": "wip"})),
+            ]),
+            tool_script(
+                "todo",
+                json!({"action": "plan", "tasks": ["change a.txt", "verify"]}),
+            ),
+            text_script("Proposed plan above."),
+        ],
+        workflow_config(&[
+            "read", "write", "edit", "patch", "undo", "bash", "git", "todo",
+        ]),
+        Vec::new(),
+        PermissionMode::Plan,
+    );
+    let names: Vec<&str> = harness.core.tools.iter().map(|tool| tool.name()).collect();
+    for removed in ["write", "edit", "patch", "undo"] {
+        assert!(!names.contains(&removed), "{removed} in {names:?}");
+    }
+
+    let (outcome, _) = run(&harness, "plan the change").await;
+
+    assert_eq!(outcome.status, TurnStatus::Done);
+    let results = tool_results(&harness.session);
+    assert_eq!(results.len(), 9, "{results:#?}");
+    for refused in &results[1..8] {
+        assert!(refused.contains("[plan_mode]"), "{refused}");
+        assert!(refused.contains("/plan approve"), "{refused}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+        "one\n"
+    );
+    let plans = plan_entries(&harness.session);
+    assert_eq!(plans.len(), 1);
+    assert_eq!(plans[0]["status"], "proposed");
+    assert_eq!(plans[0]["tasks"], json!(["change a.txt", "verify"]));
+    // The tools offered to the model are the plan-mode set.
+    let requests = harness.provider.requests.lock().unwrap();
+    let offered: Vec<String> = requests[0]
+        .tools
+        .iter()
+        .map(|spec| spec.name.clone())
+        .collect();
+    assert!(!offered.iter().any(|name| name == "write"), "{offered:?}");
+}
+
+#[tokio::test]
+async fn plan_mode_allows_read_only_bash() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "hello\n").unwrap();
+    let harness = harness_in_mode(
+        dir.path(),
+        vec![
+            tool_script("bash", json!({"command": "cat a.txt | wc -l"})),
+            tool_script("todo", json!({"action": "plan", "tasks": ["edit a.txt"]})),
+            text_script("plan ready"),
+        ],
+        workflow_config(&["bash", "todo"]),
+        Vec::new(),
+        PermissionMode::Plan,
+    );
+    let (outcome, _) = run(&harness, "look").await;
+    assert_eq!(outcome.status, TurnStatus::Done);
+    let results = tool_results(&harness.session);
+    assert!(!results[0].contains("plan_mode"), "{}", results[0]);
+    assert!(results[0].contains('1'), "{}", results[0]);
+}
+
+#[tokio::test]
+async fn a_workflow_listing_write_cannot_reenable_it_in_plan_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness_in_mode(
+        dir.path(),
+        vec![
+            tool_script("write", json!({"path": "x.txt", "content": "x"})),
+            tool_script("todo", json!({"action": "plan", "tasks": ["write x.txt"]})),
+            text_script("plan ready"),
+        ],
+        workflow_config(&["write", "read"]),
+        Vec::new(),
+        PermissionMode::Plan,
+    );
+    let names: Vec<&str> = harness.core.tools.iter().map(|tool| tool.name()).collect();
+    assert!(!names.contains(&"write"), "{names:?}");
+    // Plan mode brings `todo` so the plan can be written.
+    assert!(names.contains(&"todo"), "{names:?}");
+
+    let (outcome, _) = run(&harness, "write x").await;
+
+    assert_eq!(outcome.status, TurnStatus::Done);
+    let results = tool_results(&harness.session);
+    assert!(results[0].contains("[plan_mode]"), "{}", results[0]);
+    assert!(results[0].contains("/plan approve"), "{}", results[0]);
+    assert!(!dir.path().join("x.txt").exists());
+}
+
+#[tokio::test]
+async fn a_plan_mode_turn_cannot_settle_without_a_todo_plan() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness_in_mode(
+        dir.path(),
+        vec![
+            text_script("I would change a few files."),
+            tool_script("todo", json!({"action": "plan", "tasks": ["change files"]})),
+            text_script("plan recorded"),
+        ],
+        workflow_config(&["read", "todo"]),
+        Vec::new(),
+        PermissionMode::Plan,
+    );
+    let (outcome, events) = run(&harness, "propose").await;
+    assert_eq!(outcome.status, TurnStatus::Done);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::Notice(message) if message.contains("plan mode")
+    )));
+    assert_eq!(harness.provider.requests.lock().unwrap().len(), 3);
+    assert_eq!(plan_entries(&harness.session).len(), 1);
 }

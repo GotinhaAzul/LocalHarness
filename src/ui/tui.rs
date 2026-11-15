@@ -74,6 +74,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("compact", "append a deterministic compaction"),
     ("commit", "review, edit, or approve the staged commit"),
     ("pr", "review or approve a pending pull request action"),
+    ("plan", "plan mode: investigate and propose, change nothing"),
     ("tools", "show the active tools"),
     ("mcp", "show MCP server status"),
     ("skill", "pick a skill and append its instructions"),
@@ -102,6 +103,7 @@ fn command_usage(name: &str) -> &'static str {
         "trust" => "/trust [confirm]",
         "commit" => "/commit [confirm|cancel|edit <message>]   (no argument: show or draft)",
         "pr" => "/pr [confirm|cancel]   (no argument: show the pending action)",
+        "plan" => "/plan [approve|exit]   (no argument: enter plan mode, or show the plan)",
         "export" => "/export [path]",
         _ => "",
     }
@@ -111,6 +113,7 @@ const HELP: &str = "\
 Commands: /help [command] /quit /login [endpoint] [model] [api-key] /model [name]
 /profile [name] /theme [name|save] /tree /fork /new /resume [id|last] /sessions
 /compact /tools /mcp /commit [confirm|cancel|edit <message>] /pr [confirm|cancel]
+/plan [approve|exit]
 /skill [name] /workflow [name] /sec [...] /trust [confirm] /export [path]
 /clear /debug
 A command that chooses from a list opens a picker when run without an

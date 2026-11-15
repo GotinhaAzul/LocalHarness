@@ -124,13 +124,19 @@ pub struct Cli {
 
     /// Permission mode for unmatched calls: ask, accept-edits, plan, or
     /// dont-ask. Overrides `[permissions] mode`; rules still apply.
-    #[arg(long, global = true, value_name = "MODE", conflicts_with = "yolo")]
+    #[arg(long, global = true, value_name = "MODE", conflicts_with_all = ["yolo", "plan"])]
     pub mode: Option<String>,
 
     /// Run every tool call without asking; only deny rules still apply.
     /// Never the default; recorded in the session.
-    #[arg(long, global = true)]
+    #[arg(long, global = true, conflicts_with = "plan")]
     pub yolo: bool,
+
+    /// Start in plan mode: read-only tools only, and the turn must produce a
+    /// todo plan. With --print, runs one read-only turn, prints the plan, and
+    /// exits.
+    #[arg(long, global = true)]
+    pub plan: bool,
 }
 
 #[derive(Debug, clap::Subcommand)]
@@ -265,6 +271,9 @@ pub async fn run(cli: Cli) -> Result<i32> {
                 bail!("unknown permission mode {mode:?}; use ask, accept-edits, plan, or dont-ask")
             }
         };
+    }
+    if cli.plan {
+        config.permissions.mode = crate::policy::PermissionMode::Plan;
     }
     if cli.yolo {
         config.permissions.mode = crate::policy::PermissionMode::Yolo;
@@ -904,6 +913,25 @@ async fn run_headless(runtime: crate::app::Runtime, prompt: String, json: bool) 
     }
     let outcome = handle.await.context("agent task panicked")?;
     let status = outcome.status;
+    if runtime.core.permissions.mode() == crate::policy::PermissionMode::Plan
+        && status == TurnStatus::Done
+    {
+        let plan = runtime
+            .session
+            .lock()
+            .ok()
+            .and_then(|session| crate::tools::todo::latest_plan(&session));
+        if let Some((_, tasks)) = plan {
+            if json {
+                println!("{}", json!({"type":"plan","tasks":tasks}));
+            } else {
+                println!("\nPlan (plan mode; nothing was changed):");
+                for (index, task) in tasks.iter().enumerate() {
+                    println!("{}. {task}", index + 1);
+                }
+            }
+        }
+    }
     let _ = std::io::stdout().flush();
     Ok(match status {
         TurnStatus::Done => 0,

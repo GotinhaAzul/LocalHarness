@@ -722,6 +722,39 @@ async fn run_loop(
                 verify_configured,
                 turn_start.as_deref(),
             );
+            // Plan mode: the turn settles only once a todo plan exists, and
+            // the plan is stored as a session entry the user can read.
+            if core.permissions.mode() == crate::policy::PermissionMode::Plan {
+                if !facts.todo_plan_present && gate_tools.todo {
+                    if progress.can_continue_settle() {
+                        progress.settle_continuations += 1;
+                        let message = "[localharness] plan mode: record your proposal now with the todo tool, action \"plan\", one task per step you propose. Nothing may change until the user runs /plan approve.";
+                        if let Err(err) = append_user(&core.session, message) {
+                            return TurnOutcome::error("session_write", err.to_string());
+                        }
+                        let _ = tx.send(AgentEvent::Notice(message.into()));
+                        continue;
+                    }
+                    let message = "plan mode: the turn ended without a todo plan after reminders. Ask again for a plan; nothing was changed.".to_string();
+                    append_error(&core.session, "gate_block", &message, true);
+                    let _ = tx.send(AgentEvent::Error {
+                        code: "gate_block".into(),
+                        message,
+                        recoverable: true,
+                    });
+                    return TurnOutcome::ok(TurnStatus::Blocked);
+                }
+                let entry = {
+                    let session = core.session.lock().expect("session lock");
+                    crate::tools::todo::plan_entry(&session, "proposed")
+                };
+                if let Ok(mut session) = core.session.lock()
+                    && let Err(err) = session.append(EntryKind::Custom(entry))
+                {
+                    tracing::warn!(%err, "cannot record the plan in the session");
+                }
+                return TurnOutcome::ok(TurnStatus::Done);
+            }
             match gates::settle(&facts, &mut progress, gate_tools) {
                 SettleDecision::Done => {
                     if gate_tools.verify
@@ -1700,7 +1733,19 @@ async fn execute_batch(
         let mut result;
         let mut repaired = None;
 
-        if tool.is_none() {
+        if tool.is_none()
+            && core.permissions.mode() == crate::policy::PermissionMode::Plan
+            && core.registry.get(&call.name).is_some()
+        {
+            // Plan mode removed this tool; name the reason, not a typo.
+            result = ToolResult::err(
+                "plan_mode",
+                format!(
+                    "plan mode is active: {} is removed until the user runs /plan approve. Investigate with read-only tools and write the plan with todo action \"plan\".",
+                    call.name
+                ),
+            );
+        } else if tool.is_none() {
             let hint = unknown_suggestion
                 .map(|name| format!("did you mean {name}? "))
                 .unwrap_or_default();

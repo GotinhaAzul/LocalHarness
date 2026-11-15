@@ -981,6 +981,81 @@ async fn login_configures_a_model_and_model_command_lists_choices() {
     assert_eq!(parsed["model"]["model"].as_str(), Some("only-model"));
 }
 
+fn tool_names(app: &App) -> Vec<&'static str> {
+    app.core()
+        .unwrap()
+        .tools
+        .iter()
+        .map(|tool| tool.name())
+        .collect()
+}
+
+#[tokio::test]
+async fn plan_approve_restores_exactly_the_prior_tool_set() {
+    let (_dir, mut app) = test_app().await;
+    let before = tool_names(&app);
+    assert!(before.contains(&"write"));
+
+    app.run_command("/plan").await;
+    let planning = tool_names(&app);
+    for removed in ["write", "edit", "patch", "undo", "bg"] {
+        assert!(!planning.contains(&removed), "{removed} in {planning:?}");
+    }
+    assert!(planning.contains(&"read") && planning.contains(&"todo"));
+    assert!(
+        app.footer().status.contains("/plan approve"),
+        "{}",
+        app.footer().status
+    );
+
+    // A workflow that lists write cannot bring it back while planning.
+    let mut config = app.config.clone();
+    let workflow = WorkflowSpec {
+        name: "writer".into(),
+        description: None,
+        profile: None,
+        prompt: "write".into(),
+        skills: vec![],
+        tools: vec!["write".into(), "read".into()],
+        steps: vec![],
+        artifacts: vec![],
+    };
+    workflow.apply_to_config(&mut config).unwrap();
+    app.rebuild_core_with(config).await.unwrap();
+    assert!(!tool_names(&app).contains(&"write"));
+    app.rebuild_core_with({
+        let mut config = app.config.clone();
+        config.profile_name = "coding".into();
+        config
+    })
+    .await
+    .unwrap();
+
+    app.run_command("/plan approve").await;
+    assert_eq!(tool_names(&app), before);
+    assert_eq!(
+        app.core().unwrap().permissions.mode(),
+        crate::policy::PermissionMode::Ask
+    );
+    let approved = app
+        .runtime
+        .as_ref()
+        .unwrap()
+        .session
+        .lock()
+        .ok()
+        .and_then(|session| crate::tools::todo::latest_plan(&session));
+    assert_eq!(
+        approved.map(|(status, _)| status).as_deref(),
+        Some("approved")
+    );
+
+    // /plan exit also restores the tools and discards the plan.
+    app.run_command("/plan").await;
+    app.run_command("/plan exit").await;
+    assert_eq!(tool_names(&app), before);
+}
+
 #[tokio::test]
 async fn a_permission_prompt_shows_the_exact_command_and_answers_with_y_or_n() {
     let (_dir, mut app) = test_app().await;

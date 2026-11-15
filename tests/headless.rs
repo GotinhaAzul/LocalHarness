@@ -683,6 +683,67 @@ async fn print_executes_a_tool_call_and_writes_a_file() {
 // Permission modes and plan mode
 // ---------------------------------------------------------------------------
 
+/// Serves one scripted SSE body per request, then a final text answer.
+#[derive(Clone)]
+struct ScriptFake {
+    requests: std::sync::Arc<AtomicUsize>,
+    bodies: std::sync::Arc<Vec<String>>,
+}
+
+fn tool_call_frames(name: &str, arguments: serde_json::Value) -> String {
+    let delta = serde_json::json!({
+        "choices": [{"delta": {"tool_calls": [{
+            "index": 0,
+            "id": "call_1",
+            "function": {"name": name, "arguments": arguments.to_string()}
+        }]}}]
+    });
+    format!(
+        "data: {delta}\n\ndata: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n"
+    )
+}
+
+fn text_frames(text: &str) -> String {
+    let delta = serde_json::json!({"choices": [{"delta": {"content": text}}]});
+    format!(
+        "data: {delta}\n\ndata: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\ndata: [DONE]\n\n"
+    )
+}
+
+async fn script_chat(State(fake): State<ScriptFake>) -> Response {
+    let count = fake.requests.fetch_add(1, Ordering::SeqCst);
+    let body = fake
+        .bodies
+        .get(count)
+        .cloned()
+        .unwrap_or_else(|| text_frames("done"));
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream"),
+        )
+        .body(Body::from(body))
+        .unwrap()
+}
+
+async fn spawn_script(bodies: Vec<String>) -> (String, ScriptFake) {
+    let fake = ScriptFake {
+        requests: Default::default(),
+        bodies: std::sync::Arc::new(bodies),
+    };
+    let app = Router::new()
+        .route("/v1/chat/completions", post(script_chat))
+        .route("/v1/models", axum::routing::get(models))
+        .with_state(fake.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (format!("http://{address}"), fake)
+}
+
 /// `lh` with a persisted session (unlike `run_lh`, which passes --no-session).
 async fn run_lh_with_session(env: &Env, base: &str, extra: &[&str]) -> std::process::Output {
     let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_lh"));
@@ -726,6 +787,16 @@ fn session_lines(env: &Env) -> Vec<serde_json::Value> {
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect()
+}
+
+fn workspace_files(env: &Env) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(&env.cwd)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .collect();
+    names.sort();
+    names
 }
 
 #[tokio::test]
@@ -796,4 +867,37 @@ async fn yolo_is_explicit_and_logged_in_the_session() {
             && line["data"]["source"] == "--yolo"),
         "{lines:#?}"
     );
+}
+
+#[tokio::test]
+async fn print_plan_runs_one_read_only_turn_and_prints_the_plan() {
+    let env = env();
+    std::fs::write(env.cwd.join("a.txt"), "one\n").unwrap();
+    let before = workspace_files(&env);
+    let (base, fake) = spawn_script(vec![
+        tool_call_frames("bash", serde_json::json!({"command": "cat a.txt"})),
+        tool_call_frames(
+            "write",
+            serde_json::json!({"path": "a.txt", "content": "two\n"}),
+        ),
+        tool_call_frames("bash", serde_json::json!({"command": "touch b.txt"})),
+        tool_call_frames(
+            "todo",
+            serde_json::json!({"action": "plan", "tasks": ["rewrite a.txt", "add b.txt"]}),
+        ),
+        text_frames("That is the plan."),
+    ])
+    .await;
+    let output = run_lh(&env, &base, &["--plan", "--print", "change a.txt"]).await;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
+    assert!(stdout.contains("1. rewrite a.txt"), "stdout: {stdout}");
+    assert!(stdout.contains("2. add b.txt"), "stdout: {stdout}");
+    assert_eq!(workspace_files(&env), before);
+    assert_eq!(
+        std::fs::read_to_string(env.cwd.join("a.txt")).unwrap(),
+        "one\n"
+    );
+    assert_eq!(fake.requests.load(Ordering::SeqCst), 5);
 }
