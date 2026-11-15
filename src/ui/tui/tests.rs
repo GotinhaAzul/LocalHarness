@@ -34,8 +34,9 @@ fn header(model: &str, session: &str) -> HeaderData {
         used: 12400,
         window: 64000,
         completion: 0,
+        reasoning: 0,
         tok_s: 24.0,
-        cache: Some(91),
+        cache: Some((940, 1000)),
         session: session.into(),
         trust: true,
         window_guess: false,
@@ -105,6 +106,10 @@ fn header_at_120_contains_cwd_model_and_context() {
     assert!(text.contains("qwen3.5-35b-a3b"), "model missing:\n{text}");
     assert!(text.contains("12.4k/64k"), "context missing:\n{text}");
     assert!(text.contains("tok/s"));
+    assert!(
+        text.contains("cache 940/1000"),
+        "cached and total prompt tokens missing:\n{text}"
+    );
     assert!(text.contains("▰"), "context gauge missing:\n{text}");
 }
 
@@ -227,6 +232,7 @@ async fn switching_models_reprobes_the_context_window() {
         cwd,
         project_id: "test".into(),
         sessions_dir_override: None,
+        home_dir: None,
     };
     let base = sized_model_endpoint(&[("small", 8192), ("big", 131072)]).await;
     let mut config = Config::builtin();
@@ -381,6 +387,7 @@ async fn tab_completes_commands_arguments_and_paths() {
         cwd: cwd.clone(),
         project_id: "test".into(),
         sessions_dir_override: None,
+        home_dir: None,
     };
     let base = model_endpoint(&["m"]).await;
     let mut config = Config::builtin();
@@ -473,6 +480,7 @@ async fn test_app() -> (tempfile::TempDir, App) {
         cwd,
         project_id: "test".into(),
         sessions_dir_override: None,
+        home_dir: None,
     };
     let mut config = Config::builtin();
     config.model.endpoint = model_endpoint(&["m"]).await;
@@ -737,6 +745,135 @@ async fn screen_never_drifts_from_what_ratatui_drew() {
 }
 
 #[tokio::test]
+async fn hunk_review_modal_accepts_rejects_edits_and_submits() {
+    use crate::tools::hunk::{HunkChoice, HunkDecision, HunkView};
+
+    fn hunk(file: &str, line: usize) -> HunkView {
+        HunkView {
+            file: file.into(),
+            start_line: line,
+            end_line: line,
+            added: 1,
+            removed: 1,
+            rationale: format!("change line {line}"),
+            text: format!("new {line}\n"),
+        }
+    }
+
+    let (_dir, mut app) = test_app().await;
+    app.handle_agent_event(AgentEvent::HunkReview {
+        id: 9,
+        hunks: vec![hunk("a.rs", 1), hunk("b.rs", 2)],
+    });
+    assert!(matches!(&app.modal, Some(ModalData::HunkReview(_))));
+
+    // Reject the first hunk, then edit the second.
+    app.handle_modal_key(key(KeyCode::Char('r'))).await;
+    app.handle_modal_key(key(KeyCode::Down)).await;
+    app.handle_modal_key(key(KeyCode::Char('e'))).await;
+    assert!(app.hunk_edit.is_some(), "e opens the prompt editor");
+    assert_eq!(app.input.text(), "new 2\n");
+    app.input.set_text("edited\n");
+    app.handle_key(key(KeyCode::Enter)).await;
+    match &app.modal {
+        Some(ModalData::HunkReview(view)) => {
+            assert_eq!(view.choices[0], HunkChoice::Reject);
+            assert_eq!(view.choices[1], HunkChoice::Edit("edited\n".into()));
+        }
+        other => panic!("expected the review modal, got {other:?}"),
+    }
+
+    app.handle_modal_key(key(KeyCode::Enter)).await;
+    assert!(app.modal.is_none());
+    let decision = app.reviewer.submitted().expect("a submitted decision");
+    assert_eq!(decision.choices[0], HunkChoice::Reject);
+    assert_eq!(decision.choices[1], HunkChoice::Edit("edited\n".into()));
+
+    // Esc is reject-all: nothing lands and the model is told.
+    app.handle_agent_event(AgentEvent::HunkReview {
+        id: 10,
+        hunks: vec![hunk("a.rs", 1), hunk("b.rs", 2)],
+    });
+    app.handle_modal_key(key(KeyCode::Esc)).await;
+    assert!(app.modal.is_none());
+    let decision = app.reviewer.submitted().expect("a submitted decision");
+    assert_eq!(decision, HunkDecision::reject_all(2));
+}
+
+#[tokio::test]
+async fn rewind_restores_files_moves_the_leaf_and_keeps_the_old_branch() {
+    let (_dir, mut app) = test_app().await;
+    let cwd = app.cwd_path();
+    let session = app.runtime.as_ref().unwrap().session.clone();
+    std::fs::write(cwd.join("a.txt"), "changed\n").unwrap();
+    let (old_leaf, first_turn, first_user) = {
+        let mut session = session.lock().unwrap();
+        let first = session
+            .append(EntryKind::User(UserData {
+                attachments: Vec::new(),
+                content: "first turn".into(),
+            }))
+            .unwrap();
+        let assistant = session
+            .append(EntryKind::Assistant(crate::session::AssistantData {
+                content: Some("ok".into()),
+                ..Default::default()
+            }))
+            .unwrap();
+        let snapshot = session.artifacts.write("original\n").unwrap();
+        let hash = crate::tools::undo::content_hash(b"changed\n");
+        let leaf = session
+            .append(EntryKind::Custom(
+                crate::session::CustomData::new("fs-change")
+                    .with("path", "a.txt")
+                    .with("snapshot", snapshot.id)
+                    .with("after_sha256", hash),
+            ))
+            .unwrap();
+        (leaf.id, assistant.id, first.id)
+    };
+    assert_eq!(
+        app.runtime
+            .as_ref()
+            .unwrap()
+            .session
+            .lock()
+            .unwrap()
+            .active_leaf_id()
+            .as_deref(),
+        Some(old_leaf.as_str())
+    );
+
+    app.command_rewind("1");
+
+    assert_eq!(
+        std::fs::read_to_string(cwd.join("a.txt")).unwrap(),
+        "original\n"
+    );
+    let session = session.lock().unwrap();
+    assert!(
+        session.latest_custom_on_path("rewind").is_some(),
+        "the rewind marker is on the new branch"
+    );
+    let ids: Vec<String> = session
+        .context_path()
+        .iter()
+        .map(|entry| entry.id.clone())
+        .collect();
+    assert!(
+        !ids.contains(&old_leaf),
+        "the abandoned turn is out of context: {ids:?}"
+    );
+    assert!(session.tree.get(&first_turn).is_some());
+    assert!(session.tree.get(&first_user).is_some());
+    let rows = crate::ui::tree::TreeView::new(&session).rows;
+    assert!(
+        rows.iter().any(|row| row.preview == "first turn"),
+        "{rows:?}"
+    );
+}
+
+#[tokio::test]
 async fn list_commands_open_pickers_and_pick_without_typing() {
     let (_dir, mut app) = test_app().await;
     let enter = key(KeyCode::Enter);
@@ -770,6 +907,13 @@ async fn list_commands_open_pickers_and_pick_without_typing() {
                 view.selected_label().as_deref(),
                 Some(app.config.profile_name())
             );
+            let labels: Vec<&str> = view.items.iter().map(|item| item.label.as_str()).collect();
+            for name in ["strict", "shell"] {
+                assert!(
+                    labels.contains(&name),
+                    "the weak-model profile {name} must be pickable: {labels:?}"
+                );
+            }
         }
         _ => panic!("expected the profile picker"),
     }
@@ -829,6 +973,7 @@ async fn new_and_resume_switch_sessions() {
         cwd,
         project_id: "test".into(),
         sessions_dir_override: None,
+        home_dir: None,
     };
     let base = model_endpoint(&["m"]).await;
     let mut config = Config::builtin();
@@ -906,6 +1051,7 @@ async fn login_configures_a_model_and_model_command_lists_choices() {
         cwd,
         project_id: "test".into(),
         sessions_dir_override: None,
+        home_dir: None,
     };
 
     // Reserve a port and close it so the initial endpoint is unreachable.
@@ -970,6 +1116,20 @@ async fn login_configures_a_model_and_model_command_lists_choices() {
     let saved = std::fs::read_to_string(&config_path).unwrap();
     assert!(saved.contains("beta"), "config:\n{saved}");
 
+    // `/model <name> <preset>` pins a sampler profile for the session.
+    app.command_model("beta qwen-coding").await;
+    app.settle().await;
+    assert_eq!(app.header.model, "beta");
+    assert_eq!(
+        app.core().expect("core").model_profile.min_p,
+        Some(0.05),
+        "qwen-coding is applied to the switched session"
+    );
+    assert_eq!(
+        app.config.model_profile_override.as_deref(),
+        Some("qwen-coding")
+    );
+
     // A login without a model auto-selects the endpoint's only model and
     // replaces the previous endpoint's selection.
     let single = model_endpoint(&["only-model"]).await;
@@ -979,4 +1139,137 @@ async fn login_configures_a_model_and_model_command_lists_choices() {
     let parsed: toml::Value = toml::from_str(&saved).unwrap();
     assert_eq!(parsed["model"]["endpoint"].as_str(), Some(single.as_str()));
     assert_eq!(parsed["model"]["model"].as_str(), Some("only-model"));
+}
+
+fn tool_names(app: &App) -> Vec<&'static str> {
+    app.core()
+        .unwrap()
+        .tools
+        .iter()
+        .map(|tool| tool.name())
+        .collect()
+}
+
+#[tokio::test]
+async fn plan_approve_restores_exactly_the_prior_tool_set() {
+    let (_dir, mut app) = test_app().await;
+    let before = tool_names(&app);
+    assert!(before.contains(&"write"));
+
+    app.run_command("/plan").await;
+    let planning = tool_names(&app);
+    for removed in ["write", "edit", "patch", "undo", "bg"] {
+        assert!(!planning.contains(&removed), "{removed} in {planning:?}");
+    }
+    assert!(planning.contains(&"read") && planning.contains(&"todo"));
+    assert!(
+        app.footer().status.contains("/plan approve"),
+        "{}",
+        app.footer().status
+    );
+
+    // A workflow that lists write cannot bring it back while planning.
+    let mut config = app.config.clone();
+    let workflow = WorkflowSpec {
+        name: "writer".into(),
+        description: None,
+        profile: None,
+        prompt: "write".into(),
+        skills: vec![],
+        tools: vec!["write".into(), "read".into()],
+        steps: vec![],
+        artifacts: vec![],
+    };
+    workflow.apply_to_config(&mut config).unwrap();
+    app.rebuild_core_with(config).await.unwrap();
+    assert!(!tool_names(&app).contains(&"write"));
+    app.rebuild_core_with({
+        let mut config = app.config.clone();
+        config.profile_name = "coding".into();
+        config
+    })
+    .await
+    .unwrap();
+
+    app.run_command("/plan approve").await;
+    assert_eq!(tool_names(&app), before);
+    assert_eq!(
+        app.core().unwrap().permissions.mode(),
+        crate::policy::PermissionMode::Ask
+    );
+    let approved = app
+        .runtime
+        .as_ref()
+        .unwrap()
+        .session
+        .lock()
+        .ok()
+        .and_then(|session| crate::tools::todo::latest_plan(&session));
+    assert_eq!(
+        approved.map(|(status, _)| status).as_deref(),
+        Some("approved")
+    );
+
+    // /plan exit also restores the tools and discards the plan.
+    app.run_command("/plan").await;
+    app.run_command("/plan exit").await;
+    assert_eq!(tool_names(&app), before);
+}
+
+#[tokio::test]
+async fn a_permission_prompt_shows_the_exact_command_and_answers_with_y_or_n() {
+    let (_dir, mut app) = test_app().await;
+    let ask = |subject: &str| {
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        let pending = permission::PendingAsk {
+            request: crate::policy::AskRequest {
+                tool: "bash".into(),
+                subject: subject.into(),
+                preview: None,
+                rule: Some("push-asks".into()),
+                key: format!("bash\0{subject}"),
+            },
+            reply,
+        };
+        (pending, answer)
+    };
+
+    let (pending, answer) = ask("git push origin feature/x");
+    app.show_permission_request(pending);
+    let mut screen = EmulatedScreen::new(100, 30);
+    screen.frame(&mut app, "ask shown");
+    let shown = screen.parser.screen().contents();
+    assert!(shown.contains("$ git push origin feature/x"), "{shown}");
+    assert!(shown.contains("push-asks"), "{shown}");
+    assert!(shown.contains("y allow"), "{shown}");
+    // A stray key does not answer; y does.
+    app.handle_key(key(KeyCode::Char('q'))).await;
+    assert!(app.pending_ask.is_some());
+    app.handle_key(key(KeyCode::Char('y'))).await;
+    assert_eq!(answer.await.unwrap(), crate::policy::AskAnswer::Allow);
+
+    let (pending, answer) = ask("rm -rf build");
+    app.show_permission_request(pending);
+    app.handle_key(key(KeyCode::Char('n'))).await;
+    assert_eq!(answer.await.unwrap(), crate::policy::AskAnswer::Deny);
+    assert!(app.pending_ask.is_none());
+}
+
+#[test]
+fn ask_text_includes_the_diff_preview() {
+    let request = crate::policy::AskRequest {
+        tool: "edit".into(),
+        subject: "src/lib.rs".into(),
+        preview: crate::policy::preview(
+            "edit",
+            &serde_json::json!({"path": "src/lib.rs", "old": "a\n", "new": "b\n"}),
+            std::path::Path::new("/w"),
+            40,
+        ),
+        rule: None,
+        key: String::new(),
+    };
+    let text = permission::ask_text(&request);
+    assert!(text.starts_with("edit: src/lib.rs"), "{text}");
+    assert!(text.contains("-a") && text.contains("+b"), "{text}");
 }

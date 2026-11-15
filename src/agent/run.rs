@@ -1,6 +1,6 @@
 //! One turn: stream the model, run tool batches, enforce guards, settle.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 use std::time::Instant;
 
@@ -13,7 +13,9 @@ use crate::context::compact::{
     FindingSummary, build_summary_keeping, recent_tail_start, summary_budget, tail_budget,
 };
 use crate::context::{self, BATCH_CAP_CHARS, StaticPrompt, TokenBudget, ToolSpecCost};
-use crate::provider::{ChatMessage, ChatRequest, ErrorClass, ProviderError, StreamEvent, Usage};
+use crate::provider::{
+    CallAccumulator, ChatMessage, ChatRequest, ErrorClass, ProviderError, StreamEvent, Usage,
+};
 use crate::session::{
     AssistantData, CompactionData, CustomData, EntryKind, ToolCall, ToolResultData, UserData,
 };
@@ -113,6 +115,27 @@ pub async fn run_turn(
         tool_mode: core.tool_mode_label().unwrap_or_default(),
     });
 
+    // Lifecycle hook: session_start runs once per session and may add context
+    // or block. A failed hook is visible; it never silently approves.
+    let session_hooks = crate::hooks::session_start(&hook_env(&core)).await;
+    hook_notices(&tx, &session_hooks);
+    if let Some(block) = session_hooks.blocked {
+        let message = format!(
+            "hook {:?} blocked session start: {}. Nothing ran.",
+            block.hook, block.reason
+        );
+        append_error(&core.session, "hook_block", &message, false);
+        let _ = tx.send(AgentEvent::Error {
+            code: "hook_block".into(),
+            message: message.clone(),
+            recoverable: false,
+        });
+        let outcome = TurnOutcome::ok(TurnStatus::Blocked);
+        let _ = tx.send(AgentEvent::State(AgentState::Error));
+        let _ = tx.send(AgentEvent::TurnDone(outcome.clone()));
+        return outcome;
+    }
+
     // Resolve the window and tokenizer after bring-up. A deferred startup
     // probe runs before the server exists, so the build-time values can be
     // fallbacks; this refresh is what keeps the first turn from budgeting
@@ -184,7 +207,50 @@ pub async fn run_turn(
     }
 
     let turn_start = core.session.lock().expect("session lock").active_leaf_id();
+
+    // Lifecycle hook: user_prompt may add context or block before the model
+    // sees the prompt.
+    let prompt_hooks = crate::hooks::user_prompt(&hook_env(&core), &user_text).await;
+    hook_notices(&tx, &prompt_hooks);
+    if let Some(block) = prompt_hooks.blocked {
+        let message = format!(
+            "hook {:?} blocked this prompt: {}. The model was not called.",
+            block.hook, block.reason
+        );
+        append_error(&core.session, "hook_block", &message, false);
+        let _ = tx.send(AgentEvent::Error {
+            code: "hook_block".into(),
+            message: message.clone(),
+            recoverable: false,
+        });
+        let outcome = TurnOutcome::ok(TurnStatus::Blocked);
+        let _ = tx.send(AgentEvent::State(AgentState::Error));
+        let _ = tx.send(AgentEvent::TurnDone(outcome.clone()));
+        return outcome;
+    }
+
     let outcome = run_loop(&core, &tx, &cancel, turn_start, turn).await;
+
+    // Lifecycle hook: stop runs once for every turn ending, including budget,
+    // stall, cancellation, and errors. It is advisory: a block is visible but
+    // cannot rewrite what already happened.
+    let status = match outcome.status {
+        TurnStatus::Done => "done",
+        TurnStatus::Cancelled => "cancelled",
+        TurnStatus::Budget => "budget",
+        TurnStatus::Stalled => "stalled",
+        TurnStatus::ContextTruncated => "context_truncated",
+        TurnStatus::Error => "error",
+        TurnStatus::Blocked => "blocked",
+    };
+    let stop_hooks = crate::hooks::stop(&hook_env(&core), status).await;
+    hook_notices(&tx, &stop_hooks);
+    if let Some(block) = stop_hooks.blocked {
+        let _ = tx.send(AgentEvent::Notice(format!(
+            "hook {:?} asked to block at turn end, but the turn already stopped: {}",
+            block.hook, block.reason
+        )));
+    }
     if let Ok(mut session) = core.session.lock()
         && let Err(err) = session.fsync()
     {
@@ -198,6 +264,40 @@ pub async fn run_turn(
     }));
     let _ = tx.send(AgentEvent::TurnDone(outcome.clone()));
     outcome
+}
+
+/// A hook environment bound to this core's config, session, and artifacts.
+pub(crate) fn hook_env(core: &Core) -> crate::hooks::HookEnv<'_> {
+    let identity = crate::hooks::HookIdentity {
+        session_id: core
+            .session
+            .lock()
+            .map(|session| session.id.clone())
+            .unwrap_or_default(),
+        model: core.provider.model().to_string(),
+        profile: core.config.profile_name().to_string(),
+    };
+    crate::hooks::HookEnv {
+        config: &core.config.hooks,
+        cwd: &core.paths.cwd,
+        session: Some(&core.session),
+        artifacts: Some(core.artifacts.as_ref()),
+        identity,
+    }
+}
+
+/// Make hook failures and added context visible in the transcript.
+fn hook_notices(tx: &UnboundedSender<AgentEvent>, hooks: &crate::hooks::Outcome) {
+    for warning in &hooks.warnings {
+        let _ = tx.send(AgentEvent::Notice(format!("[hook] {warning}")));
+    }
+    for context in &hooks.contexts {
+        let _ = tx.send(AgentEvent::Notice(format!(
+            "[hook] {} added context ({} chars)",
+            context.hook,
+            context.text.chars().count()
+        )));
+    }
 }
 
 /// The configured window, if the model profile or `[model]` pins one.
@@ -332,11 +432,13 @@ async fn run_loop(
         });
         return TurnOutcome::budget(&code, message);
     }
+    record_prompt_prefix(core);
     let mut loop_guard = LoopGuard::new();
     let verify_configured = !core.config.verify.steps.is_empty();
     let gate_tools = gates::GateTools::from_names(core.tools.iter().map(|tool| tool.name()));
     let read_available = core.tools.iter().any(|tool| tool.name() == "read");
     let mut pending_compaction = false;
+    let mut cache_watch = CacheWatch::default();
     let mut call_ledger = CallLedger::from_session(&core.session.lock().expect("session lock"));
     let mut compacted_since_model_call = false;
     let mut invalid_tool_calls = 0u32;
@@ -401,6 +503,26 @@ async fn run_loop(
             } else {
                 "auto"
             };
+            // Lifecycle hook: pre_compact may add context or veto the
+            // compaction. It cannot change the budget.
+            let compact_hooks =
+                crate::hooks::pre_compact(&hook_env(core), reason, assembled.estimated_tokens)
+                    .await;
+            hook_notices(tx, &compact_hooks);
+            if let Some(block) = compact_hooks.blocked {
+                let message = format!(
+                    "hook {:?} blocked compaction: {}. The prompt was not compacted.",
+                    block.hook, block.reason
+                );
+                append_error(&core.session, "hook_block", &message, true);
+                let _ = tx.send(AgentEvent::Error {
+                    code: "hook_block".into(),
+                    message,
+                    recoverable: true,
+                });
+                return TurnOutcome::ok(TurnStatus::Blocked);
+            }
+            let system_before_compaction = leading_system(&assembled).to_string();
             let mut result = compact_session(
                 &core.session,
                 findings.as_ref(),
@@ -426,6 +548,26 @@ async fn run_loop(
             match result {
                 Ok(compacted) => {
                     compacted_since_model_call = true;
+                    let system_after_compaction = leading_system(&assembled);
+                    let reuse = context::common_prefix_chars(
+                        &system_before_compaction,
+                        system_after_compaction,
+                    );
+                    let reprefill = system_after_compaction
+                        .chars()
+                        .count()
+                        .saturating_sub(reuse);
+                    append_custom(
+                        &core.session,
+                        "cache-boundary",
+                        json!({
+                            "reason": reason,
+                            "reuse_prefix_chars": reuse,
+                            "reprefill_chars": reprefill,
+                            "chars_before": system_before_compaction.chars().count(),
+                            "chars_after": system_after_compaction.chars().count(),
+                        }),
+                    );
                     let _ = tx.send(AgentEvent::Compacted {
                         summary: compacted.summary,
                         tokens_before: compacted.tokens_before,
@@ -505,6 +647,23 @@ async fn run_loop(
         } else if let Some(reason) = &core.vision.blocked {
             ChatMessage::strip_images(&mut messages, reason);
         }
+        let request_prefix =
+            context::prompt_prefix(leading_system(&assembled), &core.tool_specs_json);
+        let extra_body = match core
+            .model_profile
+            .request_extra_body(!core.tool_specs.is_empty())
+        {
+            Ok(body) => body,
+            Err(message) => {
+                append_error(&core.session, "thinking_policy", &message, false);
+                let _ = tx.send(AgentEvent::Error {
+                    code: "thinking_policy".into(),
+                    message: message.clone(),
+                    recoverable: false,
+                });
+                return TurnOutcome::error("thinking_policy", message);
+            }
+        };
         let request = ChatRequest {
             model: core.provider.model().to_string(),
             messages,
@@ -515,17 +674,17 @@ async fn run_loop(
                 .clone()
                 .or(Some("auto".into())),
             parallel_tool_calls: core.model_profile.parallel_tool_calls,
-            temperature: core.config.model.temperature,
-            top_p: core.config.model.top_p,
+            samplers: crate::provider::SamplerSettings::resolve(
+                &core.config.model,
+                &core.model_profile,
+            ),
+            engine: core.engine,
+            response_schema: core.structured.clone(),
             // The budget's reservation, capped to the window: asking for more
             // than the window holds makes some servers reject the request.
             max_tokens: budget.max_output_tokens,
             stop: core.model_profile.stop.clone(),
-            extra_body: core
-                .model_profile
-                .extra_body
-                .as_ref()
-                .and_then(|value| serde_json::to_value(value).ok()),
+            extra_body,
             include_usage: true,
             reasoning_field: core.model_profile.reasoning_field.clone(),
         };
@@ -665,6 +824,27 @@ async fn run_loop(
             ));
             return TurnOutcome::ok(TurnStatus::ContextTruncated);
         }
+        if let Some(cold) = cache_watch.observe(
+            assistant.usage.as_ref(),
+            &request_prefix,
+            compacted_since_model_call.then_some("system block rewritten"),
+        ) {
+            let message = format!(
+                "prompt cache hit {}% on two consecutive requests; likely invalidator: {}. Keep one session on one server slot and avoid changing the profile or tool list mid-session.",
+                cold.percent, cold.invalidator
+            );
+            append_custom(
+                &core.session,
+                "cache-cold",
+                json!({
+                    "cache_percent": cold.percent,
+                    "likely_invalidator": cold.invalidator,
+                    "prompt_tokens": assistant.usage.as_ref().map(|usage| usage.prompt_tokens),
+                    "cached_tokens": assistant.usage.as_ref().and_then(|usage| usage.cached_tokens),
+                }),
+            );
+            let _ = tx.send(AgentEvent::Notice(message));
+        }
         let mut assistant = assistant;
         // A successful reply means the current context fits. A later fill can
         // compact or retry on its own allowance instead of a per-turn budget.
@@ -675,6 +855,31 @@ async fn run_loop(
             let _ = tx.send(AgentEvent::Notice(notice));
         }
         if let Some(nudge) = recovery.nudge {
+            if recovery.structured_invalid {
+                if progress.output_recoveries < MAX_OUTPUT_RECOVERIES {
+                    progress.output_recoveries += 1;
+                    if let Err(err) = append_assistant(&core.session, assistant)
+                        .and_then(|()| append_user(&core.session, &nudge))
+                    {
+                        return TurnOutcome::error("session_write", err.to_string());
+                    }
+                    continue;
+                }
+                if let Err(err) = append_assistant(&core.session, assistant) {
+                    return TurnOutcome::error("session_write", err.to_string());
+                }
+                let message = format!(
+                    "structured output did not match the requested schema after {} repairs; no invalid JSON was accepted",
+                    progress.output_recoveries
+                );
+                append_error(&core.session, "structured_output", &message, true);
+                let _ = tx.send(AgentEvent::Error {
+                    code: "structured_output".into(),
+                    message: message.clone(),
+                    recoverable: true,
+                });
+                return TurnOutcome::ok(TurnStatus::Blocked);
+            }
             if progress.output_recoveries < MAX_OUTPUT_RECOVERIES {
                 progress.output_recoveries += 1;
                 if let Err(err) = append_assistant(&core.session, assistant)
@@ -722,6 +927,39 @@ async fn run_loop(
                 verify_configured,
                 turn_start.as_deref(),
             );
+            // Plan mode: the turn settles only once a todo plan exists, and
+            // the plan is stored as a session entry the user can read.
+            if core.permissions.mode() == crate::policy::PermissionMode::Plan {
+                if !facts.todo_plan_present && gate_tools.todo {
+                    if progress.can_continue_settle() {
+                        progress.settle_continuations += 1;
+                        let message = "[localharness] plan mode: record your proposal now with the todo tool, action \"plan\", one task per step you propose. Nothing may change until the user runs /plan approve.";
+                        if let Err(err) = append_user(&core.session, message) {
+                            return TurnOutcome::error("session_write", err.to_string());
+                        }
+                        let _ = tx.send(AgentEvent::Notice(message.into()));
+                        continue;
+                    }
+                    let message = "plan mode: the turn ended without a todo plan after reminders. Ask again for a plan; nothing was changed.".to_string();
+                    append_error(&core.session, "gate_block", &message, true);
+                    let _ = tx.send(AgentEvent::Error {
+                        code: "gate_block".into(),
+                        message,
+                        recoverable: true,
+                    });
+                    return TurnOutcome::ok(TurnStatus::Blocked);
+                }
+                let entry = {
+                    let session = core.session.lock().expect("session lock");
+                    crate::tools::todo::plan_entry(&session, "proposed")
+                };
+                if let Ok(mut session) = core.session.lock()
+                    && let Err(err) = session.append(EntryKind::Custom(entry))
+                {
+                    tracing::warn!(%err, "cannot record the plan in the session");
+                }
+                return TurnOutcome::ok(TurnStatus::Done);
+            }
             match gates::settle(&facts, &mut progress, gate_tools) {
                 SettleDecision::Done => {
                     if gate_tools.verify
@@ -773,6 +1011,7 @@ async fn run_loop(
                             "the turn stopped at a no-progress checkpoint; this call did not run",
                         ),
                         None,
+                        Some(crate::provenance::tool_tag(&call.name)),
                     );
                 }
                 let message = progress.checkpoint_message(reason);
@@ -1128,6 +1367,9 @@ struct OutputRecovery {
     /// A harness message for the model; the loop continues after it.
     nudge: Option<String>,
     degenerate: bool,
+    /// The reply was not a valid instance of the requested schema. It must
+    /// never settle as the final answer.
+    structured_invalid: bool,
 }
 
 /// Repair what can be repaired in place (tool calls written as text) and name
@@ -1180,6 +1422,30 @@ fn recover_output(
         }
     }
 
+    // Schema validation applies to final answers only. A tool call recovered
+    // from assistant text above is an intermediate step, not a finished reply.
+    let has_native = assistant
+        .tool_calls
+        .as_ref()
+        .is_some_and(|calls| !calls.is_empty());
+    if let Some(schema) = &core.structured
+        && !has_native
+    {
+        let content = assistant.content.as_deref().unwrap_or("");
+        if let Err(error) = schema.validate_response(content) {
+            out.structured_invalid = true;
+            out.notice = Some(format!(
+                "structured output did not match {:?}: {error}; asking the model to repair it",
+                schema.name
+            ));
+            out.nudge = Some(format!(
+                "[localharness] structured output rejected: {error}. Reply with exactly one JSON document that matches the schema {}. No prose and no Markdown fence.",
+                serde_json::to_string(&schema.schema).unwrap_or_default()
+            ));
+            return out;
+        }
+    }
+
     let calls = assistant.tool_calls.as_deref().unwrap_or_default();
     let content_empty = assistant
         .content
@@ -1202,7 +1468,7 @@ fn recover_output(
             ));
         }
     } else if calls.is_empty() && content_empty {
-        out.nudge = Some("[localharness] empty response: you returned no text and no tool call. Make the next tool call, or give your final answer.".into());
+        out.nudge = Some("[localharness] empty response: you returned no text and no tool call (reasoning alone is not an answer). Make the next tool call, or give your final answer outside the reasoning block.".into());
     }
     out
 }
@@ -1210,7 +1476,7 @@ fn recover_output(
 struct StreamAccum {
     content: String,
     reasoning: String,
-    calls: BTreeMap<usize, PartialCall>,
+    calls: CallAccumulator,
     usage: Option<Usage>,
     finish: Option<String>,
     think: super::output::ThinkSplitter,
@@ -1218,24 +1484,21 @@ struct StreamAccum {
     reasoning_loop: super::output::RepetitionGuard,
     /// Set when the repetition guard stopped the stream.
     degenerate: bool,
+    /// The model profile's `strip_reasoning`: reasoning is shown live but
+    /// never persisted in the session entry.
+    strip_reasoning: bool,
     /// When the request was sent, and when tokens first and last arrived.
     sent: Instant,
     first_token: Option<Instant>,
     last_token: Option<Instant>,
 }
 
-#[derive(Default)]
-struct PartialCall {
-    id: String,
-    name: String,
-    arguments: String,
-}
-
 impl StreamAccum {
     /// Content streamed so far, without tool calls, for a cancelled or failed
     /// generation. Keeps the branch useful after an interruption.
     fn partial(&self) -> Option<AssistantData> {
-        if self.content.trim().is_empty() && self.reasoning.trim().is_empty() {
+        let keep_reasoning = !self.strip_reasoning && !self.reasoning.is_empty();
+        if self.content.trim().is_empty() && !keep_reasoning {
             return None;
         }
         Some(AssistantData {
@@ -1244,11 +1507,7 @@ impl StreamAccum {
             } else {
                 Some(self.content.clone())
             },
-            reasoning: if self.reasoning.is_empty() {
-                None
-            } else {
-                Some(self.reasoning.clone())
-            },
+            reasoning: keep_reasoning.then(|| self.reasoning.clone()),
             tool_calls: None,
             usage: self.usage.clone(),
             stop_reason: Some("cancelled".into()),
@@ -1259,13 +1518,14 @@ impl StreamAccum {
         Self {
             content: String::new(),
             reasoning: String::new(),
-            calls: BTreeMap::new(),
+            calls: CallAccumulator::new(),
             usage: None,
             finish: None,
             think: super::output::ThinkSplitter::default(),
             content_loop: super::output::RepetitionGuard::default(),
             reasoning_loop: super::output::RepetitionGuard::default(),
             degenerate: false,
+            strip_reasoning: false,
             sent: Instant::now(),
             first_token: None,
             last_token: None,
@@ -1299,6 +1559,35 @@ impl StreamAccum {
             if secs >= 0.2 {
                 usage.tokens_per_sec = Some((f64::from(usage.completion_tokens - 1) / secs) as f32);
             }
+        }
+    }
+
+    /// A reply that only reasoned (no text, no tool call) is a parser or
+    /// thinking-policy problem, not an answer: say so visibly. The loop's
+    /// empty-response nudge then retries instead of completing the turn.
+    fn warn_reasoning_only(&self, tx: &UnboundedSender<AgentEvent>) {
+        let cut_short = matches!(self.finish.as_deref(), Some("length") | Some("max_tokens"));
+        if self.content.trim().is_empty()
+            && !self.calls.has_named_call()
+            && !self.reasoning.trim().is_empty()
+            && !cut_short
+            && !self.degenerate
+        {
+            let _ = tx.send(AgentEvent::Guard {
+                code: "reasoning_only".into(),
+                message: "the model replied with reasoning only: no answer text and no tool call. Retrying with a nudge. If this repeats, the server's reasoning parser may be swallowing the answer or tool call (check reasoning_field and the engine's reasoning parser), or set thinking = \"off\" with a thinking_control in the model profile.".into(),
+            });
+        }
+    }
+
+    /// Count reasoning tokens from the text when the server reported usage
+    /// without them, so the token meter shows them for every engine.
+    fn estimate_reasoning_tokens(&mut self, budget: &TokenBudget) {
+        if let Some(usage) = self.usage.as_mut()
+            && usage.reasoning_tokens.is_none()
+            && !self.reasoning.trim().is_empty()
+        {
+            usage.reasoning_tokens = Some(budget.estimate_text(&self.reasoning));
         }
     }
 
@@ -1342,30 +1631,10 @@ impl StreamAccum {
     /// Other invalid JSON is left for the repair layer, which can fix common
     /// model mistakes.
     fn validate_calls(&self) -> Result<(), ProviderError> {
-        let cut_short = matches!(self.finish.as_deref(), Some("length") | Some("max_tokens"));
-        if self.degenerate || !cut_short {
+        if self.degenerate {
             return Ok(());
         }
-        for call in self.calls.values() {
-            if call.name.trim().is_empty() {
-                continue;
-            }
-            // A call cut off right after its name has no argument text at
-            // all. Finalization would turn that into `{}`, which can run a
-            // no-required-keys tool from a reply the output limit cut off.
-            if call.arguments.trim().is_empty()
-                || serde_json::from_str::<Value>(&call.arguments).is_err()
-            {
-                return Err(ProviderError::new(
-                    ErrorClass::ToolCallTruncated,
-                    format!(
-                        "the model hit the output token limit while writing the {:?} tool call; its arguments are incomplete and nothing was executed. Raise [model] max_output_tokens or split the call into smaller steps.",
-                        call.name
-                    ),
-                ));
-            }
-        }
-        Ok(())
+        self.calls.check_truncation(self.finish.as_deref())
     }
 
     /// Emit anything the think splitter held back, and move reasoning that a
@@ -1391,24 +1660,17 @@ impl StreamAccum {
 
     fn finalize(self, ledger: &mut CallLedger) -> AssistantData {
         let mut calls = Vec::new();
-        for call in self.calls.into_values() {
-            if call.name.trim().is_empty() {
-                continue;
-            }
+        // The engine id stops here: the session only ever sees the ledger's
+        // internal id, assigned in arrival order.
+        for call in self.calls.into_calls() {
             let internal_id = ledger.next_id();
-            if !call.id.trim().is_empty() {
-                ledger.map_engine_id(call.id.trim(), &internal_id);
+            if let Some(engine_id) = &call.engine_id {
+                ledger.map_engine_id(engine_id, &internal_id);
             }
-            let arguments = if call.arguments.trim().is_empty() {
-                json!({})
-            } else {
-                serde_json::from_str(&call.arguments)
-                    .unwrap_or_else(|_| Value::String(call.arguments.clone()))
-            };
             calls.push(ToolCall {
                 id: internal_id,
+                arguments: call.parsed_arguments(),
                 name: call.name,
-                arguments,
             });
         }
         AssistantData {
@@ -1417,7 +1679,7 @@ impl StreamAccum {
             } else {
                 Some(self.content)
             },
-            reasoning: if self.reasoning.is_empty() {
+            reasoning: if self.reasoning.is_empty() || self.strip_reasoning {
                 None
             } else {
                 Some(self.reasoning)
@@ -1458,6 +1720,7 @@ async fn stream_assistant(
         provider.chat_stream(request, etx, child).await;
     });
     let mut accum = StreamAccum::new();
+    accum.strip_reasoning = core.model_profile.strip_reasoning();
     let mut failure: Option<ProviderError> = None;
     while let Some(item) = erx.recv().await {
         if let Some(err) = handle_stream_item(
@@ -1481,6 +1744,8 @@ async fn stream_assistant(
     let _ = task.await;
     accum.settle_reasoning(tx);
     accum.measure();
+    accum.estimate_reasoning_tokens(budget);
+    accum.warn_reasoning_only(tx);
     if let Some(usage) = &accum.usage {
         let _ = tx.send(AgentEvent::Usage(usage.clone()));
     }
@@ -1537,16 +1802,9 @@ fn handle_stream_item(
             arguments,
         }) => {
             accum.token_arrived();
-            let call = accum.calls.entry(index).or_default();
-            if let Some(id) = id {
-                merge_fragment(&mut call.id, &id);
-            }
-            if let Some(name) = name {
-                merge_fragment(&mut call.name, &name);
-            }
-            if let Some(arguments) = arguments {
-                call.arguments.push_str(&arguments);
-            }
+            accum
+                .calls
+                .push(index, id.as_deref(), name.as_deref(), arguments.as_deref());
             None
         }
         Ok(StreamEvent::Usage(usage)) => {
@@ -1574,15 +1832,6 @@ fn handle_stream_item(
     }
 }
 
-fn merge_fragment(buffer: &mut String, fragment: &str) {
-    if fragment.is_empty() {
-        return;
-    }
-    if buffer.is_empty() || !buffer.ends_with(fragment) {
-        buffer.push_str(fragment);
-    }
-}
-
 struct BatchOutcome {
     cancelled: bool,
     guard: Option<(String, String)>,
@@ -1590,6 +1839,25 @@ struct BatchOutcome {
     thread_split: Option<ThreadSplit>,
     /// Calls rejected by the active profile's one-call rule.
     invalid_calls: u32,
+}
+
+/// A reviewed mutation that ran against a capture buffer: the file has not
+/// been touched yet, and its result text is provisional until the review
+/// decision is applied.
+struct BufferedCall {
+    call: ToolCall,
+    /// Repaired arguments, as the `post_tool` hook sees them.
+    args: Value,
+    result: ToolResult,
+    writes: Vec<crate::tools::hunk::PendingWrite>,
+    started: Instant,
+    summary_args: String,
+    /// Hook warnings and context from the pre-dispatch decision.
+    notes: Vec<String>,
+}
+
+fn is_file_mutation(name: &str) -> bool {
+    matches!(name, "edit" | "patch" | "write")
 }
 
 struct ThreadSplit {
@@ -1621,6 +1889,53 @@ async fn execute_batch(
 
     let ctx = core.tool_context_with(cancel.clone());
     let active: Vec<&str> = core.tools.iter().map(|tool| tool.name()).collect();
+
+    // Hunk review: from a turn's second file mutation (or every mutation in
+    // `always`), run the mutating tools against a capture buffer, ask the
+    // frontend which hunks to keep, and write the accepted ones atomically.
+    // Without a reviewer (headless, ACP) the buffer is not used at all: the
+    // turn behaves exactly as before, which is the documented auto-accept.
+    let review_mode = core.config.review;
+    let reviewer = if review_mode == crate::config::ReviewMode::Off {
+        None
+    } else {
+        core.reviewer()
+    };
+    let mutation_calls: Vec<usize> = calls
+        .iter()
+        .enumerate()
+        .filter(|(_, call)| is_file_mutation(&call.name))
+        .map(|(index, _)| index)
+        .collect();
+    let mut review_active = false;
+    if reviewer.is_some() {
+        let mut files: HashSet<String> = gates::analyze_turn_since(
+            &core.session.lock().expect("session lock"),
+            false,
+            turn_start,
+        )
+        .files
+        .into_iter()
+        .collect();
+        for index in &mutation_calls {
+            if let Some(raw) = calls[*index].arguments.get("path").and_then(Value::as_str)
+                && let Ok(path) = ctx.resolve(raw)
+            {
+                files.insert(display_path(&ctx.cwd, &path));
+            }
+        }
+        review_active = match review_mode {
+            crate::config::ReviewMode::Always => !mutation_calls.is_empty(),
+            crate::config::ReviewMode::MultiFile => files.len() >= 2,
+            crate::config::ReviewMode::Off => false,
+        };
+    }
+    let capture: Option<crate::tools::hunk::Capture> =
+        review_active.then(|| std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+    let last_reviewed = mutation_calls.last().copied();
+    let mut buffered: Vec<BufferedCall> = Vec::new();
+    let mut review_done = false;
+
     for (position, original) in calls.iter().enumerate() {
         if core.model_profile.one_call && position > 0 {
             invalid_calls += 1;
@@ -1636,6 +1951,7 @@ async fn execute_batch(
                     ),
                 ),
                 None,
+                Some(crate::provenance::tool_tag(&original.name)),
             );
             continue;
         }
@@ -1647,6 +1963,7 @@ async fn execute_batch(
                     remaining,
                     &ToolResult::err("cancelled", "cancelled; this call did not run"),
                     None,
+                    Some(crate::provenance::tool_tag(&remaining.name)),
                 );
             }
             break;
@@ -1699,8 +2016,23 @@ async fn execute_batch(
         let mut evidence_args: Option<Value> = None;
         let mut result;
         let mut repaired = None;
+        let mut capture_start: Option<usize> = None;
+        let mut pre_notes: Vec<String> = Vec::new();
+        let mut executed = false;
 
-        if tool.is_none() {
+        if tool.is_none()
+            && core.permissions.mode() == crate::policy::PermissionMode::Plan
+            && core.registry.get(&call.name).is_some()
+        {
+            // Plan mode removed this tool; name the reason, not a typo.
+            result = ToolResult::err(
+                "plan_mode",
+                format!(
+                    "plan mode is active: {} is removed until the user runs /plan approve. Investigate with read-only tools and write the plan with todo action \"plan\".",
+                    call.name
+                ),
+            );
+        } else if tool.is_none() {
             let hint = unknown_suggestion
                 .map(|name| format!("did you mean {name}? "))
                 .unwrap_or_default();
@@ -1726,15 +2058,35 @@ async fn execute_batch(
                         });
                     }
                     let args = repaired_args.args;
-                    args_path = args
-                        .get("path")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_string);
+                    args_path = args.get("path").and_then(|v| v.as_str()).map(|raw| {
+                        super::authorize::target_path(core, &call.name, raw).to_string()
+                    });
                     evidence_args = Some(args.clone());
                     repaired = Some(args.clone());
                     result = ToolResult::ok("");
 
-                    if read_available
+                    // The single pre-dispatch decision: permission policy,
+                    // `pre_tool` hooks, and provenance. A deny from any of
+                    // them stops the call before the harness gates. An ask
+                    // or a provenance approval waits until the gates pass.
+                    let verdict =
+                        super::authorize::decide(core, tool.as_deref().unwrap(), call, &args).await;
+                    for notice in verdict.notices {
+                        let _ = tx.send(AgentEvent::Notice(notice));
+                    }
+                    pre_notes.extend(verdict.notes);
+                    let mut pending_provenance = verdict.provenance;
+                    let mut pending_ask = None;
+                    match verdict.decision {
+                        crate::policy::Decision::Allow => {}
+                        crate::policy::Decision::Ask(request) => pending_ask = Some(request),
+                        crate::policy::Decision::Deny { code, message } => {
+                            result = ToolResult::err(&code, message);
+                        }
+                    }
+
+                    if !result.is_error
+                        && read_available
                         && matches!(call.name.as_str(), "edit" | "write" | "patch")
                         && let Some(path) = &args_path
                     {
@@ -1786,11 +2138,38 @@ async fn execute_batch(
                     if !result.is_error
                         && matches!(call.name.as_str(), "bash" | "bg")
                         && let Some(command) = args.get("command").and_then(|v| v.as_str())
+                        && let Some(script) = crate::skills::bundled_script_in_command(
+                            &core.paths,
+                            core.config.trust,
+                            &ctx.cwd,
+                            command,
+                        )
+                        && core.approver.is_none()
+                    {
+                        // A frontend with an approval channel gets the call
+                        // through the normal approver below. Without one, the
+                        // script is never run and the exact command is shown.
+                        result = ToolResult::err(
+                            "SKILL_SCRIPT_APPROVAL",
+                            crate::skills::approval_required(&script),
+                        );
+                    }
+
+                    if !result.is_error
+                        && matches!(call.name.as_str(), "bash" | "bg")
+                        && let Some(command) = args.get("command").and_then(|v| v.as_str())
                     {
                         let gate = core.security.lock().expect("security state").gate(command);
                         if let Err(message) = gate {
                             result = ToolResult::err("SEC_SCOPE", message);
                         }
+                    }
+
+                    if !result.is_error
+                        && let Some(request) = pending_ask.take()
+                        && let Err(denied) = super::authorize::confirm(core, request, cancel).await
+                    {
+                        result = denied;
                     }
 
                     // The frontend (ACP) may add its own approval gate. It
@@ -1809,35 +2188,90 @@ async fn execute_batch(
                         result = ToolResult::err("permission_denied", message);
                     }
 
+                    // Provenance approval decided above: spend `/approve` or
+                    // ask the frontend only now that the call can run.
+                    if !result.is_error
+                        && let Some(required) = pending_provenance.take()
+                        && let Err(denied) =
+                            super::authorize::confirm_provenance(core, call, &args, required).await
+                    {
+                        let _ = tx.send(AgentEvent::Notice(denied.content.clone()));
+                        result = denied;
+                    }
+
                     if result.is_error {
                         // Keep the failure and skip execution.
                     } else {
-                        let signature =
-                            format!("{}:{}", call.name, super::repair::canonical_json(&args));
-                        match loop_guard.check_and_record(signature) {
-                            LoopDecision::Tripped { reason } => {
-                                result = ToolResult::err("loop_guard", reason.clone());
-                                guard_trip = Some(("loop_guard".into(), reason));
+                        if let Some(capture) = &capture
+                            && is_file_mutation(&call.name)
+                            && let Some(path) =
+                                args_path.as_ref().and_then(|raw| ctx.resolve(raw).ok())
+                        {
+                            let duplicate = capture
+                                .lock()
+                                .map(|writes| writes.iter().any(|write| write.path == path))
+                                .unwrap_or(true);
+                            if duplicate {
+                                result = ToolResult::err(
+                                    "REVIEW_DUPLICATE",
+                                    format!(
+                                        "this batch already has a pending change to {}. Only one \
+                                         mutation per file can be reviewed at a time; this call did \
+                                         not run. Retry it in the next message after the review.",
+                                        display_path(&ctx.cwd, &path)
+                                    ),
+                                );
+                            } else {
+                                capture_start = capture.lock().ok().map(|writes| writes.len());
                             }
-                            LoopDecision::Ok => {
-                                let fut = tool.as_ref().unwrap().call(&ctx, args.clone());
-                                tokio::select! {
-                                    biased;
-                                    _ = cancel.cancelled() => {
-                                        result = ToolResult::err("cancelled", "cancelled during execution");
-                                    }
-                                    outcome = tokio::time::timeout(core.tool_timeout, fut) => {
-                                        result = match outcome {
-                                            Ok(result) => result,
-                                            Err(_) => ToolResult::err(
-                                                "timeout",
-                                                format!(
-                                                    "{} exceeded {} s; narrow the call or use bg for long work",
-                                                    call.name,
-                                                    core.tool_timeout.as_secs()
+                        }
+                        if result.is_error {
+                            // A review guard rejected the call; skip execution.
+                        } else {
+                            let signature =
+                                format!("{}:{}", call.name, super::repair::canonical_json(&args));
+                            match loop_guard.check_and_record(signature) {
+                                LoopDecision::Tripped { reason } => {
+                                    result = ToolResult::err("loop_guard", reason.clone());
+                                    guard_trip = Some(("loop_guard".into(), reason));
+                                }
+                                LoopDecision::Ok => {
+                                    executed = true;
+                                    let fut = async {
+                                        match (&capture, capture_start) {
+                                            (Some(capture), Some(_)) => {
+                                                crate::tools::hunk::with_capture(
+                                                    capture.clone(),
+                                                    tool.as_ref().unwrap().call(&ctx, args.clone()),
+                                                )
+                                                .await
+                                            }
+                                            _ => {
+                                                tool.as_ref()
+                                                    .unwrap()
+                                                    .call(&ctx, args.clone())
+                                                    .await
+                                            }
+                                        }
+                                    };
+                                    tokio::select! {
+                                        biased;
+                                        _ = cancel.cancelled() => {
+                                            result = ToolResult::err("cancelled", "cancelled during execution");
+                                        }
+                                        outcome = tokio::time::timeout(core.tool_timeout, fut) => {
+                                            result = match outcome {
+                                                Ok(result) => result,
+                                                Err(_) => ToolResult::err(
+                                                    "timeout",
+                                                    format!(
+                                                        "{} exceeded {} s; narrow the call or use bg for long work",
+                                                        call.name,
+                                                        core.tool_timeout.as_secs()
+                                                    ),
                                                 ),
-                                            ),
-                                        };
+                                            };
+                                        }
                                     }
                                 }
                             }
@@ -1847,10 +2281,135 @@ async fn execute_batch(
             }
         }
 
+        // A captured write did not touch the disk. Hold its result until the
+        // review applies the accepted hunks, then report the real outcome.
+        if let (Some(capture), Some(start)) = (&capture, capture_start) {
+            let writes = capture
+                .lock()
+                .map(|writes| writes[start..].to_vec())
+                .unwrap_or_default();
+            if !writes.is_empty() {
+                buffered.push(BufferedCall {
+                    call: call.clone(),
+                    args: evidence_args
+                        .clone()
+                        .unwrap_or_else(|| call.arguments.clone()),
+                    result,
+                    writes,
+                    started,
+                    summary_args: summary_args.clone(),
+                    notes: std::mem::take(&mut pre_notes),
+                });
+                if !review_done && last_reviewed == Some(position) {
+                    review_done = true;
+                    finish_review(
+                        core,
+                        tx,
+                        &ctx,
+                        cancel,
+                        &mut buffered,
+                        reviewer.as_ref().expect("review_active implies a reviewer"),
+                        review_mode,
+                        &mut deferred,
+                        &mut batch_chars,
+                        &mut *progress,
+                        loop_guard,
+                        &mut inferred_mutations,
+                        &mut inferred_files,
+                    )
+                    .await;
+                }
+                continue;
+            }
+        }
+
         let duration_ms = started.elapsed().as_millis() as u64;
+
+        // Scan the raw tool output, not text a hook later adds: hooks are
+        // configured code and must not trip their own detector.
+        let scan_output = result.content.clone();
+
+        // Lifecycle hook: post_tool sees the raw result. Its context is added
+        // to the result; a block turns the result into an error.
+        if executed {
+            let hook_args = evidence_args.as_ref().unwrap_or(&call.arguments);
+            let post = crate::hooks::post_tool(
+                &hook_env(core),
+                &call.name,
+                hook_args,
+                &result.content,
+                result.is_error,
+                duration_ms,
+            )
+            .await;
+            for warning in &post.warnings {
+                let _ = tx.send(AgentEvent::Notice(format!("[hook] {warning}")));
+                result.content = format!("[hook warning] {warning}\n\n{}", result.content);
+            }
+            for context in post.contexts {
+                result.content.push_str(&format!(
+                    "\n\n[hook context from {}]\n{}",
+                    context.hook, context.text
+                ));
+            }
+            if let Some(block) = post.blocked {
+                let message = format!(
+                    "hook {:?} blocked the {} result: {}. The change was not undone.",
+                    block.hook, call.name, block.reason
+                );
+                let _ = tx.send(AgentEvent::Notice(message.clone()));
+                result = ToolResult::err("hook_block", message);
+            }
+        }
+
+        // Instruction provenance: tag the result's source and warn on an
+        // instruction-shaped phrase in untrusted output. The detector only
+        // adds visible text and a pending approval gate; it never rewrites the
+        // content and never changes the tool set, scope, or endpoint.
+        let origin = crate::provenance::origin_for(core, &call.name);
+        let mut provenance_warning = None;
+        if executed
+            && !result.is_error
+            && crate::provenance::scans(&call.name)
+            && let Some(detection) = crate::provenance::detect(&scan_output)
+        {
+            let line = crate::provenance::warning_line(&origin.tag(), &detection);
+            result.content = format!("{line}\n\n{}", result.content);
+            if let Ok(mut state) = core.provenance.lock() {
+                state.note(&origin.tag(), &detection);
+            }
+            if let Ok(mut session) = core.session.lock() {
+                let data = CustomData::new("provenance-warning")
+                    .with("origin", origin.tag())
+                    .with("patterns", json!(detection.patterns))
+                    .with("excerpt", detection.excerpt.clone())
+                    .with("approval", "required");
+                if let Err(error) = session.append(EntryKind::Custom(data)) {
+                    tracing::warn!(%error, "cannot record the provenance warning");
+                }
+            }
+            provenance_warning = Some(line);
+        }
+        {
+            let pending = core
+                .provenance
+                .lock()
+                .map(|state| state.pending().is_some())
+                .unwrap_or(false);
+            let _ = tx.send(AgentEvent::Provenance {
+                call_id: call.id.clone(),
+                origin: origin.tag(),
+                warning: provenance_warning,
+                approval_required: pending,
+            });
+        }
+
         let evidence_output = result.content.clone();
         if let Some(note) = routed_note {
             result.content = format!("{note}\n{}", result.content);
+        }
+        for note in pre_notes {
+            result.content = format!("{note}\n\n{}", result.content);
         }
         result.content = format!(
             "[tool] {} - {}\n{}",
@@ -1905,8 +2464,13 @@ async fn execute_batch(
             is_error: result.is_error,
             details: result.details.clone(),
         };
-        let entry_id =
-            append_tool_result(&core.session, call, &tool_result, capped.artifact.clone());
+        let entry_id = append_tool_result(
+            &core.session,
+            call,
+            &tool_result,
+            capped.artifact.clone(),
+            Some(origin.tag()),
+        );
         if let (Some(tool), Some(args), Some(entry_id)) =
             (tool.as_deref(), evidence_args.as_ref(), entry_id.as_deref())
             && tool.evidence_enabled()
@@ -2025,10 +2589,35 @@ async fn execute_batch(
                     remaining,
                     &ToolResult::err("loop_guard", "not executed: the loop guard ended this turn"),
                     None,
+                    Some(crate::provenance::tool_tag(&remaining.name)),
                 );
             }
             break;
         }
+    }
+
+    // A cancel, guard trip, or an early break can leave captured mutations
+    // unreviewed. Review them now; a cancelled turn rejects every hunk, so the
+    // tree is untouched and the model sees why.
+    if !buffered.is_empty()
+        && let Some(reviewer) = &reviewer
+    {
+        finish_review(
+            core,
+            tx,
+            &ctx,
+            cancel,
+            &mut buffered,
+            reviewer,
+            review_mode,
+            &mut deferred,
+            &mut batch_chars,
+            &mut *progress,
+            loop_guard,
+            &mut inferred_mutations,
+            &mut inferred_files,
+        )
+        .await;
     }
 
     if let Ok(mut session) = core.session.lock() {
@@ -2052,6 +2641,322 @@ async fn execute_batch(
         thread_split,
         invalid_calls,
     }
+}
+
+/// Apply a batch of captured mutations after the frontend's hunk review.
+/// Appends the final tool results and events, records the decisions in the
+/// session, and reports rejected ranges in the tool result the model sees.
+#[allow(clippy::too_many_arguments)]
+async fn finish_review(
+    core: &std::sync::Arc<Core>,
+    tx: &UnboundedSender<AgentEvent>,
+    ctx: &crate::tools::ToolContext,
+    cancel: &CancellationToken,
+    buffered: &mut Vec<BufferedCall>,
+    reviewer: &std::sync::Arc<dyn crate::tools::hunk::HunkReviewer>,
+    mode: crate::config::ReviewMode,
+    deferred: &mut Vec<CustomData>,
+    batch_chars: &mut usize,
+    progress: &mut RunProgress,
+    loop_guard: &mut LoopGuard,
+    inferred_mutations: &mut usize,
+    inferred_files: &mut HashSet<String>,
+) {
+    if buffered.is_empty() {
+        return;
+    }
+    let calls = std::mem::take(buffered);
+    let mut writes = Vec::new();
+    let mut owners = Vec::new();
+    for (index, call) in calls.iter().enumerate() {
+        for write in &call.writes {
+            writes.push(write.clone());
+            owners.push(index);
+        }
+    }
+    let set = crate::tools::hunk::HunkSet::new(writes, &ctx.cwd);
+    let total_hunks = set.views().len();
+    let decision = if total_hunks == 0 {
+        crate::tools::hunk::HunkDecision::accept_all(0)
+    } else {
+        reviewer
+            .review(crate::tools::hunk::HunkRequest {
+                hunks: set.views().to_vec(),
+                cancel: cancel.clone(),
+            })
+            .await
+    };
+    let committed = set.commit(&decision);
+
+    let mut applied = 0usize;
+    let mut rejected = 0usize;
+    let mut rejected_ranges = Vec::new();
+    let mut files = set.files();
+    if files.is_empty() {
+        files = calls
+            .iter()
+            .filter_map(|call| call.writes.first())
+            .map(|write| {
+                write
+                    .path
+                    .strip_prefix(&ctx.cwd)
+                    .unwrap_or(&write.path)
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .collect();
+    }
+
+    // Per-call outcomes. Today each tool produces one write; keep the mapping
+    // explicit so a future multi-file tool cannot silently mismatch.
+    let mut per_call: Vec<Vec<crate::tools::hunk::ProposalOutcome>> = vec![Vec::new(); calls.len()];
+    if let Ok(outcomes) = &committed {
+        for (index, outcome) in outcomes.iter().enumerate() {
+            per_call[owners[index]].push(outcome.clone());
+        }
+    }
+
+    for (index, call) in calls.iter().enumerate() {
+        let mut result = call.result.clone();
+        let mut changed = false;
+        let mut final_hashes: Vec<String> = Vec::new();
+        match &committed {
+            Err(error) => {
+                result = ToolResult::err(
+                    "REVIEW_FAILED",
+                    format!(
+                        "{error}\nThe change was not applied; nothing in this review was written."
+                    ),
+                );
+            }
+            Ok(_) => {
+                let call_writes: Vec<&crate::tools::hunk::PendingWrite> =
+                    call.writes.iter().collect();
+                if per_call[index].len() != call_writes.len() {
+                    result = ToolResult::err(
+                        "REVIEW_FAILED",
+                        "the review returned fewer outcomes than proposed writes; nothing was written",
+                    );
+                } else {
+                    let mut texts = Vec::new();
+                    let mut call_rejected_ranges = Vec::new();
+                    let mut call_applied = 0usize;
+                    for (write, outcome) in call_writes.iter().zip(&per_call[index]) {
+                        let display = write
+                            .path
+                            .strip_prefix(&ctx.cwd)
+                            .unwrap_or(&write.path)
+                            .to_string_lossy()
+                            .to_string();
+                        call_applied += outcome.accepted;
+                        if !outcome.rejected.is_empty() {
+                            for (start, end) in &outcome.rejected {
+                                rejected += 1;
+                                let label = if end < start {
+                                    format!("{display} after line {}", start.saturating_sub(1))
+                                } else if start == end {
+                                    format!("{display} line {start}")
+                                } else {
+                                    format!("{display} lines {start}-{end}")
+                                };
+                                call_rejected_ranges.push(label.clone());
+                                rejected_ranges.push(label);
+                            }
+                        }
+                        if outcome.changed {
+                            changed = true;
+                            applied += outcome.accepted;
+                        }
+                        if let Some(final_content) = &outcome.final_content {
+                            final_hashes
+                                .push(crate::tools::undo::content_hash(final_content.as_bytes()));
+                        }
+                    }
+                    if changed {
+                        if call_rejected_ranges.is_empty() {
+                            texts.push(result.content.clone());
+                        } else {
+                            let write = call_writes[0];
+                            let before = write.before.as_deref().unwrap_or("");
+                            let after = per_call[index][0]
+                                .final_content
+                                .as_deref()
+                                .unwrap_or(&write.after);
+                            let (diff, added, removed) =
+                                crate::tools::edit::diff_report(before, after, 200);
+                            texts.push(format!(
+                                "[review] applied {call_applied} hunk(s); rejected {}. The file \
+                                 differs from your proposal in the rejected ranges; read it before \
+                                 retrying.\n{diff}",
+                                call_rejected_ranges.join(", ")
+                            ));
+                            let mut details = result.details.clone().unwrap_or_else(|| json!({}));
+                            if let Some(object) = details.as_object_mut() {
+                                object.insert(
+                                    "path".into(),
+                                    json!(display_path(&ctx.cwd, &write.path)),
+                                );
+                                object.insert("added".into(), json!(added));
+                                object.insert("removed".into(), json!(removed));
+                                object.insert("review".into(), json!("partial"));
+                                object.insert("accepted".into(), json!(call_applied));
+                                object.insert("rejected".into(), json!(call_rejected_ranges));
+                            }
+                            result.details = Some(details);
+                        }
+                    } else if !call_rejected_ranges.is_empty() {
+                        let where_ = if call_rejected_ranges.is_empty() {
+                            "the reviewed hunks".to_string()
+                        } else {
+                            call_rejected_ranges.join(", ")
+                        };
+                        result = ToolResult::err(
+                            "HUNK_REJECTED",
+                            format!(
+                                "the user rejected the proposed change to {where_}. The file is \
+                                 unchanged. Do not retry the same change; ask what to change or \
+                                 explain the trade-off."
+                            ),
+                        );
+                        result.details = Some(json!({
+                            "review": "rejected",
+                            "rejected": call_rejected_ranges,
+                        }));
+                    } else {
+                        texts.push(result.content.clone());
+                    }
+                    if !texts.is_empty() {
+                        result.content = texts.join("\n");
+                    }
+                }
+            }
+        }
+
+        // The call ran against the capture and its hunks have now landed (or
+        // been rejected): run post_tool exactly as for an unreviewed call.
+        let post = crate::hooks::post_tool(
+            &hook_env(core),
+            &call.call.name,
+            &call.args,
+            &result.content,
+            result.is_error,
+            call.started.elapsed().as_millis() as u64,
+        )
+        .await;
+        for warning in &post.warnings {
+            let _ = tx.send(AgentEvent::Notice(format!("[hook] {warning}")));
+            result.content = format!("[hook warning] {warning}\n\n{}", result.content);
+        }
+        for context in post.contexts {
+            result.content.push_str(&format!(
+                "\n\n[hook context from {}]\n{}",
+                context.hook, context.text
+            ));
+        }
+        if let Some(block) = post.blocked {
+            let message = format!(
+                "hook {:?} blocked the {} result: {}. The change was not undone.",
+                block.hook, call.call.name, block.reason
+            );
+            let _ = tx.send(AgentEvent::Notice(message.clone()));
+            result = ToolResult::err("hook_block", message);
+        }
+        for note in &call.notes {
+            result.content = format!("{note}\n\n{}", result.content);
+        }
+
+        let text = format!(
+            "[tool] {} - {}\n{}",
+            call.call.name, call.summary_args, result.content
+        );
+        let mut capped = context::cap_result_with(&ctx.artifacts, &text, context::Preview::Head);
+        if *batch_chars + capped.content.chars().count() > BATCH_CAP_CHARS {
+            match ctx.artifacts.write(&text) {
+                Ok(artifact) => {
+                    capped.content = format!(
+                        "(batch cap; full result archived as {} · {} bytes · recall {} 1-120)",
+                        artifact.id, artifact.bytes, artifact.id
+                    );
+                    capped.artifact = Some(artifact.id);
+                }
+                Err(_) => {
+                    capped.content = capped.content.chars().take(200).collect::<String>();
+                }
+            }
+            capped.truncated = true;
+        }
+        *batch_chars += capped.content.chars().count();
+        let tool_result = ToolResult {
+            content: capped.content.clone(),
+            is_error: result.is_error,
+            details: result.details.clone(),
+        };
+        let _ = append_tool_result(
+            &core.session,
+            &call.call,
+            &tool_result,
+            capped.artifact.clone(),
+            Some(crate::provenance::tool_tag(&call.call.name)),
+        );
+
+        let write_path = call
+            .writes
+            .first()
+            .map(|write| write.path.as_path())
+            .unwrap_or(ctx.cwd.as_path());
+        let display = display_path(&ctx.cwd, write_path);
+        if changed {
+            *inferred_mutations += 1;
+            inferred_files.insert(display.clone());
+            let mut details = result.details.clone().unwrap_or_else(|| json!({}));
+            if let Some(object) = details.as_object_mut() {
+                if let Some(hash) = final_hashes.first() {
+                    object.insert("after_sha256".into(), json!(hash));
+                }
+                object.insert("path".into(), json!(display));
+            }
+            deferred.push(crate::tools::undo::fs_change_entry(
+                display.clone(),
+                Some(&details),
+            ));
+            if let Some(write) = call.writes.first() {
+                crate::tools::write::record_own_write(ctx, &write.path);
+            }
+        }
+        let raw = arguments_raw(&call.call.arguments);
+        progress.record_tool_result(
+            &fingerprint(&call.call.name, &raw, &tool_result.content),
+            &tool_result.content,
+            tool_result.is_error,
+            changed,
+            false,
+        );
+        if changed {
+            loop_guard.record_progress();
+        }
+        let _ = tx.send(AgentEvent::ToolFinished {
+            call_id: call.call.id.clone(),
+            name: call.call.name.clone(),
+            is_error: tool_result.is_error,
+            duration_ms: call.started.elapsed().as_millis() as u64,
+            preview: preview(tool_body(&tool_result.content), 300),
+            artifact: capped.artifact,
+        });
+    }
+
+    let mut entry = CustomData::new("hunk-review")
+        .with("mode", mode.label())
+        .with("hunks", total_hunks)
+        .with("applied", applied)
+        .with("rejected", rejected)
+        .with("files", files.clone());
+    if !rejected_ranges.is_empty() {
+        entry = entry.with("rejected_ranges", rejected_ranges);
+    }
+    if let Err(error) = &committed {
+        entry = entry.with("error", error.to_string());
+    }
+    deferred.push(entry);
 }
 
 fn unique_file_count(existing: &[String], extra: &HashSet<String>) -> usize {
@@ -2172,6 +3077,108 @@ fn append_custom(session: &crate::tools::SessionHandle, kind: &str, payload: Val
             }
         }
         let _ = session.append(EntryKind::Custom(data));
+    }
+}
+
+/// Fingerprint the request prefix and record it on the session branch when it
+/// changes. The base system prompt and the serialized tools array are the
+/// bytes every request starts with; the volatile session facts sit at the tail
+/// of the system block, and compaction reports its own cache boundary.
+fn record_prompt_prefix(core: &Core) -> context::PromptPrefix {
+    let prefix = context::prompt_prefix(&core.system_prompt, &core.tool_specs_json);
+    let unchanged = core
+        .session
+        .lock()
+        .ok()
+        .and_then(|session| {
+            session
+                .latest_custom_on_path("prompt-prefix")
+                .and_then(|entry| match &entry.kind {
+                    EntryKind::Custom(data) => data
+                        .payload
+                        .get("hash")
+                        .and_then(Value::as_str)
+                        .map(|hash| hash == prefix.hash),
+                    _ => None,
+                })
+        })
+        .unwrap_or(false);
+    if !unchanged {
+        let stable = super::prompt::stable_prefix_chars(&core.system_prompt);
+        let stable_chars = core.system_prompt[..stable].chars().count();
+        append_custom(
+            &core.session,
+            "prompt-prefix",
+            json!({
+                "hash": prefix.hash,
+                "chars": prefix.chars,
+                "stable_chars": stable_chars,
+                "tools_chars": core.tool_specs_json.chars().count(),
+            }),
+        );
+        tracing::info!(hash = %prefix.hash, "prompt prefix");
+    }
+    prefix
+}
+
+/// The leading system message, which is the prefix the conversation follows.
+fn leading_system(assembled: &crate::context::AssembledContext) -> &str {
+    match assembled.messages.first() {
+        Some(ChatMessage::System { content }) => content,
+        _ => "",
+    }
+}
+
+/// A cold prefix-cache streak worth reporting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CacheCold {
+    percent: u32,
+    invalidator: &'static str,
+}
+
+/// Tracks prefix-cache hits across consecutive model calls in a turn. Engines
+/// that do not report `cached_tokens` are ignored rather than guessed at.
+#[derive(Debug, Default)]
+struct CacheWatch {
+    last_prefix: Option<String>,
+    cold_calls: u32,
+    warned: bool,
+}
+
+impl CacheWatch {
+    /// Observe one model call. Returns a report on the second consecutive call
+    /// below 70% so a single noisy sample does not raise an alarm.
+    fn observe(
+        &mut self,
+        usage: Option<&Usage>,
+        prefix: &context::PromptPrefix,
+        compaction_reason: Option<&str>,
+    ) -> Option<CacheCold> {
+        let previous = self.last_prefix.replace(prefix.hash.clone());
+        let usage = usage?;
+        let percent = usage.cache_percent()?;
+        if percent >= 70 {
+            self.cold_calls = 0;
+            self.warned = false;
+            return None;
+        }
+        self.cold_calls += 1;
+        if self.cold_calls < 2 || self.warned {
+            return None;
+        }
+        self.warned = true;
+        let prefix_changed = previous.is_some_and(|hash| hash != prefix.hash);
+        let invalidator = if compaction_reason.is_some() {
+            "the compaction rewrote the system block"
+        } else if prefix_changed {
+            "the prompt prefix (system prompt or tool list) changed"
+        } else {
+            "the server evicted the prefix or moved the request to another slot"
+        };
+        Some(CacheCold {
+            percent,
+            invalidator,
+        })
     }
 }
 
@@ -2320,15 +3327,19 @@ fn append_tool_result(
     call: &ToolCall,
     result: &ToolResult,
     artifact: Option<String>,
+    provenance: Option<String>,
 ) -> Option<String> {
     if let Ok(mut session) = session.lock() {
-        match session.append(EntryKind::ToolResult(ToolResultData {
-            call_id: call.id.clone(),
-            content: result.content.clone(),
-            is_error: result.is_error,
-            details: result.details.clone(),
-            artifact,
-        })) {
+        match session.append_tagged(
+            EntryKind::ToolResult(ToolResultData {
+                call_id: call.id.clone(),
+                content: result.content.clone(),
+                is_error: result.is_error,
+                details: result.details.clone(),
+                artifact,
+            }),
+            provenance,
+        ) {
             Ok(entry) => return Some(entry.id),
             Err(error) => tracing::warn!(%error, "tool result entry was not written"),
         }
@@ -2485,7 +3496,8 @@ fn compact_session(
         thread_id,
         keep_from: keep_from.clone(),
     }))?;
-    session.fsync()?;
+    // No fsync here: compaction runs inside a turn and the turn end fsyncs
+    // once, so a turn that compacts costs one fsync, not one per compaction.
     Ok(Compacted {
         summary: summary.summary,
         tokens_before: summary.tokens_before,
@@ -2582,6 +3594,7 @@ mod tests {
                 app: "test".into(),
                 redact: true,
                 context: None,
+                permissions: None,
             },
             true,
         )
@@ -2605,6 +3618,10 @@ mod tests {
             crate::app::measure_static_prompt(&budget, &system_prompt, tool_specs_cost, Some(""));
         Core {
             approver: None,
+            reviewer: Default::default(),
+            permissions: std::sync::Arc::new(crate::policy::Permissions::with_mode(
+                crate::policy::PermissionMode::Yolo,
+            )),
             config,
             paths: paths.clone(),
             provider: Arc::new(ProbeProvider {
@@ -2621,6 +3638,7 @@ mod tests {
             reads: Arc::new(Mutex::new(ReadTracker::default())),
             bg: Arc::new(Mutex::new(BgRegistry::new())),
             security: Arc::new(Mutex::new(SecurityState::default())),
+            provenance: Default::default(),
             sandbox: None,
             budget,
             static_prompt,
@@ -2631,6 +3649,8 @@ mod tests {
             model_profile: ModelProfile::default(),
             vision: Default::default(),
             tool_probe: None,
+            engine: crate::provider::Engine::Generic,
+            structured: None,
             cancel: CancellationToken::new(),
             tool_timeout: std::time::Duration::from_secs(10),
             path_jail: false,
@@ -2701,21 +3721,65 @@ mod tests {
     }
 
     #[test]
-    fn merge_fragment_handles_repeats() {
-        let mut buffer = String::new();
-        merge_fragment(&mut buffer, "read");
-        merge_fragment(&mut buffer, "read");
-        assert_eq!(buffer, "read");
-        merge_fragment(&mut buffer, "_file");
-        assert_eq!(buffer, "read_file");
+    fn cold_cache_alarm_needs_two_consecutive_calls() {
+        let prefix = crate::context::prompt_prefix("system", "[]");
+        let cold = Usage {
+            prompt_tokens: 100,
+            cached_tokens: Some(10),
+            ..Usage::default()
+        };
+        let warm = Usage {
+            prompt_tokens: 100,
+            cached_tokens: Some(90),
+            ..Usage::default()
+        };
+        let mut watch = CacheWatch::default();
+        assert!(watch.observe(Some(&cold), &prefix, None).is_none());
+        let report = watch
+            .observe(Some(&cold), &prefix, None)
+            .expect("second cold call alarms");
+        assert_eq!(report.percent, 10);
+        assert!(report.invalidator.contains("server evicted"));
+        assert!(
+            watch.observe(Some(&cold), &prefix, None).is_none(),
+            "one alarm per cold streak"
+        );
+        watch.observe(Some(&warm), &prefix, None);
+        assert!(watch.observe(Some(&cold), &prefix, None).is_none());
+    }
+
+    #[test]
+    fn cold_cache_alarm_names_a_changed_prefix_or_compaction() {
+        let first = crate::context::prompt_prefix("system", "[]");
+        let second = crate::context::prompt_prefix("system changed", "[]");
+        let cold = Usage {
+            prompt_tokens: 100,
+            cached_tokens: Some(0),
+            ..Usage::default()
+        };
+        let mut watch = CacheWatch::default();
+        watch.observe(Some(&cold), &first, None);
+        let report = watch
+            .observe(Some(&cold), &second, None)
+            .expect("changed prefix alarm");
+        assert!(report.invalidator.contains("prefix"));
+        let mut watch = CacheWatch::default();
+        watch.observe(Some(&cold), &first, None);
+        let report = watch
+            .observe(Some(&cold), &first, Some("auto"))
+            .expect("compaction alarm");
+        assert!(report.invalidator.contains("compaction"));
+        // An engine that does not report cached tokens never guesses.
+        let mut watch = CacheWatch::default();
+        let unknown = Usage::new(100, 1);
+        watch.observe(Some(&unknown), &first, None);
+        assert!(watch.observe(Some(&unknown), &first, None).is_none());
     }
 
     #[test]
     fn partial_call_finalizes_with_synthetic_id_and_bad_json() {
         let mut accum = StreamAccum::new();
-        let call = accum.calls.entry(0).or_default();
-        call.name = "read".into();
-        call.arguments = "{not json".into();
+        accum.calls.push(0, None, Some("read"), Some("{not json"));
         let mut ledger = CallLedger::default();
         let assistant = accum.finalize(&mut ledger);
         let calls = assistant.tool_calls.unwrap();
@@ -2724,7 +3788,7 @@ mod tests {
         // Ids must not repeat across messages, or replayed history pairs a
         // call with another call's result.
         let mut again = StreamAccum::new();
-        again.calls.entry(0).or_default().name = "read".into();
+        again.calls.push(0, None, Some("read"), None);
         let second = again.finalize(&mut ledger).tool_calls.unwrap();
         assert_eq!(second[0].id, "call_0002");
         assert_ne!(calls[0].id, second[0].id);
@@ -2734,9 +3798,12 @@ mod tests {
     fn a_length_cut_invalid_call_is_rejected_before_dispatch() {
         let mut accum = StreamAccum::new();
         accum.finish = Some("length".into());
-        let call = accum.calls.entry(0).or_default();
-        call.name = "write".into();
-        call.arguments = "{\"path\":\"big.rs\",\"content\":\"fn a".into();
+        accum.calls.push(
+            0,
+            None,
+            Some("write"),
+            Some("{\"path\":\"big.rs\",\"content\":\"fn a"),
+        );
         let err = accum.validate_calls().expect_err("truncated call");
         assert_eq!(err.class, ErrorClass::ToolCallTruncated);
         assert!(err.message.contains("incomplete"), "{}", err.message);
@@ -2747,10 +3814,8 @@ mod tests {
     fn a_length_cut_call_without_arguments_is_rejected() {
         let mut accum = StreamAccum::new();
         accum.finish = Some("max_tokens".into());
-        let call = accum.calls.entry(0).or_default();
         // The stream stopped after the name, before any argument text.
-        call.name = "todo".into();
-        assert!(call.arguments.is_empty());
+        accum.calls.push(0, None, Some("todo"), None);
         let err = accum.validate_calls().expect_err("truncated call");
         assert_eq!(err.class, ErrorClass::ToolCallTruncated);
         assert!(err.message.contains("incomplete"), "{}", err.message);
@@ -2760,9 +3825,9 @@ mod tests {
     fn a_complete_call_is_not_rejected_at_the_output_limit() {
         let mut accum = StreamAccum::new();
         accum.finish = Some("length".into());
-        let call = accum.calls.entry(0).or_default();
-        call.name = "read".into();
-        call.arguments = "{\"path\":\"a.rs\"}".into();
+        accum
+            .calls
+            .push(0, None, Some("read"), Some("{\"path\":\"a.rs\"}"));
         assert!(accum.validate_calls().is_ok());
     }
 

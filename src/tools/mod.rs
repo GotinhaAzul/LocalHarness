@@ -10,6 +10,7 @@ pub mod finding;
 pub mod git;
 pub mod glob;
 pub mod grep;
+pub mod hunk;
 pub mod iocs;
 pub mod lsp;
 pub mod patch;
@@ -137,7 +138,9 @@ impl ToolResult {
         path: &Path,
         snapshot: lsp::EditSnapshot,
     ) -> Self {
-        if self.is_error {
+        // A reviewed mutation has not landed yet; diagnostics taken now would
+        // describe the unchanged file.
+        if self.is_error || crate::tools::hunk::capturing() {
             return self;
         }
         let Some(verdict) = ctx.lsp.check_edit(ctx, path, &snapshot).await else {
@@ -168,6 +171,9 @@ pub struct ToolContext {
     pub trust: bool,
     pub verify: VerifyConfig,
     pub profile: String,
+    /// The active model profile's edit format. `read` annotates and `patch`
+    /// accepts anchors only in [`crate::config::EditMode::Hash`].
+    pub edit_mode: crate::config::EditMode,
     /// Packs active in this context; used to keep the skill index focused.
     pub packs: Vec<String>,
     pub reads: Arc<Mutex<ReadTracker>>,
