@@ -100,13 +100,48 @@ Streaming:
 
 - SSE frames: `data: {...}`, `data: [DONE]`, comments, CRLF, multi-line data,
   frames split across chunks, multiple frames per chunk.
-- Accumulate tool calls by `index`: `id`, `function.name`, and
-  `function.arguments` fragments. Handle providers that emit a complete call in
-  one frame.
-- Parse `usage` from the final chunk when present.
-- Parse `reasoning_content` and `reasoning` fields. A model profile decides
+- Accumulate tool calls in one state machine (`provider/accum.rs`): each call
+  is a slot that is `Open` while fragments for its stream index arrive and
+  `Closed` when the stream ends or a new whole call takes over the index (a
+  name plus arguments while the open arguments are already a complete JSON
+  object, or a different engine id). Handles SGLang fragments, vLLM whole
+  calls, Ollama calls without `id` or `index`, and object-valued `arguments`.
+- JSON is validated at close. When `finish_reason` is `length` (or
+  `max_tokens`) and a call's arguments are empty or incomplete, the turn fails
+  with `tool_call_truncated` and the call is never executed.
+- An in-stream `error` object (`{"error":{...}}` or `{"error":"..."}`) aborts
+  the turn with the server's message, even after an HTTP 200.
+- A server that ignores `stream: true` and answers `application/json` is
+  emitted as the same events, so streamed and non-streamed completions fold
+  into one normalized `Completion` (`fold_stream`).
+- Parse `usage` and llama.cpp `timings` from any chunk; reports are merged and
+  surfaced once per completion.
+- Parse reasoning from the configured `reasoning_field`, then
+  `reasoning_content`, `reasoning`, and `thinking`. Inline `<think>` blocks and gpt-oss
+  `<|channel|>analysis` messages join the same stream, and reasoning markup is
+  stripped from assistant content at context assembly. `usage` may carry
+  `reasoning_tokens` (reported, else estimated). A per-profile
+  `thinking = auto|on|off` policy merges `thinking_control` into `extra_body`
+  when thinking is off. A model profile decides
   whether reasoning is shown, kept in context, or stripped after the turn.
 - `finish_reason`: `stop`, `length`, `tool_calls`, `content_filter`.
+
+Tool-call ids:
+
+- The session never stores an engine id. `agent/calls.rs` (`CallLedger`)
+  assigns `call_0001`, `call_0002`, ... in arrival order, continuing after the
+  highest internal id anywhere in the session tree, so ids are unique and
+  sortable across turns, branches and compaction. The engine id is mapped to
+  the internal id for the current request only.
+- Before each request the replayed history must have exactly one result per
+  call and one call per result; otherwise the turn fails with a typed error
+  (`tool_result_missing`, `tool_result_duplicate`, `tool_result_orphan`,
+  `tool_call_duplicate`) and nothing is sent.
+- Ids are rendered per model at the wire: Mistral-family models
+  (`mistral_common` tokenizers) get nine alphanumerics (`call_0007` →
+  `000000007`; ids an older session stored are hashed to `z` + 8 characters).
+  Other models receive the internal id unchanged. Older session files replay
+  unchanged.
 
 ### 2.2 Optional probes
 
@@ -233,9 +268,13 @@ States: `Idle`, `AssembleContext`, `Compact`, `StreamModel`, `ToolBatch`,
 
 1. Append the user entry to the session branch.
 2. Assemble context from the active branch, including the cached repository
-   brief in the system prompt.
-3. If the prompt budget is exceeded, write a compaction entry and rebuild.
-4. Send the model request with the profile's tool list.
+   brief in the system prompt. The stable profile prompt, tool index, and
+   project instructions come first; volatile session facts (working directory,
+   profile name) sit at the tail so the engine can reuse its prefix cache.
+3. If the prompt budget is exceeded, write a compaction entry and rebuild. A
+   `cache-boundary` entry records the reused prefix and the suffix that must
+   re-prefill.
+4. Send the model request with the profile's tool list in a stable order.
 5. Stream text, reasoning, and tool calls. Emit UI events.
 6. If there are no tool calls, run settle gates.
 7. For each tool call, in order:
@@ -298,6 +337,7 @@ observable.
 
 | Guard | Behavior |
 |---|---|
+| Permission policy | Evaluated first for every repaired call (`agent/authorize.rs`, `policy/`). Ordered `[permissions]` rules match on tool glob, path glob, command regex, and network; the last matching rule wins, except that a `deny` holds against any later `allow`/`ask` that is not strictly more specific. No match falls back to the mode: `ask`, `accept-edits`, `plan`, `dont-ask`, or `yolo` (flag only). A deny or plan-mode refusal returns `DENIED`/`plan_mode` with the rule id and the turn continues; an `ask` is resolved after the other gates pass, and an approval covers exactly that command or path for the session. See 8.13. |
 | Read-before-edit | `edit`/`patch` on an existing file require a prior `read` with a matching stat stamp (`mtime`, size). `write` also requires full-line coverage of the existing file, or an explicit `overwrite: true`; a result capped by the result or batch limit marks coverage incomplete. A changed file requires a re-read. Creation is allowed. A successful `edit`/`patch`/`write` re-stamps only the file it wrote, so consecutive edits need no re-read while any outside change still does. |
 | Scope gate | Security-sensitive commands are checked against the user-set engagement scope. No scope blocks with `SEC_SCOPE` and the `/sec scope add` call. Best-effort, not a sandbox. |
 | Sandbox | When `--sandbox` is set, `bash` and `bg` run in a bubblewrap namespace (or the Landlock fallback): read-only root, hidden `$HOME`, private `/tmp`, no network, and `.git` read-only in `workspace-write`. Startup fails closed when no backend exists; a per-command wrap failure returns `SANDBOX_UNAVAILABLE`. Commands never fall back to an unsandboxed run. |
@@ -385,6 +425,14 @@ usable_prompt = context_window - max_output_tokens - safety_margin
 - If no usage is available, estimate from characters with the calibrated ratio.
 - Every entry stores an optional `tokens` estimate for the tree view and budget
   accounting.
+- `usage.cached_tokens` (`prompt_tokens_details.cached_tokens`, or llama.cpp
+  `timings.cache_n`) is reported per call. The TUI header shows `cache
+  <cached>/<prompt>`; `--json` usage events carry `cached_tokens` and
+  `cache_percent`. Two consecutive calls under 70% emit a notice naming the
+  likely invalidator: a compaction, a changed prefix, or server-side eviction.
+- The request prefix (leading system block plus serialized tools) is hashed
+  with SHA-256 and recorded once per core build as a `prompt-prefix` entry, so
+  a changed prefix is visible next to the turn where it changed.
 
 ### 4.3 Tool result caps and archive
 
@@ -515,19 +563,21 @@ Entry fields:
 - `id`: `e<seq>` for entries, `c<seq>` for checkouts, `s0` for the header.
 - `parent`: entry id, or `null` for the first user entry.
 - `ts`: RFC 3339 UTC.
+- `provenance`: optional source tag (`user`, `tool:<name>`, `skill`, `external`,
+  `repo`). Absent on old entries and on harness-internal entries.
 - `type` and `data`.
 
 ### 5.2 Entry types
 
 | Type | Data |
 |---|---|
-| `session` | cwd, endpoint, model, profile, app version |
+| `session` | cwd, endpoint, model, profile, app version, redact, context?, permissions? (`mode`, `rules_hash`, `rules`) |
 | `user` | content |
 | `assistant` | content, reasoning?, tool_calls?, usage?, stop_reason? |
 | `tool_result` | call_id, content, is_error, details?, artifact? |
 | `compaction` | summary, tokens_before, reason, thread_id? |
 | `checkout` | target, reason (`tree`, `fork`, `resume`) |
-| `custom` | kind plus payload (`fs-change`, `verify-config`, `verify-result`, `todo-state`, `finding`, `thread-state`, `guard-trip`, `profile-change`, `model-change`) |
+| `custom` | kind plus payload (`fs-change`, `hunk-review`, `rewind`, `verify-config`, `verify-result`, `todo-state`, `finding`, `thread-state`, `guard-trip`, `profile-change`, `model-change`, `prompt-prefix`, `cache-boundary`, `cache-cold`, `permissions`, `permission-mode`, `plan`, `hook-invocation`, `hook-context`, `provenance-warning`, `provenance-approval`) |
 | `error` | code, message, recoverable |
 
 An assistant entry with `tool_calls` is a batch. The tool results that answer it
@@ -597,7 +647,43 @@ e1  U  Fix the parser bug                          20:10
 resolving through its tool batch to the last result. `/tree` is a view; it never
 deletes entries.
 
-### 5.5 Storage
+### 5.5 Rewind
+
+`/rewind [turns] [force]` and `lh --rewind <session>:<entry>` move the active
+leaf to an earlier entry **and** put the working tree back to the state it had
+at that entry. `/rewind` defaults to one turn: the entry before the last user
+message, so the last turn's edits are reverted and its conversation is
+abandoned. `turns = 2` reaches before the second-to-last user message, and so
+on; the session header is a valid target for a full reset.
+
+The plan is built from the active branch's `fs-change` entries, the same data
+`undo` uses:
+
+- Changes after the target are replayed in reverse. The last write for a file
+  is its oldest post-target snapshot, which is the content it had at the
+  target; a file the reverted changes created is deleted.
+- A change an earlier `undo` reverted is ignored, exactly as undo ignores it.
+  An `undo` after the target that reverted a change made at or before the
+  target cannot be reconstructed (the harness never snapshots what an undo
+  restores) and refuses, naming the file.
+- Files with no `fs-change` entry are never touched. Changes made through
+  `bash` have no snapshot and stay as they are.
+- Before writing, each file is checked against the newest change's
+  `after_sha256`. A mismatch means the file changed outside the harness; the
+  rewind writes nothing, moves no leaf, and names every conflicting file.
+  `force` backs those files up next to the originals as
+  `<name>.lh-rewind-<nanos>.bak` before restoring them.
+- After the files, the leaf moves with a `checkout` marker (`reason =
+  "rewind"`) and a `rewind` custom entry records the target, restored and
+  deleted paths, backups, and the reverted `fs-change` seqs. The abandoned
+  branch is untouched and remains visible in `/tree`.
+- Restored bytes are re-stamped as harness-written, so the model does not have
+  to read a file again before editing it.
+
+A session with no harness file changes after the target is a pure checkout:
+only the marker and the `rewind` entry are appended.
+
+### 5.6 Storage
 
 ```
 ~/.local/share/localharness/
@@ -627,13 +713,13 @@ deletes entries.
 - `session-id` is `YYYYMMDD-HHMMSS-<pid>` or a short random suffix.
 - One advisory lock per session file. A second process refuses to write and
   names the lock holder.
-- Flush each entry to the file. `fsync` at turn end and after compaction.
+- Flush each entry to the file. `fsync` once at turn end; compactions inside a turn are covered by that fsync.
 - On load, ignore a malformed final line, drop orphan entries with a warning,
   and validate that every `parent` exists.
 - Export: `/export [path]` writes Markdown for the active branch. Findings have
   their own report.
 
-### 5.6 Resume and switching
+### 5.7 Resume and switching
 
 - `lh --continue` loads the most recent session for the project.
 - `lh --resume <session-id>` loads a specific session.
@@ -657,7 +743,7 @@ core and coding; `full` adds the security pack.
 | Core | `read` | Read a file with line numbers |
 | Core | `write` | Create or replace a file |
 | Core | `edit` | Exact-text replacement |
-| Core | `patch` | Anchor/range edit with recovery diagnostics |
+| Core | `patch` | Exact-anchor edit by default; hash mode takes line anchors with recovery diagnostics |
 | Core | `undo` | Revert the last harness change to a file, one step per call |
 | Core | `bash` | Non-interactive command with timeout |
 | Core | `grep` | Regex search with context, gitignore-aware (hidden paths only when named) |
@@ -690,7 +776,18 @@ code and, where useful, the exact call shape.
 - `content` is text, capped. `details` is structured but never sent to the
   model unless summarized.
 - `read` returns line numbers and caps at 150 lines by default, 800 maximum.
-  Binary files are detected and refused with a message.
+  Binary files are detected and refused with a message. With
+  `edit_mode = "hash"` in the model profile it also prints a
+  `[path#snapshot]` header and an 8-hex content hash before each line; text
+  mode output is unchanged.
+- In hash edit mode, `patch` takes `path#snapshot` and an `ops` array of
+  `PUT` (replace a range with text), `CUT` (delete a range), `REM` (delete one
+  line), and `MV` (move a block after another anchored line). Line numbers are
+  original read coordinates. The snapshot and every referenced line hash are
+  checked before a single atomic write; any mismatch returns `STALE_ANCHOR`
+  with fresh anchors and writes nothing. A successful patch returns fresh
+  anchors for the changed lines, and untouched lines keep their bytes and line
+  endings. Text-mode `patch` and `edit` are unchanged.
 - `write` and `edit` are atomic (temp file plus rename) and record `fs-change`.
 - `edit` preflight handles: multiple matches (list line numbers), whitespace-
   only match (show the verbatim excerpt), and no match (show the closest
@@ -737,10 +834,12 @@ code and, where useful, the exact call shape.
   mtime and size, and returns a character-budgeted map. It skips binary files,
   files above 256 KB, and build/vendor directories. A compact map is injected
   into the system prompt at startup.
-- `write`, `edit`, and `patch` request post-edit diagnostics through the shared
-  LSP service when the file belongs to a project with a server marker. Only
-  errors and warnings are appended, capped at 8 entries; an unavailable or cold
-  server leaves the mutation result untouched.
+- `write`, `edit`, and `patch` snapshot diagnostics through the shared LSP
+  service before a mutation when `[lsp] gate` is not `off`. Only new
+  severity-error diagnostics count: `warn` appends them, `block` restores the
+  pre-edit bytes and returns `EDIT_REGRESSION` with a fix hint. Pre-existing
+  errors are suppressed, and a clean, cold, or non-project edit adds no text.
+  The check never starts a cold server and caps its warm wait at 250 ms.
 - `test` detects vitest, jest, go, cargo, pytest, or an npm test script. It runs
   one file or one test and returns only the first failure, capped at 2500
   characters. Parsers strip ANSI and progress noise.
@@ -825,6 +924,45 @@ code and, where useful, the exact call shape.
   (and `+ref`, `:ref`, `--delete`), `git rebase`, `filter-branch` and
   `git tag -d` are refused with `GIT_DESTRUCTIVE`.
 
+### 6.2b Hunk review
+
+`review = "always" | "multi_file" | "off"` (default `multi_file`) decides
+whether file mutations wait for the user. The agent loop decides per assistant
+batch: `always` activates on a batch with any mutation, `multi_file` when the
+turn's files (already changed plus this batch) reach two, `off` never.
+
+With an interactive frontend installed (`Core::reviewer`), active batches run
+`edit`, `patch`, and `write` inside a capture scope. The tools compute their
+before/after text exactly as usual and call the shared `mutation_write` seam,
+which records a `PendingWrite` instead of touching the disk. Post-mutation LSP
+diagnostics are skipped for a captured batch because the file has not changed
+yet; the read tracker is re-stamped after the accepted hunks land.
+
+At the batch's last mutation the loop:
+
+1. Splits each proposal with `TextDiff::from_lines` into hunks: file, old line
+   range, added/removed counts, and a one-line rationale. This is the same diff
+   engine the tool results use, not a second one; applying a hunk walks those
+   ops.
+2. Asks the `HunkReviewer` trait for one `Accept`/`Reject`/`Edit(text)` per
+   hunk. The TUI implements it with a modal (`a`, `r`, `e`, `A`, `R`, Enter,
+   Esc = reject all). A test can implement the trait with a script.
+3. Validates every proposal's current bytes against the before-text. A file
+   that changed while the review was open aborts the whole set before any
+   write.
+4. Applies accepted hunks atomically: every file is written, and a failed
+   write restores the ones already written and removes files it created. No
+   hunk accepted leaves the tree byte-identical.
+5. Appends the tool results (partial applications name the rejected file and
+   line ranges; a fully rejected call returns `HUNK_REJECTED`), the `fs-change`
+   entries with the final hash, and a `hunk-review` custom entry recording the
+   mode, hunk/applied/rejected counts, files, and rejected ranges. Undo uses
+   the same snapshot the tool captured before the review, so it still works.
+
+Without a reviewer (`--print`, ACP, workflows), no capture is installed: the
+turn writes immediately, exactly as before the feature, and no review entry is
+recorded. This is the documented non-blocking auto-accept.
+
 ### 6.3 Hard limits
 
 | Item | Limit |
@@ -852,6 +990,7 @@ code and, where useful, the exact call shape.
 | `attack_path` | 400 nodes for full betweenness; 5000 simple paths |
 | `iocs` | 100 per category, 2,000,000 input chars |
 | tool result | 2500 chars per result, 8000 chars per batch |
+| `AGENTS.md` | 32 KiB total, 12 KiB per file; chain from repo root to cwd |
 | compaction | `clamp(usable prompt / 3, 1200, 4500)` chars, max 40% of usable |
 
 Limits are constants or config values, not model-controlled.
@@ -883,6 +1022,9 @@ tools = ["read", "bash", "verify"]
 - Tool lists are static for a model call. The set may change between calls only
   when a profile changes or an external workflow starts; `todo` stays visible
   in `full` and `coding` and its gate blocks edits rather than hiding the tool.
+- A model profile may set `edit_mode = "hash"` (default `"text"`); it changes
+  only `read` annotations and `patch` operations, and leaves exact-text `edit`
+  and text-mode `patch` byte-identical.
 - The active tool list is sent to the model and shown in `/tools`.
 
 ### 6.5 Tool result presentation
@@ -902,8 +1044,9 @@ as styled text.
 
 ## 7. Extensibility
 
-The rule: users add **tools and workflows**, not loop behavior. Loop behavior is
-changed by forking the crate.
+The rule: users add **tools, workflows, and lifecycle hooks**, not arbitrary
+loop code. Hooks observe and veto at fixed points; they cannot change tools,
+scope, policy, or the endpoint. Anything else is changed by forking the crate.
 
 ### 7.1 Profiles
 
@@ -1041,10 +1184,37 @@ The crate has a `lib.rs` and exposes `Harness`, `Provider`, `Tool`, `Stage`, and
 `SessionStore` for embedding and forking. No API stability promise before 1.0.
 Feature flags: `coding`, `security`, `lsp`. The binary is a thin wrapper.
 
-### 7.7 Explicitly not extensible at runtime
+### 7.7 Lifecycle hooks
+
+`[hooks.<name>]` declares one `event`, one `command` argv, an optional
+`timeout_secs`, and `on_error = "block" | "warn"`. Events: `session_start`,
+`user_prompt`, `pre_tool`, `post_tool`, `pre_compact`, `stop`.
+
+- The command is spawned directly (no shell), with one JSON object on stdin and
+  one expected on stdout. `decision` (`allow`/`block`), `reason`, and `context`
+  are the only honored fields.
+- `pre_tool` fails closed: the default `on_error` is `block`, and a missing
+  binary, non-zero exit, timeout, or malformed output is visible and blocks.
+  Every other event defaults to `warn`, which keeps the failure visible without
+  blocking.
+- Exit 2 is an explicit veto; stderr's first line is the reason.
+- Output is capped and archived as an artifact when large. Every invocation is
+  recorded as a `hook-invocation` custom entry with duration, outcome, and
+  reason.
+- `pre_tool` runs inside `authorize::decide` (§8.14), after the permission
+  policy and before the harness gates: a call the policy denies never reaches
+  a hook, and a hook block denies even a rule-allowed call before anyone is
+  asked. Hooks cannot enable a denied tool or change scope, the tool list, the
+  endpoint, or the permission mode. `stop` runs when
+  the turn loop ends and is advisory because the turn has already stopped.
+- `lh hooks list` and `lh hooks test <name>` exercise hooks without a model
+  turn. See `docs/hooks.md`.
+
+### 7.8 Explicitly not extensible at runtime
 
 - No plugin ABI.
-- No Lua/Rhai/WASM hooks.
+- No Lua/Rhai/WASM hooks. Lifecycle hooks are external commands with a fixed
+  JSON contract; there is no embedded scripting runtime.
 - No dynamic tool loading outside the manifest protocol.
 - No model-driven tool activation or tool search.
 
@@ -1173,26 +1343,45 @@ input characters. Missing input and unreadable files return prescriptive errors.
 - Project `.harness/` config, profiles, skills, workflows, tools, and verify
   steps are ignored unless `--trust` is set or the TUI `/trust` confirmation is
   accepted. Trust is per session and shown in the status bar.
-- `AGENTS.md` is read as untrusted project instructions. It cannot change
-  scope, tools, gates, or the endpoint.
+- `AGENTS.md` is read as untrusted project instructions from the chain between
+  the git repository root and the working directory, nearest last, each under a
+  source-path header. The chain is capped at 32 KiB total and 12 KiB per file
+  with deterministic truncation and a warning. Symlinks that resolve outside
+  the repository are refused. `lh context --show` prints path, bytes, SHA-256,
+  and loaded/skipped/truncated for each file; `--no-agents-md` and
+  `LH_AGENTS_MD=0` disable the chain. It cannot change scope, tools, gates, or
+  the endpoint.
 - A trusted project still cannot grant security scope.
 - Model input from repository files and tool output is delimited and labeled as
   untrusted data in the system prompt. This reduces, but does not eliminate,
-  prompt injection.
+  prompt injection. Section 8.13 adds a dispatch-time warning and approval
+  gate on top of the label.
 
 ### 8.10 Data handling
 
 - No telemetry, no analytics, no phone-home.
 - Endpoint defaults to `http://127.0.0.1:8080`. A non-local endpoint is allowed
   only when explicitly configured, with a warning.
-- Session entries, archived tool artifacts, evidence, and exported reports pass
-  through `security::redact` before they reach disk. Provider tokens, private
-  key blocks, bearer and high-entropy `Authorization` values, secret-like
-  `.env` assignments, and the exact values of `*TOKEN*`, `*SECRET*`, `*KEY*`,
-  and `*PASSWORD*` environment variables become
+- Session entries, archived tool artifacts, evidence, finding text, and
+  exported reports pass through `security::redact` before they reach disk.
+  Provider tokens, private key blocks, bearer and high-entropy `Authorization`
+  values, secret-like `.env` assignments (upper-case names; unquoted code
+  expressions are skipped), and the exact values of `*TOKEN*`, `*SECRET*`,
+  `*KEY*`, and `*PASSWORD*` environment variables become
   `[REDACTED:<kind>:<first4>...<hash8>]`. Evidence keeps `sha256` over the raw
   output and `stored_sha256` over the redacted artifact. `--no-redact` is the
-  explicit opt-out and is recorded in the session header. `--no-session`
+  explicit opt-out and is recorded in the session header.
+- Redaction is a persistence transform only. `Session::append` writes a
+  redacted copy to disk and keeps the raw entry in the in-memory tree that
+  prompts are built from. `ArtifactStore` writes the redacted file and keeps a
+  bounded in-memory copy of the raw text, so `recall` and `undo` read the
+  original in the live process. A placeholder in model-visible text gets
+  written back into files, so it must never come from the live path. After a
+  resume, replayed results that contain placeholders get a note, and
+  `tools::write::atomic_write` (shared by `write`, `edit`, `patch`, and
+  `undo`) refuses content that adds a placeholder the file does not already
+  hold. `Session::export_markdown` redacts a clone of each entry before
+  rendering, since the tree it reads is raw. `--no-session`
   disables session and artifact writes for sensitive engagements. It does not
   delete or disable an engagement file the user explicitly created; findings
   are separate, user-owned data.
@@ -1247,6 +1436,63 @@ input characters. Missing input and unreadable files return prescriptive errors.
 - The workspace is canonicalized at construction, and a tool `cwd` outside it
   is rejected. A workspace equal to `/` is rejected in `workspace-write`
   because re-binding it would expose the whole filesystem.
+
+### 8.13 Instruction provenance
+
+- Every session entry that carries external content has a `provenance` tag:
+  `user`, `tool:<name>`, `skill`, `external`, or `repo`. Tags are written to the
+  JSONL entry and surfaced as `provenance` events in `--json` output.
+- `src/provenance.rs` scans untrusted tool results with a conservative
+  instruction-pattern detector ("ignore previous instructions", "run this
+  command", "send the contents of", "disable the sandbox", credential paths).
+  It is plain substring matching with no model call and no rewrite; ordinary
+  prose containing "ignore" does not match.
+- A hit prepends a visible warning to the tool result, appends a
+  `provenance-warning` custom entry, and records a pending approval in
+  `Core::provenance`. The next sensitive action — network, outside-workspace
+  path, external tool, or scope change — returns `provenance_approval` unless
+  the user approves with `/approve` or a frontend approver allows it. Approval
+  covers exactly one action.
+- A tool result can never enable a tool, change the tool set, widen scope,
+  change the endpoint, or change the permission mode. Hooks and provenance can
+  only deny or add text; enforcement is at dispatch, not in the prompt.
+
+### 8.14 Permission policy and plan mode
+
+`policy/` holds the engine; `agent/authorize.rs` is the single pre-dispatch
+decision point. `authorize::decide` returns `Allow`, `Ask` (exact subject plus
+preview), or `Deny` (code and reason) before any other gate; a deny stops the
+call at once and `authorize::confirm` resolves an ask after the harness gates
+pass. Lifecycle hooks and provenance checks add their inputs inside `decide`
+so the loop keeps one decision point: policy first (a deny skips the hooks),
+then `pre_tool` hooks (block or add context), then provenance. A deny from any
+source wins; hooks and provenance never turn an ask into an allow. A
+provenance approval that something could still grant (`/approve` already
+given, or a frontend approver attached) is resolved by
+`authorize::confirm_provenance` after the gates, so a call that fails
+`READ_FIRST` or scope never spends the approval.
+
+- Policy comes from the global config and, only when trusted, the project
+  config. Rules from both are kept, global first. Skills, workflows, and the
+  model cannot change the mode or rules; workflows only select profiles.
+- Each call is classified: read-only (read-only tools, allowlisted `bash`
+  commands with no redirection or substitution, read-only `git` actions),
+  session (`todo`, `thread`, `finding`), edit (`write`, `edit`, `patch`,
+  `undo`), or exec (everything else, including MCP and external tools).
+  Read-only and session calls run in every mode unless a rule says otherwise.
+- `ask` asks for edits and exec; `accept-edits` runs edits unasked;
+  `dont-ask` denies instead of asking; `yolo` runs everything a deny rule does
+  not block. `yolo` is accepted only from `--yolo`, never from a config file,
+  and is recorded in the session header plus a `permission-mode` entry.
+- Asking needs a frontend: the TUI prompts, ACP defers to the client's
+  permission request, and headless runs deny.
+- `plan` refuses every call that is not read-only (or `todo`) with
+  `plan_mode`, before rules run, so no allow rule re-enables a mutation. Every
+  core build in plan mode also removes tools that can only mutate (`bash` and
+  `git` stay; each call is checked) and adds `todo`. A tool removed this way
+  is still refused with `plan_mode`, not `unknown_tool`. A plan-mode turn
+  cannot settle without a `todo` plan; the plan is stored as a `plan` session
+  entry (`proposed`, then `approved` or `discarded`).
 
 ---
 
@@ -1369,7 +1615,8 @@ cursor = "#c0caf5"
 - Context: `used/window` and a gauge. `used` is the estimated prompt tokens of
   the next request; during streaming, completion tokens are shown separately.
   Thresholds: normal, warning at 70%, error at 85%.
-- Throughput: rolling tokens/second over the last few seconds.
+- Throughput: rolling tokens/second over the last few seconds, plus
+  `cache <cached>/<prompt>` when the engine reports prefix-cache hits.
 - Session: short id and trusted/untrusted marker.
 - At narrow widths, drop throughput, then session id, then profile; never drop
   cwd, context, or model. With no model selected, the model slot reads
@@ -1386,7 +1633,11 @@ cursor = "#c0caf5"
 - `Ctrl+L` redraws the whole screen.
 - Slash commands: `/help`, `/quit`, `/login`, `/model`, `/profile`, `/theme`,
   `/tree`, `/fork`, `/sessions`, `/compact`, `/tools`, `/skill`, `/workflow`,
-  `/sec`, `/trust`, `/commit`, `/pr`, `/export`, `/clear`, `/debug`. `/commit`
+  `/sec`, `/trust`, `/commit`, `/pr`, `/plan`, `/export`, `/clear`, `/debug`.
+  `/plan` enters plan mode (or shows the plan), `/plan approve` restores the
+  previous mode and tool set, `/plan exit` discards the plan. A permission
+  `ask` appears in the transcript with the exact command or path and a diff
+  preview; `y` allows, `n` or `Esc` denies, other keys are ignored. `/commit`
   and `/pr` show, edit, approve (`confirm`) or drop (`cancel`) what the `git`
   and `pr` tools previewed; `/commit` alone drafts a message from the staged
   diff without a model. `/login` validates and saves
@@ -1425,8 +1676,12 @@ cursor = "#c0caf5"
 
 `lh --print "<prompt>"` runs one turn without the TUI, streams to stdout, and
 exits with the turn status. `--json` emits newline-delimited events for
-scripting. The same core and session code is used. This is not a second
-implementation.
+scripting; `usage` events include `prompt_tokens`, `cached_tokens`, and
+`cache_percent`. The same core and session code is used. This is not a second
+implementation. Nobody can answer a permission `ask` headless, so it is denied
+with `DENIED`; pass `--mode accept-edits`, add allow rules, or `--yolo`.
+`--plan --print` runs one plan-mode turn, prints the stored plan (a `plan`
+event with `--json`), and exits 0 without touching the workspace.
 
 ### 9.8 Agent Client Protocol
 
@@ -1564,9 +1819,11 @@ strip_reasoning = true
   prompts/
 ```
 
-`AGENTS.md` at the repository root is read as untrusted project instructions. It
-is data, not executable, and it cannot change scope, tools, gates, or the
-endpoint.
+`AGENTS.md` files between the repository root and the working directory are
+read as untrusted project instructions, nearest last. They are data, not
+executable, and cannot change scope, tools, gates, or the endpoint. `lh context
+--show` reports the chain and its hashes; `[prompt] agents_md = false`,
+`--no-agents-md`, and `LH_AGENTS_MD=0` disable loading.
 
 ### 10.5 Permissions and secrets
 
@@ -1594,12 +1851,15 @@ src/
   lib.rs                  library surface for embedding and tests
   cli.rs                  clap definitions
   config.rs               config load, merge, validation
+  hooks.rs                lifecycle hooks: direct spawn, JSON, timeout, records
+  provenance.rs           source tags, injection detector, approval gate
   paths.rs                config/data/project paths, project id
   git.rs                  branch and dirty status
   sanitize.rs             text safe to paint or read (escapes, tabs, emoji)
   text.rs                 shared clipping, one-line, slug, byte excerpts
   provider/
     mod.rs                Provider trait and error types
+    accum.rs              tool-call accumulator and normalized completion
     openai.rs             OpenAI-compatible client
     sse.rs                SSE framing and parsing
     types.rs              request/response/stream types
@@ -1607,6 +1867,8 @@ src/
   agent/
     mod.rs                AgentHandle, events
     run.rs                turn state machine
+    prompt.rs             system prompt construction
+    agents_md.rs          hierarchical AGENTS.md chain, caps, manifest
     repair.rs             tool argument repair
     gates.rs              settle gates and guard orchestration
     limits.rs             run budgets and stall detection
@@ -1882,7 +2144,8 @@ These do not block implementation; defaults are specified.
   acceptable after Linux is stable.
 - **Multiple live sessions.** One active session per process in v1. Tabs or
   multiple windows are later.
-- **Redaction coverage.** Secret redaction is shape-based. Unknown credential
-  formats, secrets split across stream chunks, and live `bg` log files before
-  they are read as tool output are not guaranteed. `--no-redact` is explicit
+- **Redaction coverage.** Secret redaction is shape-based and applies to
+  disk only. Unknown credential formats, secrets split across stream chunks,
+  and live `bg` log files are not guaranteed. The endpoint sees raw tool
+  output by design. `--no-redact` is explicit
   and recorded; it is not a default.

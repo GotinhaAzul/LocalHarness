@@ -12,8 +12,24 @@ use super::repair::{ToolName, resolve_tool_name};
 // ---------------------------------------------------------------------------
 // Reasoning tags
 
-const OPEN_TAGS: [&str; 2] = ["<think>", "<thinking>"];
-const CLOSE_TAGS: [&str; 2] = ["</think>", "</thinking>"];
+/// Tags that open a reasoning block in content: `<think>`, `<thinking>`, and
+/// the gpt-oss (harmony) analysis channel.
+const OPEN_TAGS: [&str; 3] = ["<think>", "<thinking>", "<|channel|>analysis<|message|>"];
+/// Tags that close one. A harmony analysis message ends at `<|end|>`, or at
+/// the final channel when the engine dropped the end marker.
+const CLOSE_TAGS: [&str; 4] = [
+    "</think>",
+    "</thinking>",
+    "<|end|>",
+    "<|channel|>final<|message|>",
+];
+/// Harmony framing that carries no text in either state.
+const DROP_TAGS: [&str; 4] = [
+    "<|start|>assistant",
+    "<|channel|>final<|message|>",
+    "<|end|>",
+    "<|return|>",
+];
 
 /// A piece of streamed content, routed by whether it sat inside a think block.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,9 +38,10 @@ pub enum Piece {
     Reasoning(String),
 }
 
-/// Splits `<think>...</think>` out of streamed content. Tags may arrive split
-/// across deltas, so a possible tag prefix at the end of a delta is held back
-/// until the next one decides it.
+/// Splits `<think>...</think>` (and harmony `<|channel|>analysis` messages)
+/// out of streamed content. Tags may arrive split across deltas, so a
+/// possible tag prefix at the end of a delta is held back until the next one
+/// decides it.
 #[derive(Debug, Default)]
 pub struct ThinkSplitter {
     inside: bool,
@@ -38,15 +55,26 @@ impl ThinkSplitter {
         buf.push_str(delta);
         let mut out = Vec::new();
         loop {
-            let tags: &[&str] = if self.inside { &CLOSE_TAGS } else { &OPEN_TAGS };
-            if let Some((at, len)) = find_first(&buf, tags) {
+            let toggles: &[&str] = if self.inside { &CLOSE_TAGS } else { &OPEN_TAGS };
+            let toggle = find_first(&buf, toggles);
+            let drop = find_first(&buf, &DROP_TAGS);
+            // A toggle wins a tie: `<|end|>` closes analysis, else is dropped.
+            let next = match (toggle, drop) {
+                (Some(t), Some(d)) if d.0 < t.0 => Some((d, false)),
+                (Some(t), _) => Some((t, true)),
+                (None, Some(d)) => Some((d, false)),
+                (None, None) => None,
+            };
+            if let Some(((at, len), flips)) = next {
                 self.emit(&mut out, &buf[..at]);
                 buf.drain(..at + len);
-                self.inside = !self.inside;
-                self.opened |= self.inside;
+                if flips {
+                    self.inside = !self.inside;
+                    self.opened |= self.inside;
+                }
                 continue;
             }
-            let keep = partial_suffix(&buf, tags);
+            let keep = partial_suffix(&buf, toggles).max(partial_suffix(&buf, &DROP_TAGS));
             let head = buf.len() - keep;
             self.emit(&mut out, &buf[..head]);
             buf.drain(..head);
@@ -85,7 +113,8 @@ impl ThinkSplitter {
 fn find_first(haystack: &str, tags: &[&str]) -> Option<(usize, usize)> {
     tags.iter()
         .filter_map(|tag| haystack.find(tag).map(|at| (at, tag.len())))
-        .min()
+        // Earliest match; the longest tag at that position.
+        .min_by_key(|&(at, len)| (at, std::cmp::Reverse(len)))
 }
 
 /// Length of the longest suffix of `text` that is a proper prefix of a tag.
@@ -101,11 +130,43 @@ fn partial_suffix(text: &str, tags: &[&str]) -> usize {
 /// Templates that put `<think>` in the prompt stream only the closing tag.
 /// Returns `(reasoning, content)` when content holds such a dangling close.
 pub fn split_unopened_think(content: &str) -> Option<(String, String)> {
-    let (at, len) = find_first(content, &CLOSE_TAGS)?;
+    let (at, len) = find_first(content, &CLOSE_TAGS[..2])?;
     Some((
         content[..at].trim().to_string(),
         content[at + len..].trim_start().to_string(),
     ))
+}
+
+/// Split complete content into `(text, reasoning)` with the same rules the
+/// stream uses: inline think blocks, harmony channels, and a dangling close.
+pub fn split_reasoning(content: &str) -> (String, String) {
+    let mut splitter = ThinkSplitter::default();
+    let mut pieces = splitter.push(content);
+    pieces.extend(splitter.flush());
+    let (mut text, mut reasoning) = (String::new(), String::new());
+    for piece in pieces {
+        match piece {
+            Piece::Text(t) => text.push_str(&t),
+            Piece::Reasoning(r) => reasoning.push_str(&r),
+        }
+    }
+    if !splitter.opened()
+        && let Some((before, after)) = split_unopened_think(&text)
+    {
+        reasoning.push_str(&before);
+        text = after;
+    }
+    if splitter.opened() {
+        text = text.trim_start().to_string();
+    }
+    (text, reasoning)
+}
+
+/// Assistant content as it may be replayed to the model: every reasoning
+/// block removed, so old sessions written before reasoning was split out
+/// never leak chain-of-thought into the next prompt.
+pub fn strip_reasoning_markup(content: &str) -> String {
+    split_reasoning(content).0
 }
 
 // ---------------------------------------------------------------------------
@@ -783,6 +844,39 @@ mod tests {
         // Ran out of tokens while thinking: it all stays reasoning.
         let (text, reasoning) = split_all(&["<thinking>still going"]);
         assert_eq!((text.as_str(), reasoning.as_str()), ("", "still going"));
+    }
+
+    #[test]
+    fn harmony_analysis_channel_is_reasoning() {
+        let (text, reasoning) = split_all(&[
+            "<|channel|>analysis<|mess",
+            "age|>User wants a file.<|en",
+            "d|><|start|>assistant<|channel|>final<|message|>Here it is.<|return|>",
+        ]);
+        assert_eq!(reasoning, "User wants a file.");
+        assert_eq!(text, "Here it is.");
+        // Final channel without the end marker still closes analysis.
+        let (text, reasoning) =
+            split_all(&["<|channel|>analysis<|message|>hmm<|channel|>final<|message|>ok"]);
+        assert_eq!((text.as_str(), reasoning.as_str()), ("ok", "hmm"));
+    }
+
+    #[test]
+    fn every_fixture_normalizes_to_one_reasoning_stream() {
+        for content in [
+            "<think>plan</think>answer",
+            "<thinking>plan</thinking>answer",
+            "plan</think>answer",
+            "<|channel|>analysis<|message|>plan<|end|><|start|>assistant<|channel|>final<|message|>answer",
+        ] {
+            assert_eq!(
+                split_reasoning(content),
+                ("answer".to_string(), "plan".to_string()),
+                "{content}"
+            );
+            assert_eq!(strip_reasoning_markup(content), "answer");
+        }
+        assert_eq!(strip_reasoning_markup("a < b"), "a < b");
     }
 
     #[test]

@@ -33,6 +33,7 @@ use crate::git::{self, GitStatus};
 use crate::provider::{OpenAiCompatProvider, probe};
 use crate::session::{CompactionData, Entry, EntryKind, UserData};
 use crate::skills::SkillIndex;
+use crate::tools::hunk::HunkReviewer as _;
 use crate::tools::todo::{PlanStatus, plan_snapshot};
 use crate::ui::UiOptions;
 use crate::ui::complete::{self, Completion};
@@ -41,8 +42,8 @@ use crate::ui::render::{self, ActivityData, Transcript};
 use crate::ui::theme::{Role, Theme};
 use crate::ui::tree::TreeView;
 use crate::ui::widgets::{
-    FooterData, HeaderData, ModalData, PickAction, PickItem, PickerModal, SessionItem,
-    SessionsModal, ToolItem, ToolsModal, clip_end,
+    FooterData, HeaderData, HunkReviewModal, ModalData, PickAction, PickItem, PickerModal,
+    SessionItem, SessionsModal, ToolItem, ToolsModal, clip_end,
 };
 use crate::workflows::{self, WorkflowSpec};
 
@@ -50,6 +51,8 @@ use crate::workflows::{self, WorkflowSpec};
 mod commands;
 mod git_commands;
 mod keys;
+mod permission;
+mod review;
 mod support;
 mod terminal;
 #[cfg(test)]
@@ -66,6 +69,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("profile", "pick the tool profile"),
     ("theme", "pick a theme (live preview) or save it"),
     ("tree", "browse and checkout the session tree"),
+    (
+        "rewind",
+        "restore files and the conversation to an earlier turn",
+    ),
     ("fork", "checkout the latest assistant step"),
     ("new", "start a fresh session"),
     ("resume", "resume a previous session"),
@@ -73,11 +80,16 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("compact", "append a deterministic compaction"),
     ("commit", "review, edit, or approve the staged commit"),
     ("pr", "review or approve a pending pull request action"),
+    ("plan", "plan mode: investigate and propose, change nothing"),
     ("tools", "show the active tools"),
     ("mcp", "show MCP server status"),
     ("skill", "pick a skill and append its instructions"),
     ("workflow", "pick a workflow to start on a new branch"),
     ("sec", "engagement summary, scope, or report"),
+    (
+        "approve",
+        "approve the next sensitive action after a provenance warning",
+    ),
     ("trust", "show the trust state"),
     ("export", "write the branch as Markdown"),
     ("clear", "clear the transcript view"),
@@ -93,14 +105,17 @@ fn command_usage(name: &str) -> &'static str {
         "profile" => "/profile [name]   (no name: pick from a list)",
         "theme" => "/theme [name|save]   (no name: pick with live preview)",
         "resume" => "/resume [id|last]   (no id: pick from a list)",
+        "rewind" => "/rewind [turns] [force]   (default: before the last user message)",
         "skill" => "/skill [name]   (no name: pick from a list)",
         "workflow" => "/workflow [name]   (no name: pick from a list)",
         "sec" => {
             "/sec [summary|report|scope add|remove <target>|scope clear]   (no argument: pick)"
         }
+        "approve" => "/approve   (after a provenance warning; one action)",
         "trust" => "/trust [confirm]",
         "commit" => "/commit [confirm|cancel|edit <message>]   (no argument: show or draft)",
         "pr" => "/pr [confirm|cancel]   (no argument: show the pending action)",
+        "plan" => "/plan [approve|exit]   (no argument: enter plan mode, or show the plan)",
         "export" => "/export [path]",
         _ => "",
     }
@@ -108,10 +123,11 @@ fn command_usage(name: &str) -> &'static str {
 
 const HELP: &str = "\
 Commands: /help [command] /quit /login [endpoint] [model] [api-key] /model [name]
-[model-profile] /profile [name] /theme [name|save] /tree /fork /new /resume
-[id|last] /sessions /compact /tools /mcp /commit [confirm|cancel|edit <message>]
-/pr [confirm|cancel] /skill [name] /workflow [name] /sec [...] /trust [confirm]
-/export [path] /clear /debug
+[model-profile] /profile [name] /theme [name|save] /tree /rewind [turns] [force] /fork /new
+/resume [id|last] /sessions /compact /tools /mcp
+/commit [confirm|cancel|edit <message>] /pr [confirm|cancel] /plan [approve|exit]
+/skill [name] /workflow [name] /sec [...] /approve /trust [confirm] /export [path]
+/clear /debug
 A command that chooses from a list opens a picker when run without an
 argument: type to filter, arrows to move, Enter to pick.
 
@@ -143,6 +159,8 @@ enum BgEvent {
         switch: Switch,
         result: std::result::Result<Arc<Core>, String>,
     },
+    /// A running turn asks the user to approve one call.
+    Permission(permission::PendingAsk),
 }
 
 /// A config switch running in the background.
@@ -179,6 +197,13 @@ struct RunningTool {
     name: String,
     summary: String,
     started: Instant,
+}
+
+/// A hunk opened in the prompt editor with `e`; the review modal is parked
+/// here until Enter saves the edited hunk or Esc restores it unchanged.
+struct HunkEdit {
+    modal: HunkReviewModal,
+    hunk: usize,
 }
 
 const LOGIN_HINT: &str = "\
@@ -404,8 +429,14 @@ struct App {
     /// The theme to restore when a `/theme` picker previewing others is
     /// dismissed.
     theme_before_preview: Option<String>,
+    /// Hunk review: the frontend seam the agent loop calls before a reviewed
+    /// batch writes, and the hunk currently open in the prompt editor.
+    reviewer: Arc<review::TuiReviewer>,
+    hunk_edit: Option<HunkEdit>,
     /// Clear the screen and repaint every cell on the next frame.
     repaint: bool,
+    /// A permission question from the running turn, waiting for y/n.
+    pending_ask: Option<permission::PendingAsk>,
     /// The last frame as drawn, for tests that check the screen.
     #[cfg(test)]
     last_frame: Option<ratatui::buffer::Buffer>,
@@ -414,6 +445,8 @@ struct App {
 impl App {
     fn new(runtime: Runtime, options: UiOptions) -> Result<Self> {
         let config = runtime.core.config.clone();
+        let reviewer = Arc::new(review::TuiReviewer::default());
+        runtime.core.set_reviewer(reviewer.clone());
         let paths = runtime.core.paths.clone();
         let theme = Theme::load(
             &config.ui.theme,
@@ -443,6 +476,7 @@ impl App {
             used,
             window,
             completion: 0,
+            reasoning: 0,
             tok_s: 0.0,
             cache: None,
             session: short_session_id(&session_id),
@@ -491,10 +525,14 @@ impl App {
             bg_rx: Some(bg_rx),
             switching: None,
             theme_before_preview: None,
+            reviewer,
+            hunk_edit: None,
             repaint: false,
+            pending_ask: None,
             #[cfg(test)]
             last_frame: None,
         };
+        app.install_asker();
         app.no_color = app.options.no_color;
         app.transcript = Transcript::new(app.config.ui.show_reasoning);
         app.refresh_session_blocks();
@@ -616,6 +654,7 @@ impl App {
                     view.replace_items(model_items(&models));
                 }
             }
+            BgEvent::Permission(pending) => self.show_permission_request(pending),
             BgEvent::Rebuilt { switch, result } => {
                 self.switching = None;
                 let core = match result {
@@ -868,6 +907,7 @@ impl App {
         self.used_tokens = estimate_used(&runtime.core);
         self.header.used = self.used_tokens;
         self.sync_banner();
+        self.install_asker();
     }
 
     /// Returns whether the header changed (the watcher reports every few
@@ -924,7 +964,9 @@ impl App {
         let activity = self.activity();
         let plan = self.visible_plan();
         let busy = self.turn_active;
-        self.input.set_placeholder(if busy {
+        self.input.set_placeholder(if self.hunk_edit.is_some() {
+            "editing hunk · Enter saves · Esc cancels"
+        } else if busy {
             "the agent is working · esc to interrupt"
         } else if self.switching.is_some() {
             "switching · type ahead, Enter sends when ready"
@@ -1003,7 +1045,9 @@ impl App {
     fn footer(&self) -> FooterData {
         // Login and trust state live in the info bar; the footer is hints or
         // a transient notice only.
-        let (status, status_role) = (String::new(), Role::Muted);
+        let (status, status_role) = self
+            .permission_status()
+            .unwrap_or((String::new(), Role::Muted));
         let hints = if !self.transcript.follow {
             "End or Ctrl+End to return to the bottom · wheel/pgup/pgdn scroll".to_string()
         } else if self.turn_active {
@@ -1271,10 +1315,12 @@ impl App {
         self.stream_phase = StreamPhase::Waiting;
         self.running_tools.clear();
         self.completion_tokens = 0;
+        self.header.reasoning = 0;
         self.tok_s = 0.0;
         self.token_events.clear();
         self.notice = None;
         let (tx, rx) = mpsc::unbounded_channel();
+        self.reviewer.attach(tx.clone());
         self.agent_rx = Some(rx);
         let token = core.cancel.child_token();
         self.turn_cancel = token.clone();
@@ -1290,11 +1336,17 @@ impl App {
     }
 
     fn finish_turn(&mut self, outcome: Option<TurnOutcome>) {
+        // An unanswered question dies with its turn.
+        if let Some(pending) = self.pending_ask.take() {
+            let _ = pending.reply.send(crate::policy::AskAnswer::Deny);
+        }
         self.turn_active = false;
         self.cancelling = false;
         self.turn_state = None;
         self.turn_started = None;
         self.running_tools.clear();
+        self.reviewer.detach();
+        self.hunk_edit = None;
         self.agent_rx = None;
         self.agent_task = None;
         self.transcript.finish_turn();
@@ -1422,12 +1474,13 @@ impl App {
                 if usage.prompt_tokens > 0 {
                     self.used_tokens = usage.prompt_tokens;
                     self.header.used = usage.prompt_tokens;
+                    self.header.cache = usage
+                        .cached_tokens
+                        .map(|cached| (cached.min(usage.prompt_tokens), usage.prompt_tokens));
                 }
                 self.completion_tokens = usage.completion_tokens;
                 self.header.completion = usage.completion_tokens;
-                if usage.cache_percent().is_some() {
-                    self.header.cache = usage.cache_percent();
-                }
+                self.header.reasoning = usage.reasoning_tokens.unwrap_or(0);
                 self.last_usage = Some(usage);
             }
             AgentEvent::Context { used, window } => {
@@ -1466,6 +1519,32 @@ impl App {
             AgentEvent::Notice(message) => {
                 self.transcript.turn_note("notice", &message, false);
                 self.set_notice(message, Role::Muted);
+            }
+            AgentEvent::HunkReview { id, hunks } => {
+                self.hunk_edit = None;
+                self.modal = Some(ModalData::HunkReview(HunkReviewModal::new(id, hunks)));
+                self.set_notice(
+                    "review the proposed hunks · a accept · r reject · e edit · Enter apply",
+                    Role::Accent,
+                );
+            }
+            AgentEvent::Provenance {
+                origin,
+                warning,
+                approval_required,
+                ..
+            } => {
+                if let Some(warning) = warning {
+                    self.transcript.turn_note("provenance", &warning, true);
+                    self.set_notice(
+                        if approval_required {
+                            format!("{origin}: injection warning; approve the next sensitive action with /approve")
+                        } else {
+                            format!("{origin}: injection warning")
+                        },
+                        Role::Warning,
+                    );
+                }
             }
             AgentEvent::Guard { code, message } => {
                 self.transcript.turn_note(&code, &message, true);

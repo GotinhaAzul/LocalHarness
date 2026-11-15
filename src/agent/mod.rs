@@ -1,5 +1,7 @@
 //! Agent loop: context assembly, model streaming, tool batch execution, gates.
 
+pub mod agents_md;
+pub mod authorize;
 pub mod calls;
 pub mod gates;
 pub mod limits;
@@ -47,6 +49,9 @@ pub struct Core {
     pub reads: Arc<Mutex<ReadTracker>>,
     pub bg: Arc<Mutex<BgRegistry>>,
     pub security: Arc<Mutex<SecurityState>>,
+    /// Instruction-provenance warnings waiting for approval. Shared across
+    /// core rebuilds so `/model` does not clear a gate.
+    pub provenance: Arc<Mutex<crate::provenance::ProvenanceState>>,
     /// OS sandbox for `bash` and `bg`, shared with every tool context.
     pub sandbox: Option<Arc<crate::sandbox::Sandbox>>,
     pub budget: TokenBudget,
@@ -102,6 +107,13 @@ pub struct Core {
     /// Optional frontend approval gate for tool calls (ACP). It runs after
     /// the harness gates and can only deny.
     pub approver: Option<Arc<dyn crate::tools::ToolApprover>>,
+    /// Frontend hunk reviewer for file mutations. `None` means no interactive
+    /// surface (headless, ACP): review auto-accepts, which matches the
+    /// pre-review behavior. The TUI installs itself after the core is built.
+    pub reviewer: std::sync::RwLock<Option<Arc<dyn crate::tools::hunk::HunkReviewer>>>,
+    /// Permission mode, rules, and session approvals, shared across core
+    /// rebuilds. Consulted before every dispatch (see [`authorize`]).
+    pub permissions: Arc<crate::policy::Permissions>,
 }
 
 /// One-time endpoint bring-up that outlives the launch path. The TUI opens
@@ -247,6 +259,22 @@ impl Core {
         self.tool_context_with(self.cancel.clone())
     }
 
+    /// The installed hunk reviewer, if this frontend has one.
+    pub fn reviewer(&self) -> Option<Arc<dyn crate::tools::hunk::HunkReviewer>> {
+        self.reviewer
+            .read()
+            .ok()
+            .and_then(|guard| guard.as_ref().cloned())
+    }
+
+    /// Install the frontend hunk reviewer. Called by the TUI after building
+    /// the runtime; the headless paths leave it unset.
+    pub fn set_reviewer(&self, reviewer: Arc<dyn crate::tools::hunk::HunkReviewer>) {
+        if let Ok(mut guard) = self.reviewer.write() {
+            *guard = Some(reviewer);
+        }
+    }
+
     /// Tool context bound to a specific turn's cancellation token. Each turn
     /// gets a child of `Core::cancel`, so cancelling one turn does not poison
     /// later turns.
@@ -260,6 +288,7 @@ impl Core {
             trust: self.config.trust,
             verify: self.config.verify.clone(),
             profile: self.config.profile_name().to_string(),
+            edit_mode: self.model_profile.edit_mode,
             packs: crate::tools::active_packs(&self.tools),
             reads: self.reads.clone(),
             bg: self.bg.clone(),
@@ -318,7 +347,21 @@ pub enum AgentEvent {
         summary: String,
         tokens_before: u64,
     },
+    /// The provenance tag of a tool result, and any injection warning it
+    /// raised. Emitted for every executed tool so `--json` shows the source.
+    Provenance {
+        call_id: String,
+        origin: String,
+        warning: Option<String>,
+        approval_required: bool,
+    },
     Notice(String),
+    /// A reviewed batch is waiting for the frontend's hunk decisions. The
+    /// answer goes back through `HunkReviewer::submit`/`cancel` with `id`.
+    HunkReview {
+        id: u64,
+        hunks: Vec<crate::tools::hunk::HunkView>,
+    },
     Guard {
         code: String,
         message: String,

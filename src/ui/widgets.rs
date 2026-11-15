@@ -25,9 +25,12 @@ pub struct HeaderData {
     pub window: u32,
     /// Completion tokens streamed in the current turn, shown separately.
     pub completion: u32,
+    /// Reasoning tokens in the last reply (reported or estimated).
+    pub reasoning: u32,
     pub tok_s: f32,
-    /// Share of the last prompt served from the server's prefix cache.
-    pub cache: Option<u32>,
+    /// Cached and total prompt tokens for the last call, when the engine
+    /// reported a prefix-cache hit.
+    pub cache: Option<(u32, u32)>,
     pub session: String,
     pub trust: bool,
     /// The context window is a fallback or an upper bound, not a measurement.
@@ -218,6 +221,10 @@ fn context_spans(data: &HeaderData, gauge: bool, theme: &Theme) -> Vec<Span<'sta
         text.push('+');
         text.push_str(&format_tokens(data.completion));
     }
+    if data.reasoning > 0 {
+        text.push_str(" think ");
+        text.push_str(&format_tokens(data.reasoning));
+    }
     spans.push(Span::styled(text, theme.style(Role::Muted)));
     if data.window_guess {
         spans.push(Span::styled("?", theme.bold(Role::Warning)));
@@ -275,9 +282,9 @@ fn header_sides(
     if flags.throughput {
         let mut speed = format!("{:.0} tok/s", data.tok_s.max(0.0));
         if flags.cache
-            && let Some(cache) = data.cache
+            && let Some((cached, prompt)) = data.cache
         {
-            speed.push_str(&format!(" · cache {cache}%"));
+            speed.push_str(&format!(" · cache {cached}/{prompt}"));
         }
         right.push(vec![Span::styled(speed, theme.style(Role::Muted))]);
     }
@@ -556,6 +563,64 @@ pub enum ModalData {
     Sessions(SessionsModal),
     Tools(ToolsModal),
     Picker(PickerModal),
+    HunkReview(HunkReviewModal),
+}
+
+/// The hunk list shown before the second file mutation of a turn lands.
+#[derive(Debug, Clone)]
+pub struct HunkReviewModal {
+    pub id: u64,
+    pub hunks: Vec<crate::tools::hunk::HunkView>,
+    pub choices: Vec<crate::tools::hunk::HunkChoice>,
+    pub selected: usize,
+    pub scroll: usize,
+}
+
+impl HunkReviewModal {
+    pub fn new(id: u64, hunks: Vec<crate::tools::hunk::HunkView>) -> Self {
+        let choices = vec![crate::tools::hunk::HunkChoice::Accept; hunks.len()];
+        Self {
+            id,
+            hunks,
+            choices,
+            selected: 0,
+            scroll: 0,
+        }
+    }
+
+    pub fn move_by(&mut self, delta: isize) {
+        if self.hunks.is_empty() {
+            return;
+        }
+        self.selected = (self.selected as isize + delta)
+            .clamp(0, self.hunks.len().saturating_sub(1) as isize) as usize;
+    }
+
+    pub fn set_selected(&mut self, choice: crate::tools::hunk::HunkChoice) {
+        if let Some(slot) = self.choices.get_mut(self.selected) {
+            *slot = choice;
+        }
+    }
+
+    pub fn set_choice(&mut self, index: usize, choice: crate::tools::hunk::HunkChoice) {
+        if let Some(slot) = self.choices.get_mut(index) {
+            *slot = choice;
+        }
+    }
+
+    pub fn accept_all(&mut self) {
+        self.choices.fill(crate::tools::hunk::HunkChoice::Accept);
+    }
+
+    pub fn reject_all(&mut self) {
+        self.choices.fill(crate::tools::hunk::HunkChoice::Reject);
+    }
+
+    pub fn decision(&self) -> crate::tools::hunk::HunkDecision {
+        crate::tools::hunk::HunkDecision {
+            choices: self.choices.clone(),
+        }
+    }
 }
 
 impl ModalData {
@@ -582,6 +647,18 @@ impl ModalData {
                     view.items.len()
                 )
             }
+            ModalData::HunkReview(view) => {
+                let accepted = view
+                    .choices
+                    .iter()
+                    .filter(|choice| !matches!(choice, crate::tools::hunk::HunkChoice::Reject))
+                    .count();
+                format!(
+                    " Review {}/{} · a accept · r reject · e edit · Enter apply · Esc reject all ",
+                    accepted,
+                    view.hunks.len()
+                )
+            }
         }
     }
 
@@ -592,6 +669,7 @@ impl ModalData {
             ModalData::Sessions(view) => view.items.len(),
             ModalData::Tools(view) => view.items.len(),
             ModalData::Picker(view) => view.filtered().len().max(1),
+            ModalData::HunkReview(view) => view.hunks.len().max(1),
         }
     }
 
@@ -601,6 +679,7 @@ impl ModalData {
             ModalData::Sessions(view) => view.scroll,
             ModalData::Tools(view) => view.scroll,
             ModalData::Picker(view) => view.scroll,
+            ModalData::HunkReview(view) => view.scroll,
         }
     }
 
@@ -634,6 +713,14 @@ impl ModalData {
                 }
                 view.scroll = view.scroll.min(count.saturating_sub(height));
             }
+            ModalData::HunkReview(view) => {
+                if view.selected < view.scroll {
+                    view.scroll = view.selected;
+                } else if view.selected >= view.scroll + height {
+                    view.scroll = view.selected + 1 - height;
+                }
+                view.scroll = view.scroll.min(view.hunks.len().saturating_sub(height));
+            }
         }
     }
 
@@ -644,8 +731,52 @@ impl ModalData {
             ModalData::Sessions(view) => sessions_lines(view, width, theme),
             ModalData::Tools(view) => tools_lines(view, width, theme),
             ModalData::Picker(view) => picker_lines(view, width, theme),
+            ModalData::HunkReview(view) => hunk_review_lines(view, width, theme),
         }
     }
+}
+
+fn hunk_review_lines(view: &HunkReviewModal, width: usize, theme: &Theme) -> Vec<Line<'static>> {
+    use crate::tools::hunk::HunkChoice;
+
+    let mut lines = Vec::new();
+    if view.hunks.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "no proposed changes",
+            theme.style(Role::Muted),
+        )));
+        return lines;
+    }
+    for (index, hunk) in view.hunks.iter().enumerate() {
+        let (marker, marker_role) = match view.choices.get(index) {
+            Some(HunkChoice::Reject) => ("reject", Role::Error),
+            Some(HunkChoice::Edit(_)) => ("edit  ", Role::Warning),
+            _ => ("accept", Role::Success),
+        };
+        let range = hunk.range_label();
+        let counts = format!("+{} -{}", hunk.added, hunk.removed);
+        let fixed = 2 + 6 + 1 + hunk.file.chars().count() + 1 + range.chars().count() + 1;
+        let rationale_width = width.saturating_sub(fixed + counts.chars().count() + 4);
+        let mut line = Line::from(vec![
+            Span::styled("  ", theme.style(Role::Fg)),
+            Span::styled(marker, theme.bold(marker_role)),
+            Span::styled("  ", theme.style(Role::Fg)),
+            Span::styled(hunk.file.clone(), theme.style(Role::Accent)),
+            Span::styled("  ", theme.style(Role::Fg)),
+            Span::styled(range, theme.style(Role::Muted)),
+            Span::styled("  ", theme.style(Role::Fg)),
+            Span::styled(
+                clip_end(&hunk.rationale, rationale_width.max(8)),
+                theme.style(Role::Fg),
+            ),
+            Span::styled(format!("  {counts}"), theme.style(Role::Muted)),
+        ]);
+        if index == view.selected {
+            line = line.style(selected_style(theme));
+        }
+        lines.push(line);
+    }
+    lines
 }
 
 fn selected_style(theme: &Theme) -> Style {
@@ -818,4 +949,34 @@ pub fn tools_lines(view: &ToolsModal, width: usize, theme: &Theme) -> Vec<Line<'
         lines.push(Line::styled("(no active tools)", theme.style(Role::Muted)));
     }
     lines
+}
+
+#[cfg(test)]
+mod reasoning_meter_tests {
+    use super::*;
+
+    #[test]
+    fn token_meter_shows_reasoning_tokens() {
+        let theme = Theme::bundled("default");
+        let mut data = HeaderData {
+            cwd: "/tmp/p".into(),
+            model: "m".into(),
+            logged_in: true,
+            used: 1200,
+            window: 8000,
+            completion: 900,
+            ..HeaderData::default()
+        };
+        let text = |data: &HeaderData| -> String {
+            header_line(data, 160, &theme)
+                .spans
+                .iter()
+                .map(|span| span.content.to_string())
+                .collect()
+        };
+        assert!(!text(&data).contains("think"));
+        data.reasoning = 640;
+        let line = text(&data);
+        assert!(line.contains("think 640"), "{line}");
+    }
 }
