@@ -644,7 +644,7 @@ core and coding; `full` adds the security pack.
 | Core | `read` | Read a file with line numbers |
 | Core | `write` | Create or replace a file |
 | Core | `edit` | Exact-text replacement |
-| Core | `patch` | Anchor/range edit with recovery diagnostics |
+| Core | `patch` | Exact-anchor edit by default; hash mode takes line anchors with recovery diagnostics |
 | Core | `undo` | Revert the last harness change to a file, one step per call |
 | Core | `bash` | Non-interactive command with timeout |
 | Core | `grep` | Regex search with context, gitignore-aware (hidden paths only when named) |
@@ -677,7 +677,18 @@ code and, where useful, the exact call shape.
 - `content` is text, capped. `details` is structured but never sent to the
   model unless summarized.
 - `read` returns line numbers and caps at 150 lines by default, 800 maximum.
-  Binary files are detected and refused with a message.
+  Binary files are detected and refused with a message. With
+  `edit_mode = "hash"` in the model profile it also prints a
+  `[path#snapshot]` header and an 8-hex content hash before each line; text
+  mode output is unchanged.
+- In hash edit mode, `patch` takes `path#snapshot` and an `ops` array of
+  `PUT` (replace a range with text), `CUT` (delete a range), `REM` (delete one
+  line), and `MV` (move a block after another anchored line). Line numbers are
+  original read coordinates. The snapshot and every referenced line hash are
+  checked before a single atomic write; any mismatch returns `STALE_ANCHOR`
+  with fresh anchors and writes nothing. A successful patch returns fresh
+  anchors for the changed lines, and untouched lines keep their bytes and line
+  endings. Text-mode `patch` and `edit` are unchanged.
 - `write` and `edit` are atomic (temp file plus rename) and record `fs-change`.
 - `edit` preflight handles: multiple matches (list line numbers), whitespace-
   only match (show the verbatim excerpt), and no match (show the closest
@@ -724,10 +735,12 @@ code and, where useful, the exact call shape.
   mtime and size, and returns a character-budgeted map. It skips binary files,
   files above 256 KB, and build/vendor directories. A compact map is injected
   into the system prompt at startup.
-- `write`, `edit`, and `patch` request post-edit diagnostics through the shared
-  LSP service when the file belongs to a project with a server marker. Only
-  errors and warnings are appended, capped at 8 entries; an unavailable or cold
-  server leaves the mutation result untouched.
+- `write`, `edit`, and `patch` snapshot diagnostics through the shared LSP
+  service before a mutation when `[lsp] gate` is not `off`. Only new
+  severity-error diagnostics count: `warn` appends them, `block` restores the
+  pre-edit bytes and returns `EDIT_REGRESSION` with a fix hint. Pre-existing
+  errors are suppressed, and a clean, cold, or non-project edit adds no text.
+  The check never starts a cold server and caps its warm wait at 250 ms.
 - `test` detects vitest, jest, go, cargo, pytest, or an npm test script. It runs
   one file or one test and returns only the first failure, capped at 2500
   characters. Parsers strip ANSI and progress noise.
@@ -870,6 +883,9 @@ tools = ["read", "bash", "verify"]
 - Tool lists are static for a model call. The set may change between calls only
   when a profile changes or an external workflow starts; `todo` stays visible
   in `full` and `coding` and its gate blocks edits rather than hiding the tool.
+- A model profile may set `edit_mode = "hash"` (default `"text"`); it changes
+  only `read` annotations and `patch` operations, and leaves exact-text `edit`
+  and text-mode `patch` byte-identical.
 - The active tool list is sent to the model and shown in `/tools`.
 
 ### 6.5 Tool result presentation

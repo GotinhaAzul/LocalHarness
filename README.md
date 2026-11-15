@@ -133,6 +133,7 @@ Twenty-four built-ins in three packs. `coding` (core + coding) is the default; `
 - **`review`** reads the working tree and checks the diff before the session settles.
 - **`undo`** reverts the last `edit`, `patch`, or `write` from session snapshots, and refuses when the file changed after the harness wrote it. Changes made through `bash` are not tracked.
 - **`read`/`grep`/`glob`** respect ignore files and keep results small; oversized output is archived and available through `recall`.
+- **Hash edits (opt-in)** — `edit_mode = "hash"` makes `read` print content hashes and lets `patch` apply `PUT`/`CUT`/`REM`/`MV` line anchors from `path#snapshot`; stale anchors write nothing and return fresh ones. Exact-text `edit` remains the default. See [configuration](docs/configuration.md#hash-anchored-edits).
 
 Tool results are capped, archived, and retrievable. The model never has to guess where an excerpt came from.
 
