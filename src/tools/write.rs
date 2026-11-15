@@ -151,6 +151,14 @@ fn run(ctx: &ToolContext, args: &Value) -> Result<ToolResult, ToolResult> {
 
     let mode = if existed { file_mode(&path) } else { 0o600 };
     let previous = crate::tools::undo::previous_text(&path);
+    // A read failure (not UTF-8, or over 4 MB) cannot be diffed for review;
+    // keep the lossy text so `mutation_write` knows the file exists.
+    let before_text = match &previous {
+        Ok(text) => text.clone(),
+        Err(_) => std::fs::read(&path)
+            .ok()
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned()),
+    };
     let change = crate::tools::undo::record_change(
         ctx,
         previous
@@ -159,7 +167,7 @@ fn run(ctx: &ToolContext, args: &Value) -> Result<ToolResult, ToolResult> {
             .map_err(Clone::clone),
         content,
     );
-    atomic_write(&path, content.as_bytes(), mode)
+    crate::tools::hunk::mutation_write(&path, before_text.as_deref(), content, mode)
         .map_err(|err| ToolResult::err("WRITE_FAILED", format!("cannot write {display}: {err}")))?;
 
     record_own_write(ctx, &path);
@@ -260,7 +268,18 @@ pub(crate) fn file_mode(path: &Path) -> u32 {
 }
 
 /// Replace `path` atomically: write a sibling temp file, fsync, then rename.
+/// Every harness file mutation (`write`, `edit`, `patch`, `undo`) goes
+/// through here, so this is also where redaction placeholders are refused.
 pub(crate) fn atomic_write(path: &Path, bytes: &[u8], mode: u32) -> std::io::Result<()> {
+    refuse_new_placeholders(path, bytes)?;
+    atomic_restore(path, bytes, mode)
+}
+
+/// Put back bytes that were on disk moments ago in this process, for example
+/// when a failed multi-file apply rolls back. This skips the placeholder
+/// guard: the bytes are the file's own previous state, not new content, and a
+/// file that legitimately held placeholder text must be restorable.
+pub(crate) fn atomic_restore(path: &Path, bytes: &[u8], mode: u32) -> std::io::Result<()> {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
@@ -296,6 +315,32 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8], mode: u32) -> std::io::Res
     outcome
 }
 
+/// A `[REDACTED:<kind>:<first4>...<hash8>]` placeholder stands in for a value
+/// removed when a session was saved. It is never real file content, so
+/// writing one the file does not already hold would corrupt the file. The
+/// live session never shows the model a placeholder, but a resumed session or
+/// an old artifact can.
+pub(crate) fn refuse_new_placeholders(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let after = String::from_utf8_lossy(bytes);
+    if !crate::security::redact::contains_placeholder(&after) {
+        return Ok(());
+    }
+    let before = std::fs::read(path)
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .unwrap_or_default();
+    let new = crate::security::redact::new_placeholders(&before, &after);
+    let Some(first) = new.first() else {
+        return Ok(());
+    };
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!(
+            "the new content contains {} redaction placeholder(s) such as {first} that the file does not; placeholders replace values when a session is saved and are not file content. Re-read the file and write its real text; nothing was written",
+            new.len()
+        ),
+    ))
+}
+
 #[cfg(test)]
 pub(crate) fn test_context(dir: &Path) -> ToolContext {
     use std::sync::{Arc, Mutex};
@@ -325,6 +370,7 @@ pub(crate) fn test_context(dir: &Path) -> ToolContext {
         app: "test".into(),
         redact: true,
         context: None,
+        permissions: None,
     };
     let session = Session::create(&paths, header, true).expect("in-memory session");
     ToolContext {
@@ -336,6 +382,7 @@ pub(crate) fn test_context(dir: &Path) -> ToolContext {
         trust: false,
         verify: VerifyConfig { steps: Vec::new() },
         profile: "test".into(),
+        edit_mode: crate::config::EditMode::Text,
         packs: Vec::new(),
         reads: Arc::new(Mutex::new(ReadTracker::default())),
         bg: Arc::new(Mutex::new(BgRegistry::default())),
@@ -384,6 +431,43 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    fn placeholder_for(value: &str) -> String {
+        // Built through the redactor so the test follows its real format.
+        let redacted = crate::security::redact::Redactor::new(true)
+            .redact_owned(&format!("aws_key = {value}"));
+        redacted.trim_start_matches("aws_key = ").to_string()
+    }
+
+    #[test]
+    fn atomic_write_refuses_a_new_placeholder_and_leaves_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("task_storage.py");
+        let original = "name = Column(Text)\n";
+        std::fs::write(&path, original).unwrap();
+        let key = format!("AKIA{}", "Q".repeat(16));
+        let placeholder = placeholder_for(&key);
+        assert!(placeholder.starts_with("[REDACTED:aws:"), "{placeholder}");
+        let corrupted = format!("name = {placeholder} Text)\n");
+        let err = atomic_write(&path, corrupted.as_bytes(), 0o600).unwrap_err();
+        assert!(err.to_string().contains("redaction placeholder"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        // A new file is refused too.
+        let fresh = dir.path().join("fresh.py");
+        assert!(atomic_write(&fresh, corrupted.as_bytes(), 0o600).is_err());
+        assert!(!fresh.exists());
+    }
+
+    #[test]
+    fn atomic_write_keeps_placeholders_the_file_already_has() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fixture.txt");
+        let placeholder = placeholder_for(&format!("AKIA{}", "Z".repeat(16)));
+        std::fs::write(&path, format!("expected = {placeholder}\n")).unwrap();
+        let edited = format!("expected = {placeholder}\nmore = 1\n");
+        atomic_write(&path, edited.as_bytes(), 0o600).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), edited);
     }
 
     #[tokio::test]

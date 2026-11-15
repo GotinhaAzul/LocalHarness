@@ -18,6 +18,7 @@ use crate::provider::{OpenAiCompatProvider, Provider, probe};
 use crate::security::SecurityState;
 use crate::session::{
     APP_VERSION, CustomData, EntryKind, Session, SessionContextWindow, SessionData,
+    SessionPermissions,
 };
 use crate::skills::SkillIndex;
 use crate::tools::{BgRegistry, ReadTracker, SessionHandle, SessionHandle as Handle, ToolRegistry};
@@ -225,6 +226,10 @@ pub async fn create_runtime(
     let probe_provider = OpenAiCompatProvider::new(&config.model, model.clone())?;
 
     let (_, mut profile) = config.model_profile();
+    if let Some(warning) = profile.reasoning_field_warning() {
+        tracing::warn!("{warning}");
+        startup_warnings.push(warning);
+    }
     let window_cache: Arc<Mutex<std::collections::HashMap<String, u32>>> = Default::default();
     let resolved = resolve_window_truth(&config, &probe_provider, &window_cache).await;
     let context_window = resolved.window;
@@ -241,6 +246,18 @@ pub async fn create_runtime(
         options.engagement.clone(),
         redact,
     )?));
+
+    let policy =
+        crate::policy::Policy::compile(&config.permissions.rules).map_err(anyhow::Error::msg)?;
+    let permissions = Arc::new(crate::policy::Permissions::new(
+        policy,
+        config.permissions.mode,
+    ));
+    let session_permissions = SessionPermissions {
+        mode: permissions.mode().label().to_string(),
+        rules_hash: permissions.policy().hash().to_string(),
+        rules: permissions.policy().len(),
+    };
 
     if !options.no_session {
         paths.ensure_dirs()?;
@@ -286,10 +303,39 @@ pub async fn create_runtime(
                 app: APP_VERSION.to_string(),
                 redact,
                 context: session_context(window_truth.as_ref()),
+                permissions: Some(session_permissions.clone()),
             },
             options.no_session,
         )?,
     };
+    // A resumed session keeps its original header; record the policy this
+    // run uses when it differs.
+    if session
+        .header()
+        .and_then(|header| header.permissions.as_ref())
+        != Some(&session_permissions)
+        && let Err(error) = session.append(EntryKind::Custom(
+            CustomData::new("permissions")
+                .with("mode", session_permissions.mode.as_str())
+                .with("rules_hash", session_permissions.rules_hash.as_str())
+                .with("rules", session_permissions.rules),
+        ))
+    {
+        tracing::warn!(%error, "cannot record the permission mode in the session");
+    }
+    if permissions.mode() == crate::policy::PermissionMode::Yolo {
+        // Config files cannot select yolo; only the explicit flag reaches here.
+        if let Err(error) = session.append(EntryKind::Custom(
+            CustomData::new("permission-mode")
+                .with("mode", "yolo")
+                .with("source", "--yolo"),
+        )) {
+            tracing::warn!(%error, "cannot record --yolo in the session");
+        }
+        session.warnings.push(
+            "--yolo: every tool call runs without asking; only deny rules still apply".into(),
+        );
+    }
     session.warnings.extend(startup_warnings);
     let recorded_redact = session.header().map(|header| header.redact).unwrap_or(true);
     if recorded_redact != redact {
@@ -361,6 +407,7 @@ pub async fn create_runtime(
     registry.configure_git(&config.git);
     let mcp = Arc::new(crate::mcp::McpManager::new());
     let (tools, mcp_warnings) = select_tools(&registry, &config, &paths, &mcp).await?;
+    let tools = permissions.filter_tools(tools, &registry);
     session.warnings.extend(mcp_warnings);
     let mut tool_specs = ToolRegistry::specs_with(&tools, profile.short_tool_schemas());
     // With a background `model.start_command`, the server may not be up yet;
@@ -393,17 +440,47 @@ pub async fn create_runtime(
             }
         }
     }
+    let engine = crate::provider::Engine::resolve(provider.as_ref(), &config.model.engine).await;
+    let samplers = crate::provider::SamplerSettings::resolve(&config.model, &profile);
+    for warning in samplers.warnings(engine) {
+        tracing::warn!("{warning}");
+        session.warnings.push(warning);
+    }
+    let structured = resolve_structured(
+        &config,
+        &paths,
+        provider.as_ref(),
+        engine,
+        !tool_specs.is_empty(),
+        &mut session.warnings,
+    )
+    .await?;
     let skills =
         SkillIndex::load(&paths, config.trust).advertised_for(&crate::tools::active_packs(&tools));
     let repo_brief = registry
         .repo()
         .brief(&paths.cwd, crate::tools::repo_map::BRIEF_BUDGET);
-    let system_prompt =
-        prompt::build_system_prompt(&config, &paths, &skills, &tools, Some(&repo_brief));
+    let agents = crate::agent::agents_md::AgentsMd::load(&paths.cwd, config.prompt.agents_md);
+    for warning in &agents.warnings {
+        if !session.warnings.contains(warning) {
+            session.warnings.push(warning.clone());
+        }
+    }
+    let system_prompt = prompt::build_system_prompt_with_agents(
+        &config,
+        &paths,
+        &skills,
+        &tools,
+        Some(&repo_brief),
+        &agents,
+    );
     // A server without native tool calls still lists the tools in the system
     // prompt; name the exact wire format the repair layer can execute.
     let mut system_prompt = system_prompt;
     if let Some(text) = repair_protocol(tool_probe.as_ref(), &tools, !tool_specs.is_empty()) {
+        system_prompt.push_str(&text);
+    }
+    if let Some(text) = structured_protocol(structured.as_ref()) {
         system_prompt.push_str(&text);
     }
     let mut budget = TokenBudget::new(context_window, config.model.max_output_tokens);
@@ -463,6 +540,7 @@ pub async fn create_runtime(
     let artifacts = session.artifacts.clone();
     let reads = Arc::new(Mutex::new(ReadTracker::default()));
     let bg = Arc::new(Mutex::new(BgRegistry::new()));
+    let provenance = Arc::new(Mutex::new(crate::provenance::ProvenanceState::default()));
     let session_handle: Handle = Arc::new(Mutex::new(session));
 
     // The gateway may be down. Start it in the background so the TUI does not
@@ -521,6 +599,7 @@ pub async fn create_runtime(
         reads,
         bg,
         security,
+        provenance,
         sandbox: sandbox.clone(),
         budget,
         static_prompt,
@@ -531,6 +610,8 @@ pub async fn create_runtime(
         model_profile: profile,
         vision,
         tool_probe,
+        engine,
+        structured,
         cancel: CancellationToken::new(),
         tool_timeout: Duration::from_secs(660),
         path_jail: options.path_jail,
@@ -544,6 +625,8 @@ pub async fn create_runtime(
         startup,
         mcp,
         approver: options.approver.clone(),
+        reviewer: Default::default(),
+        permissions,
     };
 
     Ok(Runtime {
@@ -655,7 +738,30 @@ pub async fn rebuild_core(old: &Arc<Core>, mut config: Config) -> Result<Arc<Cor
     let mut registry = ToolRegistry::builtin();
     registry.lsp().set_gate(config.lsp.gate);
     registry.configure_git(&config.git);
+    // Rules change only when the config files do (for example `/trust`
+    // loading the project config); workflows and profiles cannot touch them.
+    let policy =
+        crate::policy::Policy::compile(&config.permissions.rules).map_err(anyhow::Error::msg)?;
+    let permissions = if policy.hash() == old.permissions.policy().hash() {
+        old.permissions.clone()
+    } else {
+        let permissions = Arc::new(old.permissions.with_policy(policy));
+        if let Ok(mut session) = old.session.lock()
+            && let Err(error) = session.append(EntryKind::Custom(
+                CustomData::new("permissions")
+                    .with("mode", permissions.mode().label())
+                    .with("rules_hash", permissions.policy().hash())
+                    .with("rules", permissions.policy().len()),
+            ))
+        {
+            tracing::warn!(%error, "cannot record the permission rules in the session");
+        }
+        permissions
+    };
     let (tools, mcp_warnings) = select_tools(&registry, &config, &old.paths, &old.mcp).await?;
+    // Plan mode filters every rebuild, so a workflow or profile switch cannot
+    // bring a mutating tool back while it is active.
+    let tools = permissions.filter_tools(tools, &registry);
     if !mcp_warnings.is_empty() {
         for warning in &mcp_warnings {
             tracing::warn!("{warning}");
@@ -671,8 +777,22 @@ pub async fn rebuild_core(old: &Arc<Core>, mut config: Config) -> Result<Arc<Cor
     let repo_brief = registry
         .repo()
         .brief(&old.paths.cwd, crate::tools::repo_map::BRIEF_BUDGET);
-    let mut system_prompt =
-        prompt::build_system_prompt(&config, &old.paths, &skills, &tools, Some(&repo_brief));
+    let agents = crate::agent::agents_md::AgentsMd::load(&old.paths.cwd, config.prompt.agents_md);
+    if let Ok(mut session) = old.session.lock() {
+        for warning in &agents.warnings {
+            if !session.warnings.contains(warning) {
+                session.warnings.push(warning.clone());
+            }
+        }
+    }
+    let mut system_prompt = prompt::build_system_prompt_with_agents(
+        &config,
+        &old.paths,
+        &skills,
+        &tools,
+        Some(&repo_brief),
+        &agents,
+    );
     // Same target: keep the conformance result unless it never ran. A model
     // switch probes again so the mode tracks the newly loaded server.
     let tool_probe = if same_target && old.tool_probe.is_some() {
@@ -689,7 +809,39 @@ pub async fn rebuild_core(old: &Arc<Core>, mut config: Config) -> Result<Arc<Cor
     if let Some(probe) = &tool_probe {
         apply_tool_probe(probe, &mut model_profile, &mut tool_specs);
     }
+    let engine = if same_target {
+        old.engine
+    } else {
+        crate::provider::Engine::resolve(provider.as_ref(), &config.model.engine).await
+    };
+    if !same_target {
+        let samplers = crate::provider::SamplerSettings::resolve(&config.model, &model_profile);
+        for warning in samplers.warnings(engine) {
+            tracing::warn!("{warning}");
+            if let Ok(mut session) = old.session.lock() {
+                session.warnings.push(warning);
+            }
+        }
+    }
+    let mut structured_warnings = Vec::new();
+    let structured = resolve_structured(
+        &config,
+        &old.paths,
+        provider.as_ref(),
+        engine,
+        !tool_specs.is_empty(),
+        &mut structured_warnings,
+    )
+    .await?;
+    if !structured_warnings.is_empty()
+        && let Ok(mut session) = old.session.lock()
+    {
+        session.warnings.extend(structured_warnings);
+    }
     if let Some(text) = repair_protocol(tool_probe.as_ref(), &tools, !tool_specs.is_empty()) {
+        system_prompt.push_str(&text);
+    }
+    if let Some(text) = structured_protocol(structured.as_ref()) {
         system_prompt.push_str(&text);
     }
     let mut budget = TokenBudget::new(context_window, config.model.max_output_tokens);
@@ -756,6 +908,7 @@ pub async fn rebuild_core(old: &Arc<Core>, mut config: Config) -> Result<Arc<Cor
         reads: old.reads.clone(),
         bg: old.bg.clone(),
         security: old.security.clone(),
+        provenance: old.provenance.clone(),
         sandbox: old.sandbox.clone(),
         budget,
         static_prompt,
@@ -766,6 +919,8 @@ pub async fn rebuild_core(old: &Arc<Core>, mut config: Config) -> Result<Arc<Cor
         model_profile,
         vision,
         tool_probe,
+        engine,
+        structured,
         cancel: old.cancel.clone(),
         tool_timeout: old.tool_timeout,
         path_jail: old.path_jail,
@@ -778,6 +933,8 @@ pub async fn rebuild_core(old: &Arc<Core>, mut config: Config) -> Result<Arc<Cor
         window_cache: old.window_cache.clone(),
         mcp: old.mcp.clone(),
         approver: old.approver.clone(),
+        reviewer: std::sync::RwLock::new(old.reviewer()),
+        permissions,
         // Endpoint bring-up is not retried on `/model` or `/login`; only a
         // still-running bring-up for the same target carries over.
         startup: if same_target {
@@ -1049,6 +1206,78 @@ fn apply_tool_probe(
     if probe.outcome == probe::ToolProbeOutcome::Rejected400 {
         tool_specs.clear();
     }
+}
+
+/// Load, validate, and lower `[model] response_schema` for this engine.
+/// An unsupported keyword is a hard error naming the keyword; a missing
+/// grammar backend is a visible fallback to the repair loop.
+async fn resolve_structured(
+    config: &Config,
+    paths: &Paths,
+    provider: &dyn Provider,
+    engine: crate::provider::Engine,
+    tools_present: bool,
+    warnings: &mut Vec<String>,
+) -> anyhow::Result<Option<crate::provider::StructuredRequest>> {
+    let configured = config.model.response_schema.trim();
+    if configured.is_empty() {
+        return Ok(None);
+    }
+    let path = [
+        paths.cwd.join(configured),
+        paths.config_dir.join(configured),
+        PathBuf::from(configured),
+    ]
+    .into_iter()
+    .find(|path| path.is_file())
+    .ok_or_else(|| {
+        anyhow::anyhow!(
+            "response schema {configured:?} does not exist; put it next to the project or pass an absolute --json-schema path"
+        )
+    })?;
+    let text = std::fs::read_to_string(&path)
+        .with_context(|| format!("cannot read response schema {}", path.display()))?;
+    let schema: serde_json::Value = serde_json::from_str(&text)
+        .with_context(|| format!("response schema {} is not JSON", path.display()))?;
+    let name = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("response")
+        .to_string();
+    let mut request = crate::provider::structured::plan(engine, &name, &schema)
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    if let Some(refusal) =
+        crate::provider::structured::tools_conflict(engine, &request, tools_present)
+    {
+        bail!("{refusal}");
+    }
+    if request.mode == crate::provider::StructuredMode::KoboldGrammar {
+        match crate::provider::structured::kobold_grammar(provider, &request.schema).await {
+            Ok(grammar) => request.grammar = Some(grammar),
+            Err(error) => {
+                let warning = format!(
+                    "koboldcpp json_to_grammar failed ({error}); using the locally lowered GBNF instead"
+                );
+                tracing::warn!("{warning}");
+                warnings.push(warning);
+            }
+        }
+    } else if let Some(notice) = request.notice() {
+        tracing::warn!("{notice}");
+        warnings.push(notice);
+    }
+    Ok(Some(request))
+}
+
+/// Tell the model the exact shape and that prose is not accepted. The
+/// grammar constrains tokens but never reaches the prompt on llama.cpp, so
+/// the schema is repeated as data.
+fn structured_protocol(request: Option<&crate::provider::StructuredRequest>) -> Option<String> {
+    let request = request?;
+    Some(format!(
+        "\n\n## Structured output\nReturn exactly one JSON document, with no prose and no Markdown fence. It must validate against this JSON Schema:\n{}\n",
+        serde_json::to_string_pretty(&request.schema).unwrap_or_default()
+    ))
 }
 
 fn warn_if_remote(endpoint: &str) {
@@ -1561,6 +1790,57 @@ mod tests {
             message: outcome.code().into(),
             checked: "2026-11-11T00:00:00Z".into(),
         }
+    }
+
+    #[tokio::test]
+    async fn unsupported_schema_keyword_is_refused_and_mlx_falls_back_to_repair() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(dir.path());
+        let schema_path = paths.cwd.join("reply.json");
+        std::fs::write(
+            &schema_path,
+            r#"{"oneOf":[{"type":"object"},{"type":"string"}]}"#,
+        )
+        .unwrap();
+        let mut config = Config::builtin();
+        config.model.response_schema = schema_path.display().to_string();
+        let provider = OpenAiCompatProvider::new(&config.model, "qwen3-coder").unwrap();
+        let error = resolve_structured(
+            &config,
+            &paths,
+            &provider,
+            crate::provider::Engine::Vllm,
+            false,
+            &mut Vec::new(),
+        )
+        .await
+        .expect_err("oneOf must be rejected");
+        assert!(error.to_string().contains("oneOf"), "{error}");
+
+        std::fs::write(
+            &schema_path,
+            r#"{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"]}"#,
+        )
+        .unwrap();
+        let mut warnings = Vec::new();
+        let structured = resolve_structured(
+            &config,
+            &paths,
+            &provider,
+            crate::provider::Engine::Mlx,
+            false,
+            &mut warnings,
+        )
+        .await
+        .expect("mlx fallback")
+        .expect("schema");
+        assert_eq!(structured.mode, crate::provider::StructuredMode::Repair);
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("no grammar backend")),
+            "{warnings:?}"
+        );
     }
 
     #[test]

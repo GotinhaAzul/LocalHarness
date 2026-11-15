@@ -32,10 +32,18 @@ pub struct Config {
     #[serde(rename = "model_profile")]
     pub model_profiles: BTreeMap<String, ModelProfile>,
     pub verify: VerifyConfig,
+    /// When file mutations pause for interactive hunk review.
+    pub review: ReviewMode,
+    /// Lifecycle hooks, keyed by hook name (`[hooks.<name>]`).
+    pub hooks: HooksConfig,
     /// Model Context Protocol servers, keyed by server name (`[mcp.<name>]`).
     pub mcp: BTreeMap<String, McpServerConfig>,
     /// Image attachments and the optional describing model (`[vision]`).
     pub vision: VisionConfig,
+    /// Permission mode and ordered allow/ask/deny rules (`[permissions]`).
+    /// Read from the global config and a trusted project config only; rules
+    /// from both are kept, global first.
+    pub permissions: crate::policy::PermissionsConfig,
     /// Runtime selection, set from CLI or environment.
     #[serde(skip)]
     pub profile_name: String,
@@ -189,6 +197,19 @@ impl Config {
                 ..ModelProfile::default()
             },
         );
+        // Opt-in content-hash anchors: `read` annotates lines and `patch`
+        // accepts `path#snapshot` plus PUT/CUT/REM/MV operations. Exact-text
+        // editing remains the default.
+        cfg.model_profiles.insert(
+            "hash".into(),
+            ModelProfile {
+                tool_mode: ToolMode::Repair,
+                strip_reasoning: Some(true),
+                edit_mode: EditMode::Hash,
+                short_tool_schemas: Some(true),
+                ..ModelProfile::default()
+            },
+        );
         cfg.model_profiles.insert(
             "strict".into(),
             ModelProfile {
@@ -217,6 +238,65 @@ impl Config {
                 ..ModelProfile::default()
             },
         );
+        // Sampler presets. `model_profile = "auto"` picks one from the model
+        // id, so selecting a Qwen/Gemma/GLM model with `/model` also applies
+        // its sampler profile. They can be named explicitly with
+        // `--model-profile` or `model_profile = "qwen-coding"`.
+        cfg.model_profiles.insert(
+            "qwen-coding".into(),
+            ModelProfile {
+                match_: vec![
+                    "qwen3-coder".into(),
+                    "qwen3.5-coder".into(),
+                    "qwen2.5-coder".into(),
+                    "qwen3".into(),
+                ],
+                temperature: Some(0.2),
+                top_p: Some(0.95),
+                min_p: Some(0.05),
+                repeat_penalty: Some(1.05),
+                dry_multiplier: Some(0.8),
+                dry_base: Some(1.75),
+                xtc_probability: Some(0.0),
+                seed: Some(0),
+                tool_mode: ToolMode::Auto,
+                ..ModelProfile::default()
+            },
+        );
+        cfg.model_profiles.insert(
+            "gemma-chat".into(),
+            ModelProfile {
+                match_: vec![
+                    "gemma3".into(),
+                    "gemma-3".into(),
+                    "gemma2".into(),
+                    "gemma".into(),
+                ],
+                temperature: Some(0.7),
+                top_p: Some(0.95),
+                min_p: Some(0.0),
+                repeat_penalty: Some(1.1),
+                seed: Some(0),
+                tool_mode: ToolMode::Auto,
+                ..ModelProfile::default()
+            },
+        );
+        cfg.model_profiles.insert(
+            "glm-agent".into(),
+            ModelProfile {
+                match_: vec!["glm-4".into(), "glm4".into(), "glm".into()],
+                temperature: Some(0.6),
+                top_p: Some(0.9),
+                min_p: Some(0.02),
+                repeat_penalty: Some(1.05),
+                dry_multiplier: Some(0.8),
+                dry_base: Some(1.75),
+                xtc_probability: Some(0.0),
+                seed: Some(0),
+                tool_mode: ToolMode::Auto,
+                ..ModelProfile::default()
+            },
+        );
         cfg
     }
 
@@ -224,15 +304,29 @@ impl Config {
     /// config. `project` is only passed when trust is granted.
     pub fn load(global: &Path, project: Option<&Path>) -> Result<Self> {
         let mut value = toml::Value::try_from(Self::builtin()).context("serialize defaults")?;
+        let mut rules: Vec<toml::Value> = Vec::new();
         if global.exists() {
-            let raw = read_toml(global)?;
+            let mut raw = read_toml(global)?;
+            rules.extend(take_permission_rules(&mut raw));
             deep_merge(&mut value, raw);
         }
         if let Some(project) = project
             && project.exists()
         {
-            let raw = read_toml(project)?;
+            let mut raw = read_toml(project)?;
+            rules.extend(take_permission_rules(&mut raw));
             deep_merge(&mut value, raw);
+        }
+        // Arrays replace on merge; permission rules accumulate instead, so a
+        // trusted project adds rules after the global ones rather than
+        // silently dropping them.
+        if let Some(table) = value.as_table_mut() {
+            let permissions = table
+                .entry("permissions")
+                .or_insert_with(|| toml::Value::Table(Default::default()));
+            if let Some(permissions) = permissions.as_table_mut() {
+                permissions.insert("rules".into(), toml::Value::Array(rules));
+            }
         }
         let mut cfg: Config = value.try_into().context("config schema mismatch")?;
         cfg.apply_env();
@@ -241,7 +335,8 @@ impl Config {
     }
 
     /// Environment overrides. `LH_ENDPOINT`, `LH_MODEL`, `LH_API_KEY`,
-    /// `LH_PROFILE`, `LH_MODEL_PROFILE`, `LH_THEME` are read.
+    /// `LH_PROFILE`, `LH_MODEL_PROFILE`, `LH_THEME`, and `LH_AGENTS_MD` are
+    /// read.
     pub fn apply_env(&mut self) {
         if let Ok(v) = std::env::var("LH_ENDPOINT")
             && !v.trim().is_empty()
@@ -269,6 +364,13 @@ impl Config {
         {
             self.ui.theme = v;
         }
+        if let Ok(value) = std::env::var("LH_AGENTS_MD") {
+            match value.trim().to_ascii_lowercase().as_str() {
+                "0" | "false" | "off" | "no" => self.prompt.agents_md = false,
+                "1" | "true" | "on" | "yes" => self.prompt.agents_md = true,
+                _ => {}
+            }
+        }
         if std::env::var("LH_NO_SESSION").is_ok() {
             self.session.no_session = true;
         }
@@ -295,6 +397,13 @@ impl Config {
                 .validate(name)
                 .with_context(|| format!("invalid [mcp.{name}]"))?;
         }
+        self.hooks.validate()?;
+        if self.permissions.mode == crate::policy::PermissionMode::Yolo {
+            bail!(
+                "permissions.mode = \"yolo\" is not accepted in a config file; pass --yolo explicitly for one run"
+            );
+        }
+        crate::policy::Policy::compile(&self.permissions.rules).map_err(anyhow::Error::msg)?;
         Ok(())
     }
 
@@ -343,16 +452,22 @@ impl Config {
             return (selected, default);
         }
         let model = self.model.model.to_ascii_lowercase();
-        for (name, profile) in &self.model_profiles {
-            if name == "default" {
-                continue;
-            }
-            if profile
-                .match_
-                .iter()
-                .any(|m| !m.is_empty() && model.starts_with(&m.to_ascii_lowercase()))
-            {
-                return (name.clone(), profile.clone());
+        // A user profile always beats a built-in sampler preset, even when
+        // both match the same prefix. Presets still apply when the user has
+        // not configured a matching profile.
+        const PRESETS: &[&str] = &["qwen-coding", "gemma-chat", "glm-agent"];
+        for skip_presets in [true, false] {
+            for (name, profile) in &self.model_profiles {
+                if name == "default" || (skip_presets && PRESETS.contains(&name.as_str())) {
+                    continue;
+                }
+                if profile
+                    .match_
+                    .iter()
+                    .any(|m| !m.is_empty() && model.starts_with(&m.to_ascii_lowercase()))
+                {
+                    return (name.clone(), profile.clone());
+                }
             }
         }
         let default = self
@@ -481,8 +596,23 @@ pub struct ModelConfig {
     pub start_command: String,
     /// `None` means "not explicitly configured".
     pub context_window: Option<u32>,
+    /// Engine fingerprint: `auto` (empty) or a name from `lh doctor`
+    /// (`llama.cpp`, `vllm`, `sglang`, `ollama`, `lmstudio`, `koboldcpp`,
+    /// `tabbyapi`, `mlx`, `generic`). Pinning it skips the metadata probes and
+    /// decides sampler and structured-output wire formats behind a gateway.
+    pub engine: String,
     pub temperature: f32,
     pub top_p: f32,
+    /// Global sampler defaults; a model profile overrides each field it sets.
+    pub min_p: Option<f32>,
+    pub repeat_penalty: Option<f32>,
+    pub dry_multiplier: Option<f32>,
+    pub dry_base: Option<f32>,
+    pub xtc_probability: Option<f32>,
+    pub seed: Option<i64>,
+    /// Path to a JSON Schema that constrains the final answer. Empty disables
+    /// structured output. `--json-schema` overrides it.
+    pub response_schema: String,
     pub max_output_tokens: u32,
     pub request_timeout_secs: u64,
     pub connect_timeout_secs: u64,
@@ -498,8 +628,16 @@ impl Default for ModelConfig {
             api_key: String::new(),
             start_command: String::new(),
             context_window: None,
+            engine: String::new(),
             temperature: 0.2,
             top_p: 0.95,
+            min_p: None,
+            repeat_penalty: None,
+            dry_multiplier: None,
+            dry_base: None,
+            xtc_probability: None,
+            seed: None,
+            response_schema: String::new(),
             max_output_tokens: 4096,
             request_timeout_secs: 900,
             connect_timeout_secs: 5,
@@ -650,6 +788,176 @@ impl Default for SessionConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewMode {
+    /// Review every mutation before it is written.
+    Always,
+    /// Review once a turn is about to touch a second file.
+    #[default]
+    MultiFile,
+    /// Write immediately, exactly as before the review feature.
+    Off,
+}
+
+impl ReviewMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            ReviewMode::Always => "always",
+            ReviewMode::MultiFile => "multi_file",
+            ReviewMode::Off => "off",
+        }
+    }
+
+    /// Parse a config or CLI value; unknown values return `None` so callers
+    /// can name the accepted ones.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "always" => Some(ReviewMode::Always),
+            "multi_file" | "multi-file" | "multi" => Some(ReviewMode::MultiFile),
+            "off" | "never" | "none" => Some(ReviewMode::Off),
+            _ => None,
+        }
+    }
+}
+
+/// Lifecycle hooks. Each `[hooks.<name>]` table names one event and one
+/// directly executed command. `timeout_secs` and `max_output_bytes` are the
+/// defaults inherited by every hook.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HooksConfig {
+    /// Per-hook deadline when the hook does not set its own.
+    pub timeout_secs: u64,
+    /// Recorded output cap. Larger output is archived and referenced.
+    pub max_output_bytes: usize,
+    #[serde(flatten)]
+    pub entries: BTreeMap<String, HookConfig>,
+}
+
+impl Default for HooksConfig {
+    fn default() -> Self {
+        Self {
+            timeout_secs: 5,
+            max_output_bytes: 16 * 1024,
+            entries: BTreeMap::new(),
+        }
+    }
+}
+
+impl HooksConfig {
+    pub fn hooks_for(&self, event: HookEvent) -> impl Iterator<Item = (&String, &HookConfig)> {
+        self.entries
+            .iter()
+            .filter(move |(_, hook)| hook.event == event)
+    }
+
+    pub fn timeout(&self, hook: &HookConfig) -> Duration {
+        Duration::from_secs(if hook.timeout_secs > 0 {
+            hook.timeout_secs
+        } else {
+            self.timeout_secs.max(1)
+        })
+    }
+
+    pub(crate) fn validate(&self) -> Result<()> {
+        if self.timeout_secs == 0 {
+            bail!("hooks.timeout_secs must be at least 1 second");
+        }
+        if self.max_output_bytes < 256 {
+            bail!("hooks.max_output_bytes must be at least 256");
+        }
+        for (name, hook) in &self.entries {
+            if name.is_empty()
+                || !name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            {
+                bail!("hook names may only use letters, digits, '-' and '_'");
+            }
+            if hook.command.is_empty() || hook.command[0].trim().is_empty() {
+                bail!("hook {name:?}: set `command` to the executable and its arguments");
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One lifecycle hook.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HookConfig {
+    pub event: HookEvent,
+    /// Program plus arguments. Spawned directly; never through a shell.
+    #[serde(default)]
+    pub command: Vec<String>,
+    /// Per-hook deadline; 0 inherits `[hooks] timeout_secs`.
+    #[serde(default)]
+    pub timeout_secs: u64,
+    /// `block` fails closed when the hook cannot run or answers badly.
+    /// `warn` makes the failure visible and continues. The default is
+    /// `block` for `pre_tool` and `warn` for every other event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_error: Option<HookOnError>,
+}
+
+impl HookConfig {
+    pub fn on_error(&self) -> HookOnError {
+        self.on_error
+            .unwrap_or_else(|| self.event.default_on_error())
+    }
+}
+
+/// Where a hook runs in the turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookEvent {
+    SessionStart,
+    UserPrompt,
+    PreTool,
+    PostTool,
+    PreCompact,
+    Stop,
+}
+
+impl HookEvent {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HookEvent::SessionStart => "session_start",
+            HookEvent::UserPrompt => "user_prompt",
+            HookEvent::PreTool => "pre_tool",
+            HookEvent::PostTool => "post_tool",
+            HookEvent::PreCompact => "pre_compact",
+            HookEvent::Stop => "stop",
+        }
+    }
+
+    pub fn default_on_error(self) -> HookOnError {
+        match self {
+            HookEvent::PreTool => HookOnError::Block,
+            _ => HookOnError::Warn,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum HookOnError {
+    /// A hook that cannot run or answers badly blocks the action.
+    #[default]
+    Block,
+    /// A hook that cannot run or answers badly is visible but does not block.
+    Warn,
+}
+
+impl HookOnError {
+    pub fn label(self) -> &'static str {
+        match self {
+            HookOnError::Block => "block",
+            HookOnError::Warn => "warn",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct BudgetConfig {
@@ -679,7 +987,7 @@ impl Default for BudgetConfig {
 }
 
 /// Global prompt customization. Empty fields keep the built-in text.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PromptConfig {
     /// Replaces the built-in one-line identity when non-empty.
@@ -688,6 +996,20 @@ pub struct PromptConfig {
     pub instructions: String,
     /// Extra instructions file, resolved like a profile prompt.
     pub file: PathBuf,
+    /// Load the hierarchical `AGENTS.md` chain into the system prompt.
+    /// `--no-agents-md` and `LH_AGENTS_MD=0` disable it.
+    pub agents_md: bool,
+}
+
+impl Default for PromptConfig {
+    fn default() -> Self {
+        Self {
+            identity: String::new(),
+            instructions: String::new(),
+            file: PathBuf::new(),
+            agents_md: true,
+        }
+    }
 }
 
 /// One Model Context Protocol server. Exactly one of `command` (stdio) or
@@ -867,15 +1189,47 @@ pub struct ModelProfile {
     pub tool_choice: Option<String>,
     /// Reject a second tool call in the same assistant message at dispatch.
     pub one_call: bool,
+    /// How file edits are anchored: exact text (default) or content hashes.
+    pub edit_mode: EditMode,
     /// Strip property descriptions and shorten tool descriptions in requests.
     pub short_tool_schemas: Option<bool>,
     pub stop: Vec<String>,
     pub extra_body: Option<toml::Value>,
+    /// Sampler values for this model. Each `Some` value overrides the global
+    /// `[model]` field; fields unsupported by the detected engine are omitted
+    /// and reported by `lh doctor`.
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
+    pub min_p: Option<f32>,
+    pub repeat_penalty: Option<f32>,
+    pub dry_multiplier: Option<f32>,
+    pub dry_base: Option<f32>,
+    pub xtc_probability: Option<f32>,
+    pub seed: Option<i64>,
     /// Hint for tool schema style; the harness always sends JSON schema.
     pub native_tools: Option<bool>,
     /// The model accepts images as content parts. `None` asks the server
     /// (llama.cpp `/props`), else assumes text only.
     pub vision: Option<bool>,
+    /// Whether the model should think: `auto`, `on`, or `off`.
+    pub thinking: ThinkingPolicy,
+    /// Request fields that turn thinking off on this engine, merged into
+    /// `extra_body` when the resolved policy is off. For example
+    /// `{ chat_template_kwargs = { enable_thinking = false } }`.
+    pub thinking_control: Option<toml::Value>,
+    /// The model cannot call tools reliably while thinking; `thinking =
+    /// "auto"` then turns thinking off whenever tools are active.
+    pub thinking_breaks_tools: bool,
+}
+
+/// `thinking` in a model profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ThinkingPolicy {
+    #[default]
+    Auto,
+    On,
+    Off,
 }
 
 impl Default for ModelProfile {
@@ -889,18 +1243,103 @@ impl Default for ModelProfile {
             parallel_tool_calls: None,
             tool_choice: None,
             one_call: false,
+            edit_mode: EditMode::Text,
             short_tool_schemas: None,
             stop: vec![],
             extra_body: None,
+            temperature: None,
+            top_p: None,
+            min_p: None,
+            repeat_penalty: None,
+            dry_multiplier: None,
+            dry_base: None,
+            xtc_probability: None,
+            seed: None,
             native_tools: None,
             vision: None,
+            thinking: ThinkingPolicy::Auto,
+            thinking_control: None,
+            thinking_breaks_tools: false,
         }
     }
 }
 
+/// Deep-merge `patch` into `base`; objects merge key by key, anything else
+/// replaces.
+fn merge_json(base: &mut serde_json::Value, patch: serde_json::Value) {
+    match (base, patch) {
+        (serde_json::Value::Object(base), serde_json::Value::Object(patch)) => {
+            for (key, value) in patch {
+                merge_json(base.entry(key).or_insert(serde_json::Value::Null), value);
+            }
+        }
+        (base, patch) => *base = patch,
+    }
+}
+
+/// Stream fields the decoder reads reasoning from, in fallback order after a
+/// configured `reasoning_field`.
+pub const REASONING_FIELDS: [&str; 3] = ["reasoning_content", "reasoning", "thinking"];
+
 impl ModelProfile {
     pub fn strip_reasoning(&self) -> bool {
         self.strip_reasoning.unwrap_or(true)
+    }
+
+    /// Whether thinking is off for a request: `off`, or `auto` with tools
+    /// active on a model marked `thinking_breaks_tools`.
+    pub fn thinking_off(&self, tools_active: bool) -> bool {
+        match self.thinking {
+            ThinkingPolicy::Off => true,
+            ThinkingPolicy::On => false,
+            ThinkingPolicy::Auto => self.thinking_breaks_tools && tools_active,
+        }
+    }
+
+    /// The request's `extra_body`: the profile's, with `thinking_control`
+    /// merged on top when thinking is off. Refuses when thinking must be off
+    /// but the profile names no control, since sending the request anyway
+    /// would silently ignore the policy.
+    pub fn request_extra_body(
+        &self,
+        tools_active: bool,
+    ) -> Result<Option<serde_json::Value>, String> {
+        let base = self
+            .extra_body
+            .as_ref()
+            .and_then(|value| serde_json::to_value(value).ok());
+        if !self.thinking_off(tools_active) {
+            return Ok(base);
+        }
+        let Some(control) = self
+            .thinking_control
+            .as_ref()
+            .and_then(|value| serde_json::to_value(value).ok())
+        else {
+            let why = if self.thinking == ThinkingPolicy::Off {
+                "thinking = \"off\"".to_string()
+            } else {
+                "thinking = \"auto\" with thinking_breaks_tools = true and tools active".to_string()
+            };
+            return Err(format!(
+                "{why} needs the engine's control to turn thinking off, and this model profile sets no thinking_control. Add it to the model profile, for example `thinking_control = {{ chat_template_kwargs = {{ enable_thinking = false }} }}` (vLLM/SGLang/llama.cpp Qwen3) or `thinking_control = {{ think = false }}` (Ollama), or set thinking = \"on\"."
+            ));
+        };
+        let mut merged = base.unwrap_or_else(|| serde_json::Value::Object(Default::default()));
+        merge_json(&mut merged, control);
+        Ok(Some(merged))
+    }
+
+    /// A startup warning when `reasoning_field` names a field the decoder
+    /// never reads, so a typo does not silently hide all reasoning.
+    pub fn reasoning_field_warning(&self) -> Option<String> {
+        let field = self.reasoning_field.as_deref()?.trim();
+        (!REASONING_FIELDS.contains(&field)).then(|| {
+            format!(
+                "model profile reasoning_field = {field:?} is not a known stream field; accepted: {}. Falling back to the default order.",
+                REASONING_FIELDS.join(", ")
+            )
+        })
     }
 
     pub fn short_tool_schemas(&self) -> bool {
@@ -938,6 +1377,27 @@ impl Default for VisionConfig {
             allow_remote: false,
             max_bytes: crate::media::image::DEFAULT_MAX_BYTES,
             keep_exif: false,
+        }
+    }
+}
+
+/// How `read` and `patch` anchor an edit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum EditMode {
+    /// Exact search text; unchanged default.
+    #[default]
+    Text,
+    /// `read` annotates lines with content hashes and `patch` takes
+    /// `path#snapshot` with PUT/CUT/REM/MV operations.
+    Hash,
+}
+
+impl EditMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            EditMode::Text => "text",
+            EditMode::Hash => "hash",
         }
     }
 }
@@ -996,6 +1456,19 @@ fn read_toml(path: &Path) -> Result<toml::Value> {
     Ok(value)
 }
 
+/// Remove and return `permissions.rules` from one config file's table.
+fn take_permission_rules(raw: &mut toml::Value) -> Vec<toml::Value> {
+    raw.get_mut("permissions")
+        .and_then(toml::Value::as_table_mut)
+        .and_then(|table| table.remove("rules"))
+        .map(|rules| match rules {
+            toml::Value::Array(rules) => rules,
+            // Not an array: keep it so the schema check reports it.
+            other => vec![other],
+        })
+        .unwrap_or_default()
+}
+
 /// Recursively overlay `overlay` onto `base`. Tables merge; everything else
 /// replaces.
 pub fn deep_merge(base: &mut toml::Value, overlay: toml::Value) {
@@ -1040,6 +1513,25 @@ mod tests {
     }
 
     #[test]
+    fn sampler_presets_are_selectable_by_model_and_by_name() {
+        let mut cfg = Config::builtin();
+        for (model, preset, minimum) in [
+            ("qwen3-coder-30b-a3b", "qwen-coding", 0.05),
+            ("gemma-3-27b-it", "gemma-chat", 0.0),
+            ("glm-4.6", "glm-agent", 0.02),
+        ] {
+            cfg.model.model = model.into();
+            let (name, profile) = cfg.model_profile();
+            assert_eq!(name, preset, "{model}");
+            assert_eq!(profile.min_p, Some(minimum), "{model}");
+            assert_eq!(profile.seed, Some(0), "{model}");
+        }
+        cfg.model.model = "gemma-3-27b-it".into();
+        cfg.model_profile_override = Some("qwen-coding".into());
+        assert_eq!(cfg.model_profile().0, "qwen-coding");
+    }
+
+    #[test]
     fn strict_and_shell_profiles_are_discoverable() {
         let cfg = Config::builtin();
         for name in ["strict", "shell"] {
@@ -1081,6 +1573,24 @@ mod tests {
     }
 
     #[test]
+    fn edit_mode_defaults_to_text_and_parses_hash() {
+        let cfg = Config::builtin();
+        assert_eq!(cfg.model_profiles["default"].edit_mode, EditMode::Text);
+        assert_eq!(cfg.model_profiles["strict"].edit_mode, EditMode::Text);
+        assert_eq!(cfg.model_profiles["hash"].edit_mode, EditMode::Hash);
+
+        let parsed: Config = toml::from_str("[model_profile.custom]\nedit_mode = \"hash\"\n")
+            .expect("hash is valid");
+        assert_eq!(parsed.model_profiles["custom"].edit_mode, EditMode::Hash);
+        let parsed: Config = toml::from_str("[model_profile.custom]\nedit_mode = \"text\"\n")
+            .expect("text is valid");
+        assert_eq!(parsed.model_profiles["custom"].edit_mode, EditMode::Text);
+        assert!(
+            toml::from_str::<Config>("[model_profile.custom]\nedit_mode = \"fuzzy\"\n").is_err()
+        );
+    }
+
+    #[test]
     fn git_approval_defaults_to_ask() {
         let cfg = Config::builtin();
         assert_eq!(cfg.git.commit, GitApproval::Ask);
@@ -1101,6 +1611,68 @@ mod tests {
         let parsed: Config = toml::from_str("[lsp]\ngate = \"off\"\n").expect("off is valid");
         assert_eq!(parsed.lsp.gate, LspGate::Off);
         assert!(toml::from_str::<Config>("[lsp]\ngate = \"sometimes\"\n").is_err());
+    }
+
+    #[test]
+    fn thinking_policy_resolves_and_merges_the_control() {
+        let parsed: Config = toml::from_str(
+            r#"
+[model_profile.qwen]
+thinking = "off"
+extra_body = { top_k = 20, chat_template_kwargs = { other = 1 } }
+thinking_control = { chat_template_kwargs = { enable_thinking = false } }
+"#,
+        )
+        .expect("valid profile");
+        let profile = &parsed.model_profiles["qwen"];
+        assert_eq!(profile.thinking, ThinkingPolicy::Off);
+        let body = profile.request_extra_body(false).unwrap().unwrap();
+        assert_eq!(body["top_k"], 20);
+        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
+        assert_eq!(body["chat_template_kwargs"]["other"], 1);
+
+        // `on` and plain `auto` leave extra_body alone.
+        let mut on = profile.clone();
+        on.thinking = ThinkingPolicy::On;
+        let body = on.request_extra_body(true).unwrap().unwrap();
+        assert!(
+            body["chat_template_kwargs"]
+                .get("enable_thinking")
+                .is_none()
+        );
+        let mut auto = profile.clone();
+        auto.thinking = ThinkingPolicy::Auto;
+        assert!(!auto.thinking_off(true));
+        // `auto` turns it off only with tools active on a marked model.
+        auto.thinking_breaks_tools = true;
+        assert!(!auto.thinking_off(false));
+        let body = auto.request_extra_body(true).unwrap().unwrap();
+        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
+
+        // `off` without a control refuses and names the key.
+        let bare = ModelProfile {
+            thinking: ThinkingPolicy::Off,
+            ..ModelProfile::default()
+        };
+        let err = bare.request_extra_body(false).unwrap_err();
+        assert!(err.contains("thinking_control"), "{err}");
+        assert!(toml::from_str::<Config>("[model_profile.x]\nthinking = \"maybe\"\n").is_err());
+    }
+
+    #[test]
+    fn unknown_reasoning_field_warns_with_the_accepted_names() {
+        let mut profile = ModelProfile::default();
+        assert!(profile.reasoning_field_warning().is_none());
+        for known in REASONING_FIELDS {
+            profile.reasoning_field = Some(known.into());
+            assert!(profile.reasoning_field_warning().is_none(), "{known}");
+        }
+        profile.reasoning_field = Some("thoughts".into());
+        let warning = profile.reasoning_field_warning().expect("warning");
+        assert!(warning.contains("\"thoughts\""), "{warning}");
+        for known in REASONING_FIELDS {
+            assert!(warning.contains(known), "{warning}");
+        }
     }
 
     #[test]
@@ -1142,6 +1714,32 @@ mod tests {
         config.load_profile_dirs(&profiles, None).unwrap();
         assert_eq!(config.profiles["review"].tools, ["read"]);
         assert_eq!(config.profiles["audit"].packs, ["core", "security"]);
+    }
+
+    #[test]
+    fn hooks_load_from_config_and_validate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[hooks]\ntimeout_secs = 7\n\n[hooks.guard]\nevent = \"pre_tool\"\ncommand = [\"/bin/true\"]\n",
+        )
+        .unwrap();
+        let cfg = Config::load(&path, None).unwrap();
+        assert_eq!(cfg.hooks.timeout_secs, 7);
+        assert_eq!(cfg.hooks.max_output_bytes, 16 * 1024);
+        assert_eq!(
+            cfg.hooks.entries["guard"].event,
+            crate::config::HookEvent::PreTool
+        );
+        assert_eq!(
+            cfg.hooks.entries["guard"].on_error(),
+            crate::config::HookOnError::Block
+        );
+
+        std::fs::write(&path, "[hooks.broken]\nevent = \"stop\"\ncommand = []\n").unwrap();
+        let error = Config::load(&path, None).unwrap_err().to_string();
+        assert!(error.contains("hook"), "{error}");
     }
 
     #[test]

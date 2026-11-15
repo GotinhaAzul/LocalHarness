@@ -34,6 +34,29 @@ obfuscation can bypass it. The rules of engagement are the real control. For
 process-level isolation use `--sandbox`; for VM-grade isolation, run the
 harness itself in a container.
 
+## Permissions
+
+A policy engine runs before every tool call (see
+[configuration.md](configuration.md#permissions)). Modes (`ask`,
+`accept-edits`, `plan`, `dont-ask`, `yolo`) and ordered allow/ask/deny rules on
+tool, path, command, and network decide whether a call runs, asks the user
+with the exact command or path, or returns `DENIED` with the rule id. A `deny`
+cannot be undone by a later, less specific `allow`, and it applies in every
+mode, including `--yolo`.
+
+The policy is read only from the global config and a trusted project config.
+Skills and workflows cannot change it: a workflow that lists `bash` still hits a
+`git push` deny, and a workflow that lists `write` cannot bring it back in plan
+mode. `--yolo` is never the default, is not accepted from a config file, and is
+recorded in the session header.
+
+Rules are not a sandbox. Command matching sees the command text, so
+`sh -c "$(echo Z2l0IHB1c2g= | base64 -d)"` is not a `git push` to a regex;
+default to `ask` for commands and keep `--sandbox` as the process boundary.
+Read-only classification for plan mode is an allowlist that refuses
+redirection, substitution, and subshells; anything it does not understand is
+treated as mutating.
+
 ## Sandbox
 
 `--sandbox` puts `bash` and `bg` behind an OS-level boundary. The primary
@@ -82,6 +105,40 @@ need those guarantees. The bubblewrap executable can be overridden with
 
 `--path-jail` is a separate file-tool boundary; it does not change how `bash`
 runs.
+
+## Instruction provenance
+
+The system prompt describes repository files, tool output, `AGENTS.md`, and
+external tool output as untrusted data. The harness also enforces that at
+dispatch:
+
+- Session entries carry a provenance tag: `user`, `tool:<name>`, `skill`, or
+  `external`. The tag is written to the session JSONL and appears as a
+  `provenance` event in `lh --print --json`.
+- Every tool result from an untrusted source is scanned by a small detector for
+  instruction patterns: "ignore previous instructions", "run this command",
+  "send the contents of", "disable the sandbox", credential paths such as
+  `~/.ssh`, and a few close variants. The detector is conservative; the bare
+  word "ignore" is not a hit. It is plain substring matching with no model call
+  and no rewrite of the content.
+- A hit adds a visible `[provenance]` warning to the tool result, records a
+  `provenance-warning` entry, and requires approval for the next sensitive
+  action: network access, a path outside the workspace, or a scope change.
+- Review the warning, then run `/approve` in the TUI to allow exactly the next
+  sensitive action. Without approval the call returns `provenance_approval` and
+  does not run. A frontend permission callback (ACP) can also be the approver.
+- Untrusted content can never enable a denied tool, add a tool, change the
+  endpoint, widen `/sec` scope, or change the permission mode. Hooks and
+  provenance can only deny or add visible text; the enforcement is in the
+  dispatcher, not in prompt wording. Both feed the same pre-dispatch decision
+  as the permission rules (`authorize::decide`): a deny from any of them wins,
+  so an allow rule cannot override a hook block or a pending provenance
+  warning. An approval is spent only by a call that passed every other gate.
+
+The detector is a speed bump, not a proof of safety. Encoded or paraphrased
+instructions may pass, and a warning only gates the next sensitive action.
+Headless runs have no `/approve`, so a warned sensitive action stays blocked
+there. `--sandbox` remains the process boundary.
 
 ## Findings
 
@@ -277,9 +334,15 @@ config, profiles, skills, workflows, tools, and verify steps, plus project
 or the TUI trust confirmation is accepted. Trust is per session and shown in
 the header/footer.
 
-`AGENTS.md` is always read as untrusted project instructions. It cannot change
-scope, tools, gates, or the endpoint. A trusted project still cannot grant
-security scope.
+`AGENTS.md` is read as untrusted project instructions from the chain of
+directories between the git repository root and the working directory, nearest
+last. Each file is shown under a source-path header. The chain is capped at
+32 KiB total and 12 KiB per file; truncation is deterministic and warns. A
+symlink that resolves outside the repository is refused. `lh context --show`
+prints the manifest with each path, byte count, SHA-256, and
+loaded/skipped/truncated state; `--no-agents-md` and `LH_AGENTS_MD=0` disable
+the chain. The files cannot change scope, tools, gates, or the endpoint. A
+trusted project still cannot grant security scope.
 
 Repository content and tool output are delimited and labeled as untrusted data
 in the system prompt. This reduces, but does not eliminate, prompt injection.
@@ -288,15 +351,36 @@ in the system prompt. This reduces, but does not eliminate, prompt injection.
 
 - No telemetry, analytics, or phone-home.
 - Endpoint defaults to `http://127.0.0.1:8080`; non-local endpoints warn.
-- Session logs, artifacts, evidence artifacts, and exported reports are
-  redacted before they are written. Private key blocks, bearer and
-  `Authorization` header values, AWS/GCP/Azure keys, GitHub tokens, secret-like
-  `.env` assignments, and the exact values of environment variables matching
-  `*TOKEN*`, `*SECRET*`, `*KEY*`, or `*PASSWORD*` become
-  `[REDACTED:<kind>:<first4>...<hash8>]` (the prefix is omitted for values
-  shorter than 12 characters). The short prefix and hash keep evidence
-  comparable without exposing the value; paths and command names are left
-  intact.
+- Session logs, artifacts, evidence artifacts, finding text (title,
+  evidence, impact, remediation; not `target` or `poc_steps`, which are
+  matched and replayed), and exported reports are redacted before they are
+  written.
+  Private key blocks, bearer and `Authorization` header values, AWS/GCP/Azure
+  keys, GitHub tokens, secret-like `.env` assignments, and the exact values of
+  environment variables matching `*TOKEN*`, `*SECRET*`, `*KEY*`, or
+  `*PASSWORD*` become `[REDACTED:<kind>:<first4>...<hash8>]` (the prefix is
+  omitted for values shorter than 12 characters). The short prefix and hash
+  keep evidence comparable without exposing the value; paths and command names
+  are left intact. Assignments that are source code are not secrets: the
+  generic `.env` rule only considers upper-case `NAME=value` lines, and
+  unquoted values with call, index, or collection syntax
+  (`name = Column(Text)`, `secret_key = os.environ["X"]`) are never redacted.
+- Redaction applies to what is written to disk, not to what the model reads.
+  Tool results, `recall`, `bg` logs, and the model's own earlier tool calls
+  reach the model as they were produced. A model that sees a placeholder
+  instead of file content writes the placeholder back and corrupts the file.
+  That is true even for a correct match: rewriting a `.env` file the model saw
+  redacted would destroy the real values. The cost is that the endpoint
+  receives secrets that tool output contains, both in the turn that produced
+  them and when later prompts in the same process replay them. Use a local
+  endpoint, or keep secrets out of what the model reads, when that matters.
+- A resumed session replays its entries as saved, so a tool result that was
+  redacted on disk shows placeholders. Such results carry a note that the
+  markers are not file content, and `write`, `edit`, `patch`, and `undo`
+  refuse content that adds a `[REDACTED:...]` placeholder the file does not
+  already hold. Nothing is written in that case. An `undo` whose snapshot was
+  redacted on disk is refused the same way. A `bash` command that writes a
+  file is not checked.
 - `--no-redact` disables that pass for one session and is recorded in the
   session header (`"redact": false`). Use it only for disposable test data.
 - Evidence `sha256` continues to describe the raw tool output. A
@@ -308,10 +392,10 @@ in the system prompt. This reduces, but does not eliminate, prompt injection.
 - Evidence artifacts are `0600`; credentials extracted into the surface map are
   stored as SHA-256 references, never plaintext. URL userinfo is stripped from
   stored URLs.
-- Live `bg` logs are streamed by the process supervisor. Output is redacted when
-  it is read back through `bg`, session entries, and evidence, but the live log
-  file is not rewritten line-by-line while the process runs. Prefer `bash` for
-  one-shot commands that print secrets.
+- Live `bg` logs are streamed by the process supervisor. The log file is not
+  redacted while the process runs, and `bg log` shows the model the raw tail;
+  the session entry and evidence for that result are redacted when written.
+  Prefer `bash` for one-shot commands that print secrets.
 - Diagnostic logs are metadata only: timings, tool names, token counts, error
   codes. Prompt and tool content is not logged unless `LH_DEBUG_CONTENT=1`,
   which prints a warning.

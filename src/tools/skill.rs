@@ -198,6 +198,7 @@ mod tests {
                 app: "test".into(),
                 redact: true,
                 context: None,
+                permissions: None,
             },
             true,
         )
@@ -212,6 +213,7 @@ mod tests {
             trust,
             verify: Default::default(),
             profile: "full".into(),
+            edit_mode: Default::default(),
             packs: vec!["core".into(), "coding".into(), "security".into()],
             reads: Default::default(),
             bg: Arc::new(Mutex::new(crate::tools::BgRegistry::new())),

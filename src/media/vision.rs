@@ -197,8 +197,13 @@ pub async fn describe(
         tools: Vec::new(),
         tool_choice: None,
         parallel_tool_calls: None,
-        temperature: 0.1,
-        top_p: 0.95,
+        samplers: crate::provider::SamplerSettings {
+            temperature: Some(0.1),
+            top_p: Some(0.95),
+            ..Default::default()
+        },
+        engine: crate::provider::Engine::Generic,
+        response_schema: None,
         max_tokens: 1024,
         stop: Vec::new(),
         extra_body: None,
