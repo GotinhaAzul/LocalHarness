@@ -228,6 +228,27 @@ pub async fn run_turn(
     }
 
     let outcome = run_loop(&core, &tx, &cancel, turn_start, turn).await;
+
+    // Lifecycle hook: stop runs once for every turn ending, including budget,
+    // stall, cancellation, and errors. It is advisory: a block is visible but
+    // cannot rewrite what already happened.
+    let status = match outcome.status {
+        TurnStatus::Done => "done",
+        TurnStatus::Cancelled => "cancelled",
+        TurnStatus::Budget => "budget",
+        TurnStatus::Stalled => "stalled",
+        TurnStatus::ContextTruncated => "context_truncated",
+        TurnStatus::Error => "error",
+        TurnStatus::Blocked => "blocked",
+    };
+    let stop_hooks = crate::hooks::stop(&hook_env(&core), status).await;
+    hook_notices(&tx, &stop_hooks);
+    if let Some(block) = stop_hooks.blocked {
+        let _ = tx.send(AgentEvent::Notice(format!(
+            "hook {:?} asked to block at turn end, but the turn already stopped: {}",
+            block.hook, block.reason
+        )));
+    }
     if let Ok(mut session) = core.session.lock()
         && let Err(err) = session.fsync()
     {
@@ -480,12 +501,9 @@ async fn run_loop(
             };
             // Lifecycle hook: pre_compact may add context or veto the
             // compaction. It cannot change the budget.
-            let compact_hooks = crate::hooks::pre_compact(
-                &hook_env(core),
-                reason,
-                assembled.estimated_tokens,
-            )
-            .await;
+            let compact_hooks =
+                crate::hooks::pre_compact(&hook_env(core), reason, assembled.estimated_tokens)
+                    .await;
             hook_notices(tx, &compact_hooks);
             if let Some(block) = compact_hooks.blocked {
                 let message = format!(
@@ -823,10 +841,6 @@ async fn run_loop(
             );
             match gates::settle(&facts, &mut progress, gate_tools) {
                 SettleDecision::Done => {
-                    // Lifecycle hook: stop is advisory and cannot undo a
-                    // finished turn, but its failures and context are visible.
-                    let stop_hooks = crate::hooks::stop(&hook_env(core), "done").await;
-                    hook_notices(tx, &stop_hooks);
                     if gate_tools.verify
                         && verify_configured
                         && facts.unverified_mutations
@@ -1924,9 +1938,7 @@ async fn execute_batch(
                     if !result.is_error {
                         let pre = crate::hooks::pre_tool(&hooks, &call.name, &args).await;
                         for warning in &pre.warnings {
-                            let _ = tx.send(AgentEvent::Notice(format!(
-                                "[hook] {warning}"
-                            )));
+                            let _ = tx.send(AgentEvent::Notice(format!("[hook] {warning}")));
                         }
                         pre_context = pre
                             .contexts
@@ -2033,25 +2045,27 @@ async fn execute_batch(
         // content and never changes the tool set, scope, or endpoint.
         let origin = crate::provenance::origin_for(core, &call.name);
         let mut provenance_warning = None;
-        if executed && !result.is_error && crate::provenance::scans(&call.name) {
-            if let Some(detection) = crate::provenance::detect(&result.content) {
-                let line = crate::provenance::warning_line(&origin.tag(), &detection);
-                result.content = format!("{line}\n\n{}", result.content);
-                if let Ok(mut state) = core.provenance.lock() {
-                    state.note(&origin.tag(), &detection);
-                }
-                if let Ok(mut session) = core.session.lock() {
-                    let data = CustomData::new("provenance-warning")
-                        .with("origin", origin.tag())
-                        .with("patterns", json!(detection.patterns))
-                        .with("excerpt", detection.excerpt.clone())
-                        .with("approval", "required");
-                    if let Err(error) = session.append(EntryKind::Custom(data)) {
-                        tracing::warn!(%error, "cannot record the provenance warning");
-                    }
-                }
-                provenance_warning = Some(line);
+        if executed
+            && !result.is_error
+            && crate::provenance::scans(&call.name)
+            && let Some(detection) = crate::provenance::detect(&result.content)
+        {
+            let line = crate::provenance::warning_line(&origin.tag(), &detection);
+            result.content = format!("{line}\n\n{}", result.content);
+            if let Ok(mut state) = core.provenance.lock() {
+                state.note(&origin.tag(), &detection);
             }
+            if let Ok(mut session) = core.session.lock() {
+                let data = CustomData::new("provenance-warning")
+                    .with("origin", origin.tag())
+                    .with("patterns", json!(detection.patterns))
+                    .with("excerpt", detection.excerpt.clone())
+                    .with("approval", "required");
+                if let Err(error) = session.append(EntryKind::Custom(data)) {
+                    tracing::warn!(%error, "cannot record the provenance warning");
+                }
+            }
+            provenance_warning = Some(line);
         }
         {
             let pending = core
@@ -2127,14 +2141,13 @@ async fn execute_batch(
             is_error: result.is_error,
             details: result.details.clone(),
         };
-        let entry_id =
-            append_tool_result(
-                &core.session,
-                call,
-                &tool_result,
-                capped.artifact.clone(),
-                Some(origin.tag()),
-            );
+        let entry_id = append_tool_result(
+            &core.session,
+            call,
+            &tool_result,
+            capped.artifact.clone(),
+            Some(origin.tag()),
+        );
         if let (Some(tool), Some(args), Some(entry_id)) =
             (tool.as_deref(), evidence_args.as_ref(), entry_id.as_deref())
             && tool.evidence_enabled()

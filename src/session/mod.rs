@@ -469,6 +469,36 @@ mod tests {
     }
 
     #[test]
+    fn user_entries_are_tagged_and_tool_results_take_their_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths(dir.path());
+        let mut session = Session::create(&paths, header(), false).unwrap();
+        let user = session
+            .append(EntryKind::User(UserData {
+                attachments: Vec::new(),
+                content: "hello".into(),
+            }))
+            .unwrap();
+        assert_eq!(user.provenance.as_deref(), Some("user"));
+        let result = session
+            .append_tagged(
+                EntryKind::ToolResult(ToolResultData {
+                    call_id: "call_0001".into(),
+                    content: "[tool] read - README.md\nhello".into(),
+                    is_error: false,
+                    details: None,
+                    artifact: None,
+                }),
+                Some("tool:read".into()),
+            )
+            .unwrap();
+        assert_eq!(result.provenance.as_deref(), Some("tool:read"));
+        let raw = std::fs::read_to_string(session.path.as_ref().unwrap()).unwrap();
+        assert!(raw.contains("\"provenance\":\"tool:read\""), "{raw}");
+        assert!(raw.contains("\"provenance\":\"user\""), "{raw}");
+    }
+
+    #[test]
     fn first_user_entry_has_no_parent_and_roundtrips() {
         let dir = tempfile::tempdir().unwrap();
         let paths = paths(dir.path());

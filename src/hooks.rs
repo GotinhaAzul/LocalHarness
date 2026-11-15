@@ -192,9 +192,9 @@ pub async fn fire(env: &HookEnv<'_>, event: HookEvent, payload: Value) -> Outcom
         if verdict.decision == Decision::Block {
             outcome.blocked = Some(Block {
                 hook: name,
-                reason: verdict.reason.unwrap_or_else(|| {
-                    format!("hook blocked the {} action", event.as_str())
-                }),
+                reason: verdict
+                    .reason
+                    .unwrap_or_else(|| format!("hook blocked the {} action", event.as_str())),
             });
             break;
         }
@@ -210,10 +210,7 @@ pub async fn fire(env: &HookEnv<'_>, event: HookEvent, payload: Value) -> Outcom
 }
 
 /// Run exactly one named hook (used by `lh hooks test`). No session record.
-pub async fn test_named(
-    env: &HookEnv<'_>,
-    name: &str,
-) -> Result<(Invocation, Outcome), String> {
+pub async fn test_named(env: &HookEnv<'_>, name: &str) -> Result<(Invocation, Outcome), String> {
     let hook = env
         .config
         .entries
@@ -287,13 +284,16 @@ fn start_recorded(session: &SessionHandle) -> bool {
     let Ok(session) = session.lock() else {
         return false;
     };
-    session.customs_on_path("hook-invocation").iter().any(|entry| {
-        matches!(
-            &entry.kind,
-            EntryKind::Custom(custom)
-                if custom.payload.get("event").and_then(Value::as_str) == Some("session_start")
-        )
-    })
+    session
+        .customs_on_path("hook-invocation")
+        .iter()
+        .any(|entry| {
+            matches!(
+                &entry.kind,
+                EntryKind::Custom(custom)
+                    if custom.payload.get("event").and_then(Value::as_str) == Some("session_start")
+            )
+        })
 }
 
 pub async fn user_prompt(env: &HookEnv<'_>, prompt: &str) -> Outcome {
@@ -432,10 +432,14 @@ async fn run_one(
                 },
                 verdict: blocked.then(|| Verdict {
                     decision: Decision::Block,
-                    reason: Some(format!("hook {name:?} timed out after {} s", deadline.as_secs())),
+                    reason: Some(format!(
+                        "hook {name:?} timed out after {} s",
+                        deadline.as_secs()
+                    )),
                     contexts: Vec::new(),
                 }),
-                warning: (!blocked).then(|| format!("{message}; on_error = \"warn\", so the action continued")),
+                warning: (!blocked)
+                    .then(|| format!("{message}; on_error = \"warn\", so the action continued")),
             };
         }
     };
@@ -452,7 +456,10 @@ async fn run_one(
         Some(0) => match parse_output(&stdout) {
             Ok(verdict) => {
                 let blocked = verdict.decision == Decision::Block;
-                let reason = verdict.reason.as_deref().map(|reason| clip(reason, REASON_CAP_CHARS));
+                let reason = verdict
+                    .reason
+                    .as_deref()
+                    .map(|reason| clip(reason, REASON_CAP_CHARS));
                 Run {
                     invocation: Invocation {
                         hook: name.to_string(),
@@ -560,9 +567,7 @@ fn failure_with(
 ) -> Run {
     let blocked = on_error == HookOnError::Block;
     let warning = (!blocked).then(|| {
-        format!(
-            "{message}; on_error = \"warn\", so the action continued without this hook"
-        )
+        format!("{message}; on_error = \"warn\", so the action continued without this hook")
     });
     let reason = clip(&message, REASON_CAP_CHARS);
     Run {
@@ -743,14 +748,13 @@ mod tests {
         let mut config = HooksConfig::default();
         config.entries.insert(
             "guard".into(),
-            hook(
-                HookEvent::PreTool,
-                &[script.to_str().unwrap()],
-                None,
-            ),
+            hook(HookEvent::PreTool, &[script.to_str().unwrap()], None),
         );
         let outcome = pre_tool(&env(&config, dir.path()), "bash", &json!({"command": "rm"})).await;
-        assert_eq!(outcome.blocked.as_ref().unwrap().reason, "no writes on main");
+        assert_eq!(
+            outcome.blocked.as_ref().unwrap().reason,
+            "no writes on main"
+        );
     }
 
     #[tokio::test]
@@ -759,15 +763,17 @@ mod tests {
         let mut config = HooksConfig::default();
         config.entries.insert(
             "guard".into(),
-            hook(
-                HookEvent::PreTool,
-                &["/definitely/not/a/hook"],
-                None,
-            ),
+            hook(HookEvent::PreTool, &["/definitely/not/a/hook"], None),
         );
         let outcome = pre_tool(&env(&config, dir.path()), "bash", &json!({})).await;
         assert!(outcome.is_blocked());
-        assert!(outcome.blocked.unwrap().reason.contains("cannot start hook"));
+        assert!(
+            outcome
+                .blocked
+                .unwrap()
+                .reason
+                .contains("cannot start hook")
+        );
         assert!(outcome.warnings.is_empty());
     }
 
@@ -792,8 +798,10 @@ mod tests {
     #[tokio::test]
     async fn hook_timeout_blocks_without_hanging() {
         let dir = tempfile::tempdir().unwrap();
-        let mut config = HooksConfig::default();
-        config.timeout_secs = 1;
+        let mut config = HooksConfig {
+            timeout_secs: 1,
+            ..HooksConfig::default()
+        };
         config.entries.insert(
             "slow".into(),
             hook(HookEvent::PreTool, &["sleep", "5"], None),

@@ -213,6 +213,8 @@ Security is opt-in. The default `coding` profile has no security tools or postur
 
 Security work is for authorized labs, CTFs, and engagements only. Scope is set by the user with `/sec scope add|remove|clear`; there is no model tool for it. The scope gate blocks a known set of active-testing tools when no scope is set or when an extracted target is outside it. It is a speed bump; `--sandbox` is the process boundary.
 
+Repository files and tool output are tagged with their source. A cheap detector warns when untrusted content contains instruction-shaped phrases, and the next sensitive action needs `/approve`. Untrusted content cannot enable a tool, change scope, change the endpoint, or change permissions; that is enforced at dispatch, not in the prompt.
+
 - **Evidence.** `bash`, `bg`, and external tool runs append an evidence entry with target, command, timestamps, exit status, output artifact, and SHA-256. Secret values are redacted before session, artifact, evidence, and report writes; `--no-redact` is the explicit, recorded opt-out.
 - **Surface.** `surface` parses nmap/HTTP/TLS output into one inventory; `attack_path` queries the graph derived from surface, findings, and evidence.
 - **Findings.** `finding add` auto-links the last evidence entry. A finding can carry bounded `poc_steps`; `finding verify` replays them locally and stores `reproduced`/`confirmed`, `not_reproduced`/`rejected`, or `error|skipped`/`inconclusive`.
@@ -279,6 +281,7 @@ Global config: `~/.config/localharness/config.toml`. A trusted project `.harness
 | [Model setup](docs/model-setup.md) | llama.cpp, Ollama, vLLM, profiles, context accounting, `lh doctor` |
 | [Skills and workflows](docs/skills-workflows.md) | Skill format, references, bundled playbooks, tool allowlists |
 | [Security](docs/security.md) | Authorization, scope, evidence, findings, PoC replay, sandbox |
+| [Lifecycle hooks](docs/hooks.md) | `session_start` through `stop`, JSON protocol, fail-closed guards, `lh hooks test` |
 | [External tools](docs/external-tools.md) | Manifest format, protocol, schemas, scope gating |
 | [MCP servers](docs/mcp.md) | stdio and HTTP servers, tool naming, profiles, `lh mcp` |
 | [Editor integration](docs/acp.md) | `lh acp`, Zed setup, permissions, roots, stop reasons, limitations |

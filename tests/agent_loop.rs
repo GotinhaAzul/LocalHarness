@@ -2010,9 +2010,11 @@ fn tool_result_entry(session: &SessionHandle, call_id: &str) -> (String, bool, O
         .branch_entries()
         .into_iter()
         .find_map(|entry| match &entry.kind {
-            EntryKind::ToolResult(result) if result.call_id == call_id => {
-                Some((result.content.clone(), result.is_error, entry.provenance.clone()))
-            }
+            EntryKind::ToolResult(result) if result.call_id == call_id => Some((
+                result.content.clone(),
+                result.is_error,
+                entry.provenance.clone(),
+            )),
             _ => None,
         })
         .expect("tool result")
@@ -2145,8 +2147,7 @@ async fn a_hook_cannot_enable_a_denied_tool_or_widen_scope() {
             .any(|tool| tool.name() == "deploy")
     );
     assert_eq!(
-        harness.core.config.model.endpoint,
-        "http://127.0.0.1:0",
+        harness.core.config.model.endpoint, "http://127.0.0.1:0",
         "a hook cannot change the endpoint"
     );
 }
@@ -2191,10 +2192,10 @@ async fn slow_hook_times_out_without_stalling_the_turn() {
     let mut config = base_config();
     config.profiles.get_mut("test").unwrap().tools = vec!["bash".into()];
     config.hooks.timeout_secs = 1;
-    config.hooks.entries.insert(
-        "slow".into(),
-        hook_config(HookEvent::PreTool, "slow.sh", 0),
-    );
+    config
+        .hooks
+        .entries
+        .insert("slow".into(), hook_config(HookEvent::PreTool, "slow.sh", 0));
     let harness = harness_config(
         dir.path(),
         vec![
@@ -2213,7 +2214,10 @@ async fn slow_hook_times_out_without_stalling_the_turn() {
     assert!(!dir.path().join("slow-ran.txt").exists());
     let (content, is_error, _) = tool_result_entry(&harness.session, "call_0001");
     assert!(is_error);
-    assert!(content.contains("timed out") || content.contains("exceeded"), "{content}");
+    assert!(
+        content.contains("timed out") || content.contains("exceeded"),
+        "{content}"
+    );
     let invocations = hook_invocations(&harness.session, "pre_tool");
     assert_eq!(invocations[0].payload["outcome"], "timeout");
 }
@@ -2264,7 +2268,8 @@ async fn malicious_readme_triggers_a_warning_and_an_approval_gate() {
     assert!(warning.contains("instruction-injection"), "{warning}");
     assert!(approval_required);
 
-    let (read_content, read_error, read_provenance) = tool_result_entry(&harness.session, "call_0001");
+    let (read_content, read_error, read_provenance) =
+        tool_result_entry(&harness.session, "call_0001");
     assert!(!read_error);
     assert!(read_content.contains("[provenance]"), "{read_content}");
     assert_eq!(read_provenance.as_deref(), Some("tool:read"));
@@ -2276,7 +2281,10 @@ async fn malicious_readme_triggers_a_warning_and_an_approval_gate() {
 
     let (bash_content, bash_error, _) = tool_result_entry(&harness.session, "call_0002");
     assert!(bash_error, "{bash_content}");
-    assert!(bash_content.contains("provenance_approval"), "{bash_content}");
+    assert!(
+        bash_content.contains("provenance_approval"),
+        "{bash_content}"
+    );
     assert!(bash_content.contains("needs approval"), "{bash_content}");
     assert!(
         !dir.path().join("provenance-ran.txt").exists(),

@@ -672,3 +672,36 @@ async fn print_executes_a_tool_call_and_writes_a_file() {
     );
     assert!(fake.requests.load(Ordering::SeqCst) >= 2);
 }
+
+const HOOK_FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/hooks");
+
+#[tokio::test]
+async fn hooks_test_runs_one_named_hook_with_a_sample_payload() {
+    let env = env();
+    std::fs::create_dir_all(&env.config_dir).unwrap();
+    std::fs::write(
+        env.config_dir.join("config.toml"),
+        format!(
+            "[hooks.allow]\nevent = \"pre_tool\"\ncommand = [\"{HOOK_FIXTURES}/allow_escalate.sh\"]\n\n[hooks.guard]\nevent = \"pre_tool\"\ncommand = [\"{HOOK_FIXTURES}/block_exit2.sh\"]\n"
+        ),
+    )
+    .unwrap();
+
+    let output = run_lh_no_model(&env, "http://127.0.0.1:9", &["hooks", "test", "allow"]).await;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(0), "{stdout}");
+    assert!(stdout.contains("hook allow (pre_tool): ok"), "{stdout}");
+    assert!(stdout.contains("context: 13 chars"), "{stdout}");
+
+    let output = run_lh_no_model(&env, "http://127.0.0.1:9", &["hooks", "test", "guard"]).await;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert!(
+        stdout.contains("hook guard (pre_tool): blocked"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("blocked by policy: no writes on main"),
+        "{stdout}"
+    );
+}

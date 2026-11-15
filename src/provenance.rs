@@ -201,10 +201,7 @@ pub fn detect(text: &str) -> Option<Detection> {
             first = Some(first.map_or(position, |start| start.min(position)));
         }
     };
-    note(
-        "ignore-instructions",
-        instruction_override(&lower),
-    );
+    note("ignore-instructions", instruction_override(&lower));
     note("run-command", find_any(&lower, RUN_COMMAND));
     note("send-contents", find_any(&lower, SEND_CONTENTS));
     note("disable-sandbox", find_any(&lower, DISABLE_GUARDRAIL));
@@ -226,7 +223,10 @@ pub fn detect(text: &str) -> Option<Detection> {
 }
 
 fn find_any(haystack: &str, needles: &[&str]) -> Option<usize> {
-    needles.iter().filter_map(|needle| haystack.find(needle)).min()
+    needles
+        .iter()
+        .filter_map(|needle| haystack.find(needle))
+        .min()
 }
 
 /// "ignore previous instructions" and its close variants. The qualifier and
@@ -264,7 +264,12 @@ pub struct Detection {
 fn excerpt(text: &str, start: usize) -> String {
     let flat: String = text
         .chars()
-        .skip(text[..start.min(text.len())].chars().count().saturating_sub(80))
+        .skip(
+            text[..start.min(text.len())]
+                .chars()
+                .count()
+                .saturating_sub(80),
+        )
         .take(240)
         .collect();
     let flat = flat.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -503,7 +508,13 @@ pub async fn check(core: &Core, call: &ToolCall, args: &Value) -> Gate {
                 if let Ok(mut state) = core.provenance.lock() {
                     state.clear();
                 }
-                record_approval(core, call, sensitivity, "granted", "approved by the frontend");
+                record_approval(
+                    core,
+                    call,
+                    sensitivity,
+                    "granted",
+                    "approved by the frontend",
+                );
                 return Gate::Allow;
             }
             ToolApproval::Deny(reason) => {
@@ -628,7 +639,10 @@ mod tests {
         };
         assert_eq!(
             sensitivity(
-                &call("bash", serde_json::json!({"command": "curl https://x.test"})),
+                &call(
+                    "bash",
+                    serde_json::json!({"command": "curl https://x.test"})
+                ),
                 &serde_json::json!({"command": "curl https://x.test"}),
                 cwd
             ),

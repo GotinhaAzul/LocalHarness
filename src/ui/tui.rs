@@ -78,7 +78,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("skill", "pick a skill and append its instructions"),
     ("workflow", "pick a workflow to start on a new branch"),
     ("sec", "engagement summary, scope, or report"),
-    ("approve", "approve the next sensitive action after a provenance warning"),
+    (
+        "approve",
+        "approve the next sensitive action after a provenance warning",
+    ),
     ("trust", "show the trust state"),
     ("export", "write the branch as Markdown"),
     ("clear", "clear the transcript view"),

@@ -609,7 +609,10 @@ async fn run_hooks(config: &Config, paths: &Paths, action: &HooksCommand) -> Res
                 })
                 .collect();
             if *json {
-                println!("{}", serde_json::to_string_pretty(&json!({"hooks": hooks}))?);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({"hooks": hooks}))?
+                );
             } else if hooks.is_empty() {
                 println!(
                     "no hooks configured; add a [hooks.<name>] table to {} (see docs/hooks.md)",

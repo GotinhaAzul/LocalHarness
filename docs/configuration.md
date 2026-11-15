@@ -79,6 +79,16 @@ commit = "ask"                  # ask: /commit confirm approves; allow: commit a
 pr = "ask"                      # ask: /pr confirm approves drafts and comments
 subject_max = 72                # longest accepted commit subject
 
+[hooks]
+timeout_secs = 5                # default deadline for one hook
+max_output_bytes = 16384        # recorded output cap; larger output is archived
+
+# One table per hook. `event` is required; see docs/hooks.md.
+[hooks.guard]
+event = "pre_tool"
+command = ["/home/me/bin/policy-check"]   # direct exec, no shell
+on_error = "block"                        # pre_tool default; warn elsewhere
+
 # `coding` is the built-in default. `full` adds the security pack; `security`
 # and `minimal` narrow it further. `strict` and `shell` are weak-model presets.
 [profile.coding]
@@ -189,6 +199,19 @@ message; `\n` starts a new line; `cancel` drops either). A commit is made only
 while the staged diff still matches the preview. `allow` runs the action at
 once and suits unattended runs; headless `--print` has no way to approve, so
 `ask` leaves the preview unapplied there.
+
+## Lifecycle hooks
+
+`[hooks.<name>]` runs a local command at `session_start`, `user_prompt`,
+`pre_tool`, `post_tool`, `pre_compact`, or `stop`. The command is spawned
+directly with one JSON object on stdin and one on stdout; it may add context or
+block. `timeout_secs` is per hook (0 inherits `[hooks] timeout_secs`), and
+`on_error` is `block` or `warn` — `block` by default for `pre_tool`, `warn`
+elsewhere. A missing binary, non-zero exit, timeout, or malformed JSON is
+visible in the transcript and recorded in the session; it never looks like
+approval. Hook output cannot change tools, scope, the endpoint, or the
+permission mode. See [hooks.md](hooks.md) for the payload, output schema, exit
+codes, and `lh hooks test <name>`.
 
 ## LSP gate
 

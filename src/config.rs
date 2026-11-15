@@ -734,7 +734,8 @@ pub struct HookConfig {
 
 impl HookConfig {
     pub fn on_error(&self) -> HookOnError {
-        self.on_error.unwrap_or_else(|| self.event.default_on_error())
+        self.on_error
+            .unwrap_or_else(|| self.event.default_on_error())
     }
 }
 
@@ -1281,6 +1282,32 @@ mod tests {
         config.load_profile_dirs(&profiles, None).unwrap();
         assert_eq!(config.profiles["review"].tools, ["read"]);
         assert_eq!(config.profiles["audit"].packs, ["core", "security"]);
+    }
+
+    #[test]
+    fn hooks_load_from_config_and_validate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[hooks]\ntimeout_secs = 7\n\n[hooks.guard]\nevent = \"pre_tool\"\ncommand = [\"/bin/true\"]\n",
+        )
+        .unwrap();
+        let cfg = Config::load(&path, None).unwrap();
+        assert_eq!(cfg.hooks.timeout_secs, 7);
+        assert_eq!(cfg.hooks.max_output_bytes, 16 * 1024);
+        assert_eq!(
+            cfg.hooks.entries["guard"].event,
+            crate::config::HookEvent::PreTool
+        );
+        assert_eq!(
+            cfg.hooks.entries["guard"].on_error(),
+            crate::config::HookOnError::Block
+        );
+
+        std::fs::write(&path, "[hooks.broken]\nevent = \"stop\"\ncommand = []\n").unwrap();
+        let error = Config::load(&path, None).unwrap_err().to_string();
+        assert!(error.contains("hook"), "{error}");
     }
 
     #[test]
