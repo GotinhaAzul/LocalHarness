@@ -27,26 +27,35 @@ pub fn bundled_script_in_command(
     if roots.is_empty() {
         return None;
     }
-    for token in command.split_whitespace() {
-        let token = token.trim_matches(|ch| {
-            matches!(
-                ch,
-                '"' | '\'' | '`' | '(' | ')' | ';' | '&' | '|' | '<' | '>' | ','
-            )
-        });
-        if token.is_empty()
-            || token.starts_with('-')
-            || token.contains('=')
-            || token == "bash"
-            || token == "sh"
-            || token == "env"
-        {
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    let mut base = cwd.to_path_buf();
+    for (index, raw) in tokens.iter().enumerate() {
+        let token = trim(raw);
+        if token.is_empty() || token.starts_with('-') || token.contains('=') {
+            continue;
+        }
+        if token == "cd" {
+            if let Some(next) = tokens.get(index + 1).map(|next| trim(next))
+                && !next.is_empty()
+            {
+                base = if Path::new(next).is_absolute() {
+                    PathBuf::from(next)
+                } else {
+                    base.join(next)
+                };
+            }
+            continue;
+        }
+        if matches!(
+            token,
+            "bash" | "sh" | "env" | "exec" | "nohup" | "timeout" | "sudo"
+        ) {
             continue;
         }
         let candidate = if Path::new(token).is_absolute() {
             PathBuf::from(token)
         } else {
-            cwd.join(token)
+            base.join(token)
         };
         let Ok(real) = candidate.canonicalize() else {
             continue;
@@ -73,6 +82,15 @@ pub fn bundled_script_in_command(
         });
     }
     None
+}
+
+fn trim(token: &str) -> &str {
+    token.trim_matches(|ch| {
+        matches!(
+            ch,
+            '"' | '\'' | '`' | '(' | ')' | ';' | '&' | '|' | '<' | '>' | ','
+        )
+    })
 }
 
 fn skill_roots(paths: &Paths, trust: bool) -> Vec<PathBuf> {
@@ -146,4 +164,68 @@ pub fn approval_required(script: &BundledScript) -> String {
         script.skill,
         script.command
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn setup() -> (tempfile::TempDir, Paths, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut paths = Paths::discover(dir.path()).unwrap();
+        paths.config_dir = dir.path().join("config");
+        paths.data_dir = dir.path().join("data");
+        paths.home_dir = Some(dir.path().join("home"));
+        std::fs::create_dir_all(paths.home_dir.clone().unwrap()).unwrap();
+        let root = paths.skills_dir().join("demo");
+        std::fs::create_dir_all(root.join("scripts")).unwrap();
+        std::fs::write(root.join("SKILL.md"), "---\nname: demo\n---\nBody\n").unwrap();
+        let script = root.join("scripts/setup.sh");
+        std::fs::write(&script, "#!/bin/sh\ntouch marker\n").unwrap();
+        (dir, paths, script)
+    }
+
+    #[test]
+    fn absolute_relative_and_cd_forms_are_detected() {
+        let (dir, paths, script) = setup();
+        let cwd = dir.path();
+        let found = bundled_script_in_command(&paths, false, cwd, &script.display().to_string())
+            .expect("absolute script");
+        assert_eq!(found.skill, "demo");
+        assert_eq!(found.path, script.canonicalize().unwrap());
+
+        let found = bundled_script_in_command(
+            &paths,
+            false,
+            script.parent().unwrap().parent().unwrap(),
+            "bash scripts/setup.sh",
+        )
+        .expect("relative script");
+        assert_eq!(found.skill, "demo");
+
+        let cd = format!(
+            "cd {} && ./scripts/setup.sh",
+            script.parent().unwrap().parent().unwrap().display()
+        );
+        let found =
+            bundled_script_in_command(&paths, false, cwd, &cd).expect("cd + relative script");
+        assert_eq!(found.skill, "demo");
+    }
+
+    #[test]
+    fn a_reference_document_or_an_unrelated_path_is_not_a_script() {
+        let (dir, paths, _script) = setup();
+        let root = paths.skills_dir().join("demo");
+        std::fs::write(root.join("references.md"), "notes").unwrap();
+        assert!(
+            bundled_script_in_command(
+                &paths,
+                false,
+                dir.path(),
+                &root.join("references.md").display().to_string()
+            )
+            .is_none()
+        );
+        assert!(bundled_script_in_command(&paths, false, dir.path(), "cargo test").is_none());
+    }
 }

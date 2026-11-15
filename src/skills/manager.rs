@@ -550,14 +550,20 @@ fn parse_source(paths: &Paths, raw: &str) -> Result<SourceSpec> {
     }
     let (location, requested_ref) = match raw.rsplit_once('#') {
         Some((location, reference)) if !reference.trim().is_empty() => {
-            (location.to_string(), Some(reference.trim().to_string()))
+            let reference = reference.trim();
+            if reference.starts_with('-') {
+                bail!(
+                    "ref {reference:?} starts with `-`; pass a branch, tag, or commit name, not a git option"
+                );
+            }
+            (location.to_string(), Some(reference.to_string()))
         }
         Some((_, _)) => bail!("empty ref after `#` in {raw:?}; use `url#branch`"),
         None => (raw.to_string(), None),
     };
     let local = expand_path(paths, &location);
     if local.exists() {
-        if !local.join(".git").exists() {
+        if !is_git_repo(&local) {
             bail!(
                 "`{location}` is a local directory, not a git repository; a local directory has no ref. Install the checkout you want without `#ref`."
             );
@@ -580,6 +586,13 @@ fn parse_source(paths: &Paths, raw: &str) -> Result<SourceSpec> {
     bail!(
         "source {raw:?} does not exist; pass a path to a skill directory or a git URL with an optional #ref"
     )
+}
+
+fn is_git_repo(path: &Path) -> bool {
+    Command::new("git")
+        .args(["-C", &path.to_string_lossy(), "rev-parse", "--git-dir"])
+        .output()
+        .is_ok_and(|output| output.status.success())
 }
 
 fn looks_like_git(location: &str) -> bool {
@@ -820,8 +833,17 @@ fn materialize(
         updating,
         action,
     } = request;
+    std::fs::create_dir_all(&paths.config_dir)
+        .with_context(|| format!("cannot create {}", paths.config_dir.display()))?;
     std::fs::create_dir_all(paths.skills_dir())
         .with_context(|| format!("cannot create {}", paths.skills_dir().display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for dir in [&paths.config_dir, &paths.skills_dir()] {
+            let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+        }
+    }
     let target = install_target(paths, &skill.name)
         .ok_or_else(|| anyhow::anyhow!("invalid skill name {:?}", skill.name))?;
     if target.exists() && !updating && !force {

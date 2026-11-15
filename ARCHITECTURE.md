@@ -1185,10 +1185,12 @@ input characters. Missing input and unreadable files return prescriptive errors.
 
 ### 8.9 Trust model
 
-- Global config (`~/.config/localharness/`) is trusted because the user wrote it.
+- Global config (`~/.config/localharness/`), `~/.claude/skills/`, and
+  `~/.agents/skills/` are trusted because the user wrote them.
 - Project `.harness/` config, profiles, skills, workflows, tools, and verify
-  steps are ignored unless `--trust` is set or the TUI `/trust` confirmation is
-  accepted. Trust is per session and shown in the status bar.
+  steps, plus project `.claude/skills/` and `.agents/skills/`, are ignored
+  unless `--trust` is set or the TUI `/trust` confirmation is accepted. Trust
+  is per session and shown in the status bar.
 - `AGENTS.md` is read as untrusted project instructions. It cannot change
   scope, tools, gates, or the endpoint.
 - A trusted project still cannot grant security scope.

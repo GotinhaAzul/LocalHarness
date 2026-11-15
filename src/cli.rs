@@ -903,8 +903,10 @@ fn run_skill_command(paths: &Paths, trust: bool, action: &SkillCommand) -> Resul
                     );
                 }
                 println!(
-                    "average loaded tokens: {:.0}; false-load cost: {}",
-                    report.average_loaded_tokens, report.false_load_cost
+                    "average loaded tokens: {:.0}; total loaded tokens: {}; false-load cost: {}",
+                    report.average_loaded_tokens,
+                    report.total_loaded_tokens,
+                    report.false_load_cost
                 );
             }
             Ok(if report.passed { 0 } else { 1 })

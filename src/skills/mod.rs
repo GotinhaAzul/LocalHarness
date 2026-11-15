@@ -510,8 +510,7 @@ fn parse_skill_file(
             }));
         }
     };
-    let fallback_dir = dir.clone().or_else(|| path.parent().map(Path::to_path_buf));
-    match build_skill(&raw, path, dir, origin, fallback_dir) {
+    match build_skill(&raw, path, dir, origin) {
         Ok(skill) => {
             let diagnostics = validate::validate_skill(&skill, validate::Scope::Metadata);
             if diagnostics
@@ -548,10 +547,9 @@ fn build_skill(
     path: &Path,
     dir: Option<PathBuf>,
     origin: SkillOrigin,
-    fallback_dir: Option<PathBuf>,
 ) -> Result<Skill, String> {
     let front = Frontmatter::parse(raw)?;
-    let fallback_name = fallback_dir
+    let fallback_name = dir
         .as_deref()
         .and_then(|dir| dir.file_name())
         .or_else(|| path.file_stem())
@@ -1079,25 +1077,53 @@ mod tests {
             "Claude copy",
             "claude body",
         );
+        write_skill(
+            &paths.home_dir.clone().unwrap().join(".agents/skills"),
+            "agents-global",
+            "Agents global",
+            "agents body",
+        );
         write_skill(&paths.skills_dir(), "deploy", "Native copy", "native body");
-        std::fs::create_dir_all(paths.cwd.join(".claude/skills")).unwrap();
         write_skill(
             &paths.cwd.join(".claude/skills"),
             "project-only",
             "Project standard",
             "project body",
         );
+        write_skill(
+            &paths.cwd.join(".agents/skills"),
+            "agents-project",
+            "Agents project",
+            "agents project body",
+        );
 
         let untrusted = discover(&paths, false).index();
         assert_eq!(untrusted.get("deploy").unwrap().description, "Native copy");
         assert!(untrusted.get("project-only").is_none());
+        assert!(untrusted.get("agents-project").is_none());
+        assert!(untrusted.get("agents-global").is_some());
         assert_eq!(untrusted.shadows.len(), 1);
         assert_eq!(untrusted.shadows[0].loser, SkillOrigin::GlobalClaude);
         assert_eq!(untrusted.shadows[0].winner, SkillOrigin::GlobalNative);
 
         let trusted = discover(&paths, true).index();
         assert!(trusted.get("project-only").is_some());
+        assert!(trusted.get("agents-project").is_some());
         assert_eq!(trusted.get("deploy").unwrap().description, "Native copy");
+    }
+
+    #[test]
+    fn a_loose_native_markdown_file_falls_back_to_its_file_stem() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths(dir.path());
+        std::fs::create_dir_all(paths.skills_dir()).unwrap();
+        std::fs::write(
+            paths.skills_dir().join("legacy.md"),
+            "---\ndescription: Old style\n---\n\nBody\n",
+        )
+        .unwrap();
+        let index = discover(&paths, false).index();
+        assert!(index.get("legacy").is_some());
     }
 
     #[test]

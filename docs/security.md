@@ -270,10 +270,12 @@ Leave servers that reach out-of-scope systems out of security profiles with
 
 ## Trust
 
-Global config under `~/.config/localharness/` is trusted because the user wrote
-it. Project `.harness/` config, profiles, skills, workflows, tools, and verify
-steps are ignored unless `--trust` is passed or the TUI trust confirmation is
-accepted. Trust is per session and shown in the header/footer.
+Global config under `~/.config/localharness/`, `~/.claude/skills/`, and
+`~/.agents/skills/` is trusted because the user wrote it. Project `.harness/`
+config, profiles, skills, workflows, tools, and verify steps, plus project
+`.claude/skills/` and `.agents/skills/`, are ignored unless `--trust` is passed
+or the TUI trust confirmation is accepted. Trust is per session and shown in
+the header/footer.
 
 `AGENTS.md` is always read as untrusted project instructions. It cannot change
 scope, tools, gates, or the endpoint. A trusted project still cannot grant

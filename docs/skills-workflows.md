@@ -152,9 +152,11 @@ expect = "load"                         # or "skip"
 reference = "references/triage.md"      # optional
 ```
 
-The evaluator uses the deterministic fake provider: it scores the prompt
-against the skill name, description, and `when`, loads the best match, and picks
-a reference by name and content overlap. No model or network is involved, so CI
+`skill` may be omitted when the fixture lives in a subdirectory named after the
+skill, or when the fixture directory names exactly one installed skill. The
+evaluator uses the deterministic fake provider: it scores the prompt against the
+skill name, description, and `when`, loads the best match, and picks a reference
+by name and content overlap. No model or network is involved, so CI
 can run it. It reports precision and recall per skill, average loaded tokens,
 and the false-load cost (tokens spent on fixtures that should have skipped). A
 fixture that says `skip` and loads is a failure, not a warning; the command

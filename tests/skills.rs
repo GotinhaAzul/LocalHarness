@@ -7,7 +7,6 @@
 use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 
 use axum::Router;
@@ -211,19 +210,34 @@ async fn a_claude_skills_fixture_loads_without_conversion_and_the_body_stays_bac
     std::fs::create_dir_all(&skill).unwrap();
     std::fs::write(
         skill.join("SKILL.md"),
-        "---\nname: review\ndescription: Review a diff for correctness\n---\n\nBODY-SENTINEL review instructions\n",
+        "---\nname: review\ndescription: PROJECT-ONLY-DESCRIPTION\n---\n\nBODY-SENTINEL review instructions\n",
     )
     .unwrap();
     let (base, fake) = spawn_fake(vec![text_frame("ok")]).await;
 
     let output = run_print(&env, &base, &["--trust", "--print", "hello"]).await;
     assert_ok(&output);
+    {
+        let requests = fake.requests.lock().unwrap();
+        let system = requests[0]["messages"][0]["content"]
+            .as_str()
+            .expect("system prompt");
+        assert!(
+            system.contains("review: PROJECT-ONLY-DESCRIPTION"),
+            "{system}"
+        );
+        assert!(!system.contains("BODY-SENTINEL"), "body reached the prompt");
+    }
+
+    // Project standard directories are repository content: no trust, no load.
+    let (base, fake) = spawn_fake(vec![text_frame("ok")]).await;
+    let output = run_print(&env, &base, &["--print", "hello"]).await;
+    assert_ok(&output);
     let requests = fake.requests.lock().unwrap();
     let system = requests[0]["messages"][0]["content"]
         .as_str()
         .expect("system prompt");
-    assert!(system.contains("review: Review a diff"), "{system}");
-    assert!(!system.contains("BODY-SENTINEL"), "body reached the prompt");
+    assert!(!system.contains("PROJECT-ONLY-DESCRIPTION"), "{system}");
 }
 
 #[tokio::test]
@@ -776,9 +790,10 @@ async fn eval_reports_precision_recall_and_token_cost() {
         "prompt = \"deploy the service to production\"\nskill = \"deploy\"\nexpect = \"load\"\n",
     )
     .unwrap();
+    // No `skill` field: the flat directory has exactly one installed skill.
     std::fs::write(
         fixtures.join("skip.toml"),
-        "prompt = \"write a haiku about the sea\"\nskill = \"deploy\"\nexpect = \"skip\"\n",
+        "prompt = \"write a haiku about the sea\"\nexpect = \"skip\"\n",
     )
     .unwrap();
     let output = run(
@@ -797,6 +812,7 @@ async fn eval_reports_precision_recall_and_token_cost() {
     assert_eq!(value["passed"], true);
     assert_eq!(value["false_load_cost"], 0);
     assert!(value["average_loaded_tokens"].as_f64().unwrap() > 0.0);
+    assert!(value["total_loaded_tokens"].as_u64().unwrap() > 0);
     assert_eq!(value["skills"][0]["precision"], 1.0);
     assert_eq!(value["skills"][0]["recall"], 1.0);
 
@@ -868,10 +884,4 @@ fn collect_files(path: &Path, out: &mut Vec<PathBuf>) {
             collect_files(&entry.path(), out);
         }
     }
-}
-
-// Keep Stdio imported for platforms where the test harness inherits it.
-#[allow(dead_code)]
-fn _stdio() -> Stdio {
-    Stdio::null()
 }

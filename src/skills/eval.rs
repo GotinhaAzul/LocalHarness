@@ -42,8 +42,10 @@ pub struct Fixture {
 #[serde(deny_unknown_fields)]
 struct FixtureFile {
     prompt: String,
+    #[serde(alias = "expected")]
     expect: String,
     skill: Option<String>,
+    #[serde(alias = "expected_reference", alias = "expect_reference")]
     reference: Option<String>,
 }
 
@@ -78,6 +80,7 @@ pub struct EvalReport {
     pub fixtures: Vec<FixtureResult>,
     pub skills: Vec<SkillMetrics>,
     pub average_loaded_tokens: f64,
+    pub total_loaded_tokens: usize,
     pub false_load_cost: usize,
     pub failures: usize,
     pub passed: bool,
@@ -90,6 +93,7 @@ impl EvalReport {
             "passed": self.passed,
             "failures": self.failures,
             "average_loaded_tokens": self.average_loaded_tokens,
+            "total_loaded_tokens": self.total_loaded_tokens,
             "false_load_cost": self.false_load_cost,
             "skills": self.skills.iter().map(|metrics| serde_json::json!({
                 "skill": metrics.skill,
@@ -118,8 +122,8 @@ impl EvalReport {
 
 /// Run the deterministic provider over every fixture in `dir`.
 pub fn run(paths: &Paths, trust: bool, dir: &Path) -> Result<EvalReport, String> {
-    let fixtures = load_fixtures(dir)?;
     let index = SkillIndex::load(paths, trust);
+    let fixtures = load_fixtures(dir, &index)?;
     let mut results = Vec::new();
     for fixture in fixtures {
         let (predicted, reference, tokens, failure) = evaluate_one(&index, &fixture);
@@ -156,6 +160,7 @@ pub fn run(paths: &Paths, trust: bool, dir: &Path) -> Result<EvalReport, String>
         passed: failures == 0,
         failures,
         average_loaded_tokens,
+        total_loaded_tokens: total_tokens,
         false_load_cost,
         fixtures: results,
         skills,
@@ -382,7 +387,7 @@ fn metrics(results: &[FixtureResult]) -> Vec<SkillMetrics> {
         .collect()
 }
 
-fn load_fixtures(dir: &Path) -> Result<Vec<Fixture>, String> {
+fn load_fixtures(dir: &Path, index: &SkillIndex) -> Result<Vec<Fixture>, String> {
     if !dir.is_dir() {
         return Err(format!(
             "--fixtures {} is not a directory; pass a directory of .toml or .json fixtures",
@@ -433,11 +438,14 @@ fn load_fixtures(dir: &Path) -> Result<Vec<Fixture>, String> {
             .and_then(|stem| stem.to_str())
             .unwrap_or("fixture")
             .to_string();
-        let Some(skill) = file.skill else {
-            return Err(format!(
-                "{} must name the skill under test with `skill = \"<name>\"`",
-                path.display()
-            ));
+        let skill = match file.skill {
+            Some(skill) => skill,
+            None => infer_skill(dir, &path, index).ok_or_else(|| {
+                format!(
+                    "{} does not name the skill under test; add `skill = \"<name>\"`, or put the fixture in a subdirectory named after the skill",
+                    path.display()
+                )
+            })?,
         };
         fixtures.push(Fixture {
             name,
@@ -448,6 +456,29 @@ fn load_fixtures(dir: &Path) -> Result<Vec<Fixture>, String> {
         });
     }
     Ok(fixtures)
+}
+
+/// A fixture without `skill` belongs to the subdirectory it lives in, or to
+/// the only installed skill when the fixture directory is flat.
+fn infer_skill(dir: &Path, path: &Path, index: &SkillIndex) -> Option<String> {
+    if let Some(parent) = path.parent()
+        && parent != dir
+        && let Some(name) = parent.file_name().and_then(|name| name.to_str())
+        && !name.is_empty()
+    {
+        return Some(name.to_string());
+    }
+    let non_bundled: Vec<&str> = index
+        .skills
+        .iter()
+        .filter(|skill| !skill.bundled)
+        .map(|skill| skill.name.as_str())
+        .collect();
+    match non_bundled.as_slice() {
+        [only] => Some((*only).to_string()),
+        [] if index.skills.len() == 1 => Some(index.skills[0].name.clone()),
+        _ => None,
+    }
 }
 
 /// Convenience for tests and a future `--json`-free summary.
