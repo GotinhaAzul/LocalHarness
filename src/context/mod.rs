@@ -5,6 +5,7 @@ pub mod budget;
 pub mod compact;
 
 use crate::provider::{ChatMessage, ImageData, ToolCall};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
 use crate::session::{
@@ -23,6 +24,40 @@ pub struct AssembledContext {
     pub messages: Vec<ChatMessage>,
     pub estimated_tokens: u32,
     pub char_count: usize,
+}
+
+/// Byte-stable fingerprint of everything a request sends before the
+/// conversation: the leading system message followed by the serialized
+/// `tools` array. Two requests that share it can reuse the engine's
+/// KV/prefix cache.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptPrefix {
+    pub hash: String,
+    /// Characters in the system block plus the serialized tools.
+    pub chars: usize,
+}
+
+/// Hash the request prefix. Tool order and schema key order are already
+/// deterministic, so the same profile and model produce the same hash.
+pub fn prompt_prefix(system: &str, tools_json: &str) -> PromptPrefix {
+    let mut hasher = Sha256::new();
+    hasher.update(b"localharness-prompt-prefix-v1\0");
+    hasher.update(system.as_bytes());
+    hasher.update(b"\0tools\0");
+    hasher.update(tools_json.as_bytes());
+    PromptPrefix {
+        hash: format!("{:x}", hasher.finalize()),
+        chars: system.chars().count() + tools_json.chars().count(),
+    }
+}
+
+/// Characters shared by two rendered prefixes. A compaction reports this as
+/// the part the engine keeps and re-prefills only the remainder.
+pub fn common_prefix_chars(a: &str, b: &str) -> usize {
+    a.chars()
+        .zip(b.chars())
+        .take_while(|(left, right)| left == right)
+        .count()
 }
 
 /// Build provider messages for the active branch. Every system message (base
@@ -44,10 +79,25 @@ pub fn assemble(
 
     for entry in path {
         match &entry.kind {
-            EntryKind::Session(_)
-            | EntryKind::Checkout(_)
-            | EntryKind::Custom(_)
-            | EntryKind::Error(_) => {}
+            EntryKind::Session(_) | EntryKind::Checkout(_) | EntryKind::Error(_) => {}
+            EntryKind::Custom(custom) => {
+                // Hook context is configured, local text. It joins the system
+                // turn so it is visible to the model without pretending to be
+                // a user turn.
+                if custom.kind == "hook-context"
+                    && let Some(text) = custom.payload.get("text").and_then(|value| value.as_str())
+                    && !text.trim().is_empty()
+                {
+                    let hook = custom
+                        .payload
+                        .get("hook")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("hook");
+                    messages.push(ChatMessage::System {
+                        content: format!("[hook context: {hook}]\n{text}"),
+                    });
+                }
+            }
             EntryKind::Compaction(compaction) => {
                 had_compaction = true;
                 messages.push(ChatMessage::System {
@@ -338,8 +388,14 @@ fn push_assistant(
                 .collect()
         })
         .unwrap_or_default();
+    // Reasoning is never replayed, even from entries written before the
+    // stream split it out of content.
+    let content = assistant
+        .content
+        .as_deref()
+        .map(crate::agent::output::strip_reasoning_markup);
     messages.push(ChatMessage::Assistant {
-        content: assistant.content.clone(),
+        content,
         tool_calls: tool_calls.clone(),
     });
     // Chat APIs carry images only in user messages, so images returned by
@@ -457,10 +513,32 @@ mod tests {
                 app: "test".into(),
                 redact: true,
                 context: None,
+                permissions: None,
             },
             true,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn prompt_prefix_is_deterministic_and_tracks_both_parts() {
+        let prefix = crate::context::prompt_prefix("system", r#"[{"name":"read"}]"#);
+        assert_eq!(
+            prefix,
+            crate::context::prompt_prefix("system", r#"[{"name":"read"}]"#)
+        );
+        assert_eq!(prefix.chars, "system".chars().count() + 17);
+        assert_ne!(
+            prefix.hash,
+            crate::context::prompt_prefix("system ver2", r#"[{"name":"read"}]"#).hash
+        );
+        assert_ne!(
+            prefix.hash,
+            crate::context::prompt_prefix("system", r#"[{"name":"write"}]"#).hash
+        );
+        assert_eq!(crate::context::common_prefix_chars("abcdef", "abcxyz"), 3);
+        assert_eq!(crate::context::common_prefix_chars("", "abc"), 0);
+        assert_eq!(crate::context::common_prefix_chars("same", "same"), 4);
     }
 
     #[test]

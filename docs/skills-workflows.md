@@ -5,13 +5,18 @@ the tool list, or the gates; code enforces those.
 
 ## Skills
 
-A skill is Markdown with optional YAML frontmatter:
+A skill is a directory with `SKILL.md`: YAML frontmatter, then Markdown. The
+format follows the [Agent Skills specification](https://agentskills.io/specification),
+so a `.claude/skills` library loads without conversion.
 
 ```markdown
 ---
 name: rust-review
-description: Review Rust changes for correctness and unsafe code
+description: Review Rust changes for correctness and unsafe code. Use for a diff, a PR, or a pre-handback check.
 when: the task is a Rust code review
+allowed-tools: read grep lsp
+metadata:
+  upstream: example
 ---
 
 # Instructions
@@ -19,16 +24,50 @@ when: the task is a Rust code review
 ...
 ```
 
-Locations:
+- `name` is required by the specification: 1-64 lowercase letters, digits, or
+  hyphens; no leading, trailing, or doubled hyphen. The directory should match
+  the name.
+- `description` is the trigger: one line, at most 1,024 characters, written for
+  the model. It is how the skill gets loaded.
+- `when` is the native trigger hint. It is shown in the compact index, next to
+  the description.
+- `allowed-tools` is an **intersection**, never a grant. The harness intersects
+  it with the tools the active profile already selected; it can only remove
+  tools the profile has, never add one it does not. A skill cannot enable
+  `bash` in a read-only profile.
+- Every other frontmatter field is preserved as data. Lint rejects fields that
+  claim to grant tools, scope, or permissions (`tools`, `scope`, `permissions`,
+  `capabilities`, `grants`, and similar) because the harness would never honor
+  them.
 
-- Global: `~/.config/localharness/skills/<name>/SKILL.md`
-- Project: `.harness/skills/<name>/SKILL.md` (requires trust)
+### Locations and precedence
 
-The system prompt carries a compact index of name, description, and when to use
-each skill. Write the `description` and `when` for the model: they are how it
-decides to load the skill. Bundled security skills are advertised only while
-the `security` pack is active, so the `coding` default stays focused; they are
-still loadable by name and are preloaded by the security workflows.
+Lowest to highest:
+
+| Origin | Path | Trust |
+| --- | --- | --- |
+| Bundled | compiled into the binary | always |
+| Claude global | `~/.claude/skills/<name>/SKILL.md` | user-owned |
+| Agents global | `~/.agents/skills/<name>/SKILL.md` | user-owned |
+| Native global | `~/.config/localharness/skills/<name>/SKILL.md` | user-owned |
+| Claude project | `.claude/skills/<name>/SKILL.md` | `--trust` |
+| Agents project | `.agents/skills/<name>/SKILL.md` | `--trust` |
+| Native project | `.harness/skills/<name>/SKILL.md` | `--trust` |
+
+Native directories beat the ecosystem directories at the same level, and a
+project skill beats a global one. Resolution is deterministic; every collision
+is recorded as a shadow and `lh skill lint --all` reports it. An intentional
+override sets `shadow: true` in the winning skill's frontmatter, which turns the
+duplicate-name error into an explicit warning. Project `.claude/skills` and
+`.agents/skills` are untrusted repository content and load only with `--trust`,
+exactly like `.harness/skills`.
+
+### Progressive disclosure
+
+Discovery reads only `name`, `description`, and `when`. The body is read from
+disk when the skill is activated, and a reference only when the model names it.
+A 100-skill library adds 100 index lines at startup, not 100 bodies; the index
+is what `SkillIndex::index_text` injects into the system prompt.
 
 **The model loads skills itself** with the `skill` tool (core pack, read-only):
 
@@ -72,7 +111,110 @@ Skills are data: they cannot grant security scope, load tools, or bypass a
 guard. Project skills load only in trusted sessions, for the tool and for
 `/skill` alike.
 
+### Bundled scripts
+
+A skill may ship `scripts/` alongside its instructions. The harness copies those
+files but **never runs them**: not at discovery, install, update, lint, or eval.
+A `bash` or `bg` call whose command names a script inside a skill directory
+requires per-execution approval with the exact command shown. A frontend with
+an approval channel (ACP) asks; one without it refuses with
+`SKILL_SCRIPT_APPROVAL`, names the command, and runs nothing.
+
+### Linting and trigger eval
+
+```sh
+lh skill lint rust-review            # one skill
+lh skill lint                        # global and trusted project skills
+lh skill lint --all                  # bundled, global, and trusted project
+lh skill lint --all --json
+```
+
+The linter and the loader share one validator. Errors: a name outside the spec,
+a description over 1,024 characters, a body over 500 lines, a reference the body
+names but the skill does not ship, an unreadable or over-size reference, a
+frontmatter field that claims a grant, and a duplicate name without
+`shadow: true`. Warnings: a body over 300 lines, more than ten references, a
+missing description, an absolute home path, a secret-shaped string, and a name
+that does not match its directory. Exit status is 1 when there is any error;
+CI runs `lh skill lint --all` on the bundled skills with no model.
+
+```sh
+lh skill eval --fixtures ./skill-fixtures
+lh skill eval --fixtures ./skill-fixtures --json
+```
+
+A fixture is one `.toml` (or `.json`) file:
+
+```toml
+prompt = "the parser test fails after my change"
+skill = "test-repair"
+expect = "load"                         # or "skip"
+reference = "references/triage.md"      # optional
+```
+
+`skill` may be omitted when the fixture lives in a subdirectory named after the
+skill, or when the fixture directory names exactly one installed skill. The
+evaluator uses the deterministic fake provider: it scores the prompt against the
+skill name, description, and `when`, loads the best match, and picks a reference
+by name and content overlap. No model or network is involved, so CI
+can run it. It reports precision and recall per skill, average loaded tokens,
+and the false-load cost (tokens spent on fixtures that should have skipped). A
+fixture that says `skip` and loads is a failure, not a warning; the command
+exits 1.
+
+### Installing skills
+
+```sh
+lh skill add ./skills/deploy                  # local directory
+lh skill add https://example.com/skills.git#main
+lh skill update                               # every locked skill
+lh skill update deploy --force                # discard local edits, keep a backup
+lh skill update --frozen                      # verify pins, change nothing
+lh skill remove deploy
+lh skill list --json
+lh skill list --frozen
+```
+
+`add` accepts a local directory or a git URL with an optional `#ref` (branch,
+tag, or commit). Git runs through the `git` CLI; there is no runtime dependency.
+The skill is validated before install: frontmatter, body, references, and size.
+The description and file list are printed, and bundled scripts are copied but
+never executed.
+
+Installed copies live in `~/.config/localharness/skills/<name>/`.
+`~/.config/localharness/skills.lock` records the source, requested ref, resolved
+commit, install time, and a SHA-256 for every installed file:
+
+```toml
+version = 1
+
+[[skill]]
+name = "deploy"
+source = "https://example.com/skills.git#main"
+source_kind = "git"
+ref = "main"
+resolved_commit = "0123456789abcdef..."
+installed_at = "2026-11-15T12:00:00Z"
+
+[skill.files]
+"SKILL.md" = "…64 hex…"
+"references/rollback.md" = "…64 hex…"
+```
+
+`list` reports source, pinned ref, combined digest, per-file digests, and whether
+the installed copy differs from the lockfile. `--frozen` compares every digest,
+fails on a changed, missing, or extra file, and never writes the lockfile; it is
+the CI/reproducible-setup mode.
+
+`update` re-reads the source (the git ref resolves again) and refuses when the
+installed copy has local edits, naming the changed files. `--force` replaces it
+anyway. `add --force`, `update --force`, and `remove` move the old copy to
+`~/.config/localharness/skills-trash/<timestamp>-<name>/` and never delete it.
+Removing the last copy leaves the session able to start; the name is simply
+missing from `/skill` and `lh skill list`.
+
 ### Bundled coding skill pack
+
 
 Eight coding skills ship in the binary. They advertise while the `coding` pack
 is active, so the coding profile's index carries them and a security-only
@@ -196,6 +338,12 @@ leave it are rejected. Steps cannot name a profile, tools, or skills: the
 workflow-level fields are the only policy, and the engine has no code
 evaluator. An approval step takes a `message` only; `prompt`, `require`, and
 `retry` are configuration errors on a gate.
+
+A workflow's `tools` list narrows the tool set; it never widens the
+permission policy. `[permissions]` deny rules and plan mode still apply to
+every listed tool, and `lh workflow run` cannot answer a permission prompt, so
+calls that would ask are denied unless the run passes `--mode accept-edits`,
+has matching allow rules, or uses `--yolo`.
 
 `lh workflow run` loads and validates the workflow's `skills` and prepends
 their instructions to the first prompt step. The TUI does the same by adding

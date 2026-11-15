@@ -72,7 +72,11 @@ fn unknown(index: &SkillIndex, name: &str) -> ToolResult {
 
 fn load_reference(ctx: &ToolContext, skill: &Skill, needle: &str) -> ToolResult {
     let Some(reference) = skill.reference(needle) else {
-        let available: Vec<&str> = skill.references.iter().map(|r| r.path.as_str()).collect();
+        let available: Vec<String> = skill
+            .references()
+            .into_iter()
+            .map(|reference| reference.path)
+            .collect();
         return ToolResult::err(
             "unknown_reference",
             if available.is_empty() {
@@ -183,6 +187,7 @@ mod tests {
         let mut paths = crate::paths::Paths::discover(dir).unwrap();
         paths.config_dir = dir.join("config");
         paths.data_dir = dir.join("data");
+        paths.home_dir = Some(dir.join("home"));
         let session = Session::create(
             &paths,
             SessionData {
@@ -193,6 +198,7 @@ mod tests {
                 app: "test".into(),
                 redact: true,
                 context: None,
+                permissions: None,
             },
             true,
         )
@@ -207,6 +213,7 @@ mod tests {
             trust,
             verify: Default::default(),
             profile: "full".into(),
+            edit_mode: Default::default(),
             packs: vec!["core".into(), "coding".into(), "security".into()],
             reads: Default::default(),
             bg: Arc::new(Mutex::new(crate::tools::BgRegistry::new())),

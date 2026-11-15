@@ -132,6 +132,7 @@ mod tests {
                 app: "test".into(),
                 context: None,
                 redact: true,
+                permissions: None,
             },
             true,
         )

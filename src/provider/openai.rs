@@ -76,6 +76,7 @@ impl OpenAiCompatProvider {
             Ok(body) => body,
             Err(err) => return Attempt::Failed(err),
         };
+        log_request_body(&body, &self.api_key);
         let mut request = self.client.post(self.url()).json(&body);
         if !self.api_key.is_empty() {
             request = request.bearer_auth(&self.api_key);
@@ -123,6 +124,41 @@ impl OpenAiCompatProvider {
                 code,
                 self.scrub(format!("endpoint rejected the request ({code}): {text}")),
             ));
+        }
+
+        // Some servers and gateways ignore `stream: true` and answer with one
+        // completion body. Normalize it into the same events a stream yields,
+        // so both shapes reach one accumulator.
+        if is_json_response(response.headers()) {
+            let text = tokio::select! {
+                _ = cancel.cancelled() => {
+                    let _ = tx.send(Err(ProviderError::new(
+                        ErrorClass::Cancelled,
+                        "generation cancelled",
+                    )));
+                    return Attempt::Finished;
+                }
+                result = tokio::time::timeout(self.timeouts.total, response.text()) => result,
+            };
+            return match text {
+                Ok(Ok(text)) => match self.handle_full_body(&text, req, tx, yielded) {
+                    Ok(()) => Attempt::Finished,
+                    Err(err) => Attempt::Failed(err),
+                },
+                Ok(Err(err)) => Attempt::Failed(ProviderError::new(
+                    ErrorClass::Connection,
+                    self.scrub(format!(
+                        "reading the response failed: {err}. Retry; if it persists check the engine."
+                    )),
+                )),
+                Err(_) => Attempt::Failed(ProviderError::new(
+                    ErrorClass::Connection,
+                    format!(
+                        "request exceeded {} s; raise model.request_timeout_secs or reduce context.",
+                        self.timeouts.total.as_secs()
+                    ),
+                )),
+            };
         }
 
         let mut parser = SseParser::new();
@@ -244,13 +280,7 @@ impl OpenAiCompatProvider {
         })?;
 
         if let Some(err) = chunk.error {
-            let message = err.into_message();
-            let class = if is_context_error(&message) {
-                ErrorClass::ContextTooSmall
-            } else {
-                ErrorClass::BadRequest
-            };
-            return Err(ProviderError::new(class, self.scrub(message)));
+            return Err(self.api_error(err));
         }
 
         let truncated = chunk.truncated;
@@ -276,7 +306,7 @@ impl OpenAiCompatProvider {
             for call in delta.tool_calls.unwrap_or_default() {
                 let index = tool_index.assign(&call);
                 let (name, arguments) = match call.function {
-                    Some(function) => (function.name, function.arguments),
+                    Some(function) => (function.name, function.arguments.map(arguments_text)),
                     None => (None, None),
                 };
                 if call.id.is_some() || name.is_some() || arguments.is_some() {
@@ -294,6 +324,98 @@ impl OpenAiCompatProvider {
             }
         }
         Ok(())
+    }
+
+    fn api_error(&self, err: ApiError) -> ProviderError {
+        let message = err.into_message();
+        let class = if is_context_error(&message) {
+            ErrorClass::ContextTooSmall
+        } else {
+            ErrorClass::BadRequest
+        };
+        ProviderError::new(class, self.scrub(message))
+    }
+
+    /// A non-streamed completion body, emitted as the events a stream of the
+    /// same completion would produce: reasoning, content, one whole delta per
+    /// tool call, finish reason, then usage.
+    fn handle_full_body(
+        &self,
+        text: &str,
+        req: &ChatRequest,
+        tx: &UnboundedSender<StreamItem>,
+        yielded: &mut bool,
+    ) -> Result<(), ProviderError> {
+        let body: FullResponse = serde_json::from_str(text.trim()).map_err(|err| {
+            ProviderError::new(
+                ErrorClass::Parse,
+                format!(
+                    "could not parse the completion body ({err}); provider is not speaking the OpenAI chat API. Body: {}",
+                    truncate_body(text)
+                ),
+            )
+        })?;
+        if let Some(err) = body.error {
+            return Err(self.api_error(err));
+        }
+        for choice in body.choices {
+            let message = choice.message;
+            if let Some(reasoning) = reasoning_text(&message, req.reasoning_field.as_deref())
+                && !reasoning.is_empty()
+            {
+                *yielded = true;
+                let _ = tx.send(Ok(StreamEvent::ReasoningDelta(reasoning)));
+            }
+            if let Some(content) = message.content
+                && !content.is_empty()
+            {
+                *yielded = true;
+                let _ = tx.send(Ok(StreamEvent::Delta(content)));
+            }
+            for (index, call) in message
+                .tool_calls
+                .unwrap_or_default()
+                .into_iter()
+                .enumerate()
+            {
+                let Some(function) = call.function else {
+                    continue;
+                };
+                *yielded = true;
+                let _ = tx.send(Ok(StreamEvent::ToolCallDelta {
+                    index: call.index.unwrap_or(index),
+                    id: call.id,
+                    name: function.name,
+                    arguments: function.arguments.map(arguments_text),
+                }));
+            }
+            if let Some(reason) = choice.finish_reason {
+                let _ = tx.send(Ok(StreamEvent::Finish(reason)));
+            }
+        }
+        if let Some(usage) =
+            usage_from(body.usage, body.timings, body.truncated, body.context_shift)
+        {
+            let _ = tx.send(Ok(StreamEvent::Usage(usage)));
+        }
+        Ok(())
+    }
+}
+
+fn is_json_response(headers: &reqwest::header::HeaderMap) -> bool {
+    headers
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.to_ascii_lowercase().starts_with("application/json"))
+}
+
+/// Tool-call arguments as text. The OpenAI shape is a JSON string; some
+/// gateways (and Ollama's native format) send the object itself.
+fn arguments_text(arguments: Value) -> String {
+    match arguments {
+        Value::String(text) => text,
+        Value::Null => String::new(),
+        other => other.to_string(),
     }
 }
 
@@ -462,7 +584,106 @@ fn merge_leading_system(messages: &[ChatMessage]) -> Vec<ChatMessage> {
     merged
 }
 
+/// Record the exact body sent at `--debug`, with every occurrence of the
+/// configured bearer token redacted. The API key travels in a header, not the
+/// body, but a custom endpoint can echo it back into `extra_body`, so scrub it
+/// anyway.
+fn log_request_body(body: &Value, api_key: &str) {
+    let redacted = logged_request_body(body, api_key);
+    tracing::debug!(
+        target: "localharness::provider::request",
+        body = %redacted,
+        "chat request body"
+    );
+}
+
+/// The exact body as `--debug` records it. `redact` keeps a bearer token that
+/// a custom endpoint echoed into `extra_body` out of the log.
+fn logged_request_body(body: &Value, api_key: &str) -> String {
+    let raw = serde_json::to_string(body).unwrap_or_default();
+    super::redact(raw, &[api_key])
+}
+
+/// How the session's internal call ids are written for the active model.
+///
+/// The session stores harness-owned ids (`call_0001`, ...), plus whatever
+/// older sessions recorded. Most templates accept any string, but Mistral's
+/// tokenizer (`mistral_common`, used by vLLM and Mistral-format templates)
+/// rejects any `tool_call_id` that is not exactly nine ASCII alphanumerics.
+/// The mapping is deterministic and injective per session, so a call and its
+/// result always carry the same wire id and the prompt prefix stays stable
+/// for the server's KV cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WireIds {
+    AsIs,
+    Mistral,
+}
+
+impl WireIds {
+    fn for_model(model: &str) -> Self {
+        let model = model.to_ascii_lowercase();
+        const MISTRAL: [&str; 7] = [
+            "mistral",
+            "mixtral",
+            "devstral",
+            "magistral",
+            "codestral",
+            "ministral",
+            "pixtral",
+        ];
+        if MISTRAL.iter().any(|family| model.contains(family)) {
+            WireIds::Mistral
+        } else {
+            WireIds::AsIs
+        }
+    }
+
+    fn render(self, id: &str) -> String {
+        match self {
+            WireIds::AsIs => id.to_string(),
+            WireIds::Mistral => mistral_call_id(id),
+        }
+    }
+}
+
+/// Nine alphanumerics. Internal ids keep their order as zero-padded digits
+/// (`call_0007` → `000000007`), so engines that sort tool messages by id
+/// still see call order. Any other id (an engine id an older session stored)
+/// is hashed behind a leading letter, which cannot collide with the digit
+/// form.
+fn mistral_call_id(id: &str) -> String {
+    if let Some(digits) = id.strip_prefix("call_")
+        && digits.len() >= 4
+        && digits.bytes().all(|byte| byte.is_ascii_digit())
+        && let Ok(number) = digits.parse::<u64>()
+        && number < 1_000_000_000
+    {
+        return format!("{number:09}");
+    }
+    if id.len() == 9
+        && id.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        && !id.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return id.to_string();
+    }
+    // FNV-1a: stable across builds, unlike the std hasher.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in id.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    const ALPHABET: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut out = String::with_capacity(9);
+    out.push('z');
+    for _ in 0..8 {
+        out.push(ALPHABET[(hash % 36) as usize] as char);
+        hash /= 36;
+    }
+    out
+}
+
 fn build_body(req: &ChatRequest, include_usage: bool) -> Result<Value, ProviderError> {
+    let wire_ids = WireIds::for_model(&req.model);
     let normalized = merge_leading_system(&req.messages);
     debug_assert!(
         normalized
@@ -504,7 +725,7 @@ fn build_body(req: &ChatRequest, include_usage: bool) -> Result<Value, ProviderE
                         .iter()
                         .map(|call| {
                             json!({
-                                "id": call.id,
+                                "id": wire_ids.render(&call.id),
                                 "type": "function",
                                 "function": {
                                     "name": call.name,
@@ -518,7 +739,7 @@ fn build_body(req: &ChatRequest, include_usage: bool) -> Result<Value, ProviderE
                 Value::Object(object)
             }
             ChatMessage::Tool { call_id, content } => {
-                json!({"role":"tool","tool_call_id":call_id,"content":content})
+                json!({"role":"tool","tool_call_id":wire_ids.render(call_id),"content":content})
             }
         })
         .collect();
@@ -527,16 +748,25 @@ fn build_body(req: &ChatRequest, include_usage: bool) -> Result<Value, ProviderE
         "model": req.model,
         "messages": messages,
         "stream": true,
-        "temperature": req.temperature,
-        "top_p": req.top_p,
         "max_tokens": req.max_tokens,
     });
+    for (key, value) in req.samplers.body_fields(req.engine) {
+        body[key] = value;
+    }
     if !req.tools.is_empty() {
         body["tools"] = super::tools_payload(&req.tools);
         body["tool_choice"] = json!(req.tool_choice.as_deref().unwrap_or("auto"));
         if let Some(parallel) = req.parallel_tool_calls {
             body["parallel_tool_calls"] = json!(parallel);
         }
+    }
+    if let Some(schema) = &req.response_schema {
+        if let Some(refusal) =
+            super::structured::tools_conflict(req.engine, schema, !req.tools.is_empty())
+        {
+            return Err(ProviderError::new(ErrorClass::BadRequest, refusal));
+        }
+        schema.apply(&mut body, req.engine);
     }
     if !req.stop.is_empty() {
         body["stop"] = json!(req.stop);
@@ -583,6 +813,14 @@ struct WireUsage {
     total_tokens: u32,
     #[serde(default)]
     prompt_tokens_details: Option<PromptTokensDetails>,
+    #[serde(default)]
+    completion_tokens_details: Option<CompletionTokensDetails>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct CompletionTokensDetails {
+    #[serde(default)]
+    reasoning_tokens: Option<u32>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -635,6 +873,10 @@ fn usage_from(
             .map(|rate| rate as f32),
         truncated,
         context_shift: context_shift.or(timings.n_shift),
+        reasoning_tokens: wire
+            .completion_tokens_details
+            .and_then(|details| details.reasoning_tokens)
+            .filter(|tokens| *tokens > 0),
     })
 }
 
@@ -654,6 +896,9 @@ struct Delta {
     reasoning: Option<String>,
     #[serde(default)]
     reasoning_content: Option<String>,
+    /// Ollama's OpenAI-compatible endpoint and some proxies name it `thinking`.
+    #[serde(default)]
+    thinking: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<ToolCallDelta>>,
 }
@@ -672,8 +917,35 @@ struct ToolCallDelta {
 struct FunctionDelta {
     #[serde(default)]
     name: Option<String>,
+    /// A string on the OpenAI wire, an object from some gateways.
     #[serde(default)]
-    arguments: Option<String>,
+    arguments: Option<Value>,
+}
+
+/// A non-streamed chat completion (`stream: false`, or a server that ignores
+/// `stream: true`). Usage and timing fields match the streamed chunk.
+#[derive(Debug, Deserialize)]
+struct FullResponse {
+    #[serde(default)]
+    choices: Vec<FullChoice>,
+    #[serde(default)]
+    usage: Option<WireUsage>,
+    #[serde(default)]
+    timings: Option<Timings>,
+    #[serde(default)]
+    truncated: Option<bool>,
+    #[serde(default)]
+    context_shift: Option<u32>,
+    #[serde(default)]
+    error: Option<ApiError>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FullChoice {
+    #[serde(default)]
+    message: Delta,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 /// Stateful assignment of stream-local tool-call indices.
@@ -863,20 +1135,21 @@ impl ApiError {
     }
 }
 
+/// Reasoning text from whichever field the engine used. Order: the
+/// configured `reasoning_field`, then `reasoning_content`, `reasoning`, and
+/// `thinking` (see [`crate::config::REASONING_FIELDS`]).
 fn reasoning_text(delta: &Delta, configured: Option<&str>) -> Option<String> {
-    if let Some(field) = configured {
-        let value = match field {
-            "reasoning" => delta.reasoning.clone(),
-            _ => delta.reasoning_content.clone(),
-        };
-        if value.is_some() {
-            return value;
-        }
-    }
-    delta
-        .reasoning_content
-        .clone()
-        .or_else(|| delta.reasoning.clone())
+    let field = |name: &str| match name {
+        "reasoning_content" => delta.reasoning_content.as_ref(),
+        "reasoning" => delta.reasoning.as_ref(),
+        "thinking" => delta.thinking.as_ref(),
+        _ => None,
+    };
+    configured
+        .into_iter()
+        .chain(crate::config::REASONING_FIELDS.iter().copied())
+        .find_map(|name| field(name).filter(|value| !value.is_empty()))
+        .cloned()
 }
 
 #[cfg(test)]
@@ -926,6 +1199,12 @@ mod tests {
         .unwrap();
         assert_eq!(usage.cached_tokens, Some(900));
         assert_eq!(usage.cache_percent(), Some(90));
+        assert_eq!(usage.reasoning_tokens, None);
+        let usage = usage_of(
+            r#"{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":50,"total_tokens":60,"completion_tokens_details":{"reasoning_tokens":42}}}"#,
+        )
+        .unwrap();
+        assert_eq!(usage.reasoning_tokens, Some(42));
         // llama.cpp timings, possibly on a chunk without usage.
         let usage = usage_of(
             r#"{"choices":[],"timings":{"cache_n":236,"prompt_n":12,"prompt_ms":30.9,"predicted_n":35,"predicted_ms":661.0,"predicted_per_second":52.94}}"#,
@@ -984,8 +1263,13 @@ mod tests {
             tools: vec![],
             tool_choice: None,
             parallel_tool_calls: None,
-            temperature: 0.2,
-            top_p: 0.95,
+            samplers: crate::provider::SamplerSettings {
+                temperature: Some(0.2),
+                top_p: Some(0.95),
+                ..Default::default()
+            },
+            engine: crate::provider::Engine::Generic,
+            response_schema: None,
             max_tokens: 16,
             stop: vec![],
             extra_body: None,
@@ -1022,8 +1306,13 @@ mod tests {
             tools: vec![],
             tool_choice: None,
             parallel_tool_calls: None,
-            temperature: 0.2,
-            top_p: 0.95,
+            samplers: crate::provider::SamplerSettings {
+                temperature: Some(0.2),
+                top_p: Some(0.95),
+                ..Default::default()
+            },
+            engine: crate::provider::Engine::Generic,
+            response_schema: None,
             max_tokens: 128,
             stop: vec![],
             extra_body: None,
@@ -1067,8 +1356,13 @@ mod tests {
             tools: vec![],
             tool_choice: None,
             parallel_tool_calls: None,
-            temperature: 0.2,
-            top_p: 0.95,
+            samplers: crate::provider::SamplerSettings {
+                temperature: Some(0.2),
+                top_p: Some(0.95),
+                ..Default::default()
+            },
+            engine: crate::provider::Engine::Generic,
+            response_schema: None,
             max_tokens: 128,
             stop: vec!["<|im_end|>".into()],
             extra_body: None,
@@ -1087,6 +1381,105 @@ mod tests {
             body["messages"][1]["tool_calls"][0]["function"]["arguments"],
             "{\"path\":\"a.rs\"}"
         );
+    }
+
+    #[test]
+    fn sampler_profile_is_lowered_to_the_engine_wire_names() {
+        let mut req = ChatRequest {
+            model: "m".into(),
+            messages: vec![ChatMessage::user("hi")],
+            tools: vec![],
+            tool_choice: None,
+            parallel_tool_calls: None,
+            samplers: crate::provider::SamplerSettings {
+                temperature: Some(0.2),
+                top_p: Some(0.95),
+                min_p: Some(0.05),
+                repeat_penalty: Some(1.05),
+                dry_multiplier: Some(0.8),
+                ..Default::default()
+            },
+            engine: crate::provider::Engine::LlamaCpp,
+            response_schema: None,
+            max_tokens: 16,
+            stop: vec![],
+            extra_body: None,
+            include_usage: false,
+            reasoning_field: None,
+        };
+        let body = build_body(&req, false).unwrap();
+        assert_eq!(body["temperature"], json!(0.2));
+        assert_eq!(body["min_p"], json!(0.05));
+        assert_eq!(body["repeat_penalty"], json!(1.05));
+        assert_eq!(body["dry_multiplier"], json!(0.8));
+
+        // vLLM renames the repeat penalty and does not accept DRY.
+        req.engine = crate::provider::Engine::Vllm;
+        let body = build_body(&req, false).unwrap();
+        assert_eq!(body["repetition_penalty"], json!(1.05));
+        assert!(body.get("repeat_penalty").is_none());
+        assert!(body.get("dry_multiplier").is_none());
+
+        // An engine without min_p never receives the key.
+        req.engine = crate::provider::Engine::Ollama;
+        let body = build_body(&req, false).unwrap();
+        assert!(body.get("min_p").is_none());
+    }
+
+    #[test]
+    fn extra_body_wins_over_a_sampler_field() {
+        let req = ChatRequest {
+            model: "m".into(),
+            messages: vec![ChatMessage::user("hi")],
+            tools: vec![],
+            tool_choice: None,
+            parallel_tool_calls: None,
+            samplers: crate::provider::SamplerSettings {
+                temperature: Some(0.2),
+                ..Default::default()
+            },
+            engine: crate::provider::Engine::Generic,
+            response_schema: None,
+            max_tokens: 16,
+            stop: vec![],
+            extra_body: Some(json!({"temperature": 0.9})),
+            include_usage: false,
+            reasoning_field: None,
+        };
+        let body = build_body(&req, false).unwrap();
+        assert_eq!(body["temperature"], json!(0.9));
+    }
+
+    #[test]
+    fn debug_request_body_never_contains_the_api_key() {
+        let body = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "extra_body": {"token": "sk-secret"}
+        });
+        let logged = logged_request_body(&body, "sk-secret");
+        assert!(!logged.contains("sk-secret"), "{logged}");
+        assert!(logged.contains("[redacted]"));
+        assert!(logged.contains("\"model\":\"m\""));
+    }
+
+    #[test]
+    fn mistral_models_get_nine_character_call_ids() {
+        assert_eq!(WireIds::for_model("Devstral-Small-2507"), WireIds::Mistral);
+        assert_eq!(WireIds::for_model("qwen3-coder"), WireIds::AsIs);
+        assert_eq!(mistral_call_id("call_0007"), "000000007");
+        assert_eq!(mistral_call_id("call_12345"), "000012345");
+        assert_eq!(mistral_call_id("aB3dE6gH9"), "aB3dE6gH9");
+        for legacy in ["call_1", "chatcmpl-tool-abc", "", "000000007"] {
+            let wire = mistral_call_id(legacy);
+            assert_eq!(wire.len(), 9, "{legacy:?} -> {wire}");
+            assert!(wire.bytes().all(|b| b.is_ascii_alphanumeric()), "{wire}");
+            assert!(wire.starts_with('z'), "{wire}");
+            assert_eq!(wire, mistral_call_id(legacy), "deterministic");
+        }
+        assert_ne!(mistral_call_id("call_1"), mistral_call_id("call_2"));
+        // Order is kept for engines that sort tool messages by id.
+        assert!(mistral_call_id("call_0009") < mistral_call_id("call_0010"));
     }
 
     #[test]
@@ -1116,6 +1509,26 @@ mod tests {
             Some("a")
         );
         assert_eq!(reasoning_text(&delta, None).as_deref(), Some("a"));
+        let thinking = Delta {
+            thinking: Some("t".into()),
+            ..Delta::default()
+        };
+        assert_eq!(reasoning_text(&thinking, None).as_deref(), Some("t"));
+        assert_eq!(
+            reasoning_text(&thinking, Some("reasoning")).as_deref(),
+            Some("t"),
+            "a configured field that is absent falls back to the others"
+        );
+        let both = Delta {
+            reasoning: Some("r".into()),
+            thinking: Some("t".into()),
+            ..Delta::default()
+        };
+        assert_eq!(
+            reasoning_text(&both, Some("thinking")).as_deref(),
+            Some("t")
+        );
+        assert_eq!(reasoning_text(&both, None).as_deref(), Some("r"));
     }
 
     #[test]

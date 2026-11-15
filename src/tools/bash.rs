@@ -412,6 +412,7 @@ pub(crate) fn test_context(dir: &Path) -> ToolContext {
             app: APP_VERSION.into(),
             redact: true,
             context: None,
+            permissions: None,
         },
         true,
     )
@@ -428,6 +429,7 @@ pub(crate) fn test_context(dir: &Path) -> ToolContext {
         trust: false,
         verify: VerifyConfig::default(),
         profile: "full".into(),
+        edit_mode: Default::default(),
         packs: vec!["core".into(), "coding".into(), "security".into()],
         reads: Arc::new(Mutex::new(ReadTracker::default())),
         bg: Arc::new(Mutex::new(BgRegistry::new())),

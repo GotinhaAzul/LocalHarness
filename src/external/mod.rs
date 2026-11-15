@@ -728,6 +728,7 @@ mod tests {
             cwd: dir.to_path_buf(),
             project_id: "test".to_string(),
             sessions_dir_override: None,
+            home_dir: None,
         };
         let header = SessionData {
             cwd: dir.display().to_string(),
@@ -737,6 +738,7 @@ mod tests {
             app: "test".to_string(),
             redact: true,
             context: None,
+            permissions: None,
         };
         let session = Session::create(&paths, header, true).unwrap();
         let artifacts = session.artifacts.clone();
@@ -749,6 +751,7 @@ mod tests {
             trust: true,
             verify: VerifyConfig::default(),
             profile: "full".to_string(),
+            edit_mode: Default::default(),
             packs: Vec::new(),
             reads: Arc::new(Mutex::new(ReadTracker::default())),
             bg: Arc::new(Mutex::new(BgRegistry::new())),

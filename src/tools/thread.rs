@@ -587,6 +587,7 @@ mod tests {
             cwd: cwd.clone(),
             project_id: "test".into(),
             sessions_dir_override: None,
+            home_dir: None,
         };
         let header = SessionData {
             cwd: cwd.display().to_string(),
@@ -596,6 +597,7 @@ mod tests {
             app: "test".into(),
             redact: true,
             context: None,
+            permissions: None,
         };
         let session = Session::create(&paths, header, true).expect("session");
         let ctx = ToolContext {
@@ -607,6 +609,7 @@ mod tests {
             trust: true,
             verify: VerifyConfig::default(),
             profile: "test".into(),
+            edit_mode: Default::default(),
             packs: Vec::new(),
             reads: Arc::new(Mutex::new(ReadTracker::default())),
             bg: Arc::new(Mutex::new(BgRegistry::new())),

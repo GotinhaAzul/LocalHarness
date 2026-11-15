@@ -2,26 +2,32 @@
 
 pub mod artifact;
 pub mod entry;
+pub mod rewind;
 pub mod store;
 pub mod tree;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use chrono::Utc;
 
 pub use artifact::{Artifact, ArtifactError, ArtifactSlice, ArtifactStore};
 pub use entry::{
     AssistantData, Attachment, CheckoutData, CompactionData, CustomData, Entry, EntryKind,
-    ErrorData, FORMAT_VERSION, ImageRef, SessionContextWindow, SessionData, ToolCall,
-    ToolResultData, UserData,
+    ErrorData, FORMAT_VERSION, ImageRef, SessionContextWindow, SessionData, SessionPermissions,
+    ToolCall, ToolResultData, UserData,
 };
+pub use rewind::{RewindPlan, RewindReport};
 pub use store::{SessionStore, StoreError};
 pub use tree::{CheckoutError, SessionTree};
 
 use crate::paths::{Paths, new_session_id};
-use crate::security::redact::Redactor;
+use crate::security::redact::{Redactor, contains_placeholder};
+
+/// Appended to a replayed tool result whose saved form contains redaction
+/// placeholders, so the model does not mistake them for file content.
+pub const RESUMED_PLACEHOLDER_NOTE: &str = "\n[localharness] This result was restored from a saved session. [REDACTED:...] markers were substituted when it was saved and are not file content; re-read a file before editing it.";
 
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -55,7 +61,7 @@ impl Session {
                 next_seq: 1,
                 redactor: Redactor::new(redact),
             };
-            let header = session.make_entry(0, "s0", None, EntryKind::Session(header));
+            let header = session.make_entry(0, "s0", None, EntryKind::Session(header), None);
             session.tree.push(header);
             return Ok(session);
         }
@@ -88,7 +94,7 @@ impl Session {
             next_seq: 1,
             redactor: Redactor::new(redact),
         };
-        let header_entry = session.make_entry(0, "s0", None, EntryKind::Session(header));
+        let header_entry = session.make_entry(0, "s0", None, EntryKind::Session(header), None);
         session.write_entry(&header_entry)?;
         session.tree.push(header_entry);
         Ok(session)
@@ -136,12 +142,17 @@ impl Session {
             next_seq,
             redactor: Redactor::new(redact),
         };
-        if redact {
-            // Old sessions may predate redaction. Clean them in memory before
-            // their entries are replayed into a new prompt.
-            let redactor = &session.redactor;
-            for entry in session.tree.entries_mut() {
-                Self::redact_entry(redactor, &mut entry.kind);
+        // Entries are replayed exactly as they were saved. Redaction is never
+        // applied to replayed text: a model that sees a placeholder in place
+        // of file content writes it back. A result that was redacted when
+        // saved gets a note instead, and the file writers refuse to write
+        // placeholders that are not already in the file.
+        for entry in session.tree.entries_mut() {
+            if let EntryKind::ToolResult(data) = &mut entry.kind
+                && contains_placeholder(&data.content)
+                && !data.content.ends_with(RESUMED_PLACEHOLDER_NOTE)
+            {
+                data.content.push_str(RESUMED_PLACEHOLDER_NOTE);
             }
         }
         Ok(session)
@@ -231,10 +242,18 @@ impl Session {
         self.redactor.enabled()
     }
 
-    pub fn append(&mut self, mut kind: EntryKind) -> Result<Entry> {
+    pub fn append(&mut self, kind: EntryKind) -> Result<Entry> {
+        self.append_tagged(kind, None)
+    }
+
+    /// Append an entry with an explicit provenance tag. User entries default
+    /// to `user`; tool results pass `tool:<name>` or `external`.
+    pub fn append_tagged(&mut self, kind: EntryKind, provenance: Option<String>) -> Result<Entry> {
         let seq = self.next_seq;
         self.next_seq += 1;
-        Self::redact_entry(&self.redactor, &mut kind);
+        let provenance = provenance.or_else(|| {
+            matches!(kind, EntryKind::User(_)).then(|| crate::provenance::USER.to_string())
+        });
         let checkout = matches!(kind, EntryKind::Checkout(_));
         let parent = if checkout {
             None
@@ -245,7 +264,23 @@ impl Session {
             }
         };
         let id = format!("{}{seq}", if checkout { 'c' } else { 'e' });
-        let entry = self.make_entry(seq, &id, parent, kind);
+        // Only the copy written to disk is redacted. The in-memory tree is
+        // what later prompts are built from, and it keeps the raw text so the
+        // model never sees a placeholder in place of content it may write
+        // back to a file.
+        if self.store.is_some() && self.redactor.enabled() {
+            let mut stored = kind.clone();
+            Self::redact_entry(&self.redactor, &mut stored);
+            let stored = self.make_entry(seq, &id, parent.clone(), stored, provenance.clone());
+            self.write_entry(&stored)?;
+            let entry = Entry {
+                ts: stored.ts,
+                ..self.make_entry(seq, &id, parent, kind, provenance)
+            };
+            self.tree.push(entry.clone());
+            return Ok(entry);
+        }
+        let entry = self.make_entry(seq, &id, parent, kind, provenance);
         self.write_entry(&entry)?;
         self.tree.push(entry.clone());
         Ok(entry)
@@ -264,6 +299,20 @@ impl Session {
             message: message.into(),
             recoverable,
         }))
+    }
+
+    /// Move the active leaf to an already-validated entry. Unlike
+    /// [`Session::checkout`] this accepts the session header, which a rewind
+    /// of the first turn targets, and does not resolve a batch boundary.
+    pub fn move_leaf(&mut self, target: &str, reason: &str) -> Result<()> {
+        if self.tree.get(target).is_none() {
+            bail!("entry {target} does not exist");
+        }
+        self.append(EntryKind::Checkout(CheckoutData {
+            target: target.to_string(),
+            reason: reason.to_string(),
+        }))?;
+        Ok(())
     }
 
     /// Checkout the resolved target and record a marker.
@@ -289,8 +338,13 @@ impl Session {
                 header.cwd, header.endpoint, header.model, header.profile
             ));
         }
+        // The in-memory tree is raw. Redact each entry's fields first, as
+        // they are written to the session file: a pass over the finished
+        // markdown alone misses values inside rendered tool-call JSON.
         for entry in self.branch_entries() {
-            match &entry.kind {
+            let mut kind = entry.kind.clone();
+            Self::redact_entry(&self.redactor, &mut kind);
+            match &kind {
                 EntryKind::Session(_) | EntryKind::Custom(_) => {}
                 EntryKind::User(u) => {
                     out.push_str(&format!("## User\n\n{}\n\n", u.content));
@@ -341,8 +395,8 @@ impl Session {
                 }
             }
         }
-        // Entries are already redacted on append; this also covers sessions
-        // written before redaction existed. With --no-redact it is a no-op.
+        // A second pass over the whole document catches values that span
+        // rendered fields. With --no-redact it is a no-op.
         self.redactor.redact_owned(&out)
     }
 
@@ -403,13 +457,21 @@ impl Session {
         }
     }
 
-    fn make_entry(&self, seq: u64, id: &str, parent: Option<String>, kind: EntryKind) -> Entry {
+    fn make_entry(
+        &self,
+        seq: u64,
+        id: &str,
+        parent: Option<String>,
+        kind: EntryKind,
+        provenance: Option<String>,
+    ) -> Entry {
         Entry {
             v: FORMAT_VERSION,
             seq,
             id: id.to_string(),
             parent,
             ts: Utc::now(),
+            provenance,
             kind,
         }
     }
@@ -437,6 +499,7 @@ mod tests {
             app: APP_VERSION.into(),
             redact: true,
             context: None,
+            permissions: None,
         }
     }
 
@@ -445,6 +508,36 @@ mod tests {
         paths.data_dir = dir.join("data");
         paths.config_dir = dir.join("config");
         paths
+    }
+
+    #[test]
+    fn user_entries_are_tagged_and_tool_results_take_their_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths(dir.path());
+        let mut session = Session::create(&paths, header(), false).unwrap();
+        let user = session
+            .append(EntryKind::User(UserData {
+                attachments: Vec::new(),
+                content: "hello".into(),
+            }))
+            .unwrap();
+        assert_eq!(user.provenance.as_deref(), Some("user"));
+        let result = session
+            .append_tagged(
+                EntryKind::ToolResult(ToolResultData {
+                    call_id: "call_0001".into(),
+                    content: "[tool] read - README.md\nhello".into(),
+                    is_error: false,
+                    details: None,
+                    artifact: None,
+                }),
+                Some("tool:read".into()),
+            )
+            .unwrap();
+        assert_eq!(result.provenance.as_deref(), Some("tool:read"));
+        let raw = std::fs::read_to_string(session.path.as_ref().unwrap()).unwrap();
+        assert!(raw.contains("\"provenance\":\"tool:read\""), "{raw}");
+        assert!(raw.contains("\"provenance\":\"user\""), "{raw}");
     }
 
     #[test]
@@ -547,7 +640,62 @@ mod tests {
     }
 
     #[test]
-    fn old_plaintext_entries_are_redacted_when_replayed() {
+    fn the_in_memory_tree_keeps_raw_text_while_disk_is_redacted() {
+        const KEY: &str = "AKIAIOSFODNN7EXAMPLE";
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths(dir.path());
+        let mut session = Session::create(&paths, header(), false).unwrap();
+        let content = format!("aws_access_key_id = {KEY}\n");
+        let entry = session
+            .append(EntryKind::ToolResult(ToolResultData {
+                call_id: "c1".into(),
+                content: content.clone(),
+                is_error: false,
+                details: None,
+                artifact: None,
+            }))
+            .unwrap();
+        // The returned entry and the tree (what prompts are built from)
+        // hold exactly what the tool produced.
+        assert_eq!(entry.tool_result().unwrap().content, content);
+        let id = entry.id.clone();
+        let stored = session.tree.get(&id).unwrap();
+        assert_eq!(stored.tool_result().unwrap().content, content);
+        session.fsync().unwrap();
+        let raw = std::fs::read_to_string(session.path.clone().unwrap()).unwrap();
+        assert!(!raw.contains(KEY), "{raw}");
+    }
+
+    #[test]
+    fn export_redacts_values_inside_tool_call_arguments() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths(dir.path());
+        let mut session = Session::create(&paths, header(), false).unwrap();
+        let password = format!("pw-{:x}", std::process::id() as u64 * 7919 + 104_729);
+        let call = crate::session::entry::ToolCall {
+            id: "c1".into(),
+            name: "write".into(),
+            arguments: serde_json::json!({
+                "path": ".env",
+                "content": format!("DB_PASSWORD={password}\n"),
+            }),
+        };
+        session
+            .append(EntryKind::Assistant(AssistantData {
+                tool_calls: Some(vec![call]),
+                ..AssistantData::default()
+            }))
+            .unwrap();
+        let export = session.export_markdown();
+        assert!(!export.contains(&password), "{export}");
+        assert!(export.contains("DB_PASSWORD=[REDACTED:env:"), "{export}");
+        session.fsync().unwrap();
+        let raw = std::fs::read_to_string(session.path.clone().unwrap()).unwrap();
+        assert!(!raw.contains(&password), "{raw}");
+    }
+
+    #[test]
+    fn replayed_entries_are_not_redacted_and_placeholders_get_a_note() {
         const KEY: &str = "AKIAIOSFODNN7EXAMPLE";
         let dir = tempfile::tempdir().unwrap();
         let mut paths = paths(dir.path());
@@ -555,35 +703,50 @@ mod tests {
         paths.ensure_dirs().unwrap();
         let path = paths.session_file("old");
         let now = Utc::now().to_rfc3339();
-        let header = serde_json::json!({
-            "v": 1, "seq": 0, "id": "s0", "parent": null, "ts": now,
-            "type": "session",
-            "data": {
-                "cwd": "/tmp", "endpoint": "http://x", "model": "m",
-                "profile": "p", "app": "test"
-            }
-        });
-        let user = serde_json::json!({
-            "v": 1, "seq": 1, "id": "e1", "parent": "s0", "ts": now,
-            "type": "user",
-            "data": {"content": format!("the key is {KEY}")}
-        });
-        std::fs::write(
-            &path,
-            format!(
-                "{}\n{}\n",
-                serde_json::to_string(&header).unwrap(),
-                serde_json::to_string(&user).unwrap()
-            ),
-        )
-        .unwrap();
+        let placeholder = Redactor::new(true).redact_owned(&format!("aws_key = {KEY}"));
+        assert!(contains_placeholder(&placeholder), "{placeholder}");
+        let lines = [
+            serde_json::json!({
+                "v": 1, "seq": 0, "id": "s0", "parent": null, "ts": now,
+                "type": "session",
+                "data": {
+                    "cwd": "/tmp", "endpoint": "http://x", "model": "m",
+                    "profile": "p", "app": "test"
+                }
+            }),
+            // Written before redaction existed: replayed as saved.
+            serde_json::json!({
+                "v": 1, "seq": 1, "id": "e1", "parent": "s0", "ts": now,
+                "type": "user",
+                "data": {"content": "name = Column(Text)"}
+            }),
+            serde_json::json!({
+                "v": 1, "seq": 2, "id": "e2", "parent": "e1", "ts": now,
+                "type": "tool_result",
+                "data": {"call_id": "c1", "content": placeholder, "is_error": false}
+            }),
+        ];
+        let text: String = lines
+            .iter()
+            .map(|line| format!("{}\n", serde_json::to_string(line).unwrap()))
+            .collect();
+        std::fs::write(&path, text).unwrap();
         let session = Session::open(&path).unwrap();
-        let content = match &session.tree.get("e1").unwrap().kind {
-            EntryKind::User(data) => &data.content,
+        match &session.tree.get("e1").unwrap().kind {
+            EntryKind::User(data) => assert_eq!(data.content, "name = Column(Text)"),
             _ => panic!("wrong entry"),
-        };
-        assert!(!content.contains(KEY), "{content}");
-        assert!(content.contains("[REDACTED:aws:AKIA..."), "{content}");
+        }
+        let result = session.tree.get("e2").unwrap().tool_result().unwrap();
+        assert!(
+            result.content.starts_with(&placeholder),
+            "{}",
+            result.content
+        );
+        assert!(
+            result.content.ends_with(RESUMED_PLACEHOLDER_NOTE),
+            "{}",
+            result.content
+        );
     }
 
     #[test]

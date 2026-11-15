@@ -234,6 +234,7 @@ mod tests {
             id: format!("e{seq}"),
             parent: parent.map(str::to_string),
             ts: Utc::now(),
+            provenance: None,
             kind: EntryKind::User(UserData {
                 attachments: Vec::new(),
                 content: content.into(),

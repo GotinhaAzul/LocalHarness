@@ -126,19 +126,106 @@ tool_mode = "repair"        # native | repair | auto
   prints a notice; if it keeps appearing, enable native tool calling on the
   server.
 - `context_window` sets the prompt budget when probes are unavailable.
-- `strip_reasoning` controls reasoning display/retention; reasoning is never
-  sent back to the provider. `<think>`/`<thinking>` blocks that arrive in
+- `strip_reasoning` (default `true`) controls retention. Reasoning always
+  streams live to the reasoning pane (Ctrl+R); with `true` it is dropped before
+  the assistant entry is written, so session files stay small and a resumed
+  session has no reasoning to replay. Set `false` to persist it and see it
+  again in Ctrl+R after `--continue`. Reasoning is never sent back to the
+  provider. `<think>`/`<thinking>` blocks that arrive in
   content (a server without a reasoning parser) are moved to reasoning, as is
   text before a lone `</think>` from templates that open the block in the
   prompt.
-- `reasoning_field` names the streaming field (`reasoning_content` by default,
-  falling back to `reasoning`).
+- `reasoning_field` names the streaming field to prefer. The decoder then
+  falls back in this order: `reasoning_content`, `reasoning`, `thinking`
+  (Ollama). Any other value prints a startup warning naming the accepted
+  fields and the default order is used.
+- Inline reasoning is normalized into the same stream as the reasoning
+  fields: `<think>`/`<thinking>` blocks, text before a lone `</think>`, and
+  gpt-oss harmony `<|channel|>analysis<|message|>…<|end|>` messages (the
+  `<|channel|>final<|message|>` text becomes the answer). Assistant content is
+  stripped of these blocks again when the context is assembled, so a session
+  written by an older build cannot replay chain-of-thought into the prompt.
+- `thinking = "auto" | "on" | "off"` (default `auto`) decides whether the model
+  thinks. When the resolved policy is off, the table in `thinking_control` is
+  deep-merged into `extra_body`; the engine's own switch goes there:
+
+  ```toml
+  [model_profile.qwen3]
+  thinking = "auto"
+  thinking_breaks_tools = true
+  thinking_control = { chat_template_kwargs = { enable_thinking = false } }  # vLLM, SGLang, llama.cpp --jinja
+  # thinking_control = { think = false }                                     # Ollama
+  ```
+
+  `auto` turns thinking off only when tools are active and
+  `thinking_breaks_tools = true` (models documented to call tools only in
+  non-thinking mode). `thinking = "off"` with no `thinking_control` refuses
+  the turn with a `thinking_policy` error naming the key, instead of sending a
+  request that silently keeps thinking.
+- A reply with reasoning but no text and no tool call is not treated as an
+  answer: the TUI shows a `reasoning_only` warning and the loop retries once
+  with an empty-response nudge. Repeats usually mean the server's reasoning
+  parser swallowed the answer or the tool call.
 - `stop` adds stop sequences.
+- `temperature`, `top_p`, `min_p`, `repeat_penalty`, `dry_multiplier`,
+  `dry_base`, `xtc_probability`, and `seed` are per-model samplers. Each one
+  overrides the same global `[model]` value. The bundled presets are
+  `qwen-coding`, `gemma-chat`, and `glm-agent`; `model_profile = "auto"`
+  applies one from the model name, `/model <name> <preset>` pins one for the
+  session, and `--model-profile <name>` selects one at startup. Only fields
+  the engine accepts are sent: `min_p` is omitted for Ollama, DRY/XTC only go
+  to llama.cpp and KoboldCpp, and `lh doctor` warns about each omitted field.
+  Set `[model] engine` when a gateway hides the real server.
 - `extra_body` merges server-specific fields into every request, for example
   `chat_template_kwargs`.
 - `parallel_tool_calls` is recorded for compatibility; tools run sequentially.
 
+## Structured output
+
+Point `[model] response_schema` at a JSON Schema file, or pass `--json-schema
+<file>` for one run:
+
+```toml
+[model]
+response_schema = "schemas/reply.json"
+```
+
+```json
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["answer"],
+  "properties": {
+    "answer": {"type": "string", "minLength": 1}
+  }
+}
+```
+
+The adapter validates the schema before sending: `oneOf`, `anyOf`, `allOf`,
+`patternProperties`, remote refs, recursive refs, `not`, conditionals, and
+unknown keywords are refused with the keyword named. Local non-recursive
+`$ref`s under `$defs`/`definitions` work.
+
+Each engine gets its own dialect: GBNF for llama.cpp, `structured_outputs` for
+vLLM, `response_format` for SGLang/Ollama/LM Studio, and
+`/api/extra/json_to_grammar` for KoboldCpp. MLX, TabbyAPI, and an unidentified
+engine have no grammar backend; the harness says so, writes the schema into the
+prompt, validates every reply, and repairs mismatches. After three failed
+repairs the turn ends with `structured_output`; an invalid document is never
+returned as the final answer.
+
+A strict response format is refused together with `tools[]` on engines that do
+not support both (llama.cpp, Ollama, LM Studio, TabbyAPI, MLX, generic). Remove
+the tools for that run or remove the schema. `lh doctor` reports the detected
+`structured_output` dialect (`json_schema`, `grammar`, `none`, or `unknown`).
+
 ## Context and token accounting
+
+Reasoning tokens are reported separately in the header meter (`think N`):
+the server's `usage.completion_tokens_details.reasoning_tokens` when present,
+otherwise an estimate from the reasoning text with the calibrated
+characters-per-token ratio. The headless `--json` `usage` event carries the
+same `reasoning_tokens` field.
 
 An engine can report three different context sizes, and they are not
 interchangeable:
@@ -246,7 +333,7 @@ scripted tests).
 | `tool_parser` | Parser name the server reports, if any. |
 | `tool_probe` | Last forced-tool conformance result (`native_ok`, `prose_fallback`, `rejected_400`, `tools_dropped`, `empty_call`), its effective `mode`, model, build, message, and check time; `null` when none is cached. |
 | `reasoning_field` | Streaming reasoning field the server reports, if any. |
-| `structured_output` | `json_schema`, `grammar`, `none`, or `unknown`; unknown when the server does not report it. |
+| `structured_output` | `json_schema`, `grammar`, `none`, or `unknown`, from the engine fingerprint: llama.cpp/KoboldCpp report `grammar`, vLLM/SGLang/Ollama/LM Studio `json_schema`, MLX/TabbyAPI `none`. |
 | `cache_mode` | Engine cache mode, if reported (for example TabbyAPI's `cache_mode`). |
 | `slots` | Parallel slot count, if reported (llama.cpp `/props`). |
 | `tokenizer_route` | `"/tokenize"` when exact tokenization works, else `null`. |
@@ -332,5 +419,6 @@ the server reported nothing; the harness falls back to the configured
   calls; cut prose is continued. Raise `[model] max_output_tokens` if it
   repeats.
 - **"repetition guard"**: the model fell into an exact loop and was stopped
-  early. Lower `temperature`, or add a repetition penalty through
-  `extra_body` (llama.cpp: `repeat_penalty`; vLLM: `repetition_penalty`).
+  early. Apply a sampler preset (`qwen-coding`, `gemma-chat`, `glm-agent`),
+  lower `temperature`, or set `min_p`/`repeat_penalty`/DRY values in the model
+  profile. `lh doctor` reports fields the engine omits.

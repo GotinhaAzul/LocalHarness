@@ -15,8 +15,10 @@ use bytes::Bytes;
 use futures_util::stream;
 use localharness::config::ModelConfig;
 use localharness::provider::{
-    ChatMessage, ChatRequest, ErrorClass, OpenAiCompatProvider, StreamEvent, collect_stream,
+    ChatMessage, ChatRequest, Completion, ErrorClass, OpenAiCompatProvider, StreamEvent, ToolCall,
+    Usage, collect_stream, fold_stream,
 };
+use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone)]
@@ -29,11 +31,14 @@ struct Script {
 #[derive(Clone, Default)]
 struct FakeState {
     requests: Arc<Mutex<Vec<serde_json::Value>>>,
+    /// The exact bytes of every request, for prefix comparisons.
+    bodies: Arc<Mutex<Vec<String>>>,
     script: Arc<Mutex<VecDeque<Script>>>,
 }
 
 async fn chat(AxumState(state): AxumState<FakeState>, body: String) -> Response {
     let value: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
+    state.bodies.lock().unwrap().push(body);
     state.requests.lock().unwrap().push(value);
     let script = state.script.lock().unwrap().pop_front();
     let Some(script) = script else {
@@ -43,10 +48,13 @@ async fn chat(AxumState(state): AxumState<FakeState>, body: String) -> Response 
             .unwrap();
     };
     let mut builder = Response::builder().status(script.status);
-    builder = builder.header(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("text/event-stream"),
-    );
+    // A body that is one JSON object is a non-streamed completion.
+    let content_type = if script.body.trim_start().starts_with('{') {
+        "application/json"
+    } else {
+        "text/event-stream"
+    };
+    builder = builder.header(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
     if script.chunked {
         let bytes = script.body.into_bytes();
         let chunks: Vec<Result<Bytes, Infallible>> = bytes
@@ -110,8 +118,13 @@ fn request() -> ChatRequest {
         }],
         tool_choice: Some("auto".into()),
         parallel_tool_calls: None,
-        temperature: 0.2,
-        top_p: 0.95,
+        samplers: localharness::provider::SamplerSettings {
+            temperature: Some(0.2),
+            top_p: Some(0.95),
+            ..Default::default()
+        },
+        engine: localharness::provider::Engine::Generic,
+        response_schema: None,
         max_tokens: 128,
         stop: vec![],
         extra_body: None,
@@ -195,6 +208,82 @@ fn tool_deltas(
             _ => None,
         })
         .collect()
+}
+
+fn request_with(system: &str, user: &str) -> ChatRequest {
+    let mut request = request();
+    request.messages = vec![
+        ChatMessage::System {
+            content: system.into(),
+        },
+        ChatMessage::User {
+            content: user.into(),
+            images: Vec::new(),
+        },
+    ];
+    request
+}
+
+/// Two consecutive requests must agree byte-for-byte on everything before the
+/// conversation: the model fields, the leading system message, and the tool
+/// schemas. This is the prefix a local engine can keep in its KV cache.
+#[tokio::test]
+async fn consecutive_requests_share_the_prefix_up_to_the_conversation() {
+    let (base, state) = spawn().await;
+    for _ in 0..2 {
+        state.script.lock().unwrap().push_back(Script {
+            status: 200,
+            body: "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n"
+                .into(),
+            chunked: false,
+        });
+    }
+    let provider = provider(&base);
+    let prompt = "# Stable system prompt\n\n## Operating rules\n\n- Inspect before acting.";
+    for user in ["first question", "second question"] {
+        let events = collect_stream(
+            &provider,
+            request_with(prompt, user),
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(
+            events.iter().all(Result::is_ok),
+            "stream failed: {events:?}"
+        );
+    }
+
+    let bodies = state.bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 2);
+    let first = bodies[0].as_bytes();
+    let second = bodies[1].as_bytes();
+    let common = first
+        .iter()
+        .zip(second)
+        .take_while(|(left, right)| left == right)
+        .count();
+
+    let system = serde_json::to_string(&serde_json::json!({"content": prompt, "role": "system"}))
+        .expect("system message json");
+    let system_end = first
+        .windows(system.len())
+        .position(|window| window == system.as_bytes())
+        .expect("the system message is on the wire")
+        + system.len();
+    assert!(
+        common >= system_end,
+        "the requests diverged at {common}, inside the system prefix ending at {system_end}"
+    );
+    assert!(first[common..].starts_with(b"first question"));
+    assert!(second[common..].starts_with(b"second question"));
+
+    let first_body: serde_json::Value = serde_json::from_str(&bodies[0]).unwrap();
+    let second_body: serde_json::Value = serde_json::from_str(&bodies[1]).unwrap();
+    assert_eq!(
+        first_body["tools"], second_body["tools"],
+        "tool order and schema bytes must not drift between requests"
+    );
+    assert_eq!(first_body["tools"][0]["function"]["name"], "read");
 }
 
 async fn tool_stream(body: &str) -> Vec<(usize, Option<String>, Option<String>, String)> {
@@ -414,6 +503,318 @@ async fn malformed_sse_is_a_parse_error() {
 }
 
 #[tokio::test]
+async fn sampler_fields_are_lowered_per_engine_and_unsupported_ones_are_omitted() {
+    use localharness::provider::{Engine, SamplerField, SamplerSettings};
+
+    async fn sent_body(engine: Engine) -> serde_json::Value {
+        let (base, state) = spawn().await;
+        state.script.lock().unwrap().push_back(Script {
+            status: 200,
+            body: SSE_OK.into(),
+            chunked: false,
+        });
+        let mut req = request();
+        req.engine = engine;
+        req.samplers = SamplerSettings {
+            temperature: Some(0.2),
+            top_p: Some(0.95),
+            min_p: Some(0.05),
+            repeat_penalty: Some(1.05),
+            dry_multiplier: Some(0.8),
+            xtc_probability: Some(0.0),
+            seed: Some(7),
+            ..Default::default()
+        };
+        let events = collect_stream(&provider(&base), req, CancellationToken::new()).await;
+        assert!(
+            events.iter().all(|event| event.is_ok()),
+            "stream should finish"
+        );
+        let requests = state.requests.lock().unwrap();
+        requests[0].clone()
+    }
+
+    // llama.cpp accepts min_p and spells the penalty repeat_penalty.
+    let llama = sent_body(Engine::LlamaCpp).await;
+    assert_eq!(llama["min_p"], 0.05);
+    assert_eq!(llama["repeat_penalty"], 1.05);
+    assert_eq!(llama["dry_multiplier"], 0.8);
+    assert!(llama.get("repetition_penalty").is_none());
+
+    // vLLM accepts min_p and spells the penalty repetition_penalty; DRY and
+    // XTC are llama.cpp-only and must not be sent.
+    let vllm = sent_body(Engine::Vllm).await;
+    assert_eq!(vllm["min_p"], 0.05);
+    assert_eq!(vllm["repetition_penalty"], 1.05);
+    assert!(vllm.get("dry_multiplier").is_none());
+    assert!(vllm.get("xtc_probability").is_none());
+
+    // Ollama's OpenAI-compatible API does not take min_p: the body omits it.
+    let ollama = sent_body(Engine::Ollama).await;
+    assert!(ollama.get("min_p").is_none());
+    assert_eq!(ollama["repeat_penalty"], 1.05);
+    let settings = SamplerSettings {
+        min_p: Some(0.05),
+        ..Default::default()
+    };
+    assert_eq!(
+        settings.unsupported(Engine::Ollama),
+        vec![SamplerField::MinP]
+    );
+    assert!(settings.warnings(Engine::Ollama)[0].contains("min_p"));
+}
+
+#[tokio::test]
+async fn tool_conformance_probe_classifies_every_outcome_against_fixture_servers() {
+    use axum::routing::get;
+    use localharness::provider::probe::{
+        ToolProbeOutcome, probe_tool_conformance, tool_probe_metadata,
+    };
+
+    async fn probe_fixture(
+        props: Option<&'static str>,
+        status: u16,
+        body: &'static str,
+    ) -> (localharness::provider::probe::ToolProbe, serde_json::Value) {
+        let state = FakeState::default();
+        let chat_state = state.clone();
+        let mut app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |request_body: String| {
+                let state = chat_state.clone();
+                async move {
+                    let value: serde_json::Value =
+                        serde_json::from_str(&request_body).unwrap_or(serde_json::Value::Null);
+                    state.requests.lock().unwrap().push(value);
+                    Response::builder()
+                        .status(StatusCode::from_u16(status).unwrap())
+                        .header(
+                            header::CONTENT_TYPE,
+                            HeaderValue::from_static("application/json"),
+                        )
+                        .body(Body::from(body))
+                        .unwrap()
+                }
+            }),
+        );
+        if let Some(props) = props {
+            app = app.route(
+                "/props",
+                get(move || async move { axum::Json(serde_json::json!({"chat_template": props})) }),
+            );
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let base = format!("http://{address}");
+        let provider = provider(&base);
+        let metadata = tool_probe_metadata(&provider).await;
+        let probe = probe_tool_conformance(&provider, &metadata)
+            .await
+            .expect("probe result");
+        let request = state
+            .requests
+            .lock()
+            .unwrap()
+            .first()
+            .cloned()
+            .expect("probe request recorded");
+        (probe, request)
+    }
+
+    let native_body = r#"{"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"probe_echo","arguments":"{\"value\":\"ok\"}"}}]}}]}"#;
+    let prose_body =
+        r#"{"choices":[{"message":{"role":"assistant","content":"I would call probe_echo."}}]}"#;
+    let empty_body =
+        r#"{"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[]}}]}"#;
+
+    let (native, request) = probe_fixture(Some("tool-aware template"), 200, native_body).await;
+    assert_eq!(native.outcome, ToolProbeOutcome::NativeOk);
+    assert!(native.native());
+    assert_eq!(native.mode, "native");
+    assert_eq!(request["tool_choice"]["function"]["name"], "probe_echo");
+    assert_eq!(
+        request["tools"][0]["function"]["parameters"]["required"],
+        serde_json::json!(["value"])
+    );
+    assert_eq!(request["stream"], false);
+
+    let (prose, _) = probe_fixture(Some("tool-aware template"), 200, prose_body).await;
+    assert_eq!(prose.outcome, ToolProbeOutcome::ProseFallback);
+    assert_eq!(prose.mode, "repair");
+    assert!(prose.warning().is_some());
+
+    let (dropped, _) = probe_fixture(Some("plain chat template"), 200, prose_body).await;
+    assert_eq!(dropped.outcome, ToolProbeOutcome::ToolsDropped);
+    assert_eq!(dropped.mode, "repair");
+
+    let (empty, _) = probe_fixture(Some("tool-aware template"), 200, empty_body).await;
+    assert_eq!(empty.outcome, ToolProbeOutcome::EmptyCall);
+    assert_eq!(empty.mode, "repair");
+
+    let (rejected, _) = probe_fixture(None, 400, r#"{"error":"tools not supported"}"#).await;
+    assert_eq!(rejected.outcome, ToolProbeOutcome::Rejected400);
+    assert!(rejected.message.contains("--enable-auto-tool-choice"));
+    assert!(rejected.message.contains("--tool-call-parser"));
+}
+
+#[tokio::test]
+async fn structured_schema_uses_each_engine_dialect_and_never_sends_strict_with_tools() {
+    use localharness::provider::StructuredMode;
+    use localharness::provider::structured::plan;
+
+    let schema = serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["answer"],
+        "properties": {"answer": {"type": "string"}}
+    });
+
+    async fn chat_body(
+        engine: localharness::provider::Engine,
+        schema: &serde_json::Value,
+    ) -> serde_json::Value {
+        let (base, state) = spawn().await;
+        state.script.lock().unwrap().push_back(Script {
+            status: 200,
+            body: "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n"
+                .into(),
+            chunked: false,
+        });
+        let mut req = request();
+        req.tools.clear();
+        req.tool_choice = None;
+        req.engine = engine;
+        req.response_schema = Some(plan(engine, "reply", schema).expect("plan"));
+        let events = collect_stream(&provider(&base), req, CancellationToken::new()).await;
+        assert!(events.iter().all(|event| event.is_ok()));
+        state.requests.lock().unwrap()[0].clone()
+    }
+
+    // llama.cpp gets the GBNF grammar.
+    let llama = chat_body(localharness::provider::Engine::LlamaCpp, &schema).await;
+    let grammar = llama["grammar"].as_str().expect("grammar");
+    assert!(grammar.contains("root ::="), "{grammar}");
+    assert!(grammar.contains("\"answer\""), "{grammar}");
+
+    // vLLM gets structured_outputs, not response_format.
+    let vllm = chat_body(localharness::provider::Engine::Vllm, &schema).await;
+    assert_eq!(vllm["structured_outputs"]["json"]["type"], "object");
+    assert!(vllm.get("response_format").is_none());
+
+    // SGLang gets its response_format dialect.
+    let sglang = chat_body(localharness::provider::Engine::Sglang, &schema).await;
+    assert_eq!(sglang["response_format"]["type"], "json_schema");
+    assert_eq!(
+        sglang["response_format"]["json_schema"]["schema"]["type"],
+        "object"
+    );
+
+    // MLX has no grammar backend: the request carries no strict field and the
+    // plan is a visible repair fallback.
+    let mlx = chat_body(localharness::provider::Engine::Mlx, &schema).await;
+    assert!(mlx.get("grammar").is_none());
+    assert!(mlx.get("response_format").is_none());
+    assert!(mlx.get("structured_outputs").is_none());
+    let mlx_plan = plan(localharness::provider::Engine::Mlx, "reply", &schema).unwrap();
+    assert_eq!(mlx_plan.mode, StructuredMode::Repair);
+    assert!(mlx_plan.notice().unwrap().contains("repair"));
+
+    // A strict schema plus tools on llama.cpp is refused before the request.
+    let mut req = request();
+    req.engine = localharness::provider::Engine::LlamaCpp;
+    req.response_schema =
+        Some(plan(localharness::provider::Engine::LlamaCpp, "reply", &schema).unwrap());
+    let events = collect_stream(
+        &provider("http://127.0.0.1:9"),
+        req,
+        CancellationToken::new(),
+    )
+    .await;
+    let error = events
+        .into_iter()
+        .find_map(|event| event.err())
+        .expect("refusal");
+    assert_eq!(error.class, ErrorClass::BadRequest);
+    assert!(error.message.contains("cannot combine tools[]"), "{error}");
+    assert!(error.message.contains("llama.cpp"), "{error}");
+
+    // The same combination is allowed on vLLM.
+    let mut req = request();
+    req.engine = localharness::provider::Engine::Vllm;
+    req.response_schema =
+        Some(plan(localharness::provider::Engine::Vllm, "reply", &schema).unwrap());
+    let (base, state) = spawn().await;
+    state.script.lock().unwrap().push_back(Script {
+        status: 200,
+        body: "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n".into(),
+        chunked: false,
+    });
+    let events = collect_stream(&provider(&base), req, CancellationToken::new()).await;
+    assert!(events.iter().all(|event| event.is_ok()));
+    let sent = state.requests.lock().unwrap()[0].clone();
+    assert_eq!(sent["structured_outputs"]["json"]["type"], "object");
+    assert_eq!(sent["tools"][0]["function"]["name"], "read");
+}
+
+#[tokio::test]
+async fn koboldcpp_grammar_endpoint_supplies_the_request_grammar() {
+    use localharness::provider::structured::{kobold_grammar, plan};
+
+    let state = FakeState::default();
+    let chat_state = state.clone();
+    let app = Router::new()
+        .route(
+            "/api/extra/json_to_grammar",
+            post(|| async {
+                axum::Json(serde_json::json!({
+                    "grammar": "root ::= \"from-kobold\""
+                }))
+            }),
+        )
+        .route(
+            "/v1/chat/completions",
+            post(move |body: String| {
+                let state = chat_state.clone();
+                async move {
+                    let value: serde_json::Value =
+                        serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
+                    state.requests.lock().unwrap().push(value);
+                    Body::from(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n",
+                    )
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let schema = serde_json::json!({"type": "object"});
+    let grammar = kobold_grammar(&provider(&base), &schema)
+        .await
+        .expect("converted grammar");
+    assert_eq!(grammar, "root ::= \"from-kobold\"");
+    let mut structured =
+        plan(localharness::provider::Engine::KoboldCpp, "reply", &schema).expect("plan");
+    structured.grammar = Some(grammar);
+
+    let mut req = request();
+    req.tools.clear();
+    req.tool_choice = None;
+    req.engine = localharness::provider::Engine::KoboldCpp;
+    req.response_schema = Some(structured);
+    let events = collect_stream(&provider(&base), req, CancellationToken::new()).await;
+    assert!(events.iter().all(|event| event.is_ok()));
+    let sent = state.requests.lock().unwrap()[0].clone();
+    assert_eq!(sent["grammar"], "root ::= \"from-kobold\"");
+}
+
+#[tokio::test]
 async fn auth_failure_is_prescriptive() {
     let (base, state) = spawn().await;
     state.script.lock().unwrap().push_back(Script {
@@ -485,4 +886,349 @@ async fn cancellation_mid_stream_returns_cancelled() {
         .find_map(|event| event.err())
         .expect("cancellation should surface as an error");
     assert_eq!(error.class, ErrorClass::Cancelled);
+}
+
+#[tokio::test]
+async fn a_thinking_only_chunk_becomes_reasoning() {
+    let (base, state) = spawn().await;
+    state.script.lock().unwrap().push_back(Script {
+        status: 200,
+        body: concat!(
+            "data: {\"choices\":[{\"delta\":{\"thinking\":\"ponder\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        )
+        .into(),
+        chunked: false,
+    });
+    let events = collect_stream(&provider(&base), request(), CancellationToken::new()).await;
+    let reasoning: Vec<String> = events
+        .into_iter()
+        .filter_map(|event| match event.expect("stream item") {
+            StreamEvent::ReasoningDelta(text) => Some(text),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(reasoning, vec!["ponder".to_string()]);
+}
+
+// ---------------------------------------------------------------------------
+// Engine fixtures. One logical completion (reasoning, text, two tool calls,
+// usage) rendered the way each engine streams it. Every fixture must fold into
+// the same normalized `Completion`, and so must the non-streamed body.
+// ---------------------------------------------------------------------------
+
+const READ_ARGS: &str = r#"{"path":"src/main.rs"}"#;
+const WRITE_ARGS: &str =
+    r#"{"path":"notes.md","content":"line one\nline \"two\" with unicode: café ✓\n"}"#;
+
+fn sse(chunks: &[serde_json::Value]) -> String {
+    let mut body = String::new();
+    for chunk in chunks {
+        body.push_str("data: ");
+        body.push_str(&chunk.to_string());
+        body.push_str("\n\n");
+    }
+    body.push_str("data: [DONE]\n\n");
+    body
+}
+
+/// Split `text` into `parts` pieces on char boundaries.
+fn pieces(text: &str, parts: usize) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    assert!(chars.len() >= parts);
+    (0..parts)
+        .map(|part| {
+            let start = part * chars.len() / parts;
+            let end = (part + 1) * chars.len() / parts;
+            chars[start..end].iter().collect()
+        })
+        .collect()
+}
+
+fn usage_json(completion: u32) -> serde_json::Value {
+    json!({"prompt_tokens": 120, "completion_tokens": completion, "total_tokens": 120 + completion})
+}
+
+fn delta(delta: serde_json::Value) -> serde_json::Value {
+    json!({"choices": [{"index": 0, "delta": delta}]})
+}
+
+fn finish(reason: &str) -> serde_json::Value {
+    json!({"choices": [{"index": 0, "delta": {}, "finish_reason": reason}]})
+}
+
+/// SGLang / llama.cpp style: explicit indices, id and name on the first
+/// fragment, arguments in 20 pieces each.
+fn fragmented_fixture(id_prefix: &str, repeat_usage: bool) -> String {
+    let mut chunks = vec![
+        delta(json!({"role": "assistant", "reasoning_content": "pl"})),
+        delta(json!({"reasoning_content": "an"})),
+    ];
+    for piece in pieces("Reading both.", 5) {
+        chunks.push(delta(json!({ "content": piece })));
+    }
+    for (index, (name, args)) in [("read", READ_ARGS), ("write", WRITE_ARGS)]
+        .into_iter()
+        .enumerate()
+    {
+        for (position, piece) in pieces(args, 20).into_iter().enumerate() {
+            let call = if position == 0 {
+                json!({"index": index, "id": format!("{id_prefix}{index}"), "type": "function",
+                       "function": {"name": name, "arguments": piece}})
+            } else {
+                json!({"index": index, "function": {"arguments": piece}})
+            };
+            chunks.push(delta(json!({ "tool_calls": [call] })));
+        }
+    }
+    chunks.push(finish("tool_calls"));
+    if repeat_usage {
+        // llama.cpp-style: a cumulative usage report on many chunks.
+        let count = chunks.len() as u32;
+        for (position, chunk) in chunks.iter_mut().enumerate() {
+            let so_far = (40 * (position as u32 + 1)) / count;
+            chunk["usage"] = usage_json(so_far.max(1));
+        }
+    } else {
+        chunks.push(json!({"choices": [], "usage": usage_json(40)}));
+    }
+    sse(&chunks)
+}
+
+/// vLLM style: each call arrives whole once its region parses.
+fn whole_call_fixture() -> String {
+    sse(&[
+        delta(json!({"role": "assistant", "reasoning_content": "plan"})),
+        delta(json!({"content": "Reading both."})),
+        delta(
+            json!({"tool_calls": [{"index": 0, "id": "chatcmpl-tool-9f1e", "type": "function",
+            "function": {"name": "read", "arguments": READ_ARGS}}]}),
+        ),
+        delta(
+            json!({"tool_calls": [{"index": 1, "id": "chatcmpl-tool-77ab", "type": "function",
+            "function": {"name": "write", "arguments": WRITE_ARGS}}]}),
+        ),
+        finish("tool_calls"),
+        json!({"choices": [], "usage": usage_json(40)}),
+    ])
+}
+
+/// Ollama compatibility route: no ids, no indices, reasoning in `reasoning`,
+/// thinking, content and calls gathered across chunks.
+fn ollama_fixture() -> String {
+    sse(&[
+        delta(json!({"role": "assistant", "reasoning": "pl"})),
+        delta(json!({"reasoning": "an"})),
+        delta(json!({"content": "Reading "})),
+        delta(json!({"content": "both."})),
+        delta(json!({"tool_calls": [{"function": {"name": "read", "arguments": READ_ARGS}}]})),
+        delta(json!({"tool_calls": [{"function": {"name": "write", "arguments": WRITE_ARGS}}]})),
+        finish("tool_calls"),
+        json!({"choices": [], "usage": usage_json(40)}),
+    ])
+}
+
+/// The same completion as one non-streamed body (`stream` ignored).
+fn non_streamed_fixture() -> String {
+    json!({
+        "id": "chatcmpl-1",
+        "object": "chat.completion",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "reasoning_content": "plan",
+                "content": "Reading both.",
+                "tool_calls": [
+                    {"id": "call_x", "type": "function", "function": {"name": "read", "arguments": READ_ARGS}},
+                    {"id": "call_y", "type": "function", "function": {"name": "write", "arguments": WRITE_ARGS}}
+                ]
+            },
+            "finish_reason": "tool_calls"
+        }],
+        "usage": usage_json(40)
+    })
+    .to_string()
+}
+
+async fn fold(
+    body: &str,
+    chunked: bool,
+) -> Result<Completion, localharness::provider::ProviderError> {
+    let (base, state) = spawn().await;
+    state.script.lock().unwrap().push_back(Script {
+        status: 200,
+        body: body.into(),
+        chunked,
+    });
+    let events = collect_stream(&provider(&base), request(), CancellationToken::new()).await;
+    fold_stream(events)
+}
+
+/// Engine ids are per-engine noise; the ledger replaces them.
+fn without_engine_ids(mut completion: Completion) -> Completion {
+    for call in &mut completion.calls {
+        call.engine_id = None;
+    }
+    completion
+}
+
+#[tokio::test]
+async fn every_engine_fixture_folds_into_the_same_completion() {
+    let expected = Completion {
+        content: "Reading both.".into(),
+        reasoning: "plan".into(),
+        calls: vec![
+            localharness::provider::AssembledCall {
+                engine_id: None,
+                name: "read".into(),
+                arguments: READ_ARGS.into(),
+            },
+            localharness::provider::AssembledCall {
+                engine_id: None,
+                name: "write".into(),
+                arguments: WRITE_ARGS.into(),
+            },
+        ],
+        usage: Some(Usage::new(120, 40)),
+        finish: Some("tool_calls".into()),
+    };
+    let fixtures = [
+        ("sglang", fragmented_fixture("call_", false)),
+        ("llama.cpp", fragmented_fixture("", true)),
+        ("vllm", whole_call_fixture()),
+        ("ollama", ollama_fixture()),
+    ];
+    for (engine, body) in &fixtures {
+        // Byte-chunked transport on top of the engine's own fragmentation.
+        for chunked in [false, true] {
+            let completion = fold(body, chunked)
+                .await
+                .unwrap_or_else(|err| panic!("{engine}: {err}"));
+            assert_eq!(
+                without_engine_ids(completion),
+                expected,
+                "{engine} chunked={chunked}"
+            );
+        }
+    }
+    let full = fold(&non_streamed_fixture(), false)
+        .await
+        .expect("non-streamed");
+    assert_eq!(full.calls[0].engine_id.as_deref(), Some("call_x"));
+    assert_eq!(without_engine_ids(full), expected, "non-streamed body");
+}
+
+#[tokio::test]
+async fn fragmented_fixtures_split_each_call_into_twenty_chunks() {
+    let body = fragmented_fixture("call_", false);
+    let (base, state) = spawn().await;
+    state.script.lock().unwrap().push_back(Script {
+        status: 200,
+        body,
+        chunked: true,
+    });
+    let events = collect_stream(&provider(&base), request(), CancellationToken::new()).await;
+    let calls = tool_deltas(events);
+    assert_eq!(calls.iter().filter(|call| call.0 == 0).count(), 20);
+    assert_eq!(calls.iter().filter(|call| call.0 == 1).count(), 20);
+}
+
+#[tokio::test]
+async fn repeated_usage_reports_fold_into_one() {
+    let (base, state) = spawn().await;
+    state.script.lock().unwrap().push_back(Script {
+        status: 200,
+        body: fragmented_fixture("", true),
+        chunked: false,
+    });
+    let events = collect_stream(&provider(&base), request(), CancellationToken::new()).await;
+    let reports = events
+        .iter()
+        .filter(|event| matches!(event, Ok(StreamEvent::Usage(_))))
+        .count();
+    assert!(reports > 1, "the fixture repeats usage");
+    let completion = fold_stream(events).unwrap();
+    assert_eq!(completion.usage, Some(Usage::new(120, 40)));
+}
+
+#[tokio::test]
+async fn a_call_cut_by_the_output_limit_is_truncated_on_every_shape() {
+    let cut = &WRITE_ARGS[..WRITE_ARGS.len() / 2];
+    let streamed = sse(&[
+        delta(
+            json!({"tool_calls": [{"index": 0, "id": "c0", "function": {"name": "write", "arguments": cut}}]}),
+        ),
+        finish("length"),
+    ]);
+    let full = json!({"choices": [{"message": {"role": "assistant", "tool_calls": [
+        {"id": "c0", "type": "function", "function": {"name": "write", "arguments": cut}}
+    ]}, "finish_reason": "length"}]})
+    .to_string();
+    for body in [streamed, full] {
+        let err = fold(&body, true).await.expect_err("truncated");
+        assert_eq!(err.class, ErrorClass::ToolCallTruncated);
+        assert_eq!(err.class.code(), "tool_call_truncated");
+    }
+}
+
+#[tokio::test]
+async fn an_error_object_after_tool_fragments_aborts_the_completion() {
+    let body = sse(&[
+        delta(
+            json!({"tool_calls": [{"index": 0, "id": "c0", "function": {"name": "read", "arguments": "{\"pa"}}]}),
+        ),
+        json!({"error": "model crashed while generating"}),
+    ]);
+    let err = fold(&body, true).await.expect_err("in-stream error");
+    assert_eq!(err.message, "model crashed while generating");
+    let full = json!({"error": {"message": "out of memory", "type": "server_error"}}).to_string();
+    let err = fold(&full, false).await.expect_err("error body");
+    assert_eq!(err.message, "out of memory");
+}
+
+#[tokio::test]
+async fn object_arguments_from_a_gateway_are_accepted() {
+    let body = sse(&[
+        delta(
+            json!({"tool_calls": [{"function": {"name": "read", "arguments": {"path": "src/main.rs"}}}]}),
+        ),
+        finish("tool_calls"),
+    ]);
+    let completion = fold(&body, false).await.unwrap();
+    assert_eq!(completion.calls[0].arguments, READ_ARGS);
+}
+
+#[tokio::test]
+async fn mistral_models_receive_nine_character_call_ids() {
+    let (base, state) = spawn().await;
+    state.script.lock().unwrap().push_back(Script {
+        status: 200,
+        body: SSE_OK.into(),
+        chunked: false,
+    });
+    let config = ModelConfig {
+        endpoint: base.clone(),
+        ..ModelConfig::default()
+    };
+    let provider = OpenAiCompatProvider::new(&config, "mistral-small-3.2").unwrap();
+    let mut req = request();
+    req.model = "mistral-small-3.2".into();
+    req.messages.push(ChatMessage::Assistant {
+        content: None,
+        tool_calls: vec![ToolCall {
+            id: "call_0001".into(),
+            name: "read".into(),
+            arguments: json!({"path": "a.rs"}),
+        }],
+    });
+    req.messages.push(ChatMessage::Tool {
+        call_id: "call_0001".into(),
+        content: "ok".into(),
+    });
+    collect_stream(&provider, req, CancellationToken::new()).await;
+    let sent = state.requests.lock().unwrap()[0].clone();
+    assert_eq!(sent["messages"][1]["tool_calls"][0]["id"], "000000001");
+    assert_eq!(sent["messages"][2]["tool_call_id"], "000000001");
 }
