@@ -313,8 +313,13 @@ impl Session {
                 header.cwd, header.endpoint, header.model, header.profile
             ));
         }
+        // The in-memory tree is raw. Redact each entry's fields first, as
+        // they are written to the session file: a pass over the finished
+        // markdown alone misses values inside rendered tool-call JSON.
         for entry in self.branch_entries() {
-            match &entry.kind {
+            let mut kind = entry.kind.clone();
+            Self::redact_entry(&self.redactor, &mut kind);
+            match &kind {
                 EntryKind::Session(_) | EntryKind::Custom(_) => {}
                 EntryKind::User(u) => {
                     out.push_str(&format!("## User\n\n{}\n\n", u.content));
@@ -365,8 +370,8 @@ impl Session {
                 }
             }
         }
-        // Entries are already redacted on append; this also covers sessions
-        // written before redaction existed. With --no-redact it is a no-op.
+        // A second pass over the whole document catches values that span
+        // rendered fields. With --no-redact it is a no-op.
         self.redactor.redact_owned(&out)
     }
 
@@ -595,6 +600,34 @@ mod tests {
         session.fsync().unwrap();
         let raw = std::fs::read_to_string(session.path.clone().unwrap()).unwrap();
         assert!(!raw.contains(KEY), "{raw}");
+    }
+
+    #[test]
+    fn export_redacts_values_inside_tool_call_arguments() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths(dir.path());
+        let mut session = Session::create(&paths, header(), false).unwrap();
+        let password = format!("pw-{:x}", std::process::id() as u64 * 7919 + 104_729);
+        let call = crate::session::entry::ToolCall {
+            id: "c1".into(),
+            name: "write".into(),
+            arguments: serde_json::json!({
+                "path": ".env",
+                "content": format!("DB_PASSWORD={password}\n"),
+            }),
+        };
+        session
+            .append(EntryKind::Assistant(AssistantData {
+                tool_calls: Some(vec![call]),
+                ..AssistantData::default()
+            }))
+            .unwrap();
+        let export = session.export_markdown();
+        assert!(!export.contains(&password), "{export}");
+        assert!(export.contains("DB_PASSWORD=[REDACTED:env:"), "{export}");
+        session.fsync().unwrap();
+        let raw = std::fs::read_to_string(session.path.clone().unwrap()).unwrap();
+        assert!(!raw.contains(&password), "{raw}");
     }
 
     #[test]

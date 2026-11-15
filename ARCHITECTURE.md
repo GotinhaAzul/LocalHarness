@@ -1172,7 +1172,7 @@ input characters. Missing input and unreadable files return prescriptive errors.
 - No telemetry, no analytics, no phone-home.
 - Endpoint defaults to `http://127.0.0.1:8080`. A non-local endpoint is allowed
   only when explicitly configured, with a warning.
-- Session entries, archived tool artifacts, evidence, finding evidence, and
+- Session entries, archived tool artifacts, evidence, finding text, and
   exported reports pass through `security::redact` before they reach disk.
   Provider tokens, private key blocks, bearer and high-entropy `Authorization`
   values, secret-like `.env` assignments (upper-case names; unquoted code
@@ -1190,7 +1190,8 @@ input characters. Missing input and unreadable files return prescriptive errors.
   resume, replayed results that contain placeholders get a note, and
   `tools::write::atomic_write` (shared by `write`, `edit`, `patch`, and
   `undo`) refuses content that adds a placeholder the file does not already
-  hold. `--no-session`
+  hold. `Session::export_markdown` redacts a clone of each entry before
+  rendering, since the tree it reads is raw. `--no-session`
   disables session and artifact writes for sensitive engagements. It does not
   delete or disable an engagement file the user explicitly created; findings
   are separate, user-owned data.

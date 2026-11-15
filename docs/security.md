@@ -286,8 +286,10 @@ in the system prompt. This reduces, but does not eliminate, prompt injection.
 
 - No telemetry, analytics, or phone-home.
 - Endpoint defaults to `http://127.0.0.1:8080`; non-local endpoints warn.
-- Session logs, artifacts, evidence artifacts, finding evidence copied from
-  a tool result, and exported reports are redacted before they are written.
+- Session logs, artifacts, evidence artifacts, finding text (title,
+  evidence, impact, remediation; not `target` or `poc_steps`, which are
+  matched and replayed), and exported reports are redacted before they are
+  written.
   Private key blocks, bearer and `Authorization` header values, AWS/GCP/Azure
   keys, GitHub tokens, secret-like `.env` assignments, and the exact values of
   environment variables matching `*TOKEN*`, `*SECRET*`, `*KEY*`, or

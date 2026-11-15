@@ -149,7 +149,7 @@ One append-only JSONL file per session tree under `~/.local/share/localharness/s
 /export     write a Markdown transcript
 ```
 
-Compaction is deterministic, not model-written. Tool output is archived with an id, and `recall` reads an exact range. `--no-session` writes nothing: no session file, no artifacts. Session files, artifacts, evidence, and reports are redacted on disk by default; `--no-redact` is the explicit opt-out and is recorded in the session header. Redaction applies only to what is written to disk. The model always sees the real tool output, so it never copies a placeholder into a file, and `write`/`edit`/`patch`/`undo` refuse content that adds a `[REDACTED:...]` placeholder the file does not already hold.
+Compaction is deterministic, not model-written. Tool output is archived with an id, and `recall` reads an exact range. `--no-session` writes nothing: no session file, no artifacts. Session files, artifacts, evidence, and reports are redacted on disk by default; `--no-redact` is the explicit opt-out and is recorded in the session header. Redaction applies only to what is written to disk: in a live session the model sees the real tool output, so it has no placeholder to copy into a file. A resumed session replays the saved, redacted form with a note, and `write`/`edit`/`patch`/`undo` refuse content that adds a `[REDACTED:...]` placeholder the file does not already hold.
 
 ## 04 · One binary, two front ends
 

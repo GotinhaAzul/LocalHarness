@@ -642,13 +642,17 @@ mod tests {
 
     #[test]
     fn secret_literals_in_source_are_still_redacted() {
-        let text = "secret_key = \"django-insecure-0aZ9bY8cX7\"\naws_secret = AKIAZZZZZZZZZZZZZZZZ\nclient_token = Zx81Kq0LmP2vB7wR\n";
-        let redacted = redactor().redact_owned(text);
-        assert!(
-            !redacted.contains("django-insecure-0aZ9bY8cX7"),
-            "{redacted}"
+        // Built at runtime so no token-shaped literal is committed.
+        let quoted = format!("insecure-{}", "aZ9".repeat(4));
+        let opaque = ["Zx", "81", "Kq", "0L", "mP", "2v", "B7", "wR"].concat();
+        let aws_tail = "Z".repeat(16);
+        let text = format!(
+            "secret_key = \"{quoted}\"\naws_secret = AKIA{aws_tail}\nclient_token = {opaque}\n"
         );
-        assert!(!redacted.contains("Zx81Kq0LmP2vB7wR"), "{redacted}");
+        let redacted = redactor().redact_owned(&text);
+        assert!(!redacted.contains(&quoted), "{redacted}");
+        assert!(!redacted.contains(&opaque), "{redacted}");
+        assert!(!redacted.contains(&aws_tail), "{redacted}");
         assert!(
             redacted.contains("secret_key = [REDACTED:env:"),
             "{redacted}"
