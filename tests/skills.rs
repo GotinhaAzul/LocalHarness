@@ -885,6 +885,55 @@ async fn eval_reports_precision_recall_and_token_cost() {
     assert_eq!(value["passed"], false);
     assert_eq!(value["failures"], 1);
     assert!(value["false_load_cost"].as_u64().unwrap() > 0);
+
+    // A skip fixture for one skill passes when a different skill loads.
+    write_skill(
+        &env.config.join("skills"),
+        "haiku",
+        "Write a haiku about nature",
+        "Haiku instructions.",
+    );
+    std::fs::write(
+        fixtures.join("skip.toml"),
+        "prompt = \"write a haiku about the sea\"\nskill = \"deploy\"\nexpect = \"skip\"\n",
+    )
+    .unwrap();
+    let output = run(
+        &env,
+        &[
+            "skill",
+            "eval",
+            "--fixtures",
+            fixtures.to_str().unwrap(),
+            "--json",
+        ],
+    )
+    .await;
+    assert_ok(&output);
+    let value = json(&output);
+    let deploy = value["skills"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|metrics| metrics["skill"] == "deploy")
+        .expect("deploy metrics");
+    assert_eq!(deploy["true_negatives"], 1, "{value}");
+    assert_eq!(deploy["false_positives"], 0, "{value}");
+}
+
+#[tokio::test]
+async fn a_relative_install_source_is_persisted_as_an_absolute_path() {
+    let env = env();
+    let source = env._dir.path().join("source/deploy");
+    write_skill(source.parent().unwrap(), "deploy", "Deploy", "Body");
+    let output = run(&env, &["skill", "add", "../source/deploy"]).await;
+    assert_ok(&output);
+    let lock: toml::Value =
+        toml::from_str(&std::fs::read_to_string(env.config.join("skills.lock")).unwrap()).unwrap();
+    let persisted = lock["skill"][0]["source"].as_str().unwrap();
+    let canonical = source.canonicalize().unwrap();
+    assert_eq!(std::path::Path::new(persisted), canonical);
+    assert!(std::path::Path::new(persisted).is_absolute());
 }
 
 fn git(cwd: &Path, args: &[&str]) {

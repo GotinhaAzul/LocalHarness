@@ -230,9 +230,9 @@ fn evaluate_one(
             }
         }
         Expect::Skip => {
-            if let Some(loaded) = &predicted {
+            if predicted.as_deref() == Some(fixture.skill.as_str()) {
                 failure = Some(format!(
-                    "expected `{}` to skip, but `{loaded}` loaded (false-load cost {tokens} tokens)",
+                    "expected `{}` to skip, but it loaded (false-load cost {tokens} tokens)",
                     fixture.skill
                 ));
             }

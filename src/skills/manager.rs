@@ -541,9 +541,13 @@ fn parse_source(paths: &Paths, raw: &str) -> Result<SourceSpec> {
     }
     let direct = expand_path(paths, raw);
     if direct.exists() {
+        // A later `lh skill update` runs from wherever the user is, so a
+        // relative install source must be recorded as the resolved path.
+        let resolved = direct.canonicalize().unwrap_or_else(|_| direct.clone());
+        let resolved = resolved.to_string_lossy().into_owned();
         return Ok(SourceSpec {
-            original: raw.to_string(),
-            location: direct.to_string_lossy().into_owned(),
+            original: resolved.clone(),
+            location: resolved,
             requested_ref: None,
             kind: SourceKind::Directory,
         });

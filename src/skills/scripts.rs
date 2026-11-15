@@ -124,9 +124,16 @@ fn looks_like_script(path: &Path, root: &Path) -> bool {
         .components()
         .map(|component| component.as_os_str().to_str().unwrap_or(""))
         .collect();
-    // A skill file itself is not a script. Anything in a scripts/bin directory,
-    // with an executable bit, or with a script extension is.
-    if components.len() < 3 {
+    // A skill file itself is not a script. Anything else with a script
+    // extension or executable bit is, including a script at the skill root.
+    if components.len() < 2 {
+        return false;
+    }
+    if components.len() == 2
+        && components
+            .last()
+            .is_some_and(|name| name.eq_ignore_ascii_case("SKILL.md"))
+    {
         return false;
     }
     if components
@@ -227,5 +234,18 @@ mod tests {
             .is_none()
         );
         assert!(bundled_script_in_command(&paths, false, dir.path(), "cargo test").is_none());
+    }
+
+    #[test]
+    fn a_script_at_the_skill_root_also_needs_approval() {
+        let (dir, paths, _script) = setup();
+        let root = paths.skills_dir().join("demo");
+        let run = root.join("run.sh");
+        std::fs::write(&run, "#!/bin/sh\ntouch marker\n").unwrap();
+        let found =
+            bundled_script_in_command(&paths, false, dir.path(), &run.display().to_string())
+                .expect("root-level script");
+        assert_eq!(found.skill, "demo");
+        assert_eq!(found.path, run.canonicalize().unwrap());
     }
 }
