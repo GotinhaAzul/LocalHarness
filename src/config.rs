@@ -898,9 +898,25 @@ impl Default for ModelProfile {
     }
 }
 
+/// Stream fields the decoder reads reasoning from, in fallback order after a
+/// configured `reasoning_field`.
+pub const REASONING_FIELDS: [&str; 3] = ["reasoning_content", "reasoning", "thinking"];
+
 impl ModelProfile {
     pub fn strip_reasoning(&self) -> bool {
         self.strip_reasoning.unwrap_or(true)
+    }
+
+    /// A startup warning when `reasoning_field` names a field the decoder
+    /// never reads, so a typo does not silently hide all reasoning.
+    pub fn reasoning_field_warning(&self) -> Option<String> {
+        let field = self.reasoning_field.as_deref()?.trim();
+        (!REASONING_FIELDS.contains(&field)).then(|| {
+            format!(
+                "model profile reasoning_field = {field:?} is not a known stream field; accepted: {}. Falling back to the default order.",
+                REASONING_FIELDS.join(", ")
+            )
+        })
     }
 
     pub fn short_tool_schemas(&self) -> bool {
@@ -1101,6 +1117,22 @@ mod tests {
         let parsed: Config = toml::from_str("[lsp]\ngate = \"off\"\n").expect("off is valid");
         assert_eq!(parsed.lsp.gate, LspGate::Off);
         assert!(toml::from_str::<Config>("[lsp]\ngate = \"sometimes\"\n").is_err());
+    }
+
+    #[test]
+    fn unknown_reasoning_field_warns_with_the_accepted_names() {
+        let mut profile = ModelProfile::default();
+        assert!(profile.reasoning_field_warning().is_none());
+        for known in REASONING_FIELDS {
+            profile.reasoning_field = Some(known.into());
+            assert!(profile.reasoning_field_warning().is_none(), "{known}");
+        }
+        profile.reasoning_field = Some("thoughts".into());
+        let warning = profile.reasoning_field_warning().expect("warning");
+        assert!(warning.contains("\"thoughts\""), "{warning}");
+        for known in REASONING_FIELDS {
+            assert!(warning.contains(known), "{warning}");
+        }
     }
 
     #[test]

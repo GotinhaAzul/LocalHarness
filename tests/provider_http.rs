@@ -486,3 +486,27 @@ async fn cancellation_mid_stream_returns_cancelled() {
         .expect("cancellation should surface as an error");
     assert_eq!(error.class, ErrorClass::Cancelled);
 }
+
+#[tokio::test]
+async fn a_thinking_only_chunk_becomes_reasoning() {
+    let (base, state) = spawn().await;
+    state.script.lock().unwrap().push_back(Script {
+        status: 200,
+        body: concat!(
+            "data: {\"choices\":[{\"delta\":{\"thinking\":\"ponder\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        )
+        .into(),
+        chunked: false,
+    });
+    let events = collect_stream(&provider(&base), request(), CancellationToken::new()).await;
+    let reasoning: Vec<String> = events
+        .into_iter()
+        .filter_map(|event| match event.expect("stream item") {
+            StreamEvent::ReasoningDelta(text) => Some(text),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(reasoning, vec!["ponder".to_string()]);
+}

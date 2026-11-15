@@ -126,13 +126,19 @@ tool_mode = "repair"        # native | repair | auto
   prints a notice; if it keeps appearing, enable native tool calling on the
   server.
 - `context_window` sets the prompt budget when probes are unavailable.
-- `strip_reasoning` controls reasoning display/retention; reasoning is never
-  sent back to the provider. `<think>`/`<thinking>` blocks that arrive in
+- `strip_reasoning` (default `true`) controls retention. Reasoning always
+  streams live to the reasoning pane (Ctrl+R); with `true` it is dropped before
+  the assistant entry is written, so session files stay small and a resumed
+  session has no reasoning to replay. Set `false` to persist it and see it
+  again in Ctrl+R after `--continue`. Reasoning is never sent back to the
+  provider. `<think>`/`<thinking>` blocks that arrive in
   content (a server without a reasoning parser) are moved to reasoning, as is
   text before a lone `</think>` from templates that open the block in the
   prompt.
-- `reasoning_field` names the streaming field (`reasoning_content` by default,
-  falling back to `reasoning`).
+- `reasoning_field` names the streaming field to prefer. The decoder then
+  falls back in this order: `reasoning_content`, `reasoning`, `thinking`
+  (Ollama). Any other value prints a startup warning naming the accepted
+  fields and the default order is used.
 - `stop` adds stop sequences.
 - `extra_body` merges server-specific fields into every request, for example
   `chat_template_kwargs`.

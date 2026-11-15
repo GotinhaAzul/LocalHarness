@@ -104,7 +104,8 @@ Streaming:
   `function.arguments` fragments. Handle providers that emit a complete call in
   one frame.
 - Parse `usage` from the final chunk when present.
-- Parse `reasoning_content` and `reasoning` fields. A model profile decides
+- Parse reasoning from the configured `reasoning_field`, then
+  `reasoning_content`, `reasoning`, and `thinking`. A model profile decides
   whether reasoning is shown, kept in context, or stripped after the turn.
 - `finish_reason`: `stop`, `length`, `tool_calls`, `content_filter`.
 

@@ -1218,6 +1218,9 @@ struct StreamAccum {
     reasoning_loop: super::output::RepetitionGuard,
     /// Set when the repetition guard stopped the stream.
     degenerate: bool,
+    /// The model profile's `strip_reasoning`: reasoning is shown live but
+    /// never persisted in the session entry.
+    strip_reasoning: bool,
     /// When the request was sent, and when tokens first and last arrived.
     sent: Instant,
     first_token: Option<Instant>,
@@ -1235,7 +1238,8 @@ impl StreamAccum {
     /// Content streamed so far, without tool calls, for a cancelled or failed
     /// generation. Keeps the branch useful after an interruption.
     fn partial(&self) -> Option<AssistantData> {
-        if self.content.trim().is_empty() && self.reasoning.trim().is_empty() {
+        let keep_reasoning = !self.strip_reasoning && !self.reasoning.is_empty();
+        if self.content.trim().is_empty() && !keep_reasoning {
             return None;
         }
         Some(AssistantData {
@@ -1244,11 +1248,7 @@ impl StreamAccum {
             } else {
                 Some(self.content.clone())
             },
-            reasoning: if self.reasoning.is_empty() {
-                None
-            } else {
-                Some(self.reasoning.clone())
-            },
+            reasoning: keep_reasoning.then(|| self.reasoning.clone()),
             tool_calls: None,
             usage: self.usage.clone(),
             stop_reason: Some("cancelled".into()),
@@ -1266,6 +1266,7 @@ impl StreamAccum {
             content_loop: super::output::RepetitionGuard::default(),
             reasoning_loop: super::output::RepetitionGuard::default(),
             degenerate: false,
+            strip_reasoning: false,
             sent: Instant::now(),
             first_token: None,
             last_token: None,
@@ -1417,7 +1418,7 @@ impl StreamAccum {
             } else {
                 Some(self.content)
             },
-            reasoning: if self.reasoning.is_empty() {
+            reasoning: if self.reasoning.is_empty() || self.strip_reasoning {
                 None
             } else {
                 Some(self.reasoning)
@@ -1458,6 +1459,7 @@ async fn stream_assistant(
         provider.chat_stream(request, etx, child).await;
     });
     let mut accum = StreamAccum::new();
+    accum.strip_reasoning = core.model_profile.strip_reasoning();
     let mut failure: Option<ProviderError> = None;
     while let Some(item) = erx.recv().await {
         if let Some(err) = handle_stream_item(

@@ -654,6 +654,9 @@ struct Delta {
     reasoning: Option<String>,
     #[serde(default)]
     reasoning_content: Option<String>,
+    /// Ollama's OpenAI-compatible endpoint and some proxies name it `thinking`.
+    #[serde(default)]
+    thinking: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<ToolCallDelta>>,
 }
@@ -863,20 +866,21 @@ impl ApiError {
     }
 }
 
+/// Reasoning text from whichever field the engine used. Order: the
+/// configured `reasoning_field`, then `reasoning_content`, `reasoning`, and
+/// `thinking` (see [`crate::config::REASONING_FIELDS`]).
 fn reasoning_text(delta: &Delta, configured: Option<&str>) -> Option<String> {
-    if let Some(field) = configured {
-        let value = match field {
-            "reasoning" => delta.reasoning.clone(),
-            _ => delta.reasoning_content.clone(),
-        };
-        if value.is_some() {
-            return value;
-        }
-    }
-    delta
-        .reasoning_content
-        .clone()
-        .or_else(|| delta.reasoning.clone())
+    let field = |name: &str| match name {
+        "reasoning_content" => delta.reasoning_content.as_ref(),
+        "reasoning" => delta.reasoning.as_ref(),
+        "thinking" => delta.thinking.as_ref(),
+        _ => None,
+    };
+    configured
+        .into_iter()
+        .chain(crate::config::REASONING_FIELDS.iter().copied())
+        .find_map(|name| field(name).filter(|value| !value.is_empty()))
+        .cloned()
 }
 
 #[cfg(test)]
@@ -1116,6 +1120,26 @@ mod tests {
             Some("a")
         );
         assert_eq!(reasoning_text(&delta, None).as_deref(), Some("a"));
+        let thinking = Delta {
+            thinking: Some("t".into()),
+            ..Delta::default()
+        };
+        assert_eq!(reasoning_text(&thinking, None).as_deref(), Some("t"));
+        assert_eq!(
+            reasoning_text(&thinking, Some("reasoning")).as_deref(),
+            Some("t"),
+            "a configured field that is absent falls back to the others"
+        );
+        let both = Delta {
+            reasoning: Some("r".into()),
+            thinking: Some("t".into()),
+            ..Delta::default()
+        };
+        assert_eq!(
+            reasoning_text(&both, Some("thinking")).as_deref(),
+            Some("t")
+        );
+        assert_eq!(reasoning_text(&both, None).as_deref(), Some("r"));
     }
 
     #[test]

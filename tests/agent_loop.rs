@@ -696,10 +696,8 @@ async fn tool_calls_written_as_text_are_executed() {
     assert!(results[0].contains("fn main() {}"), "{}", results[0]);
     let first = &assistants(&harness.session)[0];
     assert_eq!(first.content.as_deref(), Some("Reading it."));
-    assert_eq!(
-        first.reasoning.as_deref(),
-        Some("I should look at the file.")
-    );
+    // The default profile strips reasoning from the persisted entry.
+    assert_eq!(first.reasoning, None);
     assert_eq!(first.tool_calls.as_ref().unwrap()[0].name, "read");
     assert!(
         events
@@ -707,9 +705,9 @@ async fn tool_calls_written_as_text_are_executed() {
             .any(|e| matches!(e, AgentEvent::Notice(n) if n.contains("--jinja")))
     );
     assert!(
-        events
-            .iter()
-            .any(|e| matches!(e, AgentEvent::ReasoningDelta(_)))
+        events.iter().any(
+            |e| matches!(e, AgentEvent::ReasoningDelta(text) if text.contains("I should look"))
+        )
     );
 }
 
@@ -1965,4 +1963,66 @@ async fn shell_profile_reads_edits_and_tests_with_bash_only() {
             .all(|request| request.tools.iter().all(|tool| tool.name == "bash")),
         "shell must never expose a non-bash tool"
     );
+}
+
+fn reasoning_script() -> Script {
+    Script::Events(vec![
+        StreamEvent::ReasoningDelta("secret chain of thought".into()),
+        StreamEvent::Delta("answer".into()),
+        StreamEvent::Finish("stop".into()),
+    ])
+}
+
+fn harness_strip(dir: &std::path::Path, scripts: Vec<Script>, strip: bool) -> Harness {
+    let mut config = base_config();
+    config
+        .model_profiles
+        .get_mut("default")
+        .expect("default model profile")
+        .strip_reasoning = Some(strip);
+    harness_config(dir, scripts, config)
+}
+
+#[tokio::test]
+async fn strip_reasoning_true_persists_no_reasoning() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness_strip(dir.path(), vec![reasoning_script()], true);
+    let (outcome, events) = run(&harness, "think").await;
+    assert_eq!(outcome.status, TurnStatus::Done);
+    // Still streamed live for the reasoning pane.
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::ReasoningDelta(_)))
+    );
+    let replies = assistants(&harness.session);
+    assert_eq!(replies.len(), 1);
+    assert_eq!(replies[0].reasoning, None);
+    let session = harness.session.lock().unwrap();
+    let persisted = serde_json::to_string(&session.branch_entries()).unwrap();
+    assert!(
+        !persisted.contains("secret chain of thought"),
+        "{persisted}"
+    );
+}
+
+#[tokio::test]
+async fn strip_reasoning_false_persists_and_replays_reasoning() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness_strip(dir.path(), vec![reasoning_script()], false);
+    let (outcome, _) = run(&harness, "think").await;
+    assert_eq!(outcome.status, TurnStatus::Done);
+    let replies = assistants(&harness.session);
+    assert_eq!(
+        replies[0].reasoning.as_deref(),
+        Some("secret chain of thought")
+    );
+    // Ctrl+R replays reasoning from the session blocks.
+    let session = harness.session.lock().unwrap();
+    let blocks = localharness::ui::render::blocks_from_session(&session);
+    assert!(blocks.iter().any(|block| matches!(
+        &block.kind,
+        localharness::ui::render::BlockKind::Assistant { reasoning: Some(text), .. }
+            if text == "secret chain of thought"
+    )));
 }
