@@ -1315,7 +1315,7 @@ impl StreamAccum {
     fn warn_reasoning_only(&self, tx: &UnboundedSender<AgentEvent>) {
         let cut_short = matches!(self.finish.as_deref(), Some("length") | Some("max_tokens"));
         if self.content.trim().is_empty()
-            && self.calls.values().all(|call| call.name.trim().is_empty())
+            && !self.calls.has_named_call()
             && !self.reasoning.trim().is_empty()
             && !cut_short
             && !self.degenerate
