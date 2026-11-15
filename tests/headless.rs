@@ -776,7 +776,13 @@ async fn spawn_tool_server() -> (String, ToolFake) {
 async fn print_executes_a_tool_call_and_writes_a_file() {
     let (base, fake) = spawn_tool_server().await;
     let env = env();
-    let output = run_lh(&env, &base, &["--print", "create made.txt"]).await;
+    // Headless runs cannot ask, so file edits need an explicit mode.
+    let output = run_lh(
+        &env,
+        &base,
+        &["--mode", "accept-edits", "--print", "create made.txt"],
+    )
+    .await;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
@@ -786,6 +792,205 @@ async fn print_executes_a_tool_call_and_writes_a_file() {
         "hello"
     );
     assert!(fake.requests.load(Ordering::SeqCst) >= 2);
+}
+
+// ---------------------------------------------------------------------------
+// Permission modes and plan mode
+// ---------------------------------------------------------------------------
+
+/// Serves one scripted SSE body per request, then a final text answer.
+#[derive(Clone)]
+struct ScriptFake {
+    requests: std::sync::Arc<AtomicUsize>,
+    bodies: std::sync::Arc<Vec<String>>,
+}
+
+fn tool_call_frames(name: &str, arguments: serde_json::Value) -> String {
+    let delta = serde_json::json!({
+        "choices": [{"delta": {"tool_calls": [{
+            "index": 0,
+            "id": "call_1",
+            "function": {"name": name, "arguments": arguments.to_string()}
+        }]}}]
+    });
+    format!(
+        "data: {delta}\n\ndata: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n"
+    )
+}
+
+fn text_frames(text: &str) -> String {
+    let delta = serde_json::json!({"choices": [{"delta": {"content": text}}]});
+    format!(
+        "data: {delta}\n\ndata: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\ndata: [DONE]\n\n"
+    )
+}
+
+async fn script_chat(State(fake): State<ScriptFake>) -> Response {
+    let count = fake.requests.fetch_add(1, Ordering::SeqCst);
+    let body = fake
+        .bodies
+        .get(count)
+        .cloned()
+        .unwrap_or_else(|| text_frames("done"));
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream"),
+        )
+        .body(Body::from(body))
+        .unwrap()
+}
+
+async fn spawn_script(bodies: Vec<String>) -> (String, ScriptFake) {
+    let fake = ScriptFake {
+        requests: Default::default(),
+        bodies: std::sync::Arc::new(bodies),
+    };
+    let app = Router::new()
+        .route("/v1/chat/completions", post(script_chat))
+        .route("/v1/models", axum::routing::get(models))
+        .with_state(fake.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (format!("http://{address}"), fake)
+}
+
+fn session_lines(env: &Env) -> Vec<serde_json::Value> {
+    fn find(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                find(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "jsonl") {
+                out.push(path);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    find(&env.data_dir, &mut files);
+    assert_eq!(files.len(), 1, "sessions: {files:?}");
+    std::fs::read_to_string(&files[0])
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+fn workspace_files(env: &Env) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(&env.cwd)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .collect();
+    names.sort();
+    names
+}
+
+#[tokio::test]
+async fn print_denies_an_edit_it_cannot_ask_about_and_still_answers() {
+    let (base, _) = spawn_tool_server().await;
+    let env = env();
+    let output = run_lh(&env, &base, &["--print", "create made.txt"]).await;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
+    assert!(stdout.contains("wrote it"), "stdout: {stdout}");
+    assert!(!env.cwd.join("made.txt").exists());
+}
+
+#[tokio::test]
+async fn the_session_header_records_the_mode_and_rule_hash() {
+    let (base, _) = spawn().await;
+    let env = env();
+    std::fs::create_dir_all(&env.config_dir).unwrap();
+    std::fs::write(
+        env.config_dir.join("config.toml"),
+        "[permissions]\nmode = \"accept-edits\"\n\n[[permissions.rules]]\nid = \"no-push\"\ntool = \"bash\"\ncommand = 'git\\s+push'\naction = \"deny\"\n",
+    )
+    .unwrap();
+    let output = run_lh_persistent(&env, &base, &["--print", "hi"]).await;
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let lines = session_lines(&env);
+    let permissions = &lines[0]["data"]["permissions"];
+    assert_eq!(lines[0]["type"], "session");
+    assert_eq!(permissions["mode"], "accept-edits");
+    assert_eq!(permissions["rules"], 1);
+    let hash = permissions["rules_hash"].as_str().unwrap();
+    assert_eq!(hash.len(), 16);
+    assert!(hash.chars().all(|c| c.is_ascii_hexdigit()), "{hash}");
+}
+
+#[tokio::test]
+async fn yolo_is_explicit_and_logged_in_the_session() {
+    let (base, _) = spawn().await;
+    let env = env();
+    // A config file cannot select yolo.
+    std::fs::create_dir_all(&env.config_dir).unwrap();
+    std::fs::write(
+        env.config_dir.join("config.toml"),
+        "[permissions]\nmode = \"yolo\"\n",
+    )
+    .unwrap();
+    let refused = run_lh(&env, &base, &["--print", "hi"]).await;
+    assert_ne!(refused.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("--yolo"));
+    let refused = run_lh(&env, &base, &["--mode", "yolo", "--print", "hi"]).await;
+    assert_ne!(refused.status.code(), Some(0));
+
+    std::fs::remove_file(env.config_dir.join("config.toml")).unwrap();
+    let output = run_lh_persistent(&env, &base, &["--yolo", "--print", "hi"]).await;
+    assert_eq!(output.status.code(), Some(0));
+    let lines = session_lines(&env);
+    assert_eq!(lines[0]["data"]["permissions"]["mode"], "yolo");
+    assert!(
+        lines.iter().any(|line| line["type"] == "custom"
+            && line["data"]["kind"] == "permission-mode"
+            && line["data"]["mode"] == "yolo"
+            && line["data"]["source"] == "--yolo"),
+        "{lines:#?}"
+    );
+}
+
+#[tokio::test]
+async fn print_plan_runs_one_read_only_turn_and_prints_the_plan() {
+    let env = env();
+    std::fs::write(env.cwd.join("a.txt"), "one\n").unwrap();
+    let before = workspace_files(&env);
+    let (base, fake) = spawn_script(vec![
+        tool_call_frames("bash", serde_json::json!({"command": "cat a.txt"})),
+        tool_call_frames(
+            "write",
+            serde_json::json!({"path": "a.txt", "content": "two\n"}),
+        ),
+        tool_call_frames("bash", serde_json::json!({"command": "touch b.txt"})),
+        tool_call_frames(
+            "todo",
+            serde_json::json!({"action": "plan", "tasks": ["rewrite a.txt", "add b.txt"]}),
+        ),
+        text_frames("That is the plan."),
+    ])
+    .await;
+    let output = run_lh(&env, &base, &["--plan", "--print", "change a.txt"]).await;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
+    assert!(stdout.contains("1. rewrite a.txt"), "stdout: {stdout}");
+    assert!(stdout.contains("2. add b.txt"), "stdout: {stdout}");
+    assert_eq!(workspace_files(&env), before);
+    assert_eq!(
+        std::fs::read_to_string(env.cwd.join("a.txt")).unwrap(),
+        "one\n"
+    );
+    assert_eq!(fake.requests.load(Ordering::SeqCst), 5);
 }
 
 /// A credential-shaped value built at runtime, so no secret-looking literal
@@ -891,7 +1096,8 @@ async fn print_persists_only_redacted_secrets_in_session_and_artifacts() {
     let key = fake_aws_key();
     let (base, fake) = spawn_secret_server(&key).await;
     let env = env();
-    let output = run_lh_persistent(&env, &base, &["--print", "echo the token"]).await;
+    // The scripted `bash` call needs approval, which headless cannot give.
+    let output = run_lh_persistent(&env, &base, &["--yolo", "--print", "echo the token"]).await;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(
@@ -930,8 +1136,12 @@ async fn no_redact_keeps_raw_output_and_is_recorded_in_the_header() {
     let key = fake_aws_key();
     let (base, _fake) = spawn_secret_server(&key).await;
     let env = env();
-    let output =
-        run_lh_persistent(&env, &base, &["--no-redact", "--print", "echo the token"]).await;
+    let output = run_lh_persistent(
+        &env,
+        &base,
+        &["--yolo", "--no-redact", "--print", "echo the token"],
+    )
+    .await;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(

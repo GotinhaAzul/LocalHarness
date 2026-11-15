@@ -912,6 +912,7 @@ mod tests {
             app: "test".into(),
             redact: true,
             context: None,
+            permissions: None,
         };
         let session = Session::create(&paths, header, true).unwrap();
         let artifacts = session.artifacts.clone();

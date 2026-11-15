@@ -412,6 +412,7 @@ pub(crate) fn test_context(dir: &Path) -> ToolContext {
             app: APP_VERSION.into(),
             redact: true,
             context: None,
+            permissions: None,
         },
         true,
     )

@@ -248,6 +248,10 @@ async fn run_lh(env: &Env, base: &str, extra: &[&str]) -> std::process::Output {
         .arg(base)
         .arg("--model")
         .arg("test-model")
+        // The fake model runs `bash` and `write` unattended. Headless runs
+        // default to the `ask` permission mode and deny both, so opt in
+        // explicitly; this file tests redaction, not permissions.
+        .arg("--yolo")
         .args(extra)
         .current_dir(&env.cwd)
         .env("LH_CONFIG_DIR", &env.config_dir)

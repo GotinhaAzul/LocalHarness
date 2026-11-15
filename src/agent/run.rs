@@ -781,6 +781,39 @@ async fn run_loop(
                 verify_configured,
                 turn_start.as_deref(),
             );
+            // Plan mode: the turn settles only once a todo plan exists, and
+            // the plan is stored as a session entry the user can read.
+            if core.permissions.mode() == crate::policy::PermissionMode::Plan {
+                if !facts.todo_plan_present && gate_tools.todo {
+                    if progress.can_continue_settle() {
+                        progress.settle_continuations += 1;
+                        let message = "[localharness] plan mode: record your proposal now with the todo tool, action \"plan\", one task per step you propose. Nothing may change until the user runs /plan approve.";
+                        if let Err(err) = append_user(&core.session, message) {
+                            return TurnOutcome::error("session_write", err.to_string());
+                        }
+                        let _ = tx.send(AgentEvent::Notice(message.into()));
+                        continue;
+                    }
+                    let message = "plan mode: the turn ended without a todo plan after reminders. Ask again for a plan; nothing was changed.".to_string();
+                    append_error(&core.session, "gate_block", &message, true);
+                    let _ = tx.send(AgentEvent::Error {
+                        code: "gate_block".into(),
+                        message,
+                        recoverable: true,
+                    });
+                    return TurnOutcome::ok(TurnStatus::Blocked);
+                }
+                let entry = {
+                    let session = core.session.lock().expect("session lock");
+                    crate::tools::todo::plan_entry(&session, "proposed")
+                };
+                if let Ok(mut session) = core.session.lock()
+                    && let Err(err) = session.append(EntryKind::Custom(entry))
+                {
+                    tracing::warn!(%err, "cannot record the plan in the session");
+                }
+                return TurnOutcome::ok(TurnStatus::Done);
+            }
             match gates::settle(&facts, &mut progress, gate_tools) {
                 SettleDecision::Done => {
                     if gate_tools.verify
@@ -1742,7 +1775,19 @@ async fn execute_batch(
         let mut result;
         let mut repaired = None;
 
-        if tool.is_none() {
+        if tool.is_none()
+            && core.permissions.mode() == crate::policy::PermissionMode::Plan
+            && core.registry.get(&call.name).is_some()
+        {
+            // Plan mode removed this tool; name the reason, not a typo.
+            result = ToolResult::err(
+                "plan_mode",
+                format!(
+                    "plan mode is active: {} is removed until the user runs /plan approve. Investigate with read-only tools and write the plan with todo action \"plan\".",
+                    call.name
+                ),
+            );
+        } else if tool.is_none() {
             let hint = unknown_suggestion
                 .map(|name| format!("did you mean {name}? "))
                 .unwrap_or_default();
@@ -1776,7 +1821,20 @@ async fn execute_batch(
                     repaired = Some(args.clone());
                     result = ToolResult::ok("");
 
-                    if read_available
+                    // Permission policy first: a denial (rule, plan mode)
+                    // stops the call before any other gate. An ask waits
+                    // until the harness gates pass.
+                    let mut pending_ask = None;
+                    match super::authorize::decide(core, tool.as_deref().unwrap(), &args) {
+                        crate::policy::Decision::Allow => {}
+                        crate::policy::Decision::Ask(request) => pending_ask = Some(request),
+                        crate::policy::Decision::Deny { code, message } => {
+                            result = ToolResult::err(&code, message);
+                        }
+                    }
+
+                    if !result.is_error
+                        && read_available
                         && matches!(call.name.as_str(), "edit" | "write" | "patch")
                         && let Some(path) = &args_path
                     {
@@ -1833,6 +1891,13 @@ async fn execute_batch(
                         if let Err(message) = gate {
                             result = ToolResult::err("SEC_SCOPE", message);
                         }
+                    }
+
+                    if !result.is_error
+                        && let Some(request) = pending_ask.take()
+                        && let Err(denied) = super::authorize::confirm(core, request, cancel).await
+                    {
+                        result = denied;
                     }
 
                     // The frontend (ACP) may add its own approval gate. It
@@ -2727,6 +2792,7 @@ mod tests {
                 app: "test".into(),
                 redact: true,
                 context: None,
+                permissions: None,
             },
             true,
         )
@@ -2750,6 +2816,9 @@ mod tests {
             crate::app::measure_static_prompt(&budget, &system_prompt, tool_specs_cost, Some(""));
         Core {
             approver: None,
+            permissions: std::sync::Arc::new(crate::policy::Permissions::with_mode(
+                crate::policy::PermissionMode::Yolo,
+            )),
             config,
             paths: paths.clone(),
             provider: Arc::new(ProbeProvider {

@@ -36,6 +36,10 @@ pub struct Config {
     pub mcp: BTreeMap<String, McpServerConfig>,
     /// Image attachments and the optional describing model (`[vision]`).
     pub vision: VisionConfig,
+    /// Permission mode and ordered allow/ask/deny rules (`[permissions]`).
+    /// Read from the global config and a trusted project config only; rules
+    /// from both are kept, global first.
+    pub permissions: crate::policy::PermissionsConfig,
     /// Runtime selection, set from CLI or environment.
     #[serde(skip)]
     pub profile_name: String,
@@ -224,15 +228,29 @@ impl Config {
     /// config. `project` is only passed when trust is granted.
     pub fn load(global: &Path, project: Option<&Path>) -> Result<Self> {
         let mut value = toml::Value::try_from(Self::builtin()).context("serialize defaults")?;
+        let mut rules: Vec<toml::Value> = Vec::new();
         if global.exists() {
-            let raw = read_toml(global)?;
+            let mut raw = read_toml(global)?;
+            rules.extend(take_permission_rules(&mut raw));
             deep_merge(&mut value, raw);
         }
         if let Some(project) = project
             && project.exists()
         {
-            let raw = read_toml(project)?;
+            let mut raw = read_toml(project)?;
+            rules.extend(take_permission_rules(&mut raw));
             deep_merge(&mut value, raw);
+        }
+        // Arrays replace on merge; permission rules accumulate instead, so a
+        // trusted project adds rules after the global ones rather than
+        // silently dropping them.
+        if let Some(table) = value.as_table_mut() {
+            let permissions = table
+                .entry("permissions")
+                .or_insert_with(|| toml::Value::Table(Default::default()));
+            if let Some(permissions) = permissions.as_table_mut() {
+                permissions.insert("rules".into(), toml::Value::Array(rules));
+            }
         }
         let mut cfg: Config = value.try_into().context("config schema mismatch")?;
         cfg.apply_env();
@@ -303,6 +321,12 @@ impl Config {
                 .validate(name)
                 .with_context(|| format!("invalid [mcp.{name}]"))?;
         }
+        if self.permissions.mode == crate::policy::PermissionMode::Yolo {
+            bail!(
+                "permissions.mode = \"yolo\" is not accepted in a config file; pass --yolo explicitly for one run"
+            );
+        }
+        crate::policy::Policy::compile(&self.permissions.rules).map_err(anyhow::Error::msg)?;
         Ok(())
     }
 
@@ -1111,6 +1135,19 @@ fn read_toml(path: &Path) -> Result<toml::Value> {
     let value: toml::Value =
         toml::from_str(&raw).with_context(|| format!("invalid TOML in {}", path.display()))?;
     Ok(value)
+}
+
+/// Remove and return `permissions.rules` from one config file's table.
+fn take_permission_rules(raw: &mut toml::Value) -> Vec<toml::Value> {
+    raw.get_mut("permissions")
+        .and_then(toml::Value::as_table_mut)
+        .and_then(|table| table.remove("rules"))
+        .map(|rules| match rules {
+            toml::Value::Array(rules) => rules,
+            // Not an array: keep it so the schema check reports it.
+            other => vec![other],
+        })
+        .unwrap_or_default()
 }
 
 /// Recursively overlay `overlay` onto `base`. Tables merge; everything else

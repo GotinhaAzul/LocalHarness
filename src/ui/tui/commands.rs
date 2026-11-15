@@ -42,6 +42,7 @@ impl App {
             "compact" => self.command_compact(),
             "commit" => self.command_commit(rest).await,
             "pr" => self.command_pr(rest).await,
+            "plan" => self.command_plan(rest).await,
             "tools" => self.command_tools(),
             "mcp" => self.command_mcp(),
             "skill" => self.command_skill(rest),
@@ -386,6 +387,91 @@ impl App {
         let mut config = self.config.clone();
         config.profile_name = name.to_string();
         self.spawn_rebuild(Switch::Profile(name.to_string()), config);
+    }
+
+    /// `/plan`: enter plan mode, or show the plan; `/plan approve` restores
+    /// the previous mode and tool set; `/plan exit` discards the plan.
+    pub(super) async fn command_plan(&mut self, rest: &str) {
+        let Some(core) = self.core().cloned() else {
+            return;
+        };
+        let permissions = core.permissions.clone();
+        let in_plan = permissions.mode() == crate::policy::PermissionMode::Plan;
+        let (status, notice) = match rest.trim() {
+            "" if in_plan => {
+                let plan = core
+                    .session
+                    .lock()
+                    .ok()
+                    .and_then(|session| crate::tools::todo::latest_plan(&session));
+                let text = match plan {
+                    Some((status, tasks)) if !tasks.is_empty() => {
+                        let mut text = format!("{status}:");
+                        for (index, task) in tasks.iter().enumerate() {
+                            text.push_str(&format!("\n{}. {task}", index + 1));
+                        }
+                        text.push_str("\n\n/plan approve applies it · /plan exit discards it");
+                        text
+                    }
+                    _ => "plan mode is active; no plan yet. Describe the task; the model must answer with a todo plan.".into(),
+                };
+                self.transcript.push_note("plan", text, false);
+                return;
+            }
+            "" => {
+                permissions.enter_plan();
+                (
+                    None,
+                    "plan mode: read-only tools; the next turn must produce a todo plan",
+                )
+            }
+            "approve" | "exit" if !in_plan => {
+                self.set_notice("plan mode is not active; /plan enters it", Role::Muted);
+                return;
+            }
+            "approve" => {
+                permissions.leave_plan();
+                (
+                    Some("approved"),
+                    "plan approved: the previous mode and tools are back",
+                )
+            }
+            "exit" => {
+                permissions.leave_plan();
+                (
+                    Some("discarded"),
+                    "plan discarded: the previous mode and tools are back",
+                )
+            }
+            _ => {
+                self.set_notice(command_usage("plan"), Role::Error);
+                return;
+            }
+        };
+        let mut config = self.config.clone();
+        config.permissions.mode = permissions.mode();
+        if let Err(error) = self.rebuild_core_with(config).await {
+            // Keep the mode and tool set consistent: undo the switch.
+            if status.is_some() {
+                permissions.enter_plan();
+            } else {
+                permissions.leave_plan();
+            }
+            self.set_notice(format!("/plan failed: {error}"), Role::Error);
+            return;
+        }
+        if let Ok(mut session) = core.session.lock() {
+            let entry = match status {
+                Some(status) => crate::tools::todo::plan_entry(&session, status),
+                None => crate::session::CustomData::new("permission-mode")
+                    .with("mode", "plan")
+                    .with("source", "/plan"),
+            };
+            if let Err(error) = session.append(EntryKind::Custom(entry)) {
+                tracing::warn!(%error, "cannot record the plan-mode change");
+            }
+        }
+        self.set_notice(notice, Role::Success);
     }
 
     pub(super) async fn rebuild_core_with(&mut self, config: Config) -> Result<()> {

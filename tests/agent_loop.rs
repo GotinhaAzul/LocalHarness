@@ -10,6 +10,7 @@ use localharness::agent::{AgentEvent, Core, TurnStatus, run_turn};
 use localharness::config::{Config, ProfileConfig, VerifyConfig, VerifyStep};
 use localharness::context::TokenBudget;
 use localharness::paths::Paths;
+use localharness::policy::{AskAnswer, AskRequest, Asker, PermissionMode, Permissions, Policy};
 use localharness::provider::{
     ChatMessage, ChatRequest, ErrorClass, Provider, ProviderError, StreamEvent, StreamItem, Usage,
 };
@@ -186,12 +187,24 @@ fn harness_with_extra(
     config: Config,
     extra: Vec<Arc<dyn localharness::Tool>>,
 ) -> Harness {
+    harness_in_mode(dir, scripts, config, extra, PermissionMode::Yolo)
+}
+
+/// A harness whose permissions start in `mode`, with the tool set filtered
+/// for that mode exactly as `app::create_runtime` does.
+fn harness_in_mode(
+    dir: &std::path::Path,
+    scripts: Vec<Script>,
+    config: Config,
+    extra: Vec<Arc<dyn localharness::Tool>>,
+    mode: PermissionMode,
+) -> Harness {
     let provider = Arc::new(ScriptedProvider {
         scripts: Mutex::new(scripts.into()),
         requests: Mutex::new(Vec::new()),
         strict_system: AtomicBool::new(false),
     });
-    let (core, session) = build_core(dir, config, extra, provider.clone());
+    let (core, session) = build_core_in_mode(dir, config, extra, provider.clone(), mode);
     Harness {
         core,
         session,
@@ -199,12 +212,23 @@ fn harness_with_extra(
     }
 }
 
-/// A core over any provider, for example the real HTTP client.
+/// A core over any provider, for example the real HTTP client. Permissions
+/// start in yolo, as for `harness_with_extra`.
 fn build_core(
     dir: &std::path::Path,
     config: Config,
     extra: Vec<Arc<dyn localharness::Tool>>,
     provider: Arc<dyn Provider>,
+) -> (Arc<Core>, SessionHandle) {
+    build_core_in_mode(dir, config, extra, provider, PermissionMode::Yolo)
+}
+
+fn build_core_in_mode(
+    dir: &std::path::Path,
+    config: Config,
+    extra: Vec<Arc<dyn localharness::Tool>>,
+    provider: Arc<dyn Provider>,
+    mode: PermissionMode,
 ) -> (Arc<Core>, SessionHandle) {
     let mut paths = Paths::discover(dir).unwrap();
     paths.data_dir = dir.join("data");
@@ -220,6 +244,7 @@ fn build_core(
             app: "test".into(),
             redact: true,
             context: None,
+            permissions: None,
         },
         true,
     )
@@ -227,8 +252,15 @@ fn build_core(
     let session: SessionHandle = Arc::new(Mutex::new(session));
     let artifacts = session.lock().unwrap().artifacts.clone();
     let registry = ToolRegistry::builtin();
+    // The config's rules apply; callers that predate permissions use yolo
+    // (no asking) and a test switches modes with `set_mode`.
+    let permissions = Arc::new(Permissions::new(
+        Policy::compile(&config.permissions.rules).unwrap(),
+        mode,
+    ));
     let mut selected = registry.select(config.profile(), &[]).unwrap();
     selected.extend(extra);
+    let selected = permissions.filter_tools(selected, &registry);
     let (_, model_profile) = config.model_profile();
     let tool_specs = ToolRegistry::specs_with(&selected, model_profile.short_tool_schemas());
     let budget = TokenBudget::new(config.context_window(), config.model.max_output_tokens);
@@ -271,6 +303,7 @@ fn build_core(
         startup: None,
         mcp: Default::default(),
         approver: None,
+        permissions,
     };
     (Arc::new(core), session)
 }
@@ -2150,6 +2183,350 @@ async fn shell_profile_reads_edits_and_tests_with_bash_only() {
             .all(|request| request.tools.iter().all(|tool| tool.name == "bash")),
         "shell must never expose a non-bash tool"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Permission policy (#15) and plan mode (#14)
+// ---------------------------------------------------------------------------
+
+/// Records every question and answers with a fixed verdict.
+struct RecordingAsker {
+    answer: AskAnswer,
+    asked: Mutex<Vec<AskRequest>>,
+}
+
+impl RecordingAsker {
+    fn new(answer: AskAnswer) -> Arc<Self> {
+        Arc::new(Self {
+            answer,
+            asked: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn subjects(&self) -> Vec<String> {
+        self.asked
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|request| request.subject.clone())
+            .collect()
+    }
+}
+
+#[async_trait]
+impl Asker for RecordingAsker {
+    async fn ask(&self, request: AskRequest) -> AskAnswer {
+        self.asked.lock().unwrap().push(request);
+        self.answer
+    }
+}
+
+fn rule(
+    id: &str,
+    tool: Option<&str>,
+    command: Option<&str>,
+    action: localharness::policy::RuleAction,
+) -> localharness::policy::RuleConfig {
+    localharness::policy::RuleConfig {
+        id: Some(id.into()),
+        tool: tool.map(str::to_string),
+        path: None,
+        command: command.map(str::to_string),
+        network: None,
+        action,
+    }
+}
+
+fn workflow_config(tools: &[&str]) -> Config {
+    let mut config = base_config();
+    let workflow = localharness::workflows::WorkflowSpec {
+        name: "lists-tools".into(),
+        description: None,
+        profile: None,
+        prompt: "do the work".into(),
+        skills: vec![],
+        tools: tools.iter().map(|tool| tool.to_string()).collect(),
+        steps: vec![],
+        artifacts: vec![],
+    };
+    workflow.apply_to_config(&mut config).unwrap();
+    config
+}
+
+fn plan_entries(session: &SessionHandle) -> Vec<serde_json::Map<String, serde_json::Value>> {
+    let session = session.lock().unwrap();
+    session
+        .branch_entries()
+        .into_iter()
+        .filter_map(|entry| match &entry.kind {
+            EntryKind::Custom(custom) if custom.kind == "plan" => Some(custom.payload.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_deny_rule_blocks_git_push_even_when_a_workflow_lists_bash() {
+    use localharness::policy::RuleAction;
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = workflow_config(&["bash"]);
+    config.permissions.rules = vec![rule(
+        "no-push",
+        Some("bash"),
+        Some(r"\bgit\s+push\b"),
+        RuleAction::Deny,
+    )];
+    let harness = harness_in_mode(
+        dir.path(),
+        vec![
+            tool_script("bash", json!({"command": "git push origin main"})),
+            tool_script("bash", json!({"command": "touch fallback.txt"})),
+            text_script("pushed nothing; wrote fallback.txt instead"),
+        ],
+        config,
+        Vec::new(),
+        PermissionMode::Ask,
+    );
+    assert!(harness.core.tools.iter().any(|tool| tool.name() == "bash"));
+    let asker = RecordingAsker::new(AskAnswer::Allow);
+    harness.core.permissions.set_asker(asker.clone());
+
+    let (outcome, _) = run(&harness, "push it").await;
+
+    // The denial does not kill the turn: the model tried another approach.
+    assert_eq!(outcome.status, TurnStatus::Done);
+    let results = tool_results(&harness.session);
+    assert!(results[0].contains("[DENIED]"), "{}", results[0]);
+    assert!(results[0].contains("no-push"), "{}", results[0]);
+    assert!(dir.path().join("fallback.txt").exists());
+    // A deny is decided before anyone is asked.
+    assert_eq!(asker.subjects(), vec!["touch fallback.txt".to_string()]);
+}
+
+#[tokio::test]
+async fn ask_prompts_once_per_exact_command_not_per_prefix() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness_in_mode(
+        dir.path(),
+        vec![
+            tool_script("bash", json!({"command": "touch a.txt"})),
+            tool_script("bash", json!({"command": "touch a.txt"})),
+            tool_script("bash", json!({"command": "touch a.txt b.txt"})),
+            text_script("done"),
+        ],
+        workflow_config(&["bash"]),
+        Vec::new(),
+        PermissionMode::Ask,
+    );
+    let asker = RecordingAsker::new(AskAnswer::Allow);
+    harness.core.permissions.set_asker(asker.clone());
+
+    let (outcome, _) = run(&harness, "touch files").await;
+
+    assert_eq!(outcome.status, TurnStatus::Done);
+    assert_eq!(
+        asker.subjects(),
+        vec!["touch a.txt".to_string(), "touch a.txt b.txt".to_string()]
+    );
+    assert!(dir.path().join("b.txt").exists());
+}
+
+#[tokio::test]
+async fn a_later_specific_allow_beats_an_earlier_broad_ask() {
+    use localharness::policy::RuleAction;
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = workflow_config(&["bash"]);
+    config.permissions.rules = vec![
+        rule("bash-asks", Some("bash"), None, RuleAction::Ask),
+        rule("touch-ok", Some("bash"), Some("^touch "), RuleAction::Allow),
+    ];
+    let harness = harness_in_mode(
+        dir.path(),
+        vec![
+            tool_script("bash", json!({"command": "touch allowed.txt"})),
+            tool_script("bash", json!({"command": "mkdir asked"})),
+            text_script("done"),
+        ],
+        config,
+        Vec::new(),
+        PermissionMode::Ask,
+    );
+    let asker = RecordingAsker::new(AskAnswer::Deny);
+    harness.core.permissions.set_asker(asker.clone());
+
+    let (outcome, _) = run(&harness, "go").await;
+
+    assert_eq!(outcome.status, TurnStatus::Done);
+    assert!(dir.path().join("allowed.txt").exists());
+    assert!(!dir.path().join("asked").exists());
+    assert_eq!(asker.subjects(), vec!["mkdir asked".to_string()]);
+    let asked = asker.asked.lock().unwrap()[0].clone();
+    assert_eq!(asked.rule.as_deref(), Some("bash-asks"));
+    let results = tool_results(&harness.session);
+    assert!(results[1].contains("[DENIED]"), "{}", results[1]);
+    assert!(results[1].contains("declined"), "{}", results[1]);
+}
+
+#[tokio::test]
+async fn an_ask_with_no_frontend_is_denied_and_the_turn_continues() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness_in_mode(
+        dir.path(),
+        vec![
+            tool_script("write", json!({"path": "new.txt", "content": "x"})),
+            text_script("could not write; here is the content instead"),
+        ],
+        workflow_config(&["write"]),
+        Vec::new(),
+        PermissionMode::Ask,
+    );
+
+    let (outcome, _) = run(&harness, "write it").await;
+
+    assert_eq!(outcome.status, TurnStatus::Done);
+    assert!(!dir.path().join("new.txt").exists());
+    let result = last_tool_result(&harness.session);
+    assert!(result.contains("[DENIED]"), "{result}");
+    assert!(result.contains("cannot ask"), "{result}");
+    assert!(result.contains("--yolo"), "{result}");
+}
+
+#[tokio::test]
+async fn plan_mode_refuses_every_mutation_at_dispatch() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+    let harness = harness_in_mode(
+        dir.path(),
+        vec![
+            tool_script("read", json!({"path": "a.txt"})),
+            parallel_tool_script(&[
+                ("write", json!({"path": "a.txt", "content": "two\n"})),
+                ("edit", json!({"path": "a.txt", "old": "one", "new": "two"})),
+                (
+                    "patch",
+                    json!({"path": "a.txt", "anchor": "one", "replacement": "two"}),
+                ),
+                ("undo", json!({"path": "a.txt"})),
+                ("bash", json!({"command": "git commit -am wip"})),
+                ("bash", json!({"command": "git push origin main"})),
+                ("git", json!({"action": "commit", "message": "wip"})),
+            ]),
+            tool_script(
+                "todo",
+                json!({"action": "plan", "tasks": ["change a.txt", "verify"]}),
+            ),
+            text_script("Proposed plan above."),
+        ],
+        workflow_config(&[
+            "read", "write", "edit", "patch", "undo", "bash", "git", "todo",
+        ]),
+        Vec::new(),
+        PermissionMode::Plan,
+    );
+    let names: Vec<&str> = harness.core.tools.iter().map(|tool| tool.name()).collect();
+    for removed in ["write", "edit", "patch", "undo"] {
+        assert!(!names.contains(&removed), "{removed} in {names:?}");
+    }
+
+    let (outcome, _) = run(&harness, "plan the change").await;
+
+    assert_eq!(outcome.status, TurnStatus::Done);
+    let results = tool_results(&harness.session);
+    assert_eq!(results.len(), 9, "{results:#?}");
+    for refused in &results[1..8] {
+        assert!(refused.contains("[plan_mode]"), "{refused}");
+        assert!(refused.contains("/plan approve"), "{refused}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+        "one\n"
+    );
+    let plans = plan_entries(&harness.session);
+    assert_eq!(plans.len(), 1);
+    assert_eq!(plans[0]["status"], "proposed");
+    assert_eq!(plans[0]["tasks"], json!(["change a.txt", "verify"]));
+    // The tools offered to the model are the plan-mode set.
+    let requests = harness.provider.requests.lock().unwrap();
+    let offered: Vec<String> = requests[0]
+        .tools
+        .iter()
+        .map(|spec| spec.name.clone())
+        .collect();
+    assert!(!offered.iter().any(|name| name == "write"), "{offered:?}");
+}
+
+#[tokio::test]
+async fn plan_mode_allows_read_only_bash() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "hello\n").unwrap();
+    let harness = harness_in_mode(
+        dir.path(),
+        vec![
+            tool_script("bash", json!({"command": "cat a.txt | wc -l"})),
+            tool_script("todo", json!({"action": "plan", "tasks": ["edit a.txt"]})),
+            text_script("plan ready"),
+        ],
+        workflow_config(&["bash", "todo"]),
+        Vec::new(),
+        PermissionMode::Plan,
+    );
+    let (outcome, _) = run(&harness, "look").await;
+    assert_eq!(outcome.status, TurnStatus::Done);
+    let results = tool_results(&harness.session);
+    assert!(!results[0].contains("plan_mode"), "{}", results[0]);
+    assert!(results[0].contains('1'), "{}", results[0]);
+}
+
+#[tokio::test]
+async fn a_workflow_listing_write_cannot_reenable_it_in_plan_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness_in_mode(
+        dir.path(),
+        vec![
+            tool_script("write", json!({"path": "x.txt", "content": "x"})),
+            tool_script("todo", json!({"action": "plan", "tasks": ["write x.txt"]})),
+            text_script("plan ready"),
+        ],
+        workflow_config(&["write", "read"]),
+        Vec::new(),
+        PermissionMode::Plan,
+    );
+    let names: Vec<&str> = harness.core.tools.iter().map(|tool| tool.name()).collect();
+    assert!(!names.contains(&"write"), "{names:?}");
+    // Plan mode brings `todo` so the plan can be written.
+    assert!(names.contains(&"todo"), "{names:?}");
+
+    let (outcome, _) = run(&harness, "write x").await;
+
+    assert_eq!(outcome.status, TurnStatus::Done);
+    let results = tool_results(&harness.session);
+    assert!(results[0].contains("[plan_mode]"), "{}", results[0]);
+    assert!(results[0].contains("/plan approve"), "{}", results[0]);
+    assert!(!dir.path().join("x.txt").exists());
+}
+
+#[tokio::test]
+async fn a_plan_mode_turn_cannot_settle_without_a_todo_plan() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness_in_mode(
+        dir.path(),
+        vec![
+            text_script("I would change a few files."),
+            tool_script("todo", json!({"action": "plan", "tasks": ["change files"]})),
+            text_script("plan recorded"),
+        ],
+        workflow_config(&["read", "todo"]),
+        Vec::new(),
+        PermissionMode::Plan,
+    );
+    let (outcome, events) = run(&harness, "propose").await;
+    assert_eq!(outcome.status, TurnStatus::Done);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::Notice(message) if message.contains("plan mode")
+    )));
+    assert_eq!(harness.provider.requests.lock().unwrap().len(), 3);
+    assert_eq!(plan_entries(&harness.session).len(), 1);
 }
 
 fn reasoning_script() -> Script {

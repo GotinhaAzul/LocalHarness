@@ -354,6 +354,7 @@ pub(crate) fn test_context(dir: &Path) -> ToolContext {
         app: "test".into(),
         redact: true,
         context: None,
+        permissions: None,
     };
     let session = Session::create(&paths, header, true).expect("in-memory session");
     ToolContext {

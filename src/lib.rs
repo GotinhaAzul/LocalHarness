@@ -15,6 +15,7 @@ pub mod git;
 pub mod mcp;
 pub mod media;
 pub mod paths;
+pub mod policy;
 pub mod provider;
 pub mod sandbox;
 pub mod sanitize;
