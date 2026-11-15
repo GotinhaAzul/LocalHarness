@@ -413,6 +413,7 @@ mod tests {
             trust: true,
             verify: VerifyConfig { steps },
             profile: "test".into(),
+            edit_mode: Default::default(),
             packs: Vec::new(),
             reads: Arc::new(Mutex::new(ReadTracker::default())),
             bg: Arc::new(Mutex::new(BgRegistry::new())),

@@ -168,6 +168,9 @@ pub struct ToolContext {
     pub trust: bool,
     pub verify: VerifyConfig,
     pub profile: String,
+    /// The active model profile's edit format. `read` annotates and `patch`
+    /// accepts anchors only in [`crate::config::EditMode::Hash`].
+    pub edit_mode: crate::config::EditMode,
     /// Packs active in this context; used to keep the skill index focused.
     pub packs: Vec<String>,
     pub reads: Arc<Mutex<ReadTracker>>,
