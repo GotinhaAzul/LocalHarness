@@ -187,10 +187,8 @@ pub fn build_summary_keeping(
         .sum::<usize>()
         .div_ceil(4) as u64;
 
-    let mut last_instruction = instruction.unwrap_or_default();
-    if last_instruction.chars().count() > LAST_INSTRUCTION_CHARS {
-        last_instruction = one_line(&last_instruction, LAST_INSTRUCTION_CHARS);
-    }
+    let last_instruction = instruction.unwrap_or_default();
+    let last_instruction = last_instruction.trim();
 
     let compose = |actions_kept: bool,
                    facts_kept: bool,
@@ -261,8 +259,13 @@ pub fn build_summary_keeping(
         }
         if !last_instruction.is_empty() {
             out.push_str("\n## Last instruction (verbatim)\n");
-            let text = one_line(&last_instruction, instruction_chars);
-            out.push_str(&text);
+            // Whole and unflattened when it fits: it is the one thing the
+            // model must not lose. Clipped only as a last resort.
+            if last_instruction.chars().count() <= instruction_chars {
+                out.push_str(last_instruction);
+            } else {
+                out.push_str(&one_line(last_instruction, instruction_chars));
+            }
             out.push('\n');
         }
         if !minimal && actions_kept && !actions.is_empty() {
@@ -279,26 +282,37 @@ pub fn build_summary_keeping(
         out
     };
 
-    let mut summary = compose(true, true, usize::MAX, LAST_INSTRUCTION_CHARS, false);
-    if summary.chars().count() > budget.target_chars {
-        summary = compose(false, true, usize::MAX, LAST_INSTRUCTION_CHARS, false);
-    }
-    if summary.chars().count() > budget.target_chars {
-        summary = compose(false, false, usize::MAX, LAST_INSTRUCTION_CHARS, false);
-    }
-    if summary.chars().count() > budget.target_chars {
-        summary = compose(false, false, 3, LAST_INSTRUCTION_CHARS, false);
-    }
-    if summary.chars().count() > budget.target_chars {
-        summary = compose(false, false, 3, 300, false);
+    // Drop detail before clipping the instruction: actions, facts, long
+    // lists, and only then the instruction itself.
+    const WHOLE: usize = usize::MAX;
+    let fitting = [
+        (true, true, usize::MAX, WHOLE),
+        (false, true, usize::MAX, WHOLE),
+        (false, false, usize::MAX, WHOLE),
+        (false, false, 3, WHOLE),
+        (false, false, 3, LAST_INSTRUCTION_CHARS),
+        (false, false, 3, 300),
+    ];
+    let mut summary = String::new();
+    for (actions_kept, facts_kept, list_limit, instruction_chars) in fitting {
+        summary = compose(
+            actions_kept,
+            facts_kept,
+            list_limit,
+            instruction_chars,
+            false,
+        );
+        if summary.chars().count() <= budget.target_chars {
+            break;
+        }
     }
     // The hard postcondition: never let the summary take more than 40% of the
     // usable prompt. Keep only the objective, open tasks, and last instruction.
-    if summary.chars().count() > budget.max_chars {
-        summary = compose(false, false, 3, 300, true);
-    }
-    if summary.chars().count() > budget.max_chars {
-        summary = compose(false, false, 1, 120, true);
+    for (list_limit, instruction_chars) in [(3, WHOLE), (3, 300), (1, 120)] {
+        if summary.chars().count() <= budget.max_chars {
+            break;
+        }
+        summary = compose(false, false, list_limit, instruction_chars, true);
     }
     if summary.chars().count() > budget.max_chars {
         summary = one_line(&summary, budget.max_chars);
@@ -708,6 +722,42 @@ mod tests {
             "{}",
             summary.summary
         );
+    }
+
+    #[test]
+    fn last_instruction_is_kept_whole_when_it_fits() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = session(dir.path());
+        let mut brief = String::from("Wire serve into the CLI.\n\nConstraints:\n");
+        while brief.chars().count() < 1500 {
+            brief.push_str("- keep every existing test passing and report what ran\n");
+        }
+        brief.push_str("Final report: list the commands you ran. END-OF-BRIEF");
+        user(&mut session, &brief);
+        for index in 0..6 {
+            step(&mut session, &format!("c{index}"), "cargo test", "ok");
+        }
+        // Keep a tail with no user entry, as a long single agentic turn does.
+        let keep = step(&mut session, "c9", "cargo build", "ok");
+        let summary = build_summary_keeping(&session, None, 10_000, Some(&keep));
+        assert!(
+            summary.summary.contains(brief.trim()),
+            "the instruction must survive verbatim: {}",
+            summary.summary
+        );
+        assert!(summary.summary.contains("END-OF-BRIEF"));
+        // A tight budget still clips it rather than overflow.
+        let tight = build_summary_keeping(
+            &session,
+            None,
+            SummaryBudget {
+                target_chars: 900,
+                max_chars: usize::MAX,
+            },
+            Some(&keep),
+        );
+        assert!(!tight.summary.contains("END-OF-BRIEF"));
+        assert!(tight.summary.contains("## Last instruction (verbatim)"));
     }
 
     #[test]

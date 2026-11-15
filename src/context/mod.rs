@@ -138,7 +138,10 @@ pub fn assemble(
 
     // Folding keeps the logical order (base, summaries in path order, state)
     // while guaranteeing at most one system message, at the front.
-    let messages = fold_system_messages(messages);
+    let mut messages = fold_system_messages(messages);
+    if had_compaction || messages.len() > 1 {
+        ensure_leading_user(&mut messages);
+    }
 
     let char_count = messages.iter().map(|m| m.char_len()).sum();
     let estimated_tokens = budget.estimate_messages(&messages);
@@ -194,6 +197,31 @@ fn fold_system_messages(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
     });
     folded.extend(rest);
     folded
+}
+
+/// User turn placed after the system message when the conversation would
+/// otherwise open with an assistant or tool message.
+pub const COMPACTED_CONTINUE: &str = "[localharness] Earlier context was compacted into the system message above. Continue the task from there and from the messages that follow.";
+
+/// Open the conversation with a user turn. A compaction in the middle of a
+/// long agentic turn keeps a tail that starts at an assistant entry (or no
+/// tail at all), and the user's instruction then survives only inside the
+/// summary. Many chat templates reject that: Qwen's raises "No user query
+/// found in messages." when no user message exists, and alternating
+/// templates require the first non-system turn to be a user one. The
+/// inserted turn sits before the first assistant message, so it can never
+/// split a tool call from its results.
+fn ensure_leading_user(messages: &mut Vec<ChatMessage>) {
+    let first = usize::from(matches!(messages.first(), Some(ChatMessage::System { .. })));
+    if !matches!(messages.get(first), Some(ChatMessage::User { .. })) {
+        messages.insert(
+            first,
+            ChatMessage::User {
+                content: COMPACTED_CONTINUE.to_string(),
+                images: Vec::new(),
+            },
+        );
+    }
 }
 
 /// Tool results by call id, in path order. Built once per assembly: scanning
@@ -894,5 +922,155 @@ mod tests {
             validate_tool_pairs(&session).is_ok(),
             "a compacted turn must still pair its call and result"
         );
+    }
+
+    /// A long single agentic turn: one user instruction, then call/result
+    /// pairs only. Returns the assistant entry ids.
+    fn agentic_turn(session: &mut Session, steps: usize) -> Vec<String> {
+        session
+            .append(EntryKind::User(UserData {
+                attachments: Vec::new(),
+                content: "task".into(),
+            }))
+            .unwrap();
+        (0..steps)
+            .map(|index| {
+                let call_id = format!("call_{index}");
+                let id = session
+                    .append(EntryKind::Assistant(AssistantData {
+                        content: None,
+                        tool_calls: Some(vec![crate::session::ToolCall {
+                            id: call_id.clone(),
+                            name: "read".into(),
+                            arguments: json!({"path": format!("{index}.rs")}),
+                        }]),
+                        ..AssistantData::default()
+                    }))
+                    .unwrap()
+                    .id
+                    .clone();
+                session
+                    .append(EntryKind::ToolResult(ToolResultData {
+                        call_id,
+                        content: "body".into(),
+                        is_error: false,
+                        details: None,
+                        artifact: None,
+                    }))
+                    .unwrap();
+                id
+            })
+            .collect()
+    }
+
+    /// One leading system message, a user turn before any assistant turn,
+    /// and every tool message directly after its call (only tool messages
+    /// in between).
+    fn assert_provider_valid(messages: &[ChatMessage]) {
+        assert!(matches!(messages.first(), Some(ChatMessage::System { .. })));
+        assert!(
+            messages[1..]
+                .iter()
+                .all(|message| !matches!(message, ChatMessage::System { .. }))
+        );
+        assert!(
+            matches!(messages.get(1), Some(ChatMessage::User { .. })),
+            "the first non-system message must be a user turn: {messages:?}"
+        );
+        let mut open_calls: Vec<String> = Vec::new();
+        for message in messages {
+            match message {
+                ChatMessage::Assistant { tool_calls, .. } => {
+                    assert!(open_calls.is_empty(), "unanswered calls: {open_calls:?}");
+                    open_calls = tool_calls.iter().map(|call| call.id.clone()).collect();
+                }
+                ChatMessage::Tool { call_id, .. } => {
+                    let position = open_calls
+                        .iter()
+                        .position(|id| id == call_id)
+                        .unwrap_or_else(|| panic!("tool result {call_id} without its call"));
+                    open_calls.remove(position);
+                }
+                _ => assert!(
+                    open_calls.is_empty(),
+                    "a message split calls {open_calls:?} from their results"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn a_mid_turn_compaction_still_sends_a_user_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = session(dir.path());
+        let assistants = agentic_turn(&mut session, 6);
+        session
+            .append(EntryKind::Compaction(CompactionData {
+                summary: "[localharness] summary".into(),
+                tokens_before: 100,
+                reason: "auto".into(),
+                thread_id: None,
+                keep_from: Some(assistants[3].clone()),
+            }))
+            .unwrap();
+        let budget = TokenBudget::new(32768, 4096);
+        let assembled = assemble("system", &session, Some("STATE"), &budget);
+        assert_provider_valid(&assembled.messages);
+        let roles: Vec<&str> = assembled.messages.iter().map(|m| m.role()).collect();
+        assert_eq!(
+            roles,
+            vec![
+                "system",
+                "user",
+                "assistant",
+                "tool",
+                "assistant",
+                "tool",
+                "assistant",
+                "tool"
+            ]
+        );
+        // The inserted turn is counted.
+        assert_eq!(
+            assembled.char_count,
+            assembled
+                .messages
+                .iter()
+                .map(|m| m.char_len())
+                .sum::<usize>()
+        );
+    }
+
+    #[test]
+    fn a_tailless_compaction_without_a_kickoff_still_sends_a_user_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = session(dir.path());
+        agentic_turn(&mut session, 3);
+        session
+            .append(EntryKind::Compaction(CompactionData {
+                summary: "[localharness] summary".into(),
+                tokens_before: 100,
+                reason: "thread_split".into(),
+                thread_id: None,
+                keep_from: None,
+            }))
+            .unwrap();
+        let budget = TokenBudget::new(32768, 4096);
+        let assembled = assemble("system", &session, Some("STATE"), &budget);
+        assert_provider_valid(&assembled.messages);
+        assert_eq!(assembled.messages.len(), 2);
+        assert!(matches!(
+            &assembled.messages[1],
+            ChatMessage::User { content, .. } if content == COMPACTED_CONTINUE
+        ));
+    }
+
+    #[test]
+    fn an_empty_session_assembles_only_the_system_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = session(dir.path());
+        let budget = TokenBudget::new(32768, 4096);
+        let assembled = assemble("system", &session, None, &budget);
+        assert_eq!(assembled.messages.len(), 1);
     }
 }

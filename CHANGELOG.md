@@ -5,6 +5,23 @@ All notable changes to LocalHarness are recorded here. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Before 1.0, a minor
 release may change defaults when the change is called out below.
 
+## [Unreleased]
+
+### Fixed
+
+- A compaction in the middle of one long agentic turn no longer sends a
+  conversation without a user message. The kept tail started at an assistant
+  entry, so the request was `system, assistant, tool, ...`, and Qwen-family
+  chat templates failed it with HTTP 500 ("No user query found in
+  messages."), ending the turn. Context assembly now always opens the
+  conversation with a user turn, which covers automatic, forced, and manual
+  compaction, thread splits without a kickoff, and resumed sessions.
+- The compaction summary's "Last instruction (verbatim)" section keeps the
+  instruction whole, line breaks included, when it fits the summary budget.
+  It was clipped to 600 characters and flattened to one line, so a long brief
+  lost its final constraints. It is now clipped only after every other
+  optional section has been dropped.
+
 ## [0.2.0] - 2026-11-15
 
 A large feature release covering the engine, permissions, context, skills,
