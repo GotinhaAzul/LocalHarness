@@ -21,6 +21,7 @@ pub mod provider;
 pub mod sandbox;
 pub mod sanitize;
 pub mod security;
+pub mod serve;
 pub mod session;
 pub mod skills;
 pub mod text;

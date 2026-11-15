@@ -146,6 +146,24 @@ pub enum Command {
     },
     /// Serve the Agent Client Protocol v1 on stdio for editor integrations.
     Acp,
+    /// Serve a local HTTP API (sessions, turns, SSE events, cancel) for
+    /// scripts and automation. See docs/serve.md.
+    Serve {
+        /// Address to listen on. Port 0 picks a free port.
+        #[arg(long, value_name = "IP:PORT", default_value = "127.0.0.1:0")]
+        bind: String,
+        /// Permit a non-loopback --bind address (prints a warning).
+        #[arg(long)]
+        allow_non_loopback: bool,
+        /// Where to write the bearer token (mode 0600). Defaults to
+        /// <data dir>/serve/token-<port>.
+        #[arg(long, value_name = "PATH")]
+        token_file: Option<PathBuf>,
+        /// Let a session request permission_mode "yolo" (every call the
+        /// harness gates allow runs without approval).
+        #[arg(long)]
+        allow_yolo: bool,
+    },
 }
 
 #[derive(Debug, clap::Subcommand)]
@@ -286,6 +304,29 @@ pub async fn run(cli: Cli) -> Result<i32> {
             no_redact: !config.session.redact,
         };
         return crate::acp::run(config, paths, options).await;
+    }
+    if let Some(Command::Serve {
+        bind,
+        allow_non_loopback,
+        token_file,
+        allow_yolo,
+    }) = &cli.command
+    {
+        if cli.print.is_some() || cli.json || cli.continue_last || cli.resume.is_some() {
+            bail!(
+                "`lh serve` is a server; --print, --json, --continue, and --resume do not apply (resume over HTTP with {{\"resume\": \"<id>\"}})"
+            );
+        }
+        let options = crate::serve::ServeOptions {
+            bind: bind.clone(),
+            allow_non_loopback: *allow_non_loopback,
+            token_file: token_file.clone(),
+            allow_yolo: *allow_yolo,
+            engagement: cli.engagement.clone(),
+            no_session: config.session.no_session,
+            no_redact: !config.session.redact,
+        };
+        return crate::serve::run(config, paths, options).await;
     }
     if let Some(Command::Doctor { json, fix }) = &cli.command {
         return run_doctor(&config, &paths, *json, *fix).await;
