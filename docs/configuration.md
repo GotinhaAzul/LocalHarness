@@ -35,8 +35,17 @@ model = ""                      # auto-select if /v1/models has one entry
 api_key = ""
 start_command = ""              # optional; run once if the endpoint is down
 context_window = 32768
+engine = "auto"                 # auto | llama.cpp | vllm | sglang | ollama | lmstudio | koboldcpp | tabbyapi | mlx | generic
 temperature = 0.2
 top_p = 0.95
+# Optional global sampler defaults; a model profile overrides each field.
+# min_p = 0.05
+# repeat_penalty = 1.05
+# dry_multiplier = 0.8
+# dry_base = 1.75
+# xtc_probability = 0.0
+# seed = 0
+# response_schema = ""          # path to a JSON Schema for the final answer
 max_output_tokens = 4096
 request_timeout_secs = 900
 connect_timeout_secs = 5
@@ -166,6 +175,89 @@ when the model profile does not set one.
 `[vision]` configures the size cap, EXIF handling, remote endpoints, and an
 optional model that describes images for text-only models. See
 [images.md](images.md).
+
+### Sampler profiles
+
+Sampling is per model. Every field below is optional and overrides the same
+global `[model]` value when set:
+
+```toml
+[model_profile.qwen-coding]
+match = ["qwen3-coder", "qwen3.5-coder", "qwen2.5-coder", "qwen3"]
+temperature = 0.2
+top_p = 0.95
+min_p = 0.05
+repeat_penalty = 1.05
+dry_multiplier = 0.8
+dry_base = 1.75
+xtc_probability = 0.0
+seed = 0
+```
+
+Bundled presets are `qwen-coding`, `gemma-chat`, and `glm-agent`. With
+`model_profile = "auto"` (the default), selecting a matching model from
+`/model` applies its preset; `/model <name> <preset>` pins one explicitly, and
+`--model-profile qwen-coding` or a profile's `model_profile = "qwen-coding"`
+does the same for the next start. A user-defined profile always beats a
+bundled preset for the same model.
+
+The harness sends only fields the detected engine accepts, under the name that
+engine uses: `repeat_penalty` for llama.cpp/Ollama/LM Studio/KoboldCpp and
+`repetition_penalty` for vLLM/SGLang/TabbyAPI. DRY and XTC go only to llama.cpp
+and KoboldCpp; `min_p` is omitted for Ollama and the generic profile. `lh doctor`
+warns about every omitted field and names it. Pin `[model] engine` when a
+gateway hides the real server, otherwise detection is best-effort.
+`extra_body` still merges last, so an engine-only sampler can be passed there.
+
+The streaming repetition guard remains the last line of defense, not the first.
+
+`--debug` records the exact request body in the diagnostic log
+(`localharness::provider::request`), with the configured bearer token redacted.
+
+### Structured output
+
+`response_schema` (or `--json-schema FILE`) points at a JSON Schema that
+constrains the final answer:
+
+```toml
+[model]
+response_schema = "schemas/reply.json"
+```
+
+The schemas must stay inside a small, lowerable subset. `oneOf`, `anyOf`,
+`allOf`, `patternProperties`, remote `$ref`s, recursive `$ref`s, `not`,
+conditionals, and unknown keywords are rejected before any request is sent, and
+the error names the keyword. Local `$ref`s under `$defs`/`definitions` are
+allowed when they are not recursive. Supported keywords: `type`, `properties`,
+`required`, `additionalProperties`, `items`, `enum`, `const`, `minItems`,
+`maxItems`, `minLength`, `maxLength`, `minimum`, `maximum`,
+`exclusiveMinimum`, `exclusiveMaximum`, `multipleOf`, and `format` (annotation
+only).
+
+The same schema is lowered per engine:
+
+| Engine | Wire shape |
+|---|---|
+| llama.cpp | GBNF `grammar` |
+| vLLM | `structured_outputs: { json: <schema> }` |
+| SGLang | `response_format` with `json_schema` |
+| Ollama / LM Studio | `response_format` with `json_schema` |
+| KoboldCpp | `/api/extra/json_to_grammar`, then `grammar` |
+| MLX / TabbyAPI / unknown | no grammar backend: repair fallback |
+
+A strict response format and `tools[]` cannot ride together on llama.cpp,
+Ollama, LM Studio, TabbyAPI, MLX, or an unidentified engine. The harness
+refuses that combination with an actionable error instead of entering the
+reasoning loop documented in llama.cpp #30377. vLLM, SGLang, and KoboldCpp are
+treated as supporting both.
+
+When the engine has no grammar backend (MLX), the schema is not sent; the
+harness adds a visible warning, still writes the schema into the prompt, and
+validates every reply. A reply that is not valid JSON or does not match the
+schema is repaired; after three failed repairs the turn ends with
+`structured_output` and no invalid JSON is accepted as the final answer. The
+same validation runs on every engine, including those with decode-time
+grammars.
 
 ## Hunk review
 
@@ -489,8 +581,8 @@ Steps run sequentially without a shell and stop at the first failure.
 ## Flags
 
 `--print`, `--json`, `--endpoint`, `--model`, `--model-profile`, `--profile`,
-`--theme`, `--api-key`, `--trust`, `--no-session`, `--no-redact`,
-`--no-agents-md`, `--continue`, `--resume`, `--path-jail`,
+`--json-schema <file>`, `--theme`, `--api-key`, `--trust`, `--no-session`,
+`--no-redact`, `--no-agents-md`, `--continue`, `--resume`, `--path-jail`,
 `--sandbox [read-only|workspace-write]`, `--no-sandbox`, `--engagement`,
 `--no-color`, `--keep-artifacts`, `--clean-artifacts`, `--allow-remote-images`,
 `--keep-exif`, `--debug`, `--mode <ask|accept-edits|plan|dont-ask>`, `--yolo`,

@@ -238,6 +238,65 @@ impl Config {
                 ..ModelProfile::default()
             },
         );
+        // Sampler presets. `model_profile = "auto"` picks one from the model
+        // id, so selecting a Qwen/Gemma/GLM model with `/model` also applies
+        // its sampler profile. They can be named explicitly with
+        // `--model-profile` or `model_profile = "qwen-coding"`.
+        cfg.model_profiles.insert(
+            "qwen-coding".into(),
+            ModelProfile {
+                match_: vec![
+                    "qwen3-coder".into(),
+                    "qwen3.5-coder".into(),
+                    "qwen2.5-coder".into(),
+                    "qwen3".into(),
+                ],
+                temperature: Some(0.2),
+                top_p: Some(0.95),
+                min_p: Some(0.05),
+                repeat_penalty: Some(1.05),
+                dry_multiplier: Some(0.8),
+                dry_base: Some(1.75),
+                xtc_probability: Some(0.0),
+                seed: Some(0),
+                tool_mode: ToolMode::Auto,
+                ..ModelProfile::default()
+            },
+        );
+        cfg.model_profiles.insert(
+            "gemma-chat".into(),
+            ModelProfile {
+                match_: vec![
+                    "gemma3".into(),
+                    "gemma-3".into(),
+                    "gemma2".into(),
+                    "gemma".into(),
+                ],
+                temperature: Some(0.7),
+                top_p: Some(0.95),
+                min_p: Some(0.0),
+                repeat_penalty: Some(1.1),
+                seed: Some(0),
+                tool_mode: ToolMode::Auto,
+                ..ModelProfile::default()
+            },
+        );
+        cfg.model_profiles.insert(
+            "glm-agent".into(),
+            ModelProfile {
+                match_: vec!["glm-4".into(), "glm4".into(), "glm".into()],
+                temperature: Some(0.6),
+                top_p: Some(0.9),
+                min_p: Some(0.02),
+                repeat_penalty: Some(1.05),
+                dry_multiplier: Some(0.8),
+                dry_base: Some(1.75),
+                xtc_probability: Some(0.0),
+                seed: Some(0),
+                tool_mode: ToolMode::Auto,
+                ..ModelProfile::default()
+            },
+        );
         cfg
     }
 
@@ -393,16 +452,22 @@ impl Config {
             return (selected, default);
         }
         let model = self.model.model.to_ascii_lowercase();
-        for (name, profile) in &self.model_profiles {
-            if name == "default" {
-                continue;
-            }
-            if profile
-                .match_
-                .iter()
-                .any(|m| !m.is_empty() && model.starts_with(&m.to_ascii_lowercase()))
-            {
-                return (name.clone(), profile.clone());
+        // A user profile always beats a built-in sampler preset, even when
+        // both match the same prefix. Presets still apply when the user has
+        // not configured a matching profile.
+        const PRESETS: &[&str] = &["qwen-coding", "gemma-chat", "glm-agent"];
+        for skip_presets in [true, false] {
+            for (name, profile) in &self.model_profiles {
+                if name == "default" || (skip_presets && PRESETS.contains(&name.as_str())) {
+                    continue;
+                }
+                if profile
+                    .match_
+                    .iter()
+                    .any(|m| !m.is_empty() && model.starts_with(&m.to_ascii_lowercase()))
+                {
+                    return (name.clone(), profile.clone());
+                }
             }
         }
         let default = self
@@ -531,8 +596,23 @@ pub struct ModelConfig {
     pub start_command: String,
     /// `None` means "not explicitly configured".
     pub context_window: Option<u32>,
+    /// Engine fingerprint: `auto` (empty) or a name from `lh doctor`
+    /// (`llama.cpp`, `vllm`, `sglang`, `ollama`, `lmstudio`, `koboldcpp`,
+    /// `tabbyapi`, `mlx`, `generic`). Pinning it skips the metadata probes and
+    /// decides sampler and structured-output wire formats behind a gateway.
+    pub engine: String,
     pub temperature: f32,
     pub top_p: f32,
+    /// Global sampler defaults; a model profile overrides each field it sets.
+    pub min_p: Option<f32>,
+    pub repeat_penalty: Option<f32>,
+    pub dry_multiplier: Option<f32>,
+    pub dry_base: Option<f32>,
+    pub xtc_probability: Option<f32>,
+    pub seed: Option<i64>,
+    /// Path to a JSON Schema that constrains the final answer. Empty disables
+    /// structured output. `--json-schema` overrides it.
+    pub response_schema: String,
     pub max_output_tokens: u32,
     pub request_timeout_secs: u64,
     pub connect_timeout_secs: u64,
@@ -548,8 +628,16 @@ impl Default for ModelConfig {
             api_key: String::new(),
             start_command: String::new(),
             context_window: None,
+            engine: String::new(),
             temperature: 0.2,
             top_p: 0.95,
+            min_p: None,
+            repeat_penalty: None,
+            dry_multiplier: None,
+            dry_base: None,
+            xtc_probability: None,
+            seed: None,
+            response_schema: String::new(),
             max_output_tokens: 4096,
             request_timeout_secs: 900,
             connect_timeout_secs: 5,
@@ -1107,6 +1195,17 @@ pub struct ModelProfile {
     pub short_tool_schemas: Option<bool>,
     pub stop: Vec<String>,
     pub extra_body: Option<toml::Value>,
+    /// Sampler values for this model. Each `Some` value overrides the global
+    /// `[model]` field; fields unsupported by the detected engine are omitted
+    /// and reported by `lh doctor`.
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
+    pub min_p: Option<f32>,
+    pub repeat_penalty: Option<f32>,
+    pub dry_multiplier: Option<f32>,
+    pub dry_base: Option<f32>,
+    pub xtc_probability: Option<f32>,
+    pub seed: Option<i64>,
     /// Hint for tool schema style; the harness always sends JSON schema.
     pub native_tools: Option<bool>,
     /// The model accepts images as content parts. `None` asks the server
@@ -1148,6 +1247,14 @@ impl Default for ModelProfile {
             short_tool_schemas: None,
             stop: vec![],
             extra_body: None,
+            temperature: None,
+            top_p: None,
+            min_p: None,
+            repeat_penalty: None,
+            dry_multiplier: None,
+            dry_base: None,
+            xtc_probability: None,
+            seed: None,
             native_tools: None,
             vision: None,
             thinking: ThinkingPolicy::Auto,
@@ -1403,6 +1510,25 @@ mod tests {
             "minimal",
             "an explicit selection wins over the config default"
         );
+    }
+
+    #[test]
+    fn sampler_presets_are_selectable_by_model_and_by_name() {
+        let mut cfg = Config::builtin();
+        for (model, preset, minimum) in [
+            ("qwen3-coder-30b-a3b", "qwen-coding", 0.05),
+            ("gemma-3-27b-it", "gemma-chat", 0.0),
+            ("glm-4.6", "glm-agent", 0.02),
+        ] {
+            cfg.model.model = model.into();
+            let (name, profile) = cfg.model_profile();
+            assert_eq!(name, preset, "{model}");
+            assert_eq!(profile.min_p, Some(minimum), "{model}");
+            assert_eq!(profile.seed, Some(0), "{model}");
+        }
+        cfg.model.model = "gemma-3-27b-it".into();
+        cfg.model_profile_override = Some("qwen-coding".into());
+        assert_eq!(cfg.model_profile().0, "qwen-coding");
     }
 
     #[test]

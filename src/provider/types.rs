@@ -171,8 +171,14 @@ pub struct ChatRequest {
     pub tool_choice: Option<String>,
     /// Server-side hint; dispatch still enforces a profile's one-call rule.
     pub parallel_tool_calls: Option<bool>,
-    pub temperature: f32,
-    pub top_p: f32,
+    /// Resolved per-model samplers. Fields the engine does not accept are
+    /// omitted when the body is built.
+    pub samplers: super::SamplerSettings,
+    /// Engine fingerprint; decides sampler names and structured-output
+    /// dialect.
+    pub engine: super::Engine,
+    /// Optional response schema, already lowered for `engine`.
+    pub response_schema: Option<super::structured::StructuredRequest>,
     pub max_tokens: u32,
     pub stop: Vec<String>,
     pub extra_body: Option<Value>,

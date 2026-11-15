@@ -121,11 +121,34 @@ impl App {
     pub(super) async fn command_model(&mut self, name: &str) {
         let name = name.trim();
         if !name.is_empty() {
-            if name.split_whitespace().count() != 1 {
-                self.set_notice("usage: /model <name>", Role::Error);
+            let mut parts = name.split_whitespace();
+            let model = parts.next().unwrap_or_default();
+            let preset = parts.next();
+            if parts.next().is_some() {
+                self.set_notice("usage: /model <name> [model-profile]", Role::Error);
                 return;
             }
-            self.switch_model(name).await;
+            if let Some(preset) = preset {
+                if !self.config.model_profiles.contains_key(preset) {
+                    let available: Vec<&str> = self
+                        .config
+                        .model_profiles
+                        .keys()
+                        .map(String::as_str)
+                        .collect();
+                    self.set_notice(
+                        format!(
+                            "unknown model profile {preset:?}; available: {}",
+                            available.join(", ")
+                        ),
+                        Role::Error,
+                    );
+                    return;
+                }
+                self.switch_model_with(model, Some(preset)).await;
+            } else {
+                self.switch_model(model).await;
+            }
             return;
         }
         let Some(core) = self.core().cloned() else {
@@ -192,15 +215,25 @@ impl App {
     /// untouched. The rebuild (which may wait for the server to load the
     /// model) runs in the background.
     pub(super) async fn switch_model(&mut self, name: &str) {
+        self.switch_model_with(name, None).await;
+    }
+
+    /// Switch model and optionally pin a sampler preset (`/model <name>
+    /// <model-profile>`). Auto matching still applies when no preset is given.
+    pub(super) async fn switch_model_with(&mut self, name: &str, preset: Option<&str>) {
         if self
             .core()
             .is_some_and(|core| core.logged_in() && core.provider.model() == name)
+            && preset.is_none()
         {
             self.set_notice(format!("model: {name} (unchanged)"), Role::Muted);
             return;
         }
         let mut config = self.config.clone();
         config.model.model = name.to_string();
+        if let Some(preset) = preset {
+            config.model_profile_override = Some(preset.to_string());
+        }
         self.spawn_rebuild(Switch::Model(name.to_string()), config);
     }
 

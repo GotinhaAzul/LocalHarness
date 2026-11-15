@@ -674,8 +674,12 @@ async fn run_loop(
                 .clone()
                 .or(Some("auto".into())),
             parallel_tool_calls: core.model_profile.parallel_tool_calls,
-            temperature: core.config.model.temperature,
-            top_p: core.config.model.top_p,
+            samplers: crate::provider::SamplerSettings::resolve(
+                &core.config.model,
+                &core.model_profile,
+            ),
+            engine: core.engine,
+            response_schema: core.structured.clone(),
             // The budget's reservation, capped to the window: asking for more
             // than the window holds makes some servers reject the request.
             max_tokens: budget.max_output_tokens,
@@ -851,6 +855,31 @@ async fn run_loop(
             let _ = tx.send(AgentEvent::Notice(notice));
         }
         if let Some(nudge) = recovery.nudge {
+            if recovery.structured_invalid {
+                if progress.output_recoveries < MAX_OUTPUT_RECOVERIES {
+                    progress.output_recoveries += 1;
+                    if let Err(err) = append_assistant(&core.session, assistant)
+                        .and_then(|()| append_user(&core.session, &nudge))
+                    {
+                        return TurnOutcome::error("session_write", err.to_string());
+                    }
+                    continue;
+                }
+                if let Err(err) = append_assistant(&core.session, assistant) {
+                    return TurnOutcome::error("session_write", err.to_string());
+                }
+                let message = format!(
+                    "structured output did not match the requested schema after {} repairs; no invalid JSON was accepted",
+                    progress.output_recoveries
+                );
+                append_error(&core.session, "structured_output", &message, true);
+                let _ = tx.send(AgentEvent::Error {
+                    code: "structured_output".into(),
+                    message: message.clone(),
+                    recoverable: true,
+                });
+                return TurnOutcome::ok(TurnStatus::Blocked);
+            }
             if progress.output_recoveries < MAX_OUTPUT_RECOVERIES {
                 progress.output_recoveries += 1;
                 if let Err(err) = append_assistant(&core.session, assistant)
@@ -1338,6 +1367,9 @@ struct OutputRecovery {
     /// A harness message for the model; the loop continues after it.
     nudge: Option<String>,
     degenerate: bool,
+    /// The reply was not a valid instance of the requested schema. It must
+    /// never settle as the final answer.
+    structured_invalid: bool,
 }
 
 /// Repair what can be repaired in place (tool calls written as text) and name
@@ -1387,6 +1419,30 @@ fn recover_output(
             }
             assistant.content = (!found.prose.is_empty()).then_some(found.prose);
             assistant.tool_calls = Some(calls);
+        }
+    }
+
+    // Schema validation applies to final answers only. A tool call recovered
+    // from assistant text above is an intermediate step, not a finished reply.
+    let has_native = assistant
+        .tool_calls
+        .as_ref()
+        .is_some_and(|calls| !calls.is_empty());
+    if let Some(schema) = &core.structured
+        && !has_native
+    {
+        let content = assistant.content.as_deref().unwrap_or("");
+        if let Err(error) = schema.validate_response(content) {
+            out.structured_invalid = true;
+            out.notice = Some(format!(
+                "structured output did not match {:?}: {error}; asking the model to repair it",
+                schema.name
+            ));
+            out.nudge = Some(format!(
+                "[localharness] structured output rejected: {error}. Reply with exactly one JSON document that matches the schema {}. No prose and no Markdown fence.",
+                serde_json::to_string(&schema.schema).unwrap_or_default()
+            ));
+            return out;
         }
     }
 
@@ -3573,6 +3629,8 @@ mod tests {
             model_profile: ModelProfile::default(),
             vision: Default::default(),
             tool_probe: None,
+            engine: crate::provider::Engine::Generic,
+            structured: None,
             cancel: CancellationToken::new(),
             tool_timeout: std::time::Duration::from_secs(10),
             path_jail: false,

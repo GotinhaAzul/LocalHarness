@@ -76,6 +76,7 @@ impl OpenAiCompatProvider {
             Ok(body) => body,
             Err(err) => return Attempt::Failed(err),
         };
+        log_request_body(&body, &self.api_key);
         let mut request = self.client.post(self.url()).json(&body);
         if !self.api_key.is_empty() {
             request = request.bearer_auth(&self.api_key);
@@ -583,6 +584,26 @@ fn merge_leading_system(messages: &[ChatMessage]) -> Vec<ChatMessage> {
     merged
 }
 
+/// Record the exact body sent at `--debug`, with every occurrence of the
+/// configured bearer token redacted. The API key travels in a header, not the
+/// body, but a custom endpoint can echo it back into `extra_body`, so scrub it
+/// anyway.
+fn log_request_body(body: &Value, api_key: &str) {
+    let redacted = logged_request_body(body, api_key);
+    tracing::debug!(
+        target: "localharness::provider::request",
+        body = %redacted,
+        "chat request body"
+    );
+}
+
+/// The exact body as `--debug` records it. `redact` keeps a bearer token that
+/// a custom endpoint echoed into `extra_body` out of the log.
+fn logged_request_body(body: &Value, api_key: &str) -> String {
+    let raw = serde_json::to_string(body).unwrap_or_default();
+    super::redact(raw, &[api_key])
+}
+
 /// How the session's internal call ids are written for the active model.
 ///
 /// The session stores harness-owned ids (`call_0001`, ...), plus whatever
@@ -727,16 +748,25 @@ fn build_body(req: &ChatRequest, include_usage: bool) -> Result<Value, ProviderE
         "model": req.model,
         "messages": messages,
         "stream": true,
-        "temperature": req.temperature,
-        "top_p": req.top_p,
         "max_tokens": req.max_tokens,
     });
+    for (key, value) in req.samplers.body_fields(req.engine) {
+        body[key] = value;
+    }
     if !req.tools.is_empty() {
         body["tools"] = super::tools_payload(&req.tools);
         body["tool_choice"] = json!(req.tool_choice.as_deref().unwrap_or("auto"));
         if let Some(parallel) = req.parallel_tool_calls {
             body["parallel_tool_calls"] = json!(parallel);
         }
+    }
+    if let Some(schema) = &req.response_schema {
+        if let Some(refusal) =
+            super::structured::tools_conflict(req.engine, schema, !req.tools.is_empty())
+        {
+            return Err(ProviderError::new(ErrorClass::BadRequest, refusal));
+        }
+        schema.apply(&mut body, req.engine);
     }
     if !req.stop.is_empty() {
         body["stop"] = json!(req.stop);
@@ -1233,8 +1263,13 @@ mod tests {
             tools: vec![],
             tool_choice: None,
             parallel_tool_calls: None,
-            temperature: 0.2,
-            top_p: 0.95,
+            samplers: crate::provider::SamplerSettings {
+                temperature: Some(0.2),
+                top_p: Some(0.95),
+                ..Default::default()
+            },
+            engine: crate::provider::Engine::Generic,
+            response_schema: None,
             max_tokens: 16,
             stop: vec![],
             extra_body: None,
@@ -1271,8 +1306,13 @@ mod tests {
             tools: vec![],
             tool_choice: None,
             parallel_tool_calls: None,
-            temperature: 0.2,
-            top_p: 0.95,
+            samplers: crate::provider::SamplerSettings {
+                temperature: Some(0.2),
+                top_p: Some(0.95),
+                ..Default::default()
+            },
+            engine: crate::provider::Engine::Generic,
+            response_schema: None,
             max_tokens: 128,
             stop: vec![],
             extra_body: None,
@@ -1316,8 +1356,13 @@ mod tests {
             tools: vec![],
             tool_choice: None,
             parallel_tool_calls: None,
-            temperature: 0.2,
-            top_p: 0.95,
+            samplers: crate::provider::SamplerSettings {
+                temperature: Some(0.2),
+                top_p: Some(0.95),
+                ..Default::default()
+            },
+            engine: crate::provider::Engine::Generic,
+            response_schema: None,
             max_tokens: 128,
             stop: vec!["<|im_end|>".into()],
             extra_body: None,
@@ -1336,6 +1381,86 @@ mod tests {
             body["messages"][1]["tool_calls"][0]["function"]["arguments"],
             "{\"path\":\"a.rs\"}"
         );
+    }
+
+    #[test]
+    fn sampler_profile_is_lowered_to_the_engine_wire_names() {
+        let mut req = ChatRequest {
+            model: "m".into(),
+            messages: vec![ChatMessage::user("hi")],
+            tools: vec![],
+            tool_choice: None,
+            parallel_tool_calls: None,
+            samplers: crate::provider::SamplerSettings {
+                temperature: Some(0.2),
+                top_p: Some(0.95),
+                min_p: Some(0.05),
+                repeat_penalty: Some(1.05),
+                dry_multiplier: Some(0.8),
+                ..Default::default()
+            },
+            engine: crate::provider::Engine::LlamaCpp,
+            response_schema: None,
+            max_tokens: 16,
+            stop: vec![],
+            extra_body: None,
+            include_usage: false,
+            reasoning_field: None,
+        };
+        let body = build_body(&req, false).unwrap();
+        assert_eq!(body["temperature"], json!(0.2));
+        assert_eq!(body["min_p"], json!(0.05));
+        assert_eq!(body["repeat_penalty"], json!(1.05));
+        assert_eq!(body["dry_multiplier"], json!(0.8));
+
+        // vLLM renames the repeat penalty and does not accept DRY.
+        req.engine = crate::provider::Engine::Vllm;
+        let body = build_body(&req, false).unwrap();
+        assert_eq!(body["repetition_penalty"], json!(1.05));
+        assert!(body.get("repeat_penalty").is_none());
+        assert!(body.get("dry_multiplier").is_none());
+
+        // An engine without min_p never receives the key.
+        req.engine = crate::provider::Engine::Ollama;
+        let body = build_body(&req, false).unwrap();
+        assert!(body.get("min_p").is_none());
+    }
+
+    #[test]
+    fn extra_body_wins_over_a_sampler_field() {
+        let req = ChatRequest {
+            model: "m".into(),
+            messages: vec![ChatMessage::user("hi")],
+            tools: vec![],
+            tool_choice: None,
+            parallel_tool_calls: None,
+            samplers: crate::provider::SamplerSettings {
+                temperature: Some(0.2),
+                ..Default::default()
+            },
+            engine: crate::provider::Engine::Generic,
+            response_schema: None,
+            max_tokens: 16,
+            stop: vec![],
+            extra_body: Some(json!({"temperature": 0.9})),
+            include_usage: false,
+            reasoning_field: None,
+        };
+        let body = build_body(&req, false).unwrap();
+        assert_eq!(body["temperature"], json!(0.9));
+    }
+
+    #[test]
+    fn debug_request_body_never_contains_the_api_key() {
+        let body = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "extra_body": {"token": "sk-secret"}
+        });
+        let logged = logged_request_body(&body, "sk-secret");
+        assert!(!logged.contains("sk-secret"), "{logged}");
+        assert!(logged.contains("[redacted]"));
+        assert!(logged.contains("\"model\":\"m\""));
     }
 
     #[test]

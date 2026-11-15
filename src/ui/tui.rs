@@ -100,7 +100,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
 fn command_usage(name: &str) -> &'static str {
     match name {
         "help" => "/help [command]",
-        "model" => "/model [name]   (no name: pick from a list)",
+        "model" => "/model [name] [model-profile]   (no name: pick from a list)",
         "login" => "/login [endpoint] [model] [api-key|-]   (no arguments: show status)",
         "profile" => "/profile [name]   (no name: pick from a list)",
         "theme" => "/theme [name|save]   (no name: pick with live preview)",
@@ -123,7 +123,7 @@ fn command_usage(name: &str) -> &'static str {
 
 const HELP: &str = "\
 Commands: /help [command] /quit /login [endpoint] [model] [api-key] /model [name]
-/profile [name] /theme [name|save] /tree /rewind [turns] [force] /fork /new
+[model-profile] /profile [name] /theme [name|save] /tree /rewind [turns] [force] /fork /new
 /resume [id|last] /sessions /compact /tools /mcp
 /commit [confirm|cancel|edit <message>] /pr [confirm|cancel] /plan [approve|exit]
 /skill [name] /workflow [name] /sec [...] /approve /trust [confirm] /export [path]

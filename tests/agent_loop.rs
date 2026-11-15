@@ -30,6 +30,14 @@ enum Script {
     Events(Vec<StreamEvent>),
     EventsThenWait(Vec<StreamEvent>),
     Error(ProviderError),
+    /// Emit a deterministic loop when the resolved temperature is hot, and a
+    /// clean answer otherwise. Used to show a sampler preset preventing the
+    /// loop that the global sampling reproduces.
+    SamplerLoop {
+        hot: String,
+        reps: usize,
+        clean: String,
+    },
 }
 
 struct ScriptedProvider {
@@ -64,6 +72,7 @@ impl Provider for ScriptedProvider {
                 }
             }
         }
+        let temperature = req.samplers.temperature;
         self.requests.lock().unwrap().push(req);
         let script = self.scripts.lock().unwrap().pop_front();
         match script {
@@ -80,6 +89,15 @@ impl Provider for ScriptedProvider {
             }
             Some(Script::Error(err)) => {
                 let _ = tx.send(Err(err));
+            }
+            Some(Script::SamplerLoop { hot, reps, clean }) => {
+                let text = if temperature.unwrap_or(1.0) > 0.5 {
+                    hot.repeat(reps)
+                } else {
+                    clean
+                };
+                let _ = tx.send(Ok(StreamEvent::Delta(text)));
+                let _ = tx.send(Ok(StreamEvent::Finish("stop".into())));
             }
             None => {
                 let _ = tx.send(Err(ProviderError::new(
@@ -365,6 +383,8 @@ fn build_core_in_mode(
         model_profile,
         vision: Default::default(),
         tool_probe: None,
+        engine: localharness::provider::Engine::Generic,
+        structured: None,
         cancel: CancellationToken::new(),
         tool_timeout: std::time::Duration::from_secs(10),
         path_jail: false,
@@ -926,6 +946,170 @@ async fn repetition_loops_are_cut_and_nudged() {
             .any(|e| matches!(e, AgentEvent::Notice(n) if n.contains("looping")))
     );
     assert_eq!(last_assistant(&harness.session), "Done.");
+}
+
+#[tokio::test]
+async fn structured_output_repairs_invalid_json_or_blocks_the_turn() {
+    let schema = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["answer"],
+        "properties": {"answer": {"type": "string"}}
+    });
+    let plan = localharness::provider::structured::plan(
+        localharness::provider::Engine::Vllm,
+        "reply",
+        &schema,
+    )
+    .expect("plan");
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut harness = harness_config(
+        dir.path(),
+        vec![
+            text_script("not json at all"),
+            text_script("{\"answer\":\"ok\"}"),
+        ],
+        base_config(),
+    );
+    Arc::get_mut(&mut harness.core)
+        .expect("unique core")
+        .structured = Some(plan.clone());
+    let (outcome, events) = run(&harness, "answer").await;
+    assert_eq!(outcome.status, TurnStatus::Done, "{:?}", outcome.error);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::Notice(notice) if notice.contains("structured output did not match")
+    )));
+    assert_eq!(last_assistant(&harness.session), "{\"answer\":\"ok\"}");
+    assert_eq!(
+        harness.provider.requests.lock().unwrap().len(),
+        2,
+        "one repair call"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut harness = harness_config(
+        dir.path(),
+        (0..4).map(|_| text_script("still not json")).collect(),
+        base_config(),
+    );
+    Arc::get_mut(&mut harness.core)
+        .expect("unique core")
+        .structured = Some(plan);
+    let (outcome, events) = run(&harness, "answer").await;
+    assert_eq!(outcome.status, TurnStatus::Blocked);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::Error { code, .. } if code == "structured_output"
+    )));
+    let session = harness.session.lock().unwrap();
+    assert!(
+        session
+            .branch_entries()
+            .iter()
+            .any(|entry| matches!(&entry.kind, EntryKind::Error(data) if data.code == "structured_output")),
+        "an invalid document is never accepted as the final answer"
+    );
+}
+
+#[tokio::test]
+async fn structured_output_lets_recovered_text_calls_execute() {
+    let schema = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["answer"],
+        "properties": {"answer": {"type": "string"}}
+    });
+    let plan = localharness::provider::structured::plan(
+        localharness::provider::Engine::Vllm,
+        "reply",
+        &schema,
+    )
+    .expect("plan");
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.rs"), "fn main() {}\n").unwrap();
+    let mut harness = harness(
+        dir.path(),
+        vec![
+            text_script(
+                "Reading it.\n<tool_call>{\"name\":\"read\",\"arguments\":{\"path\":\"a.rs\"}}</tool_call>",
+            ),
+            text_script("{\"answer\":\"ok\"}"),
+        ],
+        &["read"],
+    );
+    Arc::get_mut(&mut harness.core)
+        .expect("unique core")
+        .structured = Some(plan);
+    let (outcome, events) = run(&harness, "answer").await;
+    assert_eq!(outcome.status, TurnStatus::Done, "{:?}", outcome.error);
+    let results = tool_results(&harness.session);
+    assert_eq!(results.len(), 1, "the text call must run");
+    assert!(results[0].contains("fn main() {}"), "{}", results[0]);
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Notice(notice) if notice.contains("structured output did not match")
+        )),
+        "an intermediate tool call is not final output to validate"
+    );
+    assert_eq!(last_assistant(&harness.session), "{\"answer\":\"ok\"}");
+}
+
+#[tokio::test]
+async fn a_sampler_preset_prevents_the_loop_the_global_sampling_reproduces() {
+    // Deterministic fixture: with a hot request the scripted endpoint emits
+    // the same 16-byte phrase 80 times (1,280 bytes, above the repetition
+    // guard's 600-byte floor); with a cool request it emits a 5-byte answer.
+    // Global sampling: temperature 0.9 -> 4 calls, 1,280 bytes each, guard
+    // cuts every reply. qwen-coding: temperature 0.2 -> 1 call, 5 bytes.
+    let phrase = "loop loop loop.\n";
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut hot_config = base_config();
+    hot_config.model.model = "qwen3-coder-30b".into();
+    hot_config.model.temperature = 0.9;
+    let hot = harness_config(
+        dir.path(),
+        (0..4)
+            .map(|_| Script::SamplerLoop {
+                hot: phrase.into(),
+                reps: 80,
+                clean: "Done".into(),
+            })
+            .collect(),
+        hot_config,
+    );
+    let (hot_outcome, hot_events) = run(&hot, "go").await;
+    assert_eq!(hot_outcome.status, TurnStatus::Stalled);
+    assert_eq!(hot.provider.requests.lock().unwrap().len(), 4);
+    assert!(hot_events.iter().any(|event| matches!(
+        event,
+        AgentEvent::Guard { code, .. } if code == "repetition"
+    )));
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut cool_config = base_config();
+    cool_config.model.model = "qwen3-coder-30b".into();
+    cool_config.model.temperature = 0.9;
+    cool_config.model_profile_override = Some("qwen-coding".into());
+    let cool = harness_config(
+        dir.path(),
+        vec![Script::SamplerLoop {
+            hot: phrase.into(),
+            reps: 80,
+            clean: "Done".into(),
+        }],
+        cool_config,
+    );
+    let (cool_outcome, _) = run(&cool, "go").await;
+    assert_eq!(cool_outcome.status, TurnStatus::Done);
+    let requests = cool.provider.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].samplers.temperature, Some(0.2));
+    assert_eq!(requests[0].samplers.min_p, Some(0.05));
 }
 
 #[tokio::test]

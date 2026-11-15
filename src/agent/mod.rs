@@ -72,6 +72,11 @@ pub struct Core {
     /// Last forced-tool conformance result for this model/build. `None` when
     /// the probe could not run (server down or a deferred start).
     pub tool_probe: Option<crate::provider::probe::ToolProbe>,
+    /// Engine fingerprint used for sampler and structured-output wire names.
+    pub engine: crate::provider::Engine,
+    /// Optional response schema, lowered for `engine` and used to validate the
+    /// final answer. `None` when the user did not request structured output.
+    pub structured: Option<crate::provider::StructuredRequest>,
     pub cancel: CancellationToken,
     pub tool_timeout: Duration,
     pub path_jail: bool,

@@ -46,6 +46,11 @@ pub struct Cli {
     #[arg(long = "model-profile", global = true, value_name = "NAME")]
     pub model_profile: Option<String>,
 
+    /// JSON Schema file that constrains the final answer. The schema is
+    /// lowered to the engine's grammar dialect and every reply is validated.
+    #[arg(long = "json-schema", global = true, value_name = "FILE")]
+    pub json_schema: Option<PathBuf>,
+
     /// Tool profile (coding, full, security, minimal, or a custom profile).
     #[arg(long, global = true, value_name = "NAME")]
     pub profile: Option<String>,
@@ -295,6 +300,9 @@ pub async fn run(cli: Cli) -> Result<i32> {
     if let Some(profile) = cli.model_profile {
         config.model_profile_override = Some(profile);
     }
+    if let Some(schema) = cli.json_schema {
+        config.model.response_schema = schema.display().to_string();
+    }
     if let Some(theme) = cli.theme {
         config.ui.theme = theme;
     }
@@ -487,6 +495,15 @@ fn run_context(config: &Config, paths: &Paths, json: bool) -> Result<i32> {
     Ok(0)
 }
 
+/// The engine a diagnostic should judge capabilities against. Runtime
+/// resolution honors `[model] engine` even when a gateway hides the server
+/// metadata, so the configured pin wins over the probe result.
+fn diagnostic_engine(configured: &str, detected: &str) -> crate::provider::Engine {
+    crate::provider::Engine::parse(configured)
+        .or_else(|| crate::provider::Engine::parse(detected))
+        .unwrap_or(crate::provider::Engine::Generic)
+}
+
 /// `lh doctor`: fingerprint the engine and print a capability manifest. Only
 /// metadata probes are used; no chat completion and no model load.
 async fn run_doctor(config: &Config, paths: &Paths, json: bool, fix: bool) -> Result<i32> {
@@ -502,13 +519,15 @@ async fn run_doctor(config: &Config, paths: &Paths, json: bool, fix: bool) -> Re
         }
     }
     let provider = crate::provider::OpenAiCompatProvider::new(&config.model, model)?;
-    let (_, profile) = config.model_profile();
+    let (profile_name, profile) = config.model_profile();
     let configured = profile
         .context_window
         .or(config.model.context_window)
         .unwrap_or(0);
-    let manifest = crate::doctor::DoctorManifest::probe(&provider, configured).await;
-    let mut manifest = manifest;
+    let samplers = crate::provider::SamplerSettings::resolve(&config.model, &profile);
+    let mut manifest = crate::doctor::DoctorManifest::probe(&provider, configured).await;
+    let engine = diagnostic_engine(&config.model.engine, &manifest.engine);
+    manifest.warn_unsupported_samplers(&profile_name, engine, &samplers);
     // `lh doctor` never sends a chat completion. Show the last conformance
     // result the runtime stored for this model/build, if any.
     let probe_path = paths.data_dir.join("tool-probe-cache.json");
@@ -1374,6 +1393,15 @@ mod tests {
         let cli = Cli::try_parse_from(["lh", "--no-redact"]).unwrap();
         assert!(cli.no_redact);
         assert!(!Cli::try_parse_from(["lh"]).unwrap().no_redact);
+    }
+
+    #[test]
+    fn doctor_prefers_the_configured_engine_over_detection() {
+        use crate::provider::Engine;
+        assert_eq!(diagnostic_engine("vllm", "generic"), Engine::Vllm);
+        assert_eq!(diagnostic_engine("", "llama.cpp"), Engine::LlamaCpp);
+        assert_eq!(diagnostic_engine("auto", "ollama"), Engine::Ollama);
+        assert_eq!(diagnostic_engine("", "unknown"), Engine::Generic);
     }
 
     #[test]
