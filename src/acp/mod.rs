@@ -32,7 +32,7 @@ use tokio::sync::oneshot;
 use crate::config::Config;
 use crate::paths::Paths;
 
-use session::AcpSession;
+use crate::host::{Host, HostedSession as AcpSession};
 
 pub const PROTOCOL_VERSION: u64 = 1;
 
@@ -45,10 +45,8 @@ pub struct AcpOptions {
 }
 
 pub(crate) struct Server {
-    config: Config,
-    /// Paths for the process working directory: config/data roots, the
-    /// `[session] dir` override, and the trust boundary.
-    process_paths: Paths,
+    /// Config, paths, and session options shared with `lh serve`.
+    host: Host,
     options: AcpOptions,
     out: UnboundedSender<String>,
     pub(crate) sessions: Mutex<HashMap<String, Arc<AcpSession>>>,
@@ -156,9 +154,15 @@ impl RpcError {
 pub async fn run(config: Config, paths: Paths, options: AcpOptions) -> Result<i32> {
     let (out, out_rx) = mpsc::unbounded_channel();
     let writer = tokio::spawn(writer(out_rx));
-    let server = Arc::new(Server {
+    let host = Host {
         config,
         process_paths: paths,
+        engagement: options.engagement.clone(),
+        no_session: options.no_session,
+        no_redact: options.no_redact,
+    };
+    let server = Arc::new(Server {
+        host,
         options,
         out,
         sessions: Mutex::new(HashMap::new()),
@@ -427,24 +431,9 @@ fn initialize_result(params: &Value, load_session: bool) -> Value {
     })
 }
 
-/// Canonicalize a client-declared root. It must be an absolute, existing
-/// directory; symlinks resolve before the jail is applied.
+/// Canonicalize a client-declared root (see [`crate::host::declared_root`]).
 pub(crate) fn declared_root(cwd: &str) -> Result<std::path::PathBuf, RpcError> {
-    let path = std::path::Path::new(cwd);
-    if !path.is_absolute() {
-        return Err(RpcError::invalid_params(format!(
-            "cwd {cwd:?} must be an absolute path"
-        )));
-    }
-    let canonical = path.canonicalize().map_err(|error| {
-        RpcError::invalid_params(format!("cwd {cwd:?} cannot be resolved: {error}"))
-    })?;
-    if !canonical.is_dir() {
-        return Err(RpcError::invalid_params(format!(
-            "cwd {cwd:?} is not a directory"
-        )));
-    }
-    Ok(canonical)
+    crate::host::declared_root(cwd).map_err(RpcError::invalid_params)
 }
 
 /// Reject roots this iteration cannot honor instead of pretending to allow
@@ -463,14 +452,7 @@ pub(crate) fn check_additional_directories(params: &Value) -> Result<(), RpcErro
     Ok(())
 }
 
-/// A best-effort check that a session id cannot be used as a path.
-pub(crate) fn valid_session_id(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= 128
-        && id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-}
+pub(crate) use crate::host::valid_session_id;
 
 #[cfg(test)]
 mod tests {
