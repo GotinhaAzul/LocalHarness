@@ -70,6 +70,10 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub no_redact: bool,
 
+    /// Do not load AGENTS.md files into the system prompt.
+    #[arg(long, global = true)]
+    pub no_agents_md: bool,
+
     /// Resume the most recent session for this project.
     #[arg(long = "continue", conflicts_with = "resume")]
     pub continue_last: bool,
@@ -162,6 +166,15 @@ pub enum Command {
     },
     /// Serve the Agent Client Protocol v1 on stdio for editor integrations.
     Acp,
+    /// Inspect context assembly inputs: the hierarchical AGENTS.md manifest.
+    Context {
+        /// Print the manifest with each loaded file, its bytes, and SHA-256.
+        #[arg(long, required_unless_present = "json")]
+        show: bool,
+        /// Emit one stable JSON object.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, clap::Subcommand)]
@@ -283,6 +296,9 @@ pub async fn run(cli: Cli) -> Result<i32> {
     if cli.no_redact {
         config.session.redact = false;
     }
+    if cli.no_agents_md {
+        config.prompt.agents_md = false;
+    }
     if cli.keep_artifacts {
         config.session.keep_artifacts = true;
     }
@@ -319,6 +335,9 @@ pub async fn run(cli: Cli) -> Result<i32> {
             no_redact: !config.session.redact,
         };
         return crate::acp::run(config, paths, options).await;
+    }
+    if let Some(Command::Context { json, .. }) = &cli.command {
+        return run_context(&config, &paths, *json);
     }
     if let Some(Command::Doctor { json, fix }) = &cli.command {
         return run_doctor(&config, &paths, *json, *fix).await;
@@ -410,6 +429,21 @@ pub async fn run(cli: Cli) -> Result<i32> {
     };
     mcp.shutdown().await;
     outcome
+}
+
+/// `lh context`: print the AGENTS.md chain and its manifest. This reads local
+/// files only; it does not open a session, start a turn, or contact a model.
+fn run_context(config: &Config, paths: &Paths, json: bool) -> Result<i32> {
+    let agents = crate::agent::agents_md::AgentsMd::load(&paths.cwd, config.prompt.agents_md);
+    if json {
+        println!("{}", serde_json::to_string_pretty(&agents.manifest_json())?);
+    } else {
+        print!("{}", agents.manifest_text());
+        for warning in &agents.warnings {
+            eprintln!("warning: {warning}");
+        }
+    }
+    Ok(0)
 }
 
 /// `lh doctor`: fingerprint the engine and print a capability manifest. Only
@@ -971,7 +1005,14 @@ fn render_event(event: AgentEvent, json: bool) -> Result<Option<TurnStatus>> {
                 json!({"type":"tool_finished","call_id":call_id,"name":name,"is_error":is_error,"duration_ms":duration_ms,"preview":preview,"artifact":artifact})
             }
             AgentEvent::Usage(usage) => {
-                json!({"type":"usage","prompt_tokens":usage.prompt_tokens,"completion_tokens":usage.completion_tokens})
+                json!({
+                    "type":"usage",
+                    "prompt_tokens":usage.prompt_tokens,
+                    "completion_tokens":usage.completion_tokens,
+                    "cached_tokens":usage.cached_tokens,
+                    "cache_percent":usage.cache_percent(),
+                    "reasoning_tokens":usage.reasoning_tokens,
+                })
             }
             AgentEvent::Context { used, window } => {
                 json!({"type":"context","used":used,"window":window})
@@ -1028,8 +1069,14 @@ fn render_event(event: AgentEvent, json: bool) -> Result<Option<TurnStatus>> {
         AgentEvent::Guard { code, message } => eprintln!("[{code}] {message}"),
         AgentEvent::Error { code, message, .. } => eprintln!("[{code}] {message}"),
         AgentEvent::Usage(usage) => {
+            let cache = match (usage.cached_tokens, usage.cache_percent()) {
+                (Some(cached), Some(percent)) => {
+                    format!(" cache {cached}/{} ({percent}%)", usage.prompt_tokens)
+                }
+                _ => String::new(),
+            };
             eprintln!(
-                "[usage] prompt {} completion {}",
+                "[usage] prompt {} completion {}{cache}",
                 usage.prompt_tokens, usage.completion_tokens
             );
         }

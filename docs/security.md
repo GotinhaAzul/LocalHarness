@@ -298,9 +298,15 @@ it. Project `.harness/` config, profiles, skills, workflows, tools, and verify
 steps are ignored unless `--trust` is passed or the TUI trust confirmation is
 accepted. Trust is per session and shown in the header/footer.
 
-`AGENTS.md` is always read as untrusted project instructions. It cannot change
-scope, tools, gates, or the endpoint. A trusted project still cannot grant
-security scope.
+`AGENTS.md` is read as untrusted project instructions from the chain of
+directories between the git repository root and the working directory, nearest
+last. Each file is shown under a source-path header. The chain is capped at
+32 KiB total and 12 KiB per file; truncation is deterministic and warns. A
+symlink that resolves outside the repository is refused. `lh context --show`
+prints the manifest with each path, byte count, SHA-256, and
+loaded/skipped/truncated state; `--no-agents-md` and `LH_AGENTS_MD=0` disable
+the chain. The files cannot change scope, tools, gates, or the endpoint. A
+trusted project still cannot grant security scope.
 
 Repository content and tool output are delimited and labeled as untrusted data
 in the system prompt. This reduces, but does not eliminate, prompt injection.
@@ -309,15 +315,36 @@ in the system prompt. This reduces, but does not eliminate, prompt injection.
 
 - No telemetry, analytics, or phone-home.
 - Endpoint defaults to `http://127.0.0.1:8080`; non-local endpoints warn.
-- Session logs, artifacts, evidence artifacts, and exported reports are
-  redacted before they are written. Private key blocks, bearer and
-  `Authorization` header values, AWS/GCP/Azure keys, GitHub tokens, secret-like
-  `.env` assignments, and the exact values of environment variables matching
-  `*TOKEN*`, `*SECRET*`, `*KEY*`, or `*PASSWORD*` become
-  `[REDACTED:<kind>:<first4>...<hash8>]` (the prefix is omitted for values
-  shorter than 12 characters). The short prefix and hash keep evidence
-  comparable without exposing the value; paths and command names are left
-  intact.
+- Session logs, artifacts, evidence artifacts, finding text (title,
+  evidence, impact, remediation; not `target` or `poc_steps`, which are
+  matched and replayed), and exported reports are redacted before they are
+  written.
+  Private key blocks, bearer and `Authorization` header values, AWS/GCP/Azure
+  keys, GitHub tokens, secret-like `.env` assignments, and the exact values of
+  environment variables matching `*TOKEN*`, `*SECRET*`, `*KEY*`, or
+  `*PASSWORD*` become `[REDACTED:<kind>:<first4>...<hash8>]` (the prefix is
+  omitted for values shorter than 12 characters). The short prefix and hash
+  keep evidence comparable without exposing the value; paths and command names
+  are left intact. Assignments that are source code are not secrets: the
+  generic `.env` rule only considers upper-case `NAME=value` lines, and
+  unquoted values with call, index, or collection syntax
+  (`name = Column(Text)`, `secret_key = os.environ["X"]`) are never redacted.
+- Redaction applies to what is written to disk, not to what the model reads.
+  Tool results, `recall`, `bg` logs, and the model's own earlier tool calls
+  reach the model as they were produced. A model that sees a placeholder
+  instead of file content writes the placeholder back and corrupts the file.
+  That is true even for a correct match: rewriting a `.env` file the model saw
+  redacted would destroy the real values. The cost is that the endpoint
+  receives secrets that tool output contains, both in the turn that produced
+  them and when later prompts in the same process replay them. Use a local
+  endpoint, or keep secrets out of what the model reads, when that matters.
+- A resumed session replays its entries as saved, so a tool result that was
+  redacted on disk shows placeholders. Such results carry a note that the
+  markers are not file content, and `write`, `edit`, `patch`, and `undo`
+  refuse content that adds a `[REDACTED:...]` placeholder the file does not
+  already hold. Nothing is written in that case. An `undo` whose snapshot was
+  redacted on disk is refused the same way. A `bash` command that writes a
+  file is not checked.
 - `--no-redact` disables that pass for one session and is recorded in the
   session header (`"redact": false`). Use it only for disposable test data.
 - Evidence `sha256` continues to describe the raw tool output. A
@@ -329,10 +356,10 @@ in the system prompt. This reduces, but does not eliminate, prompt injection.
 - Evidence artifacts are `0600`; credentials extracted into the surface map are
   stored as SHA-256 references, never plaintext. URL userinfo is stripped from
   stored URLs.
-- Live `bg` logs are streamed by the process supervisor. Output is redacted when
-  it is read back through `bg`, session entries, and evidence, but the live log
-  file is not rewritten line-by-line while the process runs. Prefer `bash` for
-  one-shot commands that print secrets.
+- Live `bg` logs are streamed by the process supervisor. The log file is not
+  redacted while the process runs, and `bg log` shows the model the raw tail;
+  the session entry and evidence for that result are redacted when written.
+  Prefer `bash` for one-shot commands that print secrets.
 - Diagnostic logs are metadata only: timings, tool names, token counts, error
   codes. Prompt and tool content is not logged unless `LH_DEBUG_CONTENT=1`,
   which prints a warning.

@@ -451,6 +451,7 @@ impl App {
             used,
             window,
             completion: 0,
+            reasoning: 0,
             tok_s: 0.0,
             cache: None,
             session: short_session_id(&session_id),
@@ -1285,6 +1286,7 @@ impl App {
         self.stream_phase = StreamPhase::Waiting;
         self.running_tools.clear();
         self.completion_tokens = 0;
+        self.header.reasoning = 0;
         self.tok_s = 0.0;
         self.token_events.clear();
         self.notice = None;
@@ -1440,12 +1442,13 @@ impl App {
                 if usage.prompt_tokens > 0 {
                     self.used_tokens = usage.prompt_tokens;
                     self.header.used = usage.prompt_tokens;
+                    self.header.cache = usage
+                        .cached_tokens
+                        .map(|cached| (cached.min(usage.prompt_tokens), usage.prompt_tokens));
                 }
                 self.completion_tokens = usage.completion_tokens;
                 self.header.completion = usage.completion_tokens;
-                if usage.cache_percent().is_some() {
-                    self.header.cache = usage.cache_percent();
-                }
+                self.header.reasoning = usage.reasoning_tokens.unwrap_or(0);
                 self.last_usage = Some(usage);
             }
             AgentEvent::Context { used, window } => {

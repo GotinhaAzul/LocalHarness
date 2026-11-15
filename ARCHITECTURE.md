@@ -100,13 +100,48 @@ Streaming:
 
 - SSE frames: `data: {...}`, `data: [DONE]`, comments, CRLF, multi-line data,
   frames split across chunks, multiple frames per chunk.
-- Accumulate tool calls by `index`: `id`, `function.name`, and
-  `function.arguments` fragments. Handle providers that emit a complete call in
-  one frame.
-- Parse `usage` from the final chunk when present.
-- Parse `reasoning_content` and `reasoning` fields. A model profile decides
+- Accumulate tool calls in one state machine (`provider/accum.rs`): each call
+  is a slot that is `Open` while fragments for its stream index arrive and
+  `Closed` when the stream ends or a new whole call takes over the index (a
+  name plus arguments while the open arguments are already a complete JSON
+  object, or a different engine id). Handles SGLang fragments, vLLM whole
+  calls, Ollama calls without `id` or `index`, and object-valued `arguments`.
+- JSON is validated at close. When `finish_reason` is `length` (or
+  `max_tokens`) and a call's arguments are empty or incomplete, the turn fails
+  with `tool_call_truncated` and the call is never executed.
+- An in-stream `error` object (`{"error":{...}}` or `{"error":"..."}`) aborts
+  the turn with the server's message, even after an HTTP 200.
+- A server that ignores `stream: true` and answers `application/json` is
+  emitted as the same events, so streamed and non-streamed completions fold
+  into one normalized `Completion` (`fold_stream`).
+- Parse `usage` and llama.cpp `timings` from any chunk; reports are merged and
+  surfaced once per completion.
+- Parse reasoning from the configured `reasoning_field`, then
+  `reasoning_content`, `reasoning`, and `thinking`. Inline `<think>` blocks and gpt-oss
+  `<|channel|>analysis` messages join the same stream, and reasoning markup is
+  stripped from assistant content at context assembly. `usage` may carry
+  `reasoning_tokens` (reported, else estimated). A per-profile
+  `thinking = auto|on|off` policy merges `thinking_control` into `extra_body`
+  when thinking is off. A model profile decides
   whether reasoning is shown, kept in context, or stripped after the turn.
 - `finish_reason`: `stop`, `length`, `tool_calls`, `content_filter`.
+
+Tool-call ids:
+
+- The session never stores an engine id. `agent/calls.rs` (`CallLedger`)
+  assigns `call_0001`, `call_0002`, ... in arrival order, continuing after the
+  highest internal id anywhere in the session tree, so ids are unique and
+  sortable across turns, branches and compaction. The engine id is mapped to
+  the internal id for the current request only.
+- Before each request the replayed history must have exactly one result per
+  call and one call per result; otherwise the turn fails with a typed error
+  (`tool_result_missing`, `tool_result_duplicate`, `tool_result_orphan`,
+  `tool_call_duplicate`) and nothing is sent.
+- Ids are rendered per model at the wire: Mistral-family models
+  (`mistral_common` tokenizers) get nine alphanumerics (`call_0007` →
+  `000000007`; ids an older session stored are hashed to `z` + 8 characters).
+  Other models receive the internal id unchanged. Older session files replay
+  unchanged.
 
 ### 2.2 Optional probes
 
@@ -220,9 +255,13 @@ States: `Idle`, `AssembleContext`, `Compact`, `StreamModel`, `ToolBatch`,
 
 1. Append the user entry to the session branch.
 2. Assemble context from the active branch, including the cached repository
-   brief in the system prompt.
-3. If the prompt budget is exceeded, write a compaction entry and rebuild.
-4. Send the model request with the profile's tool list.
+   brief in the system prompt. The stable profile prompt, tool index, and
+   project instructions come first; volatile session facts (working directory,
+   profile name) sit at the tail so the engine can reuse its prefix cache.
+3. If the prompt budget is exceeded, write a compaction entry and rebuild. A
+   `cache-boundary` entry records the reused prefix and the suffix that must
+   re-prefill.
+4. Send the model request with the profile's tool list in a stable order.
 5. Stream text, reasoning, and tool calls. Emit UI events.
 6. If there are no tool calls, run settle gates.
 7. For each tool call, in order:
@@ -373,6 +412,14 @@ usable_prompt = context_window - max_output_tokens - safety_margin
 - If no usage is available, estimate from characters with the calibrated ratio.
 - Every entry stores an optional `tokens` estimate for the tree view and budget
   accounting.
+- `usage.cached_tokens` (`prompt_tokens_details.cached_tokens`, or llama.cpp
+  `timings.cache_n`) is reported per call. The TUI header shows `cache
+  <cached>/<prompt>`; `--json` usage events carry `cached_tokens` and
+  `cache_percent`. Two consecutive calls under 70% emit a notice naming the
+  likely invalidator: a compaction, a changed prefix, or server-side eviction.
+- The request prefix (leading system block plus serialized tools) is hashed
+  with SHA-256 and recorded once per core build as a `prompt-prefix` entry, so
+  a changed prefix is visible next to the turn where it changed.
 
 ### 4.3 Tool result caps and archive
 
@@ -515,7 +562,7 @@ Entry fields:
 | `tool_result` | call_id, content, is_error, details?, artifact? |
 | `compaction` | summary, tokens_before, reason, thread_id? |
 | `checkout` | target, reason (`tree`, `fork`, `resume`) |
-| `custom` | kind plus payload (`fs-change`, `verify-config`, `verify-result`, `todo-state`, `finding`, `thread-state`, `guard-trip`, `profile-change`, `model-change`, `permissions`, `permission-mode`, `plan`) |
+| `custom` | kind plus payload (`fs-change`, `verify-config`, `verify-result`, `todo-state`, `finding`, `thread-state`, `guard-trip`, `profile-change`, `model-change`, `prompt-prefix`, `cache-boundary`, `cache-cold`, `permissions`, `permission-mode`, `plan`) |
 | `error` | code, message, recoverable |
 
 An assistant entry with `tool_calls` is a batch. The tool results that answer it
@@ -615,7 +662,7 @@ deletes entries.
 - `session-id` is `YYYYMMDD-HHMMSS-<pid>` or a short random suffix.
 - One advisory lock per session file. A second process refuses to write and
   names the lock holder.
-- Flush each entry to the file. `fsync` at turn end and after compaction.
+- Flush each entry to the file. `fsync` once at turn end; compactions inside a turn are covered by that fsync.
 - On load, ignore a malformed final line, drop orphan entries with a warning,
   and validate that every `parent` exists.
 - Export: `/export [path]` writes Markdown for the active branch. Findings have
@@ -840,6 +887,7 @@ code and, where useful, the exact call shape.
 | `attack_path` | 400 nodes for full betweenness; 5000 simple paths |
 | `iocs` | 100 per category, 2,000,000 input chars |
 | tool result | 2500 chars per result, 8000 chars per batch |
+| `AGENTS.md` | 32 KiB total, 12 KiB per file; chain from repo root to cwd |
 | compaction | `clamp(usable prompt / 3, 1200, 4500)` chars, max 40% of usable |
 
 Limits are constants or config values, not model-controlled.
@@ -1161,8 +1209,14 @@ input characters. Missing input and unreadable files return prescriptive errors.
 - Project `.harness/` config, profiles, skills, workflows, tools, and verify
   steps are ignored unless `--trust` is set or the TUI `/trust` confirmation is
   accepted. Trust is per session and shown in the status bar.
-- `AGENTS.md` is read as untrusted project instructions. It cannot change
-  scope, tools, gates, or the endpoint.
+- `AGENTS.md` is read as untrusted project instructions from the chain between
+  the git repository root and the working directory, nearest last, each under a
+  source-path header. The chain is capped at 32 KiB total and 12 KiB per file
+  with deterministic truncation and a warning. Symlinks that resolve outside
+  the repository are refused. `lh context --show` prints path, bytes, SHA-256,
+  and loaded/skipped/truncated for each file; `--no-agents-md` and
+  `LH_AGENTS_MD=0` disable the chain. It cannot change scope, tools, gates, or
+  the endpoint.
 - A trusted project still cannot grant security scope.
 - Model input from repository files and tool output is delimited and labeled as
   untrusted data in the system prompt. This reduces, but does not eliminate,
@@ -1173,14 +1227,26 @@ input characters. Missing input and unreadable files return prescriptive errors.
 - No telemetry, no analytics, no phone-home.
 - Endpoint defaults to `http://127.0.0.1:8080`. A non-local endpoint is allowed
   only when explicitly configured, with a warning.
-- Session entries, archived tool artifacts, evidence, and exported reports pass
-  through `security::redact` before they reach disk. Provider tokens, private
-  key blocks, bearer and high-entropy `Authorization` values, secret-like
-  `.env` assignments, and the exact values of `*TOKEN*`, `*SECRET*`, `*KEY*`,
-  and `*PASSWORD*` environment variables become
+- Session entries, archived tool artifacts, evidence, finding text, and
+  exported reports pass through `security::redact` before they reach disk.
+  Provider tokens, private key blocks, bearer and high-entropy `Authorization`
+  values, secret-like `.env` assignments (upper-case names; unquoted code
+  expressions are skipped), and the exact values of `*TOKEN*`, `*SECRET*`,
+  `*KEY*`, and `*PASSWORD*` environment variables become
   `[REDACTED:<kind>:<first4>...<hash8>]`. Evidence keeps `sha256` over the raw
   output and `stored_sha256` over the redacted artifact. `--no-redact` is the
-  explicit opt-out and is recorded in the session header. `--no-session`
+  explicit opt-out and is recorded in the session header.
+- Redaction is a persistence transform only. `Session::append` writes a
+  redacted copy to disk and keeps the raw entry in the in-memory tree that
+  prompts are built from. `ArtifactStore` writes the redacted file and keeps a
+  bounded in-memory copy of the raw text, so `recall` and `undo` read the
+  original in the live process. A placeholder in model-visible text gets
+  written back into files, so it must never come from the live path. After a
+  resume, replayed results that contain placeholders get a note, and
+  `tools::write::atomic_write` (shared by `write`, `edit`, `patch`, and
+  `undo`) refuses content that adds a placeholder the file does not already
+  hold. `Session::export_markdown` redacts a clone of each entry before
+  rendering, since the tree it reads is raw. `--no-session`
   disables session and artifact writes for sensitive engagements. It does not
   delete or disable an engagement file the user explicitly created; findings
   are separate, user-owned data.
@@ -1388,7 +1454,8 @@ cursor = "#c0caf5"
 - Context: `used/window` and a gauge. `used` is the estimated prompt tokens of
   the next request; during streaming, completion tokens are shown separately.
   Thresholds: normal, warning at 70%, error at 85%.
-- Throughput: rolling tokens/second over the last few seconds.
+- Throughput: rolling tokens/second over the last few seconds, plus
+  `cache <cached>/<prompt>` when the engine reports prefix-cache hits.
 - Session: short id and trusted/untrusted marker.
 - At narrow widths, drop throughput, then session id, then profile; never drop
   cwd, context, or model. With no model selected, the model slot reads
@@ -1448,7 +1515,8 @@ cursor = "#c0caf5"
 
 `lh --print "<prompt>"` runs one turn without the TUI, streams to stdout, and
 exits with the turn status. `--json` emits newline-delimited events for
-scripting. The same core and session code is used. This is not a second
+scripting; `usage` events include `prompt_tokens`, `cached_tokens`, and
+`cache_percent`. The same core and session code is used. This is not a second
 implementation. Nobody can answer a permission `ask` headless, so it is denied
 with `DENIED`; pass `--mode accept-edits`, add allow rules, or `--yolo`.
 `--plan --print` runs one plan-mode turn, prints the stored plan (a `plan`
@@ -1590,9 +1658,11 @@ strip_reasoning = true
   prompts/
 ```
 
-`AGENTS.md` at the repository root is read as untrusted project instructions. It
-is data, not executable, and it cannot change scope, tools, gates, or the
-endpoint.
+`AGENTS.md` files between the repository root and the working directory are
+read as untrusted project instructions, nearest last. They are data, not
+executable, and cannot change scope, tools, gates, or the endpoint. `lh context
+--show` reports the chain and its hashes; `[prompt] agents_md = false`,
+`--no-agents-md`, and `LH_AGENTS_MD=0` disable loading.
 
 ### 10.5 Permissions and secrets
 
@@ -1626,6 +1696,7 @@ src/
   text.rs                 shared clipping, one-line, slug, byte excerpts
   provider/
     mod.rs                Provider trait and error types
+    accum.rs              tool-call accumulator and normalized completion
     openai.rs             OpenAI-compatible client
     sse.rs                SSE framing and parsing
     types.rs              request/response/stream types
@@ -1633,6 +1704,8 @@ src/
   agent/
     mod.rs                AgentHandle, events
     run.rs                turn state machine
+    prompt.rs             system prompt construction
+    agents_md.rs          hierarchical AGENTS.md chain, caps, manifest
     repair.rs             tool argument repair
     gates.rs              settle gates and guard orchestration
     limits.rs             run budgets and stall detection
@@ -1908,7 +1981,8 @@ These do not block implementation; defaults are specified.
   acceptable after Linux is stable.
 - **Multiple live sessions.** One active session per process in v1. Tabs or
   multiple windows are later.
-- **Redaction coverage.** Secret redaction is shape-based. Unknown credential
-  formats, secrets split across stream chunks, and live `bg` log files before
-  they are read as tool output are not guaranteed. `--no-redact` is explicit
+- **Redaction coverage.** Secret redaction is shape-based and applies to
+  disk only. Unknown credential formats, secrets split across stream chunks,
+  and live `bg` log files are not guaranteed. The endpoint sees raw tool
+  output by design. `--no-redact` is explicit
   and recorded; it is not a default.
