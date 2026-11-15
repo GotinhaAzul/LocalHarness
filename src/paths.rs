@@ -14,6 +14,10 @@ pub struct Paths {
     pub project_id: String,
     /// `[session] dir` override; sessions live directly under this root.
     pub sessions_dir_override: Option<PathBuf>,
+    /// The user's home directory, used for the standard skill roots. Tests
+    /// construct paths without one so a developer's `~/.claude/skills` cannot
+    /// leak into a fixture.
+    pub home_dir: Option<PathBuf>,
 }
 
 impl Paths {
@@ -40,6 +44,9 @@ impl Paths {
             project_id: project_id(&cwd),
             cwd,
             sessions_dir_override: None,
+            home_dir: std::env::var_os("LH_HOME")
+                .map(PathBuf::from)
+                .or_else(dirs::home_dir),
         })
     }
 
@@ -53,6 +60,16 @@ impl Paths {
 
     pub fn skills_dir(&self) -> PathBuf {
         self.config_dir.join("skills")
+    }
+
+    /// Lockfile for installed skills: source, resolved commit, and digests.
+    pub fn skills_lock_file(&self) -> PathBuf {
+        self.config_dir.join("skills.lock")
+    }
+
+    /// Replaced skill copies are moved here and never deleted.
+    pub fn skills_trash_dir(&self) -> PathBuf {
+        self.config_dir.join("skills-trash")
     }
 
     pub fn workflows_dir(&self) -> PathBuf {

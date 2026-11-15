@@ -1,11 +1,25 @@
-//! Skills: bundled, global, and trusted project instructions.
+//! Skills: bundled, global, project, and Agent Skills compatible instructions.
 //!
 //! Skills are Markdown instructions with YAML frontmatter. They cannot change
-//! scope, tool lists, gates, or the endpoint; code enforces those.
+//! scope, tool lists, gates, or the endpoint; code enforces those. Discovery
+//! keeps only name and description in memory; the body loads on activation and
+//! a reference only when the model names it.
 
+pub mod eval;
+pub mod frontmatter;
+pub mod lint;
+pub mod manager;
+pub mod scripts;
+pub mod validate;
+
+pub use scripts::{BundledScript, approval_required, bundled_script_in_command};
+
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::paths::Paths;
+use frontmatter::Frontmatter;
+use serde_yaml::Value;
 
 /// Most reference files picked up from one skill directory.
 const MAX_REFERENCES: usize = 40;
@@ -44,28 +58,128 @@ impl SkillReference {
     }
 }
 
+/// Where a skill came from. Precedence is the declaration order: a later
+/// origin wins a name collision, and native directories beat the ecosystem
+/// directories at the same level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SkillOrigin {
+    Bundled,
+    GlobalClaude,
+    GlobalAgents,
+    GlobalNative,
+    ProjectClaude,
+    ProjectAgents,
+    ProjectNative,
+}
+
+impl SkillOrigin {
+    pub fn label(self) -> &'static str {
+        match self {
+            SkillOrigin::Bundled => "bundled",
+            SkillOrigin::GlobalClaude => "~/.claude/skills",
+            SkillOrigin::GlobalAgents => "~/.agents/skills",
+            SkillOrigin::GlobalNative => "~/.config/localharness/skills",
+            SkillOrigin::ProjectClaude => ".claude/skills",
+            SkillOrigin::ProjectAgents => ".agents/skills",
+            SkillOrigin::ProjectNative => ".harness/skills",
+        }
+    }
+
+    pub fn is_bundled(self) -> bool {
+        self == SkillOrigin::Bundled
+    }
+}
+
+impl std::fmt::Display for SkillOrigin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+#[derive(Debug, Clone)]
+enum SkillText {
+    Embedded(&'static str),
+    File(PathBuf),
+}
+
+#[derive(Debug, Clone)]
+enum ReferenceStore {
+    None,
+    Embedded(&'static [(&'static str, &'static str)]),
+    Dir(PathBuf),
+}
+
 #[derive(Debug, Clone)]
 pub struct Skill {
     pub name: String,
     pub description: String,
     pub when: Option<String>,
-    /// The main instructions, without references.
-    pub body: String,
-    pub references: Vec<SkillReference>,
+    /// The `SKILL.md` (or loose native Markdown file) this skill was read from.
     pub source: Option<PathBuf>,
+    /// The skill directory, when it has one.
+    pub dir: Option<PathBuf>,
     pub bundled: bool,
     /// Tool packs that advertise this skill. Empty means every profile.
     pub packs: Vec<String>,
+    /// `allowed-tools` from the standard frontmatter. It is an intersection
+    /// helper, never a grant; see [`Skill::effective_allowed_tools`].
+    pub allowed_tools: Vec<String>,
+    pub origin: SkillOrigin,
+    /// Frontmatter fields the harness does not interpret, preserved verbatim.
+    pub unknown: BTreeMap<String, Value>,
+    /// `shadow: true` marks an intentional override of a lower-precedence
+    /// skill with the same name.
+    pub shadow: bool,
+    text: SkillText,
+    reference_store: ReferenceStore,
 }
 
 impl Skill {
+    /// The main instructions, without references. Read from disk on each call
+    /// so discovery never preloads a body into memory or the prompt.
+    pub fn body(&self) -> String {
+        match &self.text {
+            SkillText::Embedded(raw) => Frontmatter::parse(raw)
+                .map(|front| front.body.trim().to_string())
+                .unwrap_or_default(),
+            SkillText::File(path) => std::fs::read_to_string(path)
+                .ok()
+                .and_then(|raw| Frontmatter::parse(&raw).ok())
+                .map(|front| front.body.trim().to_string())
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Reference documents in the skill directory, scanned only when a caller
+    /// activates or lints the skill.
+    pub fn references(&self) -> Vec<SkillReference> {
+        match &self.reference_store {
+            ReferenceStore::None => Vec::new(),
+            ReferenceStore::Embedded(embedded) => embedded
+                .iter()
+                .map(|(path, text)| SkillReference {
+                    path: (*path).to_string(),
+                    source: ReferenceSource::Embedded(text),
+                })
+                .collect(),
+            ReferenceStore::Dir(dir) => {
+                let main = match &self.text {
+                    SkillText::File(path) => Some(path.clone()),
+                    SkillText::Embedded(_) => None,
+                };
+                discover_references(dir, main.as_deref())
+            }
+        }
+    }
+
     /// Instructions plus every reference, for `/skill` where the user asked
     /// for the whole thing.
     pub fn full_text(&self) -> String {
-        let mut out = self.body.clone();
-        if !self.references.is_empty() {
+        let mut out = self.body();
+        let references = self.references();
+        if !references.is_empty() {
             out.push_str("\n\n## References\n");
-            for reference in &self.references {
+            for reference in &references {
                 if let Some(text) = reference.text() {
                     out.push_str(&format!("\n### {}\n\n{text}\n", reference.path));
                 }
@@ -77,56 +191,117 @@ impl Skill {
     /// Instructions plus a list of references the model can load one at a
     /// time with the `skill` tool.
     pub fn instructions_text(&self) -> String {
-        let mut out = self.body.clone();
-        if !self.references.is_empty() {
+        let mut out = self.body();
+        let references = self.references();
+        if !references.is_empty() {
             out.push_str(&format!(
                 "\n\n## References\n\nLoad one when the task needs it: skill {{\"name\":\"{}\",\"reference\":\"<path>\"}}\n",
                 self.name
             ));
-            for reference in &self.references {
+            for reference in &references {
                 out.push_str(&format!("- {}\n", reference.path));
             }
         }
         out
     }
 
-    pub fn reference(&self, needle: &str) -> Option<&SkillReference> {
-        self.references
-            .iter()
+    pub fn reference(&self, needle: &str) -> Option<SkillReference> {
+        self.references()
+            .into_iter()
             .find(|reference| reference.matches(needle))
+    }
+
+    /// `allowed-tools` intersected with the tools the active profile actually
+    /// has. The result can only shrink: a skill can never enable a tool the
+    /// profile did not select.
+    pub fn effective_allowed_tools(&self, active: &[String]) -> Vec<String> {
+        self.allowed_tools
+            .iter()
+            .filter(|allowed| active.iter().any(|tool| tool == *allowed))
+            .cloned()
+            .collect()
+    }
+}
+
+/// A name collision discovery resolved. `winner` is the skill that is visible;
+/// `loser` was shadowed.
+#[derive(Debug, Clone)]
+pub struct Shadow {
+    pub name: String,
+    pub winner: SkillOrigin,
+    pub winner_path: Option<PathBuf>,
+    pub loser: SkillOrigin,
+    pub loser_path: Option<PathBuf>,
+    /// The winner declared `shadow: true`, so lint reports a warning instead
+    /// of a duplicate-name error.
+    pub explicit: bool,
+}
+
+/// A skill that failed metadata validation during discovery. Lint still gets
+/// the parsed skill so it can report body and reference problems too.
+#[derive(Debug, Clone)]
+pub struct InvalidSkill {
+    pub path: PathBuf,
+    pub origin: SkillOrigin,
+    pub name: Option<String>,
+    pub diagnostics: Vec<validate::Diagnostic>,
+    pub skill: Option<Skill>,
+}
+
+/// Every skill found on disk, before name resolution.
+#[derive(Debug, Clone, Default)]
+pub struct Discovery {
+    /// Valid skills in precedence order (lowest first).
+    pub skills: Vec<Skill>,
+    pub invalid: Vec<InvalidSkill>,
+}
+
+impl Discovery {
+    /// Resolve name collisions deterministically. Later origins win; every
+    /// replacement is recorded as a shadow.
+    pub fn index(&self) -> SkillIndex {
+        let mut index = SkillIndex::default();
+        for skill in &self.skills {
+            if let Some(slot) = index
+                .skills
+                .iter_mut()
+                .find(|existing| existing.name == skill.name)
+            {
+                let previous = slot.clone();
+                index.shadows.push(Shadow {
+                    name: skill.name.clone(),
+                    winner: skill.origin,
+                    winner_path: skill.source.clone(),
+                    loser: previous.origin,
+                    loser_path: previous.source.clone(),
+                    explicit: skill.shadow,
+                });
+                *slot = skill.clone();
+            } else {
+                index.skills.push(skill.clone());
+            }
+        }
+        index
     }
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct SkillIndex {
     pub skills: Vec<Skill>,
+    pub shadows: Vec<Shadow>,
 }
 
 impl SkillIndex {
     pub fn bundled() -> Self {
-        crate::skills::bundled()
+        Self {
+            skills: bundled_entries(),
+            shadows: Vec::new(),
+        }
     }
 
+    /// Discover bundled, global, standard, and trusted project skills.
     pub fn load(paths: &Paths, trust: bool) -> Self {
-        let mut index = bundled();
-        if let Ok(entries) = std::fs::read_dir(paths.skills_dir()) {
-            for entry in entries.flatten() {
-                if let Some(skill) = load_skill_dir(&entry.path()) {
-                    index.upsert(skill);
-                }
-            }
-        }
-        if trust {
-            let project_skills = paths.project_dir().join("skills");
-            if let Ok(entries) = std::fs::read_dir(&project_skills) {
-                for entry in entries.flatten() {
-                    if let Some(skill) = load_skill_dir(&entry.path()) {
-                        index.upsert(skill);
-                    }
-                }
-            }
-        }
-        index
+        discover(paths, trust).index()
     }
 
     pub fn upsert(&mut self, skill: Skill) {
@@ -165,10 +340,13 @@ impl SkillIndex {
                 })
                 .cloned()
                 .collect(),
+            shadows: self.shadows.clone(),
         }
     }
 
-    /// Compact index injected into the system prompt.
+    /// Compact index injected into the system prompt. Only name, description,
+    /// and the optional trigger hint are included; bodies and references stay
+    /// on disk until the skill is activated.
     pub fn index_text(&self) -> String {
         let mut out = String::new();
         for skill in &self.skills {
@@ -182,25 +360,233 @@ impl SkillIndex {
     }
 }
 
-fn load_skill_dir(dir: &Path) -> Option<Skill> {
-    let candidates = [
-        dir.join("SKILL.md"),
-        dir.join("skill.md"),
-        dir.to_path_buf(),
-    ];
-    let path = candidates.into_iter().find(|candidate| {
-        candidate.is_file() && candidate.extension().is_some_and(|e| e == "md")
-    })?;
-    let mut skill = load_skill_file(&path, false)?;
-    if dir.is_dir() {
-        skill.references = discover_references(dir, &path);
+/// Scan every skill root for `paths` and return every discovered skill in
+/// precedence order.
+pub fn discover(paths: &Paths, trust: bool) -> Discovery {
+    let mut discovery = Discovery::default();
+    for skill in bundled_entries() {
+        discovery.skills.push(skill);
     }
-    Some(skill)
+    if let Some(home) = &paths.home_dir {
+        scan_root(
+            &mut discovery,
+            &home.join(".claude/skills"),
+            SkillOrigin::GlobalClaude,
+            false,
+        );
+        scan_root(
+            &mut discovery,
+            &home.join(".agents/skills"),
+            SkillOrigin::GlobalAgents,
+            false,
+        );
+    }
+    scan_root(
+        &mut discovery,
+        &paths.skills_dir(),
+        SkillOrigin::GlobalNative,
+        true,
+    );
+    if trust {
+        scan_root(
+            &mut discovery,
+            &paths.cwd.join(".claude/skills"),
+            SkillOrigin::ProjectClaude,
+            false,
+        );
+        scan_root(
+            &mut discovery,
+            &paths.cwd.join(".agents/skills"),
+            SkillOrigin::ProjectAgents,
+            false,
+        );
+        scan_root(
+            &mut discovery,
+            &paths.project_dir().join("skills"),
+            SkillOrigin::ProjectNative,
+            true,
+        );
+    }
+    discovery
+}
+
+/// Read one skill directory, for lint and the package manager. `dir` may be a
+/// directory containing `SKILL.md`, or a loose native `.md` file.
+pub fn read_skill_dir(dir: &Path, origin: SkillOrigin) -> Result<Skill, InvalidSkill> {
+    if dir.is_file() {
+        return parse_skill_file(dir, None, origin);
+    }
+    let candidates = ["SKILL.md", "skill.md"];
+    let main = candidates
+        .iter()
+        .map(|name| dir.join(name))
+        .find(|candidate| candidate.is_file());
+    if let Some(main) = main {
+        return parse_skill_file(&main, Some(dir.to_path_buf()), origin);
+    }
+    Err(InvalidSkill {
+        path: dir.to_path_buf(),
+        origin,
+        name: dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_string),
+        diagnostics: vec![validate::Diagnostic::error(
+            "path",
+            "skill_file_missing",
+            format!(
+                "no SKILL.md in {}; a skill is a directory with SKILL.md at its root",
+                dir.display()
+            ),
+        )],
+        skill: None,
+    })
+}
+
+fn scan_root(discovery: &mut Discovery, root: &Path, origin: SkillOrigin, native: bool) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    let mut paths: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
+    paths.sort();
+    for path in paths {
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if metadata.file_type().is_symlink() {
+            // A skill directory is self-contained; a symlink could point at an
+            // unrelated tree, and install never follows one.
+            continue;
+        }
+        if metadata.is_dir() {
+            if path.join("SKILL.md").is_file() || path.join("skill.md").is_file() {
+                match parse_skill_file(
+                    &path.join(if path.join("SKILL.md").is_file() {
+                        "SKILL.md"
+                    } else {
+                        "skill.md"
+                    }),
+                    Some(path.clone()),
+                    origin,
+                ) {
+                    Ok(skill) => discovery.skills.push(skill),
+                    Err(invalid) => discovery.invalid.push(invalid),
+                }
+            }
+        } else if native && path.extension().is_some_and(|extension| extension == "md") {
+            // Native installs historically accepted a loose `<name>.md` in the
+            // skills directory. Keep that shape working.
+            match parse_skill_file(&path, None, origin) {
+                Ok(skill) => discovery.skills.push(skill),
+                Err(invalid) => discovery.invalid.push(invalid),
+            }
+        }
+    }
+}
+
+fn parse_skill_file(
+    path: &Path,
+    dir: Option<PathBuf>,
+    origin: SkillOrigin,
+) -> Result<Skill, InvalidSkill> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(error) => {
+            return Err(InvalidSkill {
+                path: path.to_path_buf(),
+                origin,
+                name: dir
+                    .as_deref()
+                    .or_else(|| path.parent())
+                    .and_then(|parent| parent.file_name())
+                    .and_then(|name| name.to_str())
+                    .map(str::to_string),
+                diagnostics: vec![validate::Diagnostic::error(
+                    "path",
+                    "skill_file_unreadable",
+                    format!("cannot read {}: {error}", path.display()),
+                )],
+                skill: None,
+            });
+        }
+    };
+    let fallback_dir = dir.clone().or_else(|| path.parent().map(Path::to_path_buf));
+    match build_skill(&raw, path, dir, origin, fallback_dir) {
+        Ok(skill) => {
+            let diagnostics = validate::validate_skill(&skill, validate::Scope::Metadata);
+            if diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.severity == validate::Severity::Error)
+            {
+                Err(InvalidSkill {
+                    path: path.to_path_buf(),
+                    origin,
+                    name: Some(skill.name.clone()),
+                    diagnostics,
+                    skill: Some(skill),
+                })
+            } else {
+                Ok(skill)
+            }
+        }
+        Err(message) => Err(InvalidSkill {
+            path: path.to_path_buf(),
+            origin,
+            name: None,
+            diagnostics: vec![validate::Diagnostic::error(
+                "frontmatter",
+                "skill_frontmatter_invalid",
+                message,
+            )],
+            skill: None,
+        }),
+    }
+}
+
+fn build_skill(
+    raw: &str,
+    path: &Path,
+    dir: Option<PathBuf>,
+    origin: SkillOrigin,
+    fallback_dir: Option<PathBuf>,
+) -> Result<Skill, String> {
+    let front = Frontmatter::parse(raw)?;
+    let fallback_name = fallback_dir
+        .as_deref()
+        .and_then(|dir| dir.file_name())
+        .or_else(|| path.file_stem())
+        .and_then(|name| name.to_str())
+        .unwrap_or("skill")
+        .to_string();
+    let name = front.scalar("name").unwrap_or(fallback_name);
+    let description = front
+        .scalar("description")
+        .unwrap_or_else(|| first_line(&front.body).unwrap_or("").to_string());
+    let description = one_line(&description);
+    let references = dir
+        .as_ref()
+        .map(|dir| ReferenceStore::Dir(dir.clone()))
+        .unwrap_or(ReferenceStore::None);
+    Ok(Skill {
+        name,
+        description,
+        when: front.scalar("when"),
+        source: Some(path.to_path_buf()),
+        dir,
+        bundled: origin.is_bundled(),
+        packs: front.list("packs"),
+        allowed_tools: front.list("allowed-tools"),
+        origin,
+        unknown: front.unknown(),
+        shadow: front.truthy("shadow"),
+        text: SkillText::File(path.to_path_buf()),
+        reference_store: references,
+    })
 }
 
 /// Markdown and text files under a skill directory, other than the skill
 /// file itself, sorted by path.
-fn discover_references(dir: &Path, main: &Path) -> Vec<SkillReference> {
+fn discover_references(dir: &Path, main: Option<&Path>) -> Vec<SkillReference> {
     let mut found = Vec::new();
     let mut stack = vec![(dir.to_path_buf(), 0usize)];
     while let Some((current, depth)) = stack.pop() {
@@ -220,7 +606,7 @@ fn discover_references(dir: &Path, main: &Path) -> Vec<SkillReference> {
                 if depth < 3 {
                     stack.push((path, depth + 1));
                 }
-            } else if path != main
+            } else if main != Some(path.as_path())
                 && path
                     .extension()
                     .is_some_and(|ext| ext == "md" || ext == "txt")
@@ -236,58 +622,6 @@ fn discover_references(dir: &Path, main: &Path) -> Vec<SkillReference> {
     found.sort_by(|a, b| a.path.cmp(&b.path));
     found.truncate(MAX_REFERENCES);
     found
-}
-
-/// Parse one Markdown skill file with optional YAML frontmatter.
-pub fn load_skill_file(path: &Path, bundled: bool) -> Option<Skill> {
-    let raw = std::fs::read_to_string(path).ok()?;
-    let (meta, body) = split_frontmatter(&raw);
-    let name = meta
-        .get("name")
-        .cloned()
-        .or_else(|| {
-            path.parent()
-                .and_then(|p| p.file_name())
-                .map(|s| s.to_string_lossy().to_string())
-        })
-        .unwrap_or_else(|| "skill".into());
-    let description = meta
-        .get("description")
-        .cloned()
-        .unwrap_or_else(|| first_line(body).unwrap_or("").to_string());
-    let when = meta.get("when").cloned();
-    Some(Skill {
-        name,
-        description: one_line(&description),
-        when,
-        body: body.trim().to_string(),
-        references: Vec::new(),
-        source: Some(path.to_path_buf()),
-        bundled,
-        packs: Vec::new(),
-    })
-}
-
-fn split_frontmatter(raw: &str) -> (std::collections::HashMap<String, String>, &str) {
-    let mut meta = std::collections::HashMap::new();
-    let trimmed = raw.trim_start_matches('\u{feff}');
-    if let Some(rest) = trimmed.strip_prefix("---")
-        && let Some(end) = rest.find("\n---")
-    {
-        let front = &rest[..end];
-        for line in front.lines() {
-            if let Some((key, value)) = line.split_once(':') {
-                let key = key.trim();
-                let value = value.trim().trim_matches('"').trim_matches('\'');
-                if !key.is_empty() {
-                    meta.insert(key.to_string(), value.to_string());
-                }
-            }
-        }
-        let body = &rest[end + 4..];
-        return (meta, body.trim_start_matches(['\r', '\n']));
-    }
-    (meta, trimmed)
 }
 
 fn first_line(body: &str) -> Option<&str> {
@@ -401,32 +735,32 @@ const METHODS_REFERENCES: &[(&str, &str)] = &[
 ];
 
 fn bundled_skill(
-    main: &str,
-    references: &[(&str, &'static str)],
-    name: &str,
+    main: &'static str,
+    references: &'static [(&'static str, &'static str)],
+    fallback_name: &str,
     packs: &[&str],
 ) -> Skill {
-    let (meta, body) = split_frontmatter(main);
+    let front = Frontmatter::parse(main).unwrap_or_else(|error| {
+        panic!("bundled skill {fallback_name} has invalid frontmatter: {error}")
+    });
     Skill {
-        name: meta.get("name").cloned().unwrap_or_else(|| name.into()),
-        description: one_line(meta.get("description").map(String::as_str).unwrap_or("")),
-        when: meta.get("when").cloned(),
-        body: body.trim().to_string(),
-        references: references
-            .iter()
-            .map(|(path, text)| SkillReference {
-                path: path.to_string(),
-                source: ReferenceSource::Embedded(text),
-            })
-            .collect(),
+        name: front.scalar("name").unwrap_or_else(|| fallback_name.into()),
+        description: one_line(front.scalar("description").as_deref().unwrap_or("")),
+        when: front.scalar("when"),
         source: None,
+        dir: None,
         bundled: true,
         packs: packs.iter().map(|pack| (*pack).to_string()).collect(),
+        allowed_tools: front.list("allowed-tools"),
+        origin: SkillOrigin::Bundled,
+        unknown: front.unknown(),
+        shadow: front.truthy("shadow"),
+        text: SkillText::Embedded(main),
+        reference_store: ReferenceStore::Embedded(references),
     }
 }
 
-/// Skills compiled into the binary.
-pub fn bundled() -> SkillIndex {
+fn bundled_entries() -> Vec<Skill> {
     let mut skills = vec![
         bundled_skill(RED_SKILL, RED_REFERENCES, "security-red", &["security"]),
         bundled_skill(BLUE_SKILL, BLUE_REFERENCES, "security-blue", &["security"]),
@@ -440,12 +774,35 @@ pub fn bundled() -> SkillIndex {
     for (name, raw) in CODING_SKILLS {
         skills.push(bundled_skill(raw, &[], name, &["coding"]));
     }
-    SkillIndex { skills }
+    skills
+}
+
+/// Skills compiled into the binary.
+pub fn bundled() -> SkillIndex {
+    SkillIndex::bundled()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn paths(dir: &Path) -> Paths {
+        let mut paths = Paths::discover(dir).unwrap();
+        paths.config_dir = dir.join("config");
+        paths.data_dir = dir.join("data");
+        paths.home_dir = Some(dir.join("home"));
+        paths
+    }
+
+    fn write_skill(root: &Path, name: &str, description: &str, body: &str) {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: {description}\n---\n\n{body}\n"),
+        )
+        .unwrap();
+    }
 
     #[test]
     fn frontmatter_parses() {
@@ -456,25 +813,25 @@ mod tests {
             "---\nname: demo\ndescription: A demo skill\nwhen: when testing\n---\n\n# Body\n",
         )
         .unwrap();
-        let skill = load_skill_file(&path, false).unwrap();
+        let skill = read_skill_dir(dir.path(), SkillOrigin::GlobalNative).unwrap();
         assert_eq!(skill.name, "demo");
         assert_eq!(skill.description, "A demo skill");
         assert_eq!(skill.when.as_deref(), Some("when testing"));
-        assert!(skill.body.contains("# Body"));
+        assert!(skill.body().contains("# Body"));
     }
 
     #[test]
     fn bundled_skills_include_references() {
         let index = bundled();
         let red = index.get("security-red").unwrap();
-        assert!(red.body.contains("references/authorization.md"));
-        assert!(red.body.len() > 2000);
+        assert!(red.body().contains("references/authorization.md"));
+        assert!(red.body().len() > 2000);
         assert!(index.index_text().contains("security-blue"));
         // The full text (for /skill) inlines references; the tool text lists them.
-        assert!(red.full_text().len() > red.body.len() + 10_000);
+        assert!(red.full_text().len() > red.body().len() + 10_000);
         let listed = red.instructions_text();
         assert!(listed.contains("- references/recon.md"));
-        assert!(listed.len() < red.body.len() + 1000);
+        assert!(listed.len() < red.body().len() + 1000);
         assert!(red.reference("recon").unwrap().text().unwrap().len() > 500);
     }
 
@@ -497,7 +854,7 @@ mod tests {
     fn every_reference_a_bundled_skill_names_is_embedded() {
         let pattern = regex::Regex::new(r"references/[a-z0-9-]+\.md").unwrap();
         for skill in bundled().skills {
-            for found in pattern.find_iter(&skill.body) {
+            for found in pattern.find_iter(&skill.body()) {
                 assert!(
                     skill.reference(found.as_str()).is_some(),
                     "{} names {} but does not embed it",
@@ -513,7 +870,7 @@ mod tests {
         let index = bundled();
         let skill = index.get("security-methods").expect("bundled skill");
         assert!(skill.bundled);
-        assert_eq!(skill.references.len(), 6);
+        assert_eq!(skill.references().len(), 6);
         for needle in [
             "native-memory",
             "web-injection",
@@ -528,9 +885,9 @@ mod tests {
             let text = reference.text().expect("embedded reference text");
             assert!(text.len() > 500, "reference {needle} is too thin");
         }
-        assert!(skill.body.contains("security-red"));
-        assert!(skill.body.contains("poc_steps"));
-        assert!(skill.body.contains("finding verify"));
+        assert!(skill.body().contains("security-red"));
+        assert!(skill.body().contains("poc_steps"));
+        assert!(skill.body().contains("finding verify"));
         assert!(skill.full_text().contains("MIT OR Apache-2.0"));
         let banned = [
             "save_finding",
@@ -541,8 +898,8 @@ mod tests {
             "list_skills",
         ];
         for name in banned {
-            assert!(!skill.body.contains(name), "body still names {name}");
-            for reference in &skill.references {
+            assert!(!skill.body().contains(name), "body still names {name}");
+            for reference in &skill.references() {
                 let text = reference.text().unwrap();
                 assert!(
                     !text.contains(name),
@@ -565,9 +922,9 @@ mod tests {
         .unwrap();
         std::fs::write(skill.join("references/rollback.md"), "Roll back with x.\n").unwrap();
         std::fs::write(skill.join("notes.bin"), "ignored").unwrap();
-        let loaded = load_skill_dir(&skill).unwrap();
-        assert_eq!(loaded.references.len(), 1);
-        assert_eq!(loaded.references[0].path, "references/rollback.md");
+        let loaded = read_skill_dir(&skill, SkillOrigin::GlobalNative).unwrap();
+        assert_eq!(loaded.references().len(), 1);
+        assert_eq!(loaded.references()[0].path, "references/rollback.md");
         assert_eq!(
             loaded.reference("rollback.md").unwrap().text().as_deref(),
             Some("Roll back with x.")
@@ -593,7 +950,7 @@ mod tests {
                 .get(name)
                 .unwrap_or_else(|| panic!("missing bundled skill {name}"));
             assert!(skill.bundled, "{name} is not marked bundled");
-            assert!(!skill.body.trim().is_empty(), "{name} has no body");
+            assert!(!skill.body().trim().is_empty(), "{name} has no body");
             assert!(
                 !skill.description.trim().is_empty(),
                 "{name} has no description"
@@ -606,11 +963,11 @@ mod tests {
                 "{name} has no when"
             );
             assert!(
-                skill.body.lines().count() < 120,
+                skill.body().lines().count() < 120,
                 "{name} is longer than 120 lines"
             );
             assert!(
-                skill.body.contains("Stop and"),
+                skill.body().contains("Stop and"),
                 "{name} does not say when to stop"
             );
             assert!(
@@ -656,15 +1013,15 @@ mod tests {
             let skill = index.get(name).unwrap();
             for banned in security_only {
                 assert!(
-                    !skill.body.contains(&format!("`{banned}`")),
+                    !skill.body().contains(&format!("`{banned}`")),
                     "{name} names security-only tool {banned}"
                 );
             }
-            assert!(!skill.body.contains("save_finding"));
-            assert!(!skill.body.contains("verify_finding"));
+            assert!(!skill.body().contains("save_finding"));
+            assert!(!skill.body().contains("verify_finding"));
             // Every backticked identifier that is a harness tool must exist.
             // Other identifiers are commands, paths, or file names.
-            for capture in backticked.captures_iter(&skill.body) {
+            for capture in backticked.captures_iter(&skill.body()) {
                 let token = &capture[1];
                 if harness_tools.contains(&token) {
                     assert!(
@@ -675,8 +1032,8 @@ mod tests {
             }
             // `lsp` is read-only and has no rename action; validate every
             // action example so the skill cannot drift from the schema.
-            if skill.body.contains("`lsp`") {
-                for capture in action.captures_iter(&skill.body) {
+            if skill.body().contains("`lsp`") {
+                for capture in action.captures_iter(&skill.body()) {
                     assert!(
                         lsp_actions.contains(&&capture[1]),
                         "{name} names unsupported lsp action {}",
@@ -684,7 +1041,7 @@ mod tests {
                     );
                 }
                 assert!(
-                    !skill.body.contains("\"rename\"") && !skill.body.contains("lsp` rename"),
+                    !skill.body().contains("\"rename\"") && !skill.body().contains("lsp` rename"),
                     "{name} still promises an lsp rename"
                 );
             }
@@ -710,5 +1067,125 @@ mod tests {
         // The model can still load an unadvertised skill by name.
         assert!(index.get("incident-triage").is_some());
         assert!(index.get("security-red").is_some());
+    }
+
+    #[test]
+    fn discovery_reads_standard_and_native_roots_with_native_precedence() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths(dir.path());
+        write_skill(
+            &paths.home_dir.clone().unwrap().join(".claude/skills"),
+            "deploy",
+            "Claude copy",
+            "claude body",
+        );
+        write_skill(&paths.skills_dir(), "deploy", "Native copy", "native body");
+        std::fs::create_dir_all(paths.cwd.join(".claude/skills")).unwrap();
+        write_skill(
+            &paths.cwd.join(".claude/skills"),
+            "project-only",
+            "Project standard",
+            "project body",
+        );
+
+        let untrusted = discover(&paths, false).index();
+        assert_eq!(untrusted.get("deploy").unwrap().description, "Native copy");
+        assert!(untrusted.get("project-only").is_none());
+        assert_eq!(untrusted.shadows.len(), 1);
+        assert_eq!(untrusted.shadows[0].loser, SkillOrigin::GlobalClaude);
+        assert_eq!(untrusted.shadows[0].winner, SkillOrigin::GlobalNative);
+
+        let trusted = discover(&paths, true).index();
+        assert!(trusted.get("project-only").is_some());
+        assert_eq!(trusted.get("deploy").unwrap().description, "Native copy");
+    }
+
+    #[test]
+    fn discovery_is_lazy_about_bodies_and_references() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths(dir.path());
+        for index in 0..100 {
+            let root = paths.skills_dir().join(format!("skill-{index}"));
+            std::fs::create_dir_all(root.join("references")).unwrap();
+            std::fs::write(
+                root.join("SKILL.md"),
+                format!(
+                    "---\nname: skill-{index}\ndescription: Skill number {index}\n---\n\nBODY-SENTINEL-{index}\n"
+                ),
+            )
+            .unwrap();
+            std::fs::write(root.join("references/notes.md"), "REFERENCE-SENTINEL").unwrap();
+        }
+        let index = SkillIndex::load(&paths, false);
+        let text = index.index_text();
+        assert_eq!(
+            index.skills.iter().filter(|skill| !skill.bundled).count(),
+            100
+        );
+        assert!(text.len() < 20_000);
+        assert!(!text.contains("BODY-SENTINEL"));
+        assert!(!text.contains("REFERENCE-SENTINEL"));
+        let skill = index.get("skill-7").unwrap();
+        assert_eq!(skill.body().trim(), "BODY-SENTINEL-7");
+        assert_eq!(skill.references().len(), 1);
+        assert_eq!(
+            skill.reference("notes").unwrap().text().as_deref(),
+            Some("REFERENCE-SENTINEL")
+        );
+    }
+
+    #[test]
+    fn allowed_tools_intersects_and_never_expands() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill = dir.path().join("bash-helper");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: bash-helper\ndescription: Helper\nallowed-tools: bash read\n---\n\nBody\n",
+        )
+        .unwrap();
+        let skill = read_skill_dir(&skill, SkillOrigin::GlobalNative).unwrap();
+        assert_eq!(skill.allowed_tools, ["bash", "read"]);
+        assert_eq!(
+            skill.effective_allowed_tools(&["read".into(), "edit".into()]),
+            ["read"]
+        );
+        assert!(
+            skill
+                .effective_allowed_tools(&["read".into(), "edit".into()])
+                .iter()
+                .all(|tool| tool != "bash")
+        );
+    }
+
+    #[test]
+    fn invalid_metadata_is_not_discovered() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths(dir.path());
+        let root = paths.skills_dir().join("bad");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("SKILL.md"),
+            format!(
+                "---\nname: Bad Name\ndescription: {}\n---\n\nBody\n",
+                "x".repeat(validate::DESCRIPTION_MAX + 1)
+            ),
+        )
+        .unwrap();
+        let discovery = discover(&paths, false);
+        assert!(discovery.index().get("Bad Name").is_none());
+        let invalid = discovery.invalid.first().expect("invalid skill");
+        assert!(
+            invalid
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.field == "name")
+        );
+        assert!(
+            invalid
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.field == "description")
+        );
     }
 }

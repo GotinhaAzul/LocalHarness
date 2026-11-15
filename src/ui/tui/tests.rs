@@ -227,6 +227,7 @@ async fn switching_models_reprobes_the_context_window() {
         cwd,
         project_id: "test".into(),
         sessions_dir_override: None,
+        home_dir: None,
     };
     let base = sized_model_endpoint(&[("small", 8192), ("big", 131072)]).await;
     let mut config = Config::builtin();
@@ -381,6 +382,7 @@ async fn tab_completes_commands_arguments_and_paths() {
         cwd: cwd.clone(),
         project_id: "test".into(),
         sessions_dir_override: None,
+        home_dir: None,
     };
     let base = model_endpoint(&["m"]).await;
     let mut config = Config::builtin();
@@ -473,6 +475,7 @@ async fn test_app() -> (tempfile::TempDir, App) {
         cwd,
         project_id: "test".into(),
         sessions_dir_override: None,
+        home_dir: None,
     };
     let mut config = Config::builtin();
     config.model.endpoint = model_endpoint(&["m"]).await;
@@ -829,6 +832,7 @@ async fn new_and_resume_switch_sessions() {
         cwd,
         project_id: "test".into(),
         sessions_dir_override: None,
+        home_dir: None,
     };
     let base = model_endpoint(&["m"]).await;
     let mut config = Config::builtin();
@@ -906,6 +910,7 @@ async fn login_configures_a_model_and_model_command_lists_choices() {
         cwd,
         project_id: "test".into(),
         sessions_dir_override: None,
+        home_dir: None,
     };
 
     // Reserve a port and close it so the initial endpoint is unreachable.

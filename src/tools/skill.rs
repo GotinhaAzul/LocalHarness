@@ -72,7 +72,11 @@ fn unknown(index: &SkillIndex, name: &str) -> ToolResult {
 
 fn load_reference(ctx: &ToolContext, skill: &Skill, needle: &str) -> ToolResult {
     let Some(reference) = skill.reference(needle) else {
-        let available: Vec<&str> = skill.references.iter().map(|r| r.path.as_str()).collect();
+        let available: Vec<String> = skill
+            .references()
+            .into_iter()
+            .map(|reference| reference.path)
+            .collect();
         return ToolResult::err(
             "unknown_reference",
             if available.is_empty() {
