@@ -47,6 +47,7 @@ fn session(dir: &Path) -> Session {
             app: "test".into(),
             redact: true,
             context: None,
+            permissions: None,
         },
         true,
     )

@@ -859,30 +859,6 @@ async fn spawn_script(bodies: Vec<String>) -> (String, ScriptFake) {
     (format!("http://{address}"), fake)
 }
 
-/// `lh` with a persisted session (unlike `run_lh`, which passes --no-session).
-async fn run_lh_with_session(env: &Env, base: &str, extra: &[&str]) -> std::process::Output {
-    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_lh"));
-    command
-        .arg("--endpoint")
-        .arg(base)
-        .arg("--model")
-        .arg("test-model")
-        .args(extra)
-        .current_dir(&env.cwd)
-        .env("LH_CONFIG_DIR", &env.config_dir)
-        .env("LH_DATA_DIR", &env.data_dir)
-        .env("LH_SKIP_TOOL_PROBE", "1")
-        .env_remove("LH_ENDPOINT")
-        .env_remove("LH_MODEL")
-        .env_remove("LH_API_KEY")
-        .env_remove("LH_PROFILE")
-        .env_remove("LH_TRUST");
-    tokio::time::timeout(std::time::Duration::from_secs(30), command.output())
-        .await
-        .expect("lh timed out")
-        .expect("cannot run lh")
-}
-
 fn session_lines(env: &Env) -> Vec<serde_json::Value> {
     fn find(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
         for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
@@ -936,7 +912,7 @@ async fn the_session_header_records_the_mode_and_rule_hash() {
         "[permissions]\nmode = \"accept-edits\"\n\n[[permissions.rules]]\nid = \"no-push\"\ntool = \"bash\"\ncommand = 'git\\s+push'\naction = \"deny\"\n",
     )
     .unwrap();
-    let output = run_lh_with_session(&env, &base, &["--print", "hi"]).await;
+    let output = run_lh_persistent(&env, &base, &["--print", "hi"]).await;
     assert_eq!(
         output.status.code(),
         Some(0),
@@ -971,7 +947,7 @@ async fn yolo_is_explicit_and_logged_in_the_session() {
     assert_ne!(refused.status.code(), Some(0));
 
     std::fs::remove_file(env.config_dir.join("config.toml")).unwrap();
-    let output = run_lh_with_session(&env, &base, &["--yolo", "--print", "hi"]).await;
+    let output = run_lh_persistent(&env, &base, &["--yolo", "--print", "hi"]).await;
     assert_eq!(output.status.code(), Some(0));
     let lines = session_lines(&env);
     assert_eq!(lines[0]["data"]["permissions"]["mode"], "yolo");
@@ -1120,7 +1096,8 @@ async fn print_persists_only_redacted_secrets_in_session_and_artifacts() {
     let key = fake_aws_key();
     let (base, fake) = spawn_secret_server(&key).await;
     let env = env();
-    let output = run_lh_persistent(&env, &base, &["--print", "echo the token"]).await;
+    // The scripted `bash` call needs approval, which headless cannot give.
+    let output = run_lh_persistent(&env, &base, &["--yolo", "--print", "echo the token"]).await;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(
@@ -1159,8 +1136,12 @@ async fn no_redact_keeps_raw_output_and_is_recorded_in_the_header() {
     let key = fake_aws_key();
     let (base, _fake) = spawn_secret_server(&key).await;
     let env = env();
-    let output =
-        run_lh_persistent(&env, &base, &["--no-redact", "--print", "echo the token"]).await;
+    let output = run_lh_persistent(
+        &env,
+        &base,
+        &["--yolo", "--no-redact", "--print", "echo the token"],
+    )
+    .await;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(
