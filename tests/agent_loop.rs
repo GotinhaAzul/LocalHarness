@@ -2194,3 +2194,51 @@ async fn reasoning_tokens_are_estimated_when_the_server_omits_them() {
         "reasoning tokens: {reported:?}"
     );
 }
+
+#[tokio::test]
+async fn an_8k_window_compacts_once_between_a_tool_call_and_the_answer() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("big.rs"),
+        "let value = compute_something(1, 2, 3);\n".repeat(500),
+    )
+    .unwrap();
+    let mut harness = harness(
+        dir.path(),
+        vec![
+            tool_script("read", json!({"path": "big.rs", "limit": 400})),
+            bare_text_script("it computes values"),
+        ],
+        &["read"],
+    );
+    let mut core = Arc::try_unwrap(harness.core).unwrap_or_else(|_| panic!("sole owner"));
+    core.budget = TokenBudget::new(8192, 1024);
+    harness.core = Arc::new(core);
+
+    // The question carries enough context to sit under the 80% threshold
+    // before the tool call; the read result pushes it over once.
+    let prompt = format!("what does big.rs do? {}", "context ".repeat(2100));
+    let (outcome, events) = run(&harness, &prompt).await;
+    assert_eq!(outcome.status, TurnStatus::Done, "outcome: {outcome:?}");
+    assert_eq!(
+        harness.provider.requests.lock().unwrap().len(),
+        2,
+        "one call for the tool, one for the answer"
+    );
+    let session = harness.session.lock().unwrap();
+    let compactions = session
+        .branch_entries()
+        .iter()
+        .filter(|entry| entry.is_compaction())
+        .count();
+    assert_eq!(compactions, 1, "exactly one compaction per turn");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::Compacted { .. }))
+            .count(),
+        1
+    );
+    drop(session);
+    assert_eq!(last_assistant(&harness.session), "it computes values");
+}

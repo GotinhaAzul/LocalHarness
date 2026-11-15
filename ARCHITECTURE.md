@@ -620,7 +620,7 @@ deletes entries.
 - `session-id` is `YYYYMMDD-HHMMSS-<pid>` or a short random suffix.
 - One advisory lock per session file. A second process refuses to write and
   names the lock holder.
-- Flush each entry to the file. `fsync` at turn end and after compaction.
+- Flush each entry to the file. `fsync` once at turn end; compactions inside a turn are covered by that fsync.
 - On load, ignore a malformed final line, drop orphan entries with a warning,
   and validate that every `parent` exists.
 - Export: `/export [path]` writes Markdown for the active branch. Findings have

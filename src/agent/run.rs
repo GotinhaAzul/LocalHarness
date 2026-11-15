@@ -2529,7 +2529,8 @@ fn compact_session(
         thread_id,
         keep_from: keep_from.clone(),
     }))?;
-    session.fsync()?;
+    // No fsync here: compaction runs inside a turn and the turn end fsyncs
+    // once, so a turn that compacts costs one fsync, not one per compaction.
     Ok(Compacted {
         summary: summary.summary,
         tokens_before: summary.tokens_before,
