@@ -770,6 +770,13 @@ async fn list_commands_open_pickers_and_pick_without_typing() {
                 view.selected_label().as_deref(),
                 Some(app.config.profile_name())
             );
+            let labels: Vec<&str> = view.items.iter().map(|item| item.label.as_str()).collect();
+            for name in ["strict", "shell"] {
+                assert!(
+                    labels.contains(&name),
+                    "the weak-model profile {name} must be pickable: {labels:?}"
+                );
+            }
         }
         _ => panic!("expected the profile picker"),
     }
