@@ -5,6 +5,7 @@ use std::path::Path;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
+use crate::config::EditMode;
 use crate::tools::{
     FileStamp, Tool, ToolContext, ToolPack, ToolResult, display_path, optional_u64, required_str,
 };
@@ -149,6 +150,7 @@ pub(crate) fn run(ctx: &ToolContext, args: &Value) -> Result<ToolResult, ToolRes
     let content = String::from_utf8_lossy(&bytes);
     let lines = split_lines(&content);
     let total = lines.len();
+    let snapshot = (ctx.edit_mode == EditMode::Hash).then(|| snapshot_hash(&bytes));
 
     let start_u64 = optional_u64(args, "start").unwrap_or(1).max(1);
     let start = usize::try_from(start_u64).unwrap_or(usize::MAX);
@@ -173,27 +175,40 @@ pub(crate) fn run(ctx: &ToolContext, args: &Value) -> Result<ToolResult, ToolRes
 
     if total == 0 {
         record_read(ctx, &path, 0, None);
-        let text = format!("{display} is empty (0 lines)");
-        return Ok(ToolResult::ok(text).with_details(json!({
-            "path": display,
-            "start": 1,
-            "end": 0,
-            "total_lines": 0,
-            "capped": false,
-        })));
+        let text = match &snapshot {
+            Some(snapshot) => format!("[{display}#{snapshot}]\n{display} is empty (0 lines)"),
+            None => format!("{display} is empty (0 lines)"),
+        };
+        return Ok(ToolResult::ok(text).with_details(with_snapshot(
+            json!({
+                "path": display,
+                "start": 1,
+                "end": 0,
+                "total_lines": 0,
+                "capped": false,
+            }),
+            &snapshot,
+        )));
     }
 
     let first = start.saturating_sub(1);
     if first >= total {
         record_read(ctx, &path, total, None);
-        let text = format!("{display} has {total} lines; start={start} is past the end");
-        return Ok(ToolResult::ok(text).with_details(json!({
-            "path": display,
-            "start": start,
-            "end": total,
-            "total_lines": total,
-            "capped": false,
-        })));
+        let body = format!("{display} has {total} lines; start={start} is past the end");
+        let text = match &snapshot {
+            Some(snapshot) => format!("[{display}#{snapshot}]\n{body}"),
+            None => body,
+        };
+        return Ok(ToolResult::ok(text).with_details(with_snapshot(
+            json!({
+                "path": display,
+                "start": start,
+                "end": total,
+                "total_lines": total,
+                "capped": false,
+            }),
+            &snapshot,
+        )));
     }
 
     let available_end = optional_u64(args, "end")
@@ -205,9 +220,21 @@ pub(crate) fn run(ctx: &ToolContext, args: &Value) -> Result<ToolResult, ToolRes
 
     let width = last.to_string().len();
     let mut text = String::new();
+    if let Some(snapshot) = &snapshot {
+        text.push_str(&format!("[{display}#{snapshot}]\n"));
+    }
     for (offset, line) in lines[first..last].iter().enumerate() {
         let number = start + offset;
-        text.push_str(&format!("{:>width$}  {}\n", number, line, width = width));
+        match &snapshot {
+            Some(_) => text.push_str(&format!(
+                "{:>width$}  {}  {}\n",
+                number,
+                line_hash(line),
+                line,
+                width = width
+            )),
+            None => text.push_str(&format!("{:>width$}  {}\n", number, line, width = width)),
+        }
     }
     while text.ends_with('\n') {
         text.pop();
@@ -220,13 +247,26 @@ pub(crate) fn run(ctx: &ToolContext, args: &Value) -> Result<ToolResult, ToolRes
     }
 
     record_read(ctx, &path, total, Some((start, last)));
-    Ok(ToolResult::ok(text).with_details(json!({
-        "path": display,
-        "start": start,
-        "end": last,
-        "total_lines": total,
-        "capped": capped,
-    })))
+    Ok(ToolResult::ok(text).with_details(with_snapshot(
+        json!({
+            "path": display,
+            "start": start,
+            "end": last,
+            "total_lines": total,
+            "capped": capped,
+        }),
+        &snapshot,
+    )))
+}
+
+/// Add the hash-mode fields to a read result's details without changing the
+/// default (text-mode) shape.
+fn with_snapshot(mut details: Value, snapshot: &Option<String>) -> Value {
+    if let (Some(snapshot), Some(object)) = (snapshot, details.as_object_mut()) {
+        object.insert("snapshot".into(), json!(snapshot));
+        object.insert("edit_mode".into(), json!("hash"));
+    }
+    details
 }
 
 /// Record what this read delivered: `Some((start, end))` for a line range,
@@ -239,6 +279,66 @@ fn record_read(ctx: &ToolContext, path: &Path, total_lines: usize, range: Option
             None => reads.record_empty(path, stamp, total_lines),
         }
     }
+}
+
+/// FNV-1a over bytes. Unlike `DefaultHasher`, this is stable across processes,
+/// Rust versions, and machines, so a snapshot tag survives a resumed session.
+fn hash64(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// Short, stable content hash shown next to one `read` line in hash mode.
+pub fn line_hash(line: &str) -> String {
+    format!("{:08x}", hash64(line.as_bytes()) as u32)
+}
+
+/// Short, stable tag for the exact bytes a `read` returned.
+pub fn snapshot_hash(bytes: &[u8]) -> String {
+    format!("{:012x}", hash64(bytes) & 0x0000_ffff_ffff_ffff)
+}
+
+/// Render `[path#snapshot]` plus fresh hashes for the requested 1-based lines.
+/// `patch` returns this when an anchor is stale and after a successful hash
+/// edit, so the model can retry without re-reading the whole file.
+pub fn anchor_block(display: &str, content: &str, requested: &[usize]) -> String {
+    let snapshot = snapshot_hash(content.as_bytes());
+    let lines = split_lines(content);
+    let mut wanted: Vec<usize> = requested
+        .iter()
+        .copied()
+        .filter(|number| *number >= 1 && *number <= lines.len())
+        .collect();
+    wanted.sort_unstable();
+    wanted.dedup();
+
+    let mut text = format!("[{display}#{snapshot}]");
+    if lines.is_empty() {
+        text.push_str("\n(0 lines)");
+        return text;
+    }
+    let width = wanted
+        .iter()
+        .max()
+        .copied()
+        .unwrap_or(lines.len())
+        .max(1)
+        .to_string()
+        .len();
+    for number in wanted {
+        text.push_str(&format!(
+            "\n{:>width$}  {}  {}",
+            number,
+            line_hash(lines[number - 1]),
+            lines[number - 1],
+            width = width
+        ));
+    }
+    text
 }
 
 /// Split text into lines, dropping the trailing empty line produced by a final
