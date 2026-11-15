@@ -41,6 +41,7 @@ impl Fixture {
             app: "test".into(),
             redact: true,
             context: None,
+            permissions: None,
         };
         let session = Session::create(&paths, header, true).expect("in-memory session");
         let artifacts = session.artifacts.clone();
