@@ -46,6 +46,9 @@ struct ScriptedProvider {
     /// Reject any system message after a non-system one, like a strict
     /// llama.cpp `--jinja` template.
     strict_system: AtomicBool,
+    /// Reject a request with no user message, like Qwen chat templates
+    /// ("No user query found in messages.").
+    require_user: AtomicBool,
 }
 
 #[async_trait]
@@ -71,6 +74,18 @@ impl Provider for ScriptedProvider {
                     _ => seen_non_system = true,
                 }
             }
+        }
+        if self.require_user.load(Ordering::Relaxed)
+            && !req
+                .messages
+                .iter()
+                .any(|message| matches!(message, ChatMessage::User { .. }))
+        {
+            let _ = tx.send(Err(ProviderError::new(
+                ErrorClass::Server,
+                "endpoint error (500): raise_exception('No user query found in messages.')",
+            )));
+            return;
         }
         let temperature = req.samplers.temperature;
         self.requests.lock().unwrap().push(req);
@@ -295,6 +310,7 @@ fn harness_in_mode(
         scripts: Mutex::new(scripts.into()),
         requests: Mutex::new(Vec::new()),
         strict_system: AtomicBool::new(false),
+        require_user: AtomicBool::new(false),
     });
     let (core, session) = build_core_in_mode(dir, config, extra, provider.clone(), mode);
     Harness {
@@ -1867,6 +1883,61 @@ async fn an_automatic_compaction_keeps_the_latest_step_verbatim() {
             .iter()
             .any(|message| matches!(message, ChatMessage::Tool { .. })),
         "the kept tail must reach the model"
+    );
+}
+
+#[tokio::test]
+async fn a_mid_turn_compaction_keeps_a_user_turn_for_strict_templates() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut scripts = Vec::new();
+    for index in 0..24 {
+        let name = format!("file-{index}.rs");
+        std::fs::write(
+            dir.path().join(&name),
+            format!("// {name}\n{}", "let x = 1;\n".repeat(220)),
+        )
+        .unwrap();
+        scripts.push(tool_script("read", json!({"path": name})));
+    }
+    scripts.push(bare_text_script("done"));
+    let mut harness = harness(dir.path(), scripts, &["read"]);
+    harness.provider.require_user.store(true, Ordering::Relaxed);
+    harness
+        .provider
+        .strict_system
+        .store(true, Ordering::Relaxed);
+    let mut core = Arc::try_unwrap(harness.core).unwrap_or_else(|_| panic!("sole owner"));
+    core.budget = TokenBudget::new(16_384, 1024);
+    harness.core = Arc::new(core);
+
+    let (outcome, _) = run(&harness, "read every file").await;
+    assert_eq!(outcome.status, TurnStatus::Done, "outcome: {outcome:?}");
+    let session = harness.session.lock().unwrap();
+    // The shape that failed: the kept tail starts at an assistant entry,
+    // so the only real user entry was folded into the summary.
+    let users = session
+        .branch_entries()
+        .iter()
+        .filter(|entry| matches!(entry.kind, EntryKind::User(_)))
+        .count();
+    assert_eq!(users, 1, "one agentic turn has one user entry");
+    let tail_starts = session
+        .branch_entries()
+        .iter()
+        .filter_map(|entry| match &entry.kind {
+            EntryKind::Compaction(data) => data.keep_from.clone(),
+            _ => None,
+        })
+        .filter_map(|id| {
+            session
+                .tree
+                .get(&id)
+                .map(|entry| entry.assistant().is_some())
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        tail_starts.contains(&true),
+        "expected a kept tail that starts at an assistant entry: {tail_starts:?}"
     );
 }
 
@@ -4136,6 +4207,7 @@ mod engines {
                     scripts: Mutex::new(VecDeque::new()),
                     requests: Mutex::new(Vec::new()),
                     strict_system: AtomicBool::new(false),
+                    require_user: AtomicBool::new(false),
                 }),
             };
             let (first, _) = run(&harness, "read a then b").await;
