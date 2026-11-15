@@ -1,0 +1,43 @@
+class Localharness < Formula
+  desc "Local-first agent harness for coding and security work"
+  homepage "https://github.com/GotinhaAzul/LocalHarness"
+  version "__VERSION__"
+  license any_of: ["MIT", "Apache-2.0"]
+
+  on_linux do
+    if Hardware::CPU.intel?
+      url "https://github.com/GotinhaAzul/LocalHarness/releases/download/v#{version}/lh-v#{version}-x86_64-unknown-linux-musl.tar.gz"
+      sha256 "__SHA256_LINUX_X86_64__"
+    else
+      url "https://github.com/GotinhaAzul/LocalHarness/releases/download/v#{version}/lh-v#{version}-aarch64-unknown-linux-musl.tar.gz"
+      sha256 "__SHA256_LINUX_AARCH64__"
+    end
+  end
+
+  on_macos do
+    # macOS is best-effort: build from the tagged source with the local Rust
+    # toolchain. Linux users get the static musl binary above.
+    url "https://github.com/GotinhaAzul/LocalHarness/archive/refs/tags/v#{version}.tar.gz"
+    sha256 "__SHA256_SOURCE__"
+    depends_on "rust" => :build
+  end
+
+  def install
+    if OS.mac?
+      system "cargo", "install", *std_cargo_args
+      generate_completions_from_executable(bin/"lh", "completions")
+      (man1/"lh.1").write Utils.safe_popen_read(bin/"lh", "man")
+    else
+      bin.install "lh"
+      bash_completion.install "completions/lh.bash" => "lh"
+      zsh_completion.install "completions/lh.zsh" => "_lh"
+      fish_completion.install "completions/lh.fish" => "lh.fish"
+      man1.install "man/lh.1"
+    end
+  end
+
+  test do
+    assert_match version.to_s, shell_output("#{bin}/lh --version")
+    assert_match "completions", shell_output("#{bin}/lh --help")
+  end
+end
