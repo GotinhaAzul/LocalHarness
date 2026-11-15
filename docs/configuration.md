@@ -170,9 +170,10 @@ seed = 0
 
 Bundled presets are `qwen-coding`, `gemma-chat`, and `glm-agent`. With
 `model_profile = "auto"` (the default), selecting a matching model from
-`/model` applies its preset; `--model-profile qwen-coding` or a profile's
-`model_profile = "qwen-coding"` selects one explicitly. A user-defined profile
-always beats a bundled preset for the same model.
+`/model` applies its preset; `/model <name> <preset>` pins one explicitly, and
+`--model-profile qwen-coding` or a profile's `model_profile = "qwen-coding"`
+does the same for the next start. A user-defined profile always beats a
+bundled preset for the same model.
 
 The harness sends only fields the detected engine accepts, under the name that
 engine uses: `repeat_penalty` for llama.cpp/Ollama/LM Studio/KoboldCpp and

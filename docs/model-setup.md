@@ -138,11 +138,11 @@ tool_mode = "repair"        # native | repair | auto
   `dry_base`, `xtc_probability`, and `seed` are per-model samplers. Each one
   overrides the same global `[model]` value. The bundled presets are
   `qwen-coding`, `gemma-chat`, and `glm-agent`; `model_profile = "auto"`
-  applies one from the model name, and `--model-profile <name>` selects one
-  explicitly. Only fields the engine accepts are sent: `min_p` is omitted for
-  Ollama, DRY/XTC only go to llama.cpp and KoboldCpp, and `lh doctor` warns
-  about each omitted field. Set `[model] engine` when a gateway hides the real
-  server.
+  applies one from the model name, `/model <name> <preset>` pins one for the
+  session, and `--model-profile <name>` selects one at startup. Only fields
+  the engine accepts are sent: `min_p` is omitted for Ollama, DRY/XTC only go
+  to llama.cpp and KoboldCpp, and `lh doctor` warns about each omitted field.
+  Set `[model] engine` when a gateway hides the real server.
 - `extra_body` merges server-specific fields into every request, for example
   `chat_template_kwargs`.
 - `parallel_tool_calls` is recorded for compatibility; tools run sequentially.

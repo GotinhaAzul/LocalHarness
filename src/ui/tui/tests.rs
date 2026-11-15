@@ -970,6 +970,20 @@ async fn login_configures_a_model_and_model_command_lists_choices() {
     let saved = std::fs::read_to_string(&config_path).unwrap();
     assert!(saved.contains("beta"), "config:\n{saved}");
 
+    // `/model <name> <preset>` pins a sampler profile for the session.
+    app.command_model("beta qwen-coding").await;
+    app.settle().await;
+    assert_eq!(app.header.model, "beta");
+    assert_eq!(
+        app.core().expect("core").model_profile.min_p,
+        Some(0.05),
+        "qwen-coding is applied to the switched session"
+    );
+    assert_eq!(
+        app.config.model_profile_override.as_deref(),
+        Some("qwen-coding")
+    );
+
     // A login without a model auto-selects the endpoint's only model and
     // replaces the previous endpoint's selection.
     let single = model_endpoint(&["only-model"]).await;
