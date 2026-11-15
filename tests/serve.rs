@@ -526,6 +526,18 @@ async fn a_script_creates_a_session_streams_a_turn_and_cancels_it() {
     let rest = events.until_done().await;
     assert!(rest.iter().any(|frame| frame.event == "cancelled"));
     assert_eq!(done_status(&rest), "Cancelled");
+    let cancelled_at = rest
+        .iter()
+        .position(|frame| frame.event == "cancelled")
+        .expect("cancelled frame");
+    let done_at = rest
+        .iter()
+        .position(|frame| frame.event == "done")
+        .expect("done frame");
+    assert!(
+        cancelled_at < done_at,
+        "cancelled must be published before the terminal done frame: {rest:?}"
+    );
     assert!(
         !text_of(&rest).contains("chunk-399"),
         "the cancelled turn must stop streaming"
@@ -833,6 +845,69 @@ async fn stopping_the_server_leaves_sessions_resumable() {
 }
 
 #[tokio::test]
+async fn config_allow_and_deny_rules_apply_over_http() {
+    let env = env();
+    std::fs::create_dir_all(&env.config_dir).unwrap();
+    std::fs::write(
+        env.config_dir.join("config.toml"),
+        r#"
+[permissions]
+[[permissions.rules]]
+id = "allow-touch"
+tool = "bash"
+command = "^touch marker\\.txt$"
+action = "allow"
+
+[[permissions.rules]]
+id = "deny-env"
+tool = "write"
+path = "**/.env"
+action = "deny"
+"#,
+    )
+    .unwrap();
+    let (endpoint, _fake) = spawn_endpoint(vec![
+        Script::Tool {
+            name: "bash".into(),
+            args: json!({"command": "touch marker.txt"}),
+        },
+        Script::Text("written".into()),
+        Script::Tool {
+            name: "write".into(),
+            args: json!({"path": ".env", "content": "SECRET=1\n"}),
+        },
+        Script::Text("denied".into()),
+    ])
+    .await;
+    let mut server = Server::start(&env, &endpoint, &[], &["--allow-yolo"]).await;
+
+    // `ask` normally refuses a command, but the config allow rule decides first.
+    let ask = server.create(json!({})).await;
+    let frames = server.turn(&ask, "touch the marker").await;
+    let finished: Vec<&SseFrame> = frames
+        .iter()
+        .filter(|frame| frame.event == "tool_finished")
+        .collect();
+    assert_eq!(finished.len(), 1, "{frames:?}");
+    assert_eq!(finished[0].data["is_error"], false, "{frames:?}");
+    assert!(env.root.join("marker.txt").exists());
+
+    // A deny rule wins over the mode.
+    let frames = server.turn(&ask, "write env").await;
+    let finished: Vec<&SseFrame> = frames
+        .iter()
+        .filter(|frame| frame.event == "tool_finished")
+        .collect();
+    assert_eq!(finished.len(), 1, "{frames:?}");
+    let preview = finished[0].data["preview"].as_str().unwrap();
+    assert!(preview.contains("DENIED"), "{preview}");
+    assert!(preview.contains("deny-env"), "{preview}");
+    assert!(!env.root.join(".env").exists());
+
+    server.terminate().await;
+}
+
+#[tokio::test]
 async fn harness_gates_still_deny_over_http() {
     let env = env();
     let escaped = env.outside.join("escaped.txt");
@@ -879,12 +954,13 @@ async fn harness_gates_still_deny_over_http() {
     assert_eq!(finished[0].data["is_error"], true, "{frames:?}");
     let preview = finished[0].data["preview"].as_str().unwrap();
     assert!(
-        preview.contains("path_jail") && !preview.contains("permission_denied"),
-        "the path jail, not the HTTP approver, refused it: {preview}"
+        preview.contains("path_jail") && !preview.contains("DENIED"),
+        "the path jail, not the permission policy, refused it: {preview}"
     );
     assert!(!escaped.exists(), "the jailed write must not happen");
 
-    // Default mode: denied with a typed reason, nothing ran.
+    // Default mode: an `ask` has no answerer over HTTP, so it is denied with
+    // the policy's typed reason and the next action.
     let ask = server.create(json!({})).await;
     let frames = server.turn(&ask, "touch it").await;
     let finished: Vec<&SseFrame> = frames
@@ -892,7 +968,8 @@ async fn harness_gates_still_deny_over_http() {
         .filter(|frame| frame.event == "tool_finished")
         .collect();
     let preview = finished[0].data["preview"].as_str().unwrap();
-    assert!(preview.contains("permission_denied"), "{preview}");
+    assert!(preview.contains("DENIED"), "{preview}");
+    assert!(preview.contains("allow rule"), "{preview}");
     assert!(preview.contains("accept-edits"), "{preview}");
     assert!(!env.root.join("marker.txt").exists());
 

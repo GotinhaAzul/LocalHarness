@@ -27,6 +27,8 @@ pub fn event_name(event: &AgentEvent) -> &'static str {
         AgentEvent::Context { .. } => "context",
         AgentEvent::WindowDetected { .. } => "window_detected",
         AgentEvent::Compacted { .. } => "compacted",
+        AgentEvent::Provenance { .. } => "provenance",
+        AgentEvent::HunkReview { .. } => "hunk_review",
         AgentEvent::Notice(_) => "notice",
         AgentEvent::Guard { .. } => "guard",
         AgentEvent::Error { .. } => "error",
@@ -67,6 +69,9 @@ pub fn event_json(event: &AgentEvent) -> Value {
         AgentEvent::Usage(usage) => json!({
             "prompt_tokens": usage.prompt_tokens,
             "completion_tokens": usage.completion_tokens,
+            "cached_tokens": usage.cached_tokens,
+            "cache_percent": usage.cache_percent(),
+            "reasoning_tokens": usage.reasoning_tokens,
         }),
         AgentEvent::Context { used, window } => json!({"used": used, "window": window}),
         AgentEvent::WindowDetected { window, source } => {
@@ -76,6 +81,32 @@ pub fn event_json(event: &AgentEvent) -> Value {
             summary,
             tokens_before,
         } => json!({"summary": summary, "tokens_before": tokens_before}),
+        AgentEvent::Provenance {
+            call_id,
+            origin,
+            warning,
+            approval_required,
+        } => json!({
+            "call_id": call_id,
+            "origin": origin,
+            "warning": warning,
+            "approval_required": approval_required,
+        }),
+        AgentEvent::HunkReview { id, hunks } => json!({
+            "id": id,
+            "hunks": hunks
+                .iter()
+                .map(|hunk| json!({
+                    "file": hunk.file,
+                    "start_line": hunk.start_line,
+                    "end_line": hunk.end_line,
+                    "added": hunk.added,
+                    "removed": hunk.removed,
+                    "rationale": hunk.rationale,
+                    "text": hunk.text,
+                }))
+                .collect::<Vec<_>>(),
+        }),
         AgentEvent::Notice(message) => json!({"message": message}),
         AgentEvent::Guard { code, message } => json!({"code": code, "message": message}),
         AgentEvent::Error {
@@ -102,6 +133,16 @@ mod tests {
             AgentEvent::Guard {
                 code: "loop_guard".into(),
                 message: "m".into(),
+            },
+            AgentEvent::Provenance {
+                call_id: "call_0001".into(),
+                origin: "tool:read".into(),
+                warning: None,
+                approval_required: false,
+            },
+            AgentEvent::HunkReview {
+                id: 3,
+                hunks: Vec::new(),
             },
             AgentEvent::TurnDone(TurnOutcome {
                 status: TurnStatus::Done,

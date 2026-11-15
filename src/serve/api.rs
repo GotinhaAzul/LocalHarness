@@ -1,11 +1,12 @@
-//! Routing, handlers, the per-session event log, and the HTTP approver.
+//! Routing, handlers, and the per-session event log.
 //!
 //! Permission over HTTP: nobody can answer a prompt in the middle of an
 //! HTTP turn, so a session picks its permission mode when it is created and
-//! the [`ServeApprover`] applies it to every call after the harness gates
-//! (read-before-edit, scope, path jail, sandbox) have passed. It can only
-//! deny. Modes reuse the names of the permission engine (`ask` default,
-//! `accept-edits`, `dont-ask`, `yolo`); `yolo` must be enabled by the
+//! installs that mode on the session's permission engine before the runtime
+//! is built. The engine is the single pre-dispatch decision point
+//! (`authorize::decide()`): config `[permissions]` rules decide first, and an
+//! `ask` that nobody can answer is denied. Modes reuse the engine names (`ask`
+//! default, `accept-edits`, `dont-ask`, `yolo`); `yolo` must be enabled by the
 //! operator with `lh serve --allow-yolo`, never by a request alone.
 
 use std::collections::{HashMap, VecDeque};
@@ -14,7 +15,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use async_trait::async_trait;
 use http_body_util::{BodyExt, Full, Limited, StreamBody, combinators::BoxBody};
 use hyper::body::Bytes;
 use hyper::body::{Frame as BodyFrame, Incoming};
@@ -27,9 +27,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agent::AgentEvent;
 use crate::events::{CANCELLED, event_json, event_name};
-use crate::host::{Host, HostedSession, declared_root, needs_permission, start_turn};
-use crate::session::ToolCall;
-use crate::tools::{ToolApproval, ToolApprover};
+use crate::host::{Host, HostedSession, declared_root, start_turn};
 
 pub type Body = BoxBody<Bytes, Infallible>;
 
@@ -48,7 +46,7 @@ pub enum PermissionMode {
     Ask,
     /// Like `ask`, plus file edits (`write`, `edit`, `patch`, `undo`).
     AcceptEdits,
-    /// Never asks: the same as `ask` over HTTP.
+    /// Never asks: a call that would ask is denied instead.
     DontAsk,
     /// Every call the harness gates allow. Requires `--allow-yolo`.
     Yolo,
@@ -73,33 +71,16 @@ impl PermissionMode {
             Self::Yolo => "yolo",
         }
     }
-}
 
-/// The HTTP session's approval gate. It runs after every harness gate and
-/// can only deny.
-pub(crate) struct ServeApprover {
-    pub mode: PermissionMode,
-}
-
-#[async_trait]
-impl ToolApprover for ServeApprover {
-    async fn approve(&self, call: &ToolCall, _args: &Value, _read_only: bool) -> ToolApproval {
-        decide(self.mode, &call.name)
-    }
-}
-
-fn decide(mode: PermissionMode, tool: &str) -> ToolApproval {
-    if !needs_permission(tool) {
-        return ToolApproval::Allow;
-    }
-    let edit = matches!(tool, "write" | "edit" | "patch" | "undo");
-    match mode {
-        PermissionMode::Yolo => ToolApproval::Allow,
-        PermissionMode::AcceptEdits if edit => ToolApproval::Allow,
-        _ => ToolApproval::Deny(format!(
-            "{tool} needs approval and an HTTP session cannot ask (permission mode {}). The call did not run; continue without it. The user can create the session with \"permission_mode\": \"accept-edits\" for file edits, or start `lh serve --allow-yolo` and use \"yolo\".",
-            mode.label()
-        )),
+    /// The policy engine's mode. The HTTP name and the config name are the
+    /// same four modes; `plan` stays a CLI/TUI flow.
+    pub fn policy(self) -> crate::policy::PermissionMode {
+        match self {
+            Self::Ask => crate::policy::PermissionMode::Ask,
+            Self::AcceptEdits => crate::policy::PermissionMode::AcceptEdits,
+            Self::DontAsk => crate::policy::PermissionMode::DontAsk,
+            Self::Yolo => crate::policy::PermissionMode::Yolo,
+        }
     }
 }
 
@@ -412,10 +393,15 @@ pub async fn handle(state: Arc<State>, request: Request<Incoming>) -> Response<B
             let Some(live) = state.live(id) else {
                 return unknown_session(id);
             };
+            // Publish under the same lock `drive` holds while it releases the
+            // session and publishes `done`, so `cancelled` cannot slip behind
+            // the terminal frame when a turn is already settling.
+            let mut log = live.events.lock();
             let cancelled = live.session.cancel();
             if cancelled {
-                live.events.publish(CANCELLED, &json!({"type": CANCELLED}));
+                EventLog::push(&mut log, CANCELLED, &json!({"type": CANCELLED}));
             }
+            drop(log);
             json_response(
                 StatusCode::OK,
                 json!({"session_id": live.session.id, "cancelled": cancelled}),
@@ -551,8 +537,11 @@ async fn create_session(state: &Arc<State>, body: Value) -> Response<Body> {
     };
     let resumed = resume.is_some();
 
-    let approver = Arc::new(ServeApprover { mode });
-    let opened = match state.host.open(&root, resume, Some(approver)).await {
+    let opened = match state
+        .host
+        .open_in_mode(&root, resume, None, Some(mode.policy()))
+        .await
+    {
         Ok(opened) => opened,
         Err(error) => {
             return self::error(
@@ -591,7 +580,27 @@ async fn create_session(state: &Arc<State>, body: Value) -> Response<Body> {
         turns: AtomicU64::new(0),
         last_status: Mutex::new(None),
     });
-    state.sessions().insert(id, live.clone());
+    // Session ids are timestamp-based, so two roots created in the same second
+    // can collide. Insert under the map lock and refuse a collision instead of
+    // silently replacing the first live session.
+    let collision = {
+        let mut sessions = state.sessions();
+        if sessions.contains_key(&id) {
+            true
+        } else {
+            sessions.insert(id.clone(), live.clone());
+            false
+        }
+    };
+    if collision {
+        live.session.core.mcp.shutdown().await;
+        return error_with(
+            StatusCode::CONFLICT,
+            "session_id_collision",
+            "a live session already uses this id; retry in a moment, or resume the existing session",
+            json!({"session_id": id}),
+        );
+    }
     let mut info = live.info();
     info["resumed"] = json!(resumed);
     json_response(StatusCode::CREATED, info)
@@ -747,32 +756,55 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ask_runs_only_builtin_read_tools() {
-        for mode in [PermissionMode::Ask, PermissionMode::DontAsk] {
-            assert_eq!(decide(mode, "read"), ToolApproval::Allow);
-            assert_eq!(decide(mode, "grep"), ToolApproval::Allow);
-            for tool in ["write", "edit", "bash", "bg", "files__read_file"] {
-                assert!(
-                    matches!(decide(mode, tool), ToolApproval::Deny(_)),
-                    "{tool} in {mode:?}"
-                );
-            }
-        }
+    fn http_modes_select_the_same_policy_modes() {
+        use crate::policy::PermissionMode as PolicyMode;
+        assert_eq!(PermissionMode::Ask.policy(), PolicyMode::Ask);
+        assert_eq!(
+            PermissionMode::AcceptEdits.policy(),
+            PolicyMode::AcceptEdits
+        );
+        assert_eq!(PermissionMode::DontAsk.policy(), PolicyMode::DontAsk);
+        assert_eq!(PermissionMode::Yolo.policy(), PolicyMode::Yolo);
     }
 
     #[test]
-    fn accept_edits_runs_edits_but_not_commands() {
-        let mode = PermissionMode::AcceptEdits;
-        for tool in ["write", "edit", "patch", "undo"] {
-            assert_eq!(decide(mode, tool), ToolApproval::Allow, "{tool}");
-        }
-        for tool in ["bash", "bg", "verify", "mcp__x"] {
-            assert!(
-                matches!(decide(mode, tool), ToolApproval::Deny(_)),
-                "{tool}"
-            );
-        }
-        assert_eq!(decide(PermissionMode::Yolo, "bash"), ToolApproval::Allow);
+    fn config_allow_and_deny_rules_apply_to_http_sessions() {
+        use crate::policy::{
+            CallFacts, Decision, PermissionMode as PolicyMode, Permissions, Policy, RuleAction,
+            RuleConfig,
+        };
+        let rule = |tool: &str, action: RuleAction| RuleConfig {
+            id: None,
+            tool: Some(tool.into()),
+            path: None,
+            command: None,
+            network: None,
+            action,
+        };
+        let permissions = Permissions::new(
+            Policy::compile(&[
+                RuleConfig {
+                    id: Some("allow-write".into()),
+                    ..rule("write", RuleAction::Allow)
+                },
+                RuleConfig {
+                    id: Some("deny-env".into()),
+                    path: Some("**/.env".into()),
+                    ..rule("write", RuleAction::Deny)
+                },
+            ])
+            .unwrap(),
+            PolicyMode::Ask,
+        );
+        let cwd = std::path::Path::new("/work");
+        let write = CallFacts::new("write", false, &json!({"path": "out.txt"}), cwd);
+        assert_eq!(permissions.decide(&write), Decision::Allow);
+        let env = CallFacts::new("write", false, &json!({"path": ".env"}), cwd);
+        assert!(matches!(permissions.decide(&env), Decision::Deny { .. }));
+        // No rule for a mutating command: the default mode still asks, and an
+        // HTTP turn cannot answer.
+        let bash = CallFacts::new("bash", false, &json!({"command": "touch marker.txt"}), cwd);
+        assert!(matches!(permissions.decide(&bash), Decision::Ask(_)));
     }
 
     #[test]

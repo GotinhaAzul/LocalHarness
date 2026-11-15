@@ -82,6 +82,20 @@ impl Host {
         resume: Option<PathBuf>,
         approver: Option<Arc<dyn ToolApprover>>,
     ) -> Result<Opened> {
+        self.open_in_mode(root, resume, approver, None).await
+    }
+
+    /// [`Host::open`] with the session's permission mode pinned before the
+    /// runtime is built. `lh serve` selects the mode per HTTP session; setting
+    /// it here makes the policy engine the only pre-dispatch decision point,
+    /// so `[permissions]` allow and deny rules apply over HTTP too.
+    pub async fn open_in_mode(
+        &self,
+        root: &Path,
+        resume: Option<PathBuf>,
+        approver: Option<Arc<dyn ToolApprover>>,
+        mode: Option<crate::policy::PermissionMode>,
+    ) -> Result<Opened> {
         let paths = self.session_paths(root)?;
         let options = RuntimeOptions {
             path_jail: true,
@@ -92,7 +106,10 @@ impl Host {
             continue_last: false,
             approver,
         };
-        let config = self.session_config(root);
+        let mut config = self.session_config(root);
+        if let Some(mode) = mode {
+            config.permissions.mode = mode;
+        }
         let trusted = config.trust;
         let runtime = create_runtime(config, paths, options).await?;
         let harness_id = runtime

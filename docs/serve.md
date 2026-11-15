@@ -128,9 +128,10 @@ data: {"type":"text","text":"Hello"}
   Both frontends render through one function (`src/events.rs`), so they cannot
   drift. The names are `started`, `state`, `text`, `reasoning`,
   `tool_started`, `tool_finished`, `usage`, `context`, `window_detected`,
-  `compacted`, `notice`, `guard`, `error`, and `done`, plus `cancelled`. As
-  with `--json`, `cancelled` is emitted when a cancel is requested, and the
-  turn's own `done` follows with `"status":"Cancelled"`.
+  `compacted`, `provenance`, `hunk_review`, `notice`, `guard`, `error`, and
+  `done`, plus `cancelled`. As with `--json`, `cancelled` is emitted when a
+  cancel is requested, and the turn's own `done` follows with
+  `"status":"Cancelled"`.
 - **Text is passed through unchanged, as with `--json`.** Strip control
   sequences yourself before painting model text in a terminal.
 - **Ids and replay.** `id:` increases within a session. Connect with
@@ -148,21 +149,25 @@ data: {"type":"text","text":"Hello"}
 ## Permissions
 
 Nobody can answer a permission prompt in the middle of an HTTP turn. Each
-session picks its mode when it is created, and the server applies it to every
-tool call **after** the harness gates (read-before-edit, scope, path jail,
-sandbox) have passed. The mode can only deny. It never widens a gate.
+session picks its mode when it is created, and that mode is installed on the
+session's permission engine before the runtime is built. The engine is the
+single pre-dispatch decision point (`authorize::decide()`): config
+`[permissions]` rules decide first, and the mode only fills in when no rule
+matches. A deny rule always wins. The mode never widens a harness gate
+(read-before-edit, scope, path jail, sandbox), which still runs afterward.
 
 | `permission_mode` | Runs | Denied |
 | --- | --- | --- |
-| `ask` (default) | built-in read-only tools (`read`, `grep`, `glob`, `repo_map`, `recall`, `review`, `lsp`, `skill`, `todo`, `thread`) | everything else |
+| `ask` (default) | built-in read-only tools (`read`, `grep`, `glob`, `repo_map`, `recall`, `review`, `lsp`, `skill`, `todo`, `thread`), plus any call an allow rule names | everything else |
 | `accept-edits` | the above plus `write`, `edit`, `patch`, `undo` | `bash`, `bg`, `verify`, `test`, MCP and external tools |
 | `dont-ask` | same as `ask` over HTTP | same as `ask` |
 | `yolo` | every call the harness gates allow; needs `lh serve --allow-yolo` | nothing beyond the gates |
 
-A denied call does not run. The model receives a `permission_denied` tool
-result that names the mode to use, and the turn continues. MCP and external
+A denied call does not run. The model receives a `DENIED` tool result that
+names the mode, rule, or next action, and the turn continues. MCP and external
 tools always count as needing approval, even when their manifest claims to be
-read-only.
+read-only. Add an allow rule under `[permissions]` to run a specific command or
+path in `ask` or `dont-ask` mode.
 
 **Why not an approval endpoint?** `lh serve` is built for unattended callers.
 A round trip that parks a turn until a second client approves it would need its
@@ -170,12 +175,10 @@ own event type outside the `--json` schema, and a timeout policy. Picking the
 mode at creation is explicit, auditable in the session list, and safe by
 default. Approvals over HTTP can be added later without changing these modes.
 
-**The permission engine.** The mode names match the permission engine proposed
-in #105 (`ask`, `accept-edits`, `dont-ask`, `yolo`). Once that engine is merged,
-the HTTP mode becomes the session's engine mode, config `[permissions]` rules
-decide first, and the HTTP approver narrows to "an `ask` that nobody can answer
-is denied". Until then, the approver above is the whole HTTP permission layer.
-It runs at the same `ToolApprover` seam ACP uses.
+**One decision point.** The HTTP mode is the same `[permissions]` mode the CLI
+uses. Config allow and deny rules apply over HTTP exactly as they do in the
+TUI and `--print`; an `ask` that nobody can answer is denied. There is no
+separate HTTP approver narrowing the call after the policy already decided.
 
 ## Security
 
