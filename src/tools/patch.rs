@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use crate::config::EditMode;
 use crate::tools::edit::{diff_report, locate, nearest_window, read_text, require_fresh};
 use crate::tools::read::{anchor_block, line_hash, snapshot_hash};
-use crate::tools::write::{atomic_write, file_mode, lock_reads, record_own_write};
+use crate::tools::write::{file_mode, lock_reads, record_own_write};
 use crate::tools::{
     Tool, ToolContext, ToolPack, ToolResult, display_path, optional_u64, required_str,
 };
@@ -575,7 +575,9 @@ fn run_hash(ctx: &ToolContext, args: &Value, raw: &str) -> Result<ToolResult, To
     }
     let (diff, added, removed) = diff_report(&before, &after, MAX_DIFF_LINES);
     let change = crate::tools::undo::record_change(ctx, Ok(Some(&before)), &after);
-    atomic_write(&path, after.as_bytes(), file_mode(&path))
+    // Same seam as an exact-text patch: under hunk review the bytes are
+    // captured, otherwise written atomically (with the placeholder guard).
+    crate::tools::hunk::mutation_write(&path, Some(&before), &after, file_mode(&path))
         .map_err(|err| ToolResult::err("PATCH_FAILED", format!("cannot write {display}: {err}")))?;
     record_own_write(ctx, &path);
 

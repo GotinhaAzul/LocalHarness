@@ -19,7 +19,7 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::config::LspGate;
 use crate::text::clip;
-use crate::tools::write::{atomic_write, file_mode, record_own_write};
+use crate::tools::write::{atomic_restore, file_mode, record_own_write};
 use crate::tools::{
     Tool, ToolContext, ToolPack, ToolResult, display_path, object_schema, optional_str,
     optional_u64, required_str,
@@ -852,7 +852,7 @@ fn restore_file(path: &Path, before: Option<&[u8]>) -> bool {
     match before {
         Some(bytes) => {
             let mode = file_mode(path);
-            atomic_write(path, bytes, mode).is_ok()
+            atomic_restore(path, bytes, mode).is_ok()
         }
         None => match std::fs::remove_file(path) {
             Ok(()) => true,
