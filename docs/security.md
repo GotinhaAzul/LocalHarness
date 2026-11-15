@@ -106,6 +106,40 @@ need those guarantees. The bubblewrap executable can be overridden with
 `--path-jail` is a separate file-tool boundary; it does not change how `bash`
 runs.
 
+## Instruction provenance
+
+The system prompt describes repository files, tool output, `AGENTS.md`, and
+external tool output as untrusted data. The harness also enforces that at
+dispatch:
+
+- Session entries carry a provenance tag: `user`, `tool:<name>`, `skill`, or
+  `external`. The tag is written to the session JSONL and appears as a
+  `provenance` event in `lh --print --json`.
+- Every tool result from an untrusted source is scanned by a small detector for
+  instruction patterns: "ignore previous instructions", "run this command",
+  "send the contents of", "disable the sandbox", credential paths such as
+  `~/.ssh`, and a few close variants. The detector is conservative; the bare
+  word "ignore" is not a hit. It is plain substring matching with no model call
+  and no rewrite of the content.
+- A hit adds a visible `[provenance]` warning to the tool result, records a
+  `provenance-warning` entry, and requires approval for the next sensitive
+  action: network access, a path outside the workspace, or a scope change.
+- Review the warning, then run `/approve` in the TUI to allow exactly the next
+  sensitive action. Without approval the call returns `provenance_approval` and
+  does not run. A frontend permission callback (ACP) can also be the approver.
+- Untrusted content can never enable a denied tool, add a tool, change the
+  endpoint, widen `/sec` scope, or change the permission mode. Hooks and
+  provenance can only deny or add visible text; the enforcement is in the
+  dispatcher, not in prompt wording. Both feed the same pre-dispatch decision
+  as the permission rules (`authorize::decide`): a deny from any of them wins,
+  so an allow rule cannot override a hook block or a pending provenance
+  warning. An approval is spent only by a call that passed every other gate.
+
+The detector is a speed bump, not a proof of safety. Encoded or paraphrased
+instructions may pass, and a warning only gates the next sensitive action.
+Headless runs have no `/approve`, so a warned sensitive action stays blocked
+there. `--sandbox` remains the process boundary.
+
 ## Findings
 
 Findings are engagement-global and stored in

@@ -164,6 +164,11 @@ pub enum Command {
         #[command(subcommand)]
         action: WorkflowCommand,
     },
+    /// List lifecycle hooks or run one with a sample payload.
+    Hooks {
+        #[command(subcommand)]
+        action: HooksCommand,
+    },
     /// Serve the Agent Client Protocol v1 on stdio for editor integrations.
     Acp,
     /// Inspect context assembly inputs: the hierarchical AGENTS.md manifest.
@@ -171,6 +176,24 @@ pub enum Command {
         /// Print the manifest with each loaded file, its bytes, and SHA-256.
         #[arg(long, required_unless_present = "json")]
         show: bool,
+        /// Emit one stable JSON object.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, clap::Subcommand)]
+pub enum HooksCommand {
+    /// List configured hooks.
+    List {
+        /// Emit one stable JSON object.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run one hook with a sample payload for its event.
+    Test {
+        /// Hook name from [hooks.<name>].
+        name: String,
         /// Emit one stable JSON object.
         #[arg(long)]
         json: bool,
@@ -354,6 +377,9 @@ pub async fn run(cli: Cli) -> Result<i32> {
             cli.engagement.clone(),
         )
         .await;
+    }
+    if let Some(Command::Hooks { action }) = &cli.command {
+        return run_hooks(&config, &paths, action).await;
     }
 
     let resume = match (&cli.resume, cli.continue_last) {
@@ -627,6 +653,118 @@ async fn run_mcp(config: &Config, paths: &Paths, action: &McpCommand) -> Result<
                     Ok(1)
                 }
             }
+        }
+    }
+}
+
+/// `lh hooks`: list or exercise configured lifecycle hooks without a turn.
+async fn run_hooks(config: &Config, paths: &Paths, action: &HooksCommand) -> Result<i32> {
+    match action {
+        HooksCommand::List { json } => {
+            let hooks: Vec<serde_json::Value> = config
+                .hooks
+                .entries
+                .iter()
+                .map(|(name, hook)| {
+                    json!({
+                        "name": name,
+                        "event": hook.event.as_str(),
+                        "command": hook.command,
+                        "on_error": hook.on_error().label(),
+                        "timeout_secs": config.hooks.timeout(hook).as_secs(),
+                    })
+                })
+                .collect();
+            if *json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({"hooks": hooks}))?
+                );
+            } else if hooks.is_empty() {
+                println!(
+                    "no hooks configured; add a [hooks.<name>] table to {} (see docs/hooks.md)",
+                    paths.config_file().display()
+                );
+            } else {
+                for row in &hooks {
+                    println!(
+                        "{}: {} · {} · on_error={} · {}s",
+                        row["name"].as_str().unwrap_or("?"),
+                        row["event"].as_str().unwrap_or("?"),
+                        row["command"]
+                            .as_array()
+                            .map(|parts| parts
+                                .iter()
+                                .filter_map(|part| part.as_str())
+                                .collect::<Vec<_>>()
+                                .join(" "))
+                            .unwrap_or_default(),
+                        row["on_error"].as_str().unwrap_or("?"),
+                        row["timeout_secs"].as_u64().unwrap_or(0),
+                    );
+                }
+            }
+            Ok(0)
+        }
+        HooksCommand::Test { name, json } => {
+            if !config.hooks.entries.contains_key(name) {
+                bail!(
+                    "no hook named {name:?} in {}; run `lh hooks list` to see configured hooks and docs/hooks.md for the format",
+                    paths.config_file().display()
+                );
+            }
+            let env = crate::hooks::HookEnv {
+                config: &config.hooks,
+                cwd: &paths.cwd,
+                session: None,
+                artifacts: None,
+                identity: crate::hooks::HookIdentity {
+                    session_id: "hooks-test".into(),
+                    model: config.model.model.clone(),
+                    profile: config.profile_name().to_string(),
+                },
+            };
+            let (invocation, outcome) = crate::hooks::test_named(&env, name)
+                .await
+                .map_err(anyhow::Error::msg)?;
+            if *json {
+                let mut value = json!({
+                    "hook": invocation.hook,
+                    "event": invocation.event.as_str(),
+                    "outcome": invocation.outcome.label(),
+                    "duration_ms": invocation.duration_ms,
+                    "exit_code": invocation.exit_code,
+                    "reason": invocation.reason,
+                    "artifact": invocation.artifact,
+                    "warnings": outcome.warnings.clone(),
+                    "contexts": outcome.contexts.iter().map(|context| context.text.clone()).collect::<Vec<_>>(),
+                });
+                if let Some(block) = &outcome.blocked {
+                    value["blocked"] = json!({"hook": block.hook, "reason": block.reason});
+                }
+                println!("{}", serde_json::to_string_pretty(&value)?);
+            } else {
+                println!(
+                    "hook {} ({}): {} in {} ms",
+                    invocation.hook,
+                    invocation.event.as_str(),
+                    invocation.outcome.label(),
+                    invocation.duration_ms
+                );
+                if let Some(block) = &outcome.blocked {
+                    println!("blocked: {}", block.reason);
+                }
+                for warning in &outcome.warnings {
+                    println!("warning: {warning}");
+                }
+                for context in &outcome.contexts {
+                    println!("context: {} chars", context.text.chars().count());
+                }
+                if let Some(artifact) = &invocation.artifact {
+                    println!("output artifact: {artifact}");
+                }
+            }
+            Ok(if outcome.is_blocked() { 1 } else { 0 })
         }
     }
 }
@@ -975,73 +1113,90 @@ async fn run_headless(runtime: crate::app::Runtime, prompt: String, json: bool) 
     })
 }
 
+/// One stable JSON object for a `--json` event.
+fn event_json(event: &AgentEvent) -> serde_json::Value {
+    match event {
+        AgentEvent::TurnStarted {
+            model,
+            profile,
+            tool_mode,
+        } => {
+            json!({"type":"started","model":model,"profile":profile,"tool_mode":tool_mode})
+        }
+        AgentEvent::State(state) => json!({"type":"state","state":format!("{state:?}")}),
+        AgentEvent::TextDelta(text) => json!({"type":"text","text":text}),
+        AgentEvent::ReasoningDelta(text) => json!({"type":"reasoning","text":text}),
+        AgentEvent::ToolStarted {
+            call_id,
+            name,
+            summary,
+        } => json!({"type":"tool_started","call_id":call_id,"name":name,"summary":summary}),
+        AgentEvent::ToolFinished {
+            call_id,
+            name,
+            is_error,
+            duration_ms,
+            preview,
+            artifact,
+        } => {
+            json!({"type":"tool_finished","call_id":call_id,"name":name,"is_error":is_error,"duration_ms":duration_ms,"preview":preview,"artifact":artifact})
+        }
+        AgentEvent::Usage(usage) => {
+            json!({
+                "type":"usage",
+                "prompt_tokens":usage.prompt_tokens,
+                "completion_tokens":usage.completion_tokens,
+                "cached_tokens":usage.cached_tokens,
+                "cache_percent":usage.cache_percent(),
+                "reasoning_tokens":usage.reasoning_tokens,
+            })
+        }
+        AgentEvent::Context { used, window } => {
+            json!({"type":"context","used":used,"window":window})
+        }
+        AgentEvent::WindowDetected { window, source } => {
+            json!({"type":"window_detected","window":window,"source":source})
+        }
+        AgentEvent::Compacted {
+            summary,
+            tokens_before,
+        } => json!({"type":"compacted","summary":summary,"tokens_before":tokens_before}),
+        AgentEvent::Notice(message) => json!({"type":"notice","message":message}),
+        AgentEvent::Provenance {
+            call_id,
+            origin,
+            warning,
+            approval_required,
+        } => json!({
+            "type": "provenance",
+            "call_id": call_id,
+            "origin": origin,
+            "warning": warning,
+            "approval_required": approval_required,
+        }),
+        AgentEvent::Guard { code, message } => {
+            json!({"type":"guard","code":code,"message":message})
+        }
+        AgentEvent::Error {
+            code,
+            message,
+            recoverable,
+        } => json!({"type":"error","code":code,"message":message,"recoverable":recoverable}),
+        AgentEvent::TurnDone(outcome) => {
+            json!({"type":"done","status":format!("{:?}", outcome.status)})
+        }
+    }
+}
+
 /// Render one event in plain or JSON mode. Returns the final status when done.
 fn render_event(event: AgentEvent, json: bool) -> Result<Option<TurnStatus>> {
     if json {
-        let value = match &event {
-            AgentEvent::TurnStarted {
-                model,
-                profile,
-                tool_mode,
-            } => {
-                json!({"type":"started","model":model,"profile":profile,"tool_mode":tool_mode})
-            }
-            AgentEvent::State(state) => json!({"type":"state","state":format!("{state:?}")}),
-            AgentEvent::TextDelta(text) => json!({"type":"text","text":text}),
-            AgentEvent::ReasoningDelta(text) => json!({"type":"reasoning","text":text}),
-            AgentEvent::ToolStarted {
-                call_id,
-                name,
-                summary,
-            } => json!({"type":"tool_started","call_id":call_id,"name":name,"summary":summary}),
-            AgentEvent::ToolFinished {
-                call_id,
-                name,
-                is_error,
-                duration_ms,
-                preview,
-                artifact,
-            } => {
-                json!({"type":"tool_finished","call_id":call_id,"name":name,"is_error":is_error,"duration_ms":duration_ms,"preview":preview,"artifact":artifact})
-            }
-            AgentEvent::Usage(usage) => {
-                json!({
-                    "type":"usage",
-                    "prompt_tokens":usage.prompt_tokens,
-                    "completion_tokens":usage.completion_tokens,
-                    "cached_tokens":usage.cached_tokens,
-                    "cache_percent":usage.cache_percent(),
-                    "reasoning_tokens":usage.reasoning_tokens,
-                })
-            }
-            AgentEvent::Context { used, window } => {
-                json!({"type":"context","used":used,"window":window})
-            }
-            AgentEvent::WindowDetected { window, source } => {
-                json!({"type":"window_detected","window":window,"source":source})
-            }
-            AgentEvent::Compacted {
-                summary,
-                tokens_before,
-            } => json!({"type":"compacted","summary":summary,"tokens_before":tokens_before}),
-            AgentEvent::Notice(message) => json!({"type":"notice","message":message}),
-            AgentEvent::Guard { code, message } => {
-                json!({"type":"guard","code":code,"message":message})
-            }
-            AgentEvent::Error {
-                code,
-                message,
-                recoverable,
-            } => json!({"type":"error","code":code,"message":message,"recoverable":recoverable}),
-            AgentEvent::TurnDone(outcome) => {
-                json!({"type":"done","status":format!("{:?}", outcome.status)})
-            }
+        let done = match &event {
+            AgentEvent::TurnDone(outcome) => Some(outcome.status),
+            _ => None,
         };
-        println!("{}", serde_json::to_string(&value)?);
-        if let AgentEvent::TurnDone(outcome) = event {
-            return Ok(Some(outcome.status));
-        }
-        return Ok(None);
+        println!("{}", serde_json::to_string(&event_json(&event))?);
+        return Ok(done);
     }
 
     match event {
@@ -1066,6 +1221,15 @@ fn render_event(event: AgentEvent, json: bool) -> Result<Option<TurnStatus>> {
             }
         }
         AgentEvent::Notice(message) => eprintln!("[notice] {message}"),
+        AgentEvent::Provenance {
+            origin, warning, ..
+        } => {
+            if let Some(warning) = warning {
+                eprintln!("[provenance] {origin}: {warning}");
+            } else {
+                eprintln!("[provenance] {origin}");
+            }
+        }
         AgentEvent::Guard { code, message } => eprintln!("[{code}] {message}"),
         AgentEvent::Error { code, message, .. } => eprintln!("[{code}] {message}"),
         AgentEvent::Usage(usage) => {
@@ -1120,6 +1284,22 @@ fn init_logging(paths: &Paths, debug: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provenance_event_json_exposes_the_tag_and_warning() {
+        let event = AgentEvent::Provenance {
+            call_id: "call_0001".into(),
+            origin: "tool:read".into(),
+            warning: Some("[provenance] untrusted content".into()),
+            approval_required: true,
+        };
+        let value = event_json(&event);
+        assert_eq!(value["type"], "provenance");
+        assert_eq!(value["call_id"], "call_0001");
+        assert_eq!(value["origin"], "tool:read");
+        assert_eq!(value["warning"], "[provenance] untrusted content");
+        assert_eq!(value["approval_required"], true);
+    }
 
     #[test]
     fn no_redact_is_an_explicit_global_flag() {

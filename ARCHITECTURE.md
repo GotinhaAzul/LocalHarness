@@ -550,6 +550,8 @@ Entry fields:
 - `id`: `e<seq>` for entries, `c<seq>` for checkouts, `s0` for the header.
 - `parent`: entry id, or `null` for the first user entry.
 - `ts`: RFC 3339 UTC.
+- `provenance`: optional source tag (`user`, `tool:<name>`, `skill`, `external`,
+  `repo`). Absent on old entries and on harness-internal entries.
 - `type` and `data`.
 
 ### 5.2 Entry types
@@ -562,7 +564,7 @@ Entry fields:
 | `tool_result` | call_id, content, is_error, details?, artifact? |
 | `compaction` | summary, tokens_before, reason, thread_id? |
 | `checkout` | target, reason (`tree`, `fork`, `resume`) |
-| `custom` | kind plus payload (`fs-change`, `verify-config`, `verify-result`, `todo-state`, `finding`, `thread-state`, `guard-trip`, `profile-change`, `model-change`, `prompt-prefix`, `cache-boundary`, `cache-cold`, `permissions`, `permission-mode`, `plan`) |
+| `custom` | kind plus payload (`fs-change`, `verify-config`, `verify-result`, `todo-state`, `finding`, `thread-state`, `guard-trip`, `profile-change`, `model-change`, `prompt-prefix`, `cache-boundary`, `cache-cold`, `permissions`, `permission-mode`, `plan`, `hook-invocation`, `hook-context`, `provenance-warning`, `provenance-approval`) |
 | `error` | code, message, recoverable |
 
 An assistant entry with `tool_calls` is a batch. The tool results that answer it
@@ -938,8 +940,9 @@ as styled text.
 
 ## 7. Extensibility
 
-The rule: users add **tools and workflows**, not loop behavior. Loop behavior is
-changed by forking the crate.
+The rule: users add **tools, workflows, and lifecycle hooks**, not arbitrary
+loop code. Hooks observe and veto at fixed points; they cannot change tools,
+scope, policy, or the endpoint. Anything else is changed by forking the crate.
 
 ### 7.1 Profiles
 
@@ -1077,10 +1080,37 @@ The crate has a `lib.rs` and exposes `Harness`, `Provider`, `Tool`, `Stage`, and
 `SessionStore` for embedding and forking. No API stability promise before 1.0.
 Feature flags: `coding`, `security`, `lsp`. The binary is a thin wrapper.
 
-### 7.7 Explicitly not extensible at runtime
+### 7.7 Lifecycle hooks
+
+`[hooks.<name>]` declares one `event`, one `command` argv, an optional
+`timeout_secs`, and `on_error = "block" | "warn"`. Events: `session_start`,
+`user_prompt`, `pre_tool`, `post_tool`, `pre_compact`, `stop`.
+
+- The command is spawned directly (no shell), with one JSON object on stdin and
+  one expected on stdout. `decision` (`allow`/`block`), `reason`, and `context`
+  are the only honored fields.
+- `pre_tool` fails closed: the default `on_error` is `block`, and a missing
+  binary, non-zero exit, timeout, or malformed output is visible and blocks.
+  Every other event defaults to `warn`, which keeps the failure visible without
+  blocking.
+- Exit 2 is an explicit veto; stderr's first line is the reason.
+- Output is capped and archived as an artifact when large. Every invocation is
+  recorded as a `hook-invocation` custom entry with duration, outcome, and
+  reason.
+- `pre_tool` runs inside `authorize::decide` (§8.14), after the permission
+  policy and before the harness gates: a call the policy denies never reaches
+  a hook, and a hook block denies even a rule-allowed call before anyone is
+  asked. Hooks cannot enable a denied tool or change scope, the tool list, the
+  endpoint, or the permission mode. `stop` runs when
+  the turn loop ends and is advisory because the turn has already stopped.
+- `lh hooks list` and `lh hooks test <name>` exercise hooks without a model
+  turn. See `docs/hooks.md`.
+
+### 7.8 Explicitly not extensible at runtime
 
 - No plugin ABI.
-- No Lua/Rhai/WASM hooks.
+- No Lua/Rhai/WASM hooks. Lifecycle hooks are external commands with a fixed
+  JSON contract; there is no embedded scripting runtime.
 - No dynamic tool loading outside the manifest protocol.
 - No model-driven tool activation or tool search.
 
@@ -1220,7 +1250,8 @@ input characters. Missing input and unreadable files return prescriptive errors.
 - A trusted project still cannot grant security scope.
 - Model input from repository files and tool output is delimited and labeled as
   untrusted data in the system prompt. This reduces, but does not eliminate,
-  prompt injection.
+  prompt injection. Section 8.13 adds a dispatch-time warning and approval
+  gate on top of the label.
 
 ### 8.10 Data handling
 
@@ -1302,16 +1333,40 @@ input characters. Missing input and unreadable files return prescriptive errors.
   is rejected. A workspace equal to `/` is rejected in `workspace-write`
   because re-binding it would expose the whole filesystem.
 
----
+### 8.13 Instruction provenance
 
-### 8.13 Permission policy and plan mode
+- Every session entry that carries external content has a `provenance` tag:
+  `user`, `tool:<name>`, `skill`, `external`, or `repo`. Tags are written to the
+  JSONL entry and surfaced as `provenance` events in `--json` output.
+- `src/provenance.rs` scans untrusted tool results with a conservative
+  instruction-pattern detector ("ignore previous instructions", "run this
+  command", "send the contents of", "disable the sandbox", credential paths).
+  It is plain substring matching with no model call and no rewrite; ordinary
+  prose containing "ignore" does not match.
+- A hit prepends a visible warning to the tool result, appends a
+  `provenance-warning` custom entry, and records a pending approval in
+  `Core::provenance`. The next sensitive action — network, outside-workspace
+  path, external tool, or scope change — returns `provenance_approval` unless
+  the user approves with `/approve` or a frontend approver allows it. Approval
+  covers exactly one action.
+- A tool result can never enable a tool, change the tool set, widen scope,
+  change the endpoint, or change the permission mode. Hooks and provenance can
+  only deny or add text; enforcement is at dispatch, not in the prompt.
+
+### 8.14 Permission policy and plan mode
 
 `policy/` holds the engine; `agent/authorize.rs` is the single pre-dispatch
 decision point. `authorize::decide` returns `Allow`, `Ask` (exact subject plus
 preview), or `Deny` (code and reason) before any other gate; a deny stops the
 call at once and `authorize::confirm` resolves an ask after the harness gates
 pass. Lifecycle hooks and provenance checks add their inputs inside `decide`
-so the loop keeps one decision point.
+so the loop keeps one decision point: policy first (a deny skips the hooks),
+then `pre_tool` hooks (block or add context), then provenance. A deny from any
+source wins; hooks and provenance never turn an ask into an allow. A
+provenance approval that something could still grant (`/approve` already
+given, or a frontend approver attached) is resolved by
+`authorize::confirm_provenance` after the gates, so a call that fails
+`READ_FIRST` or scope never spends the approval.
 
 - Policy comes from the global config and, only when trusted, the project
   config. Rules from both are kept, global first. Skills, workflows, and the
@@ -1334,6 +1389,8 @@ so the loop keeps one decision point.
   is still refused with `plan_mode`, not `unknown_tool`. A plan-mode turn
   cannot settle without a `todo` plan; the plan is stored as a `plan` session
   entry (`proposed`, then `approved` or `discarded`).
+
+---
 
 ## 9. Interfaces: TUI, headless, and ACP
 
@@ -1690,6 +1747,8 @@ src/
   lib.rs                  library surface for embedding and tests
   cli.rs                  clap definitions
   config.rs               config load, merge, validation
+  hooks.rs                lifecycle hooks: direct spawn, JSON, timeout, records
+  provenance.rs           source tags, injection detector, approval gate
   paths.rs                config/data/project paths, project id
   git.rs                  branch and dirty status
   sanitize.rs             text safe to paint or read (escapes, tabs, emoji)

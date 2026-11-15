@@ -49,6 +49,9 @@ pub struct Core {
     pub reads: Arc<Mutex<ReadTracker>>,
     pub bg: Arc<Mutex<BgRegistry>>,
     pub security: Arc<Mutex<SecurityState>>,
+    /// Instruction-provenance warnings waiting for approval. Shared across
+    /// core rebuilds so `/model` does not clear a gate.
+    pub provenance: Arc<Mutex<crate::provenance::ProvenanceState>>,
     /// OS sandbox for `bash` and `bg`, shared with every tool context.
     pub sandbox: Option<Arc<crate::sandbox::Sandbox>>,
     pub budget: TokenBudget,
@@ -317,6 +320,14 @@ pub enum AgentEvent {
     Compacted {
         summary: String,
         tokens_before: u64,
+    },
+    /// The provenance tag of a tool result, and any injection warning it
+    /// raised. Emitted for every executed tool so `--json` shows the source.
+    Provenance {
+        call_id: String,
+        origin: String,
+        warning: Option<String>,
+        approval_required: bool,
     },
     Notice(String),
     Guard {

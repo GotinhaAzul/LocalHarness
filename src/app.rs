@@ -522,6 +522,7 @@ pub async fn create_runtime(
     let artifacts = session.artifacts.clone();
     let reads = Arc::new(Mutex::new(ReadTracker::default()));
     let bg = Arc::new(Mutex::new(BgRegistry::new()));
+    let provenance = Arc::new(Mutex::new(crate::provenance::ProvenanceState::default()));
     let session_handle: Handle = Arc::new(Mutex::new(session));
 
     // The gateway may be down. Start it in the background so the TUI does not
@@ -580,6 +581,7 @@ pub async fn create_runtime(
         reads,
         bg,
         security,
+        provenance,
         sandbox: sandbox.clone(),
         budget,
         static_prompt,
@@ -853,6 +855,7 @@ pub async fn rebuild_core(old: &Arc<Core>, mut config: Config) -> Result<Arc<Cor
         reads: old.reads.clone(),
         bg: old.bg.clone(),
         security: old.security.clone(),
+        provenance: old.provenance.clone(),
         sandbox: old.sandbox.clone(),
         budget,
         static_prompt,

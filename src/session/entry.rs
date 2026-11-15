@@ -14,6 +14,11 @@ pub struct Entry {
     pub id: String,
     pub parent: Option<String>,
     pub ts: DateTime<Utc>,
+    /// Where this message's content came from: `user`, `tool:<name>`, `skill`,
+    /// `external`, or `repo`. Absent on entries written before provenance
+    /// existed and on harness-internal entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<String>,
     #[serde(flatten)]
     pub kind: EntryKind,
 }
@@ -367,6 +372,7 @@ mod tests {
             id: "e1".into(),
             parent: None,
             ts: Utc::now(),
+            provenance: None,
             kind: EntryKind::User(UserData {
                 attachments: Vec::new(),
                 content: "Fix the parser bug".into(),
@@ -380,6 +386,21 @@ mod tests {
     }
 
     #[test]
+    fn old_entries_without_provenance_still_load() {
+        let json = serde_json::json!({
+            "v": 1,
+            "seq": 1,
+            "id": "e1",
+            "parent": null,
+            "ts": "2026-01-01T00:00:00Z",
+            "type": "user",
+            "data": {"content": "hello"}
+        });
+        let entry: Entry = serde_json::from_value(json).unwrap();
+        assert!(entry.provenance.is_none());
+    }
+
+    #[test]
     fn custom_payload_is_flat() {
         let entry = Entry {
             v: 1,
@@ -387,6 +408,7 @@ mod tests {
             id: "e2".into(),
             parent: Some("e1".into()),
             ts: Utc::now(),
+            provenance: None,
             kind: EntryKind::Custom(CustomData::new("fs-change").with("path", "src/lib.rs")),
         };
         let json = serde_json::to_value(&entry).unwrap();
@@ -406,6 +428,7 @@ mod tests {
             id: "s1".into(),
             parent: None,
             ts: Utc::now(),
+            provenance: None,
             kind: EntryKind::Session(SessionData {
                 cwd: "/tmp".into(),
                 endpoint: "http://127.0.0.1:8080".into(),

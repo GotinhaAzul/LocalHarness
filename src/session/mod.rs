@@ -59,7 +59,7 @@ impl Session {
                 next_seq: 1,
                 redactor: Redactor::new(redact),
             };
-            let header = session.make_entry(0, "s0", None, EntryKind::Session(header));
+            let header = session.make_entry(0, "s0", None, EntryKind::Session(header), None);
             session.tree.push(header);
             return Ok(session);
         }
@@ -92,7 +92,7 @@ impl Session {
             next_seq: 1,
             redactor: Redactor::new(redact),
         };
-        let header_entry = session.make_entry(0, "s0", None, EntryKind::Session(header));
+        let header_entry = session.make_entry(0, "s0", None, EntryKind::Session(header), None);
         session.write_entry(&header_entry)?;
         session.tree.push(header_entry);
         Ok(session)
@@ -241,8 +241,17 @@ impl Session {
     }
 
     pub fn append(&mut self, kind: EntryKind) -> Result<Entry> {
+        self.append_tagged(kind, None)
+    }
+
+    /// Append an entry with an explicit provenance tag. User entries default
+    /// to `user`; tool results pass `tool:<name>` or `external`.
+    pub fn append_tagged(&mut self, kind: EntryKind, provenance: Option<String>) -> Result<Entry> {
         let seq = self.next_seq;
         self.next_seq += 1;
+        let provenance = provenance.or_else(|| {
+            matches!(kind, EntryKind::User(_)).then(|| crate::provenance::USER.to_string())
+        });
         let checkout = matches!(kind, EntryKind::Checkout(_));
         let parent = if checkout {
             None
@@ -260,16 +269,16 @@ impl Session {
         if self.store.is_some() && self.redactor.enabled() {
             let mut stored = kind.clone();
             Self::redact_entry(&self.redactor, &mut stored);
-            let stored = self.make_entry(seq, &id, parent.clone(), stored);
+            let stored = self.make_entry(seq, &id, parent.clone(), stored, provenance.clone());
             self.write_entry(&stored)?;
             let entry = Entry {
                 ts: stored.ts,
-                ..self.make_entry(seq, &id, parent, kind)
+                ..self.make_entry(seq, &id, parent, kind, provenance)
             };
             self.tree.push(entry.clone());
             return Ok(entry);
         }
-        let entry = self.make_entry(seq, &id, parent, kind);
+        let entry = self.make_entry(seq, &id, parent, kind, provenance);
         self.write_entry(&entry)?;
         self.tree.push(entry.clone());
         Ok(entry)
@@ -432,13 +441,21 @@ impl Session {
         }
     }
 
-    fn make_entry(&self, seq: u64, id: &str, parent: Option<String>, kind: EntryKind) -> Entry {
+    fn make_entry(
+        &self,
+        seq: u64,
+        id: &str,
+        parent: Option<String>,
+        kind: EntryKind,
+        provenance: Option<String>,
+    ) -> Entry {
         Entry {
             v: FORMAT_VERSION,
             seq,
             id: id.to_string(),
             parent,
             ts: Utc::now(),
+            provenance,
             kind,
         }
     }
@@ -475,6 +492,36 @@ mod tests {
         paths.data_dir = dir.join("data");
         paths.config_dir = dir.join("config");
         paths
+    }
+
+    #[test]
+    fn user_entries_are_tagged_and_tool_results_take_their_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths(dir.path());
+        let mut session = Session::create(&paths, header(), false).unwrap();
+        let user = session
+            .append(EntryKind::User(UserData {
+                attachments: Vec::new(),
+                content: "hello".into(),
+            }))
+            .unwrap();
+        assert_eq!(user.provenance.as_deref(), Some("user"));
+        let result = session
+            .append_tagged(
+                EntryKind::ToolResult(ToolResultData {
+                    call_id: "call_0001".into(),
+                    content: "[tool] read - README.md\nhello".into(),
+                    is_error: false,
+                    details: None,
+                    artifact: None,
+                }),
+                Some("tool:read".into()),
+            )
+            .unwrap();
+        assert_eq!(result.provenance.as_deref(), Some("tool:read"));
+        let raw = std::fs::read_to_string(session.path.as_ref().unwrap()).unwrap();
+        assert!(raw.contains("\"provenance\":\"tool:read\""), "{raw}");
+        assert!(raw.contains("\"provenance\":\"user\""), "{raw}");
     }
 
     #[test]

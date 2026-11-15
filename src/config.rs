@@ -32,6 +32,8 @@ pub struct Config {
     #[serde(rename = "model_profile")]
     pub model_profiles: BTreeMap<String, ModelProfile>,
     pub verify: VerifyConfig,
+    /// Lifecycle hooks, keyed by hook name (`[hooks.<name>]`).
+    pub hooks: HooksConfig,
     /// Model Context Protocol servers, keyed by server name (`[mcp.<name>]`).
     pub mcp: BTreeMap<String, McpServerConfig>,
     /// Image attachments and the optional describing model (`[vision]`).
@@ -321,6 +323,7 @@ impl Config {
                 .validate(name)
                 .with_context(|| format!("invalid [mcp.{name}]"))?;
         }
+        self.hooks.validate()?;
         if self.permissions.mode == crate::policy::PermissionMode::Yolo {
             bail!(
                 "permissions.mode = \"yolo\" is not accepted in a config file; pass --yolo explicitly for one run"
@@ -678,6 +681,143 @@ impl Default for SessionConfig {
             artifact_retention_days: 30,
             keep_artifacts: false,
             clean_artifacts: false,
+        }
+    }
+}
+
+/// Lifecycle hooks. Each `[hooks.<name>]` table names one event and one
+/// directly executed command. `timeout_secs` and `max_output_bytes` are the
+/// defaults inherited by every hook.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HooksConfig {
+    /// Per-hook deadline when the hook does not set its own.
+    pub timeout_secs: u64,
+    /// Recorded output cap. Larger output is archived and referenced.
+    pub max_output_bytes: usize,
+    #[serde(flatten)]
+    pub entries: BTreeMap<String, HookConfig>,
+}
+
+impl Default for HooksConfig {
+    fn default() -> Self {
+        Self {
+            timeout_secs: 5,
+            max_output_bytes: 16 * 1024,
+            entries: BTreeMap::new(),
+        }
+    }
+}
+
+impl HooksConfig {
+    pub fn hooks_for(&self, event: HookEvent) -> impl Iterator<Item = (&String, &HookConfig)> {
+        self.entries
+            .iter()
+            .filter(move |(_, hook)| hook.event == event)
+    }
+
+    pub fn timeout(&self, hook: &HookConfig) -> Duration {
+        Duration::from_secs(if hook.timeout_secs > 0 {
+            hook.timeout_secs
+        } else {
+            self.timeout_secs.max(1)
+        })
+    }
+
+    pub(crate) fn validate(&self) -> Result<()> {
+        if self.timeout_secs == 0 {
+            bail!("hooks.timeout_secs must be at least 1 second");
+        }
+        if self.max_output_bytes < 256 {
+            bail!("hooks.max_output_bytes must be at least 256");
+        }
+        for (name, hook) in &self.entries {
+            if name.is_empty()
+                || !name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            {
+                bail!("hook names may only use letters, digits, '-' and '_'");
+            }
+            if hook.command.is_empty() || hook.command[0].trim().is_empty() {
+                bail!("hook {name:?}: set `command` to the executable and its arguments");
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One lifecycle hook.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HookConfig {
+    pub event: HookEvent,
+    /// Program plus arguments. Spawned directly; never through a shell.
+    #[serde(default)]
+    pub command: Vec<String>,
+    /// Per-hook deadline; 0 inherits `[hooks] timeout_secs`.
+    #[serde(default)]
+    pub timeout_secs: u64,
+    /// `block` fails closed when the hook cannot run or answers badly.
+    /// `warn` makes the failure visible and continues. The default is
+    /// `block` for `pre_tool` and `warn` for every other event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_error: Option<HookOnError>,
+}
+
+impl HookConfig {
+    pub fn on_error(&self) -> HookOnError {
+        self.on_error
+            .unwrap_or_else(|| self.event.default_on_error())
+    }
+}
+
+/// Where a hook runs in the turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookEvent {
+    SessionStart,
+    UserPrompt,
+    PreTool,
+    PostTool,
+    PreCompact,
+    Stop,
+}
+
+impl HookEvent {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HookEvent::SessionStart => "session_start",
+            HookEvent::UserPrompt => "user_prompt",
+            HookEvent::PreTool => "pre_tool",
+            HookEvent::PostTool => "post_tool",
+            HookEvent::PreCompact => "pre_compact",
+            HookEvent::Stop => "stop",
+        }
+    }
+
+    pub fn default_on_error(self) -> HookOnError {
+        match self {
+            HookEvent::PreTool => HookOnError::Block,
+            _ => HookOnError::Warn,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum HookOnError {
+    /// A hook that cannot run or answers badly blocks the action.
+    #[default]
+    Block,
+    /// A hook that cannot run or answers badly is visible but does not block.
+    Warn,
+}
+
+impl HookOnError {
+    pub fn label(self) -> &'static str {
+        match self {
+            HookOnError::Block => "block",
+            HookOnError::Warn => "warn",
         }
     }
 }
@@ -1358,6 +1498,32 @@ thinking_control = { chat_template_kwargs = { enable_thinking = false } }
         config.load_profile_dirs(&profiles, None).unwrap();
         assert_eq!(config.profiles["review"].tools, ["read"]);
         assert_eq!(config.profiles["audit"].packs, ["core", "security"]);
+    }
+
+    #[test]
+    fn hooks_load_from_config_and_validate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[hooks]\ntimeout_secs = 7\n\n[hooks.guard]\nevent = \"pre_tool\"\ncommand = [\"/bin/true\"]\n",
+        )
+        .unwrap();
+        let cfg = Config::load(&path, None).unwrap();
+        assert_eq!(cfg.hooks.timeout_secs, 7);
+        assert_eq!(cfg.hooks.max_output_bytes, 16 * 1024);
+        assert_eq!(
+            cfg.hooks.entries["guard"].event,
+            crate::config::HookEvent::PreTool
+        );
+        assert_eq!(
+            cfg.hooks.entries["guard"].on_error(),
+            crate::config::HookOnError::Block
+        );
+
+        std::fs::write(&path, "[hooks.broken]\nevent = \"stop\"\ncommand = []\n").unwrap();
+        let error = Config::load(&path, None).unwrap_err().to_string();
+        assert!(error.contains("hook"), "{error}");
     }
 
     #[test]

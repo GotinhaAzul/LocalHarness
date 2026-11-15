@@ -79,10 +79,25 @@ pub fn assemble(
 
     for entry in path {
         match &entry.kind {
-            EntryKind::Session(_)
-            | EntryKind::Checkout(_)
-            | EntryKind::Custom(_)
-            | EntryKind::Error(_) => {}
+            EntryKind::Session(_) | EntryKind::Checkout(_) | EntryKind::Error(_) => {}
+            EntryKind::Custom(custom) => {
+                // Hook context is configured, local text. It joins the system
+                // turn so it is visible to the model without pretending to be
+                // a user turn.
+                if custom.kind == "hook-context"
+                    && let Some(text) = custom.payload.get("text").and_then(|value| value.as_str())
+                    && !text.trim().is_empty()
+                {
+                    let hook = custom
+                        .payload
+                        .get("hook")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("hook");
+                    messages.push(ChatMessage::System {
+                        content: format!("[hook context: {hook}]\n{text}"),
+                    });
+                }
+            }
             EntryKind::Compaction(compaction) => {
                 had_compaction = true;
                 messages.push(ChatMessage::System {
