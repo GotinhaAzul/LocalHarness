@@ -385,6 +385,25 @@ async fn native_and_standard_skills_resolve_deterministically_and_record_the_sha
 }
 
 #[tokio::test]
+async fn explicit_shadow_makes_a_bundled_override_intentional() {
+    let env = env();
+    write_raw_skill(
+        &env.config.join("skills"),
+        "test-repair",
+        "name: test-repair\ndescription: My variant\nshadow: true",
+        "Variant body",
+    );
+    let output = run(&env, &["skill", "lint", "--all", "--json"]).await;
+    assert_ok(&output);
+    let value = json(&output);
+    assert_eq!(value["errors"], 0, "{value}");
+    let duplicates = value["duplicates"].as_array().unwrap();
+    assert_eq!(duplicates.len(), 1, "{value}");
+    assert_eq!(duplicates[0]["code"], "skill_shadow_explicit");
+    assert_eq!(duplicates[0]["severity"], "warning");
+}
+
+#[tokio::test]
 async fn installing_from_a_directory_and_a_git_ref_writes_a_lockfile() {
     let env = env();
     let source = env._dir.path().join("source/deploy");
@@ -438,6 +457,34 @@ async fn installing_from_a_directory_and_a_git_ref_writes_a_lockfile() {
     assert_eq!(git_skill["source"].as_str().unwrap(), source_arg.as_str());
     assert_eq!(git_skill["digest"].as_str().unwrap().len(), 64);
     assert!(git_skill["files"]["SKILL.md"].is_string());
+
+    // A new commit on the same ref updates the installed copy and the pin.
+    std::fs::write(
+        repo.join("SKILL.md"),
+        "---\nname: git-skill\ndescription: From git\n---\n\nGit body v2\n",
+    )
+    .unwrap();
+    git(&repo, &["add", "SKILL.md"]);
+    git(&repo, &["commit", "-q", "-m", "update skill"]);
+    let second = git_output(&repo, &["rev-parse", "HEAD"]);
+    let output = run(&env, &["skill", "update", "git-skill"]).await;
+    assert_ok(&output);
+    assert!(
+        std::fs::read_to_string(env.config.join("skills/git-skill/SKILL.md"))
+            .unwrap()
+            .contains("Git body v2")
+    );
+    let list = run(&env, &["skill", "list", "--json"]).await;
+    assert_ok(&list);
+    let value = json(&list);
+    let git_skill = value["skills"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|skill| skill["name"] == "git-skill")
+        .expect("git skill");
+    assert_eq!(git_skill["pinned_ref"], second);
+    assert_ne!(git_skill["pinned_ref"], commit);
 }
 
 #[tokio::test]

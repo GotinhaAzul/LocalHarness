@@ -193,7 +193,6 @@ pub fn add(paths: &Paths, raw_source: &str, force: bool) -> Result<InstallReport
     let spec = parse_source(paths, raw_source)?;
     let resolved = resolve_source(paths, &spec)?;
     let (skill, skill_root) = inspect(&resolved.root)?;
-    print_approval(&skill, &skill_root, paths)?;
     if let Some(target) = install_target(paths, &skill.name)
         && target.exists()
         && !force
@@ -321,6 +320,7 @@ pub fn update(
             });
             continue;
         }
+        print_approval(&skill, &skill_root, paths)?;
         let mut report = materialize(
             paths,
             Materialize {
