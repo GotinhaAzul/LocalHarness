@@ -1962,6 +1962,40 @@ async fn context_error_triggers_compaction_and_one_retry() {
 }
 
 #[tokio::test]
+async fn pre_compact_context_survives_a_tail_less_compaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = base_config();
+    config.hooks.entries.insert(
+        "context".into(),
+        hook_config(HookEvent::PreCompact, "context.sh", 0),
+    );
+    let harness = harness_config(
+        dir.path(),
+        vec![
+            Script::Error(ProviderError::new(
+                ErrorClass::ContextTooSmall,
+                "the prompt is too long for context",
+            )),
+            text_script("recovered"),
+        ],
+        config,
+    );
+    let (outcome, _) = run(&harness, "do it").await;
+    assert_eq!(outcome.status, TurnStatus::Done);
+    let requests = harness.provider.requests.lock().unwrap();
+    let after = requests.last().expect("post-compaction request");
+    assert!(
+        after.messages.iter().any(|message| matches!(
+            message,
+            ChatMessage::System { content }
+                if content.contains("pre-compaction hook context survives")
+        )),
+        "hook context must reach the model after a tail-less compaction: {:?}",
+        after.messages
+    );
+}
+
+#[tokio::test]
 async fn cancellation_appends_results_for_unanswered_calls() {
     let dir = tempfile::tempdir().unwrap();
     let harness = harness(
@@ -2816,6 +2850,73 @@ async fn missing_hook_binary_is_a_visible_failure_never_an_approval() {
         "{:?}",
         invocations[0]
     );
+}
+
+#[tokio::test]
+async fn session_start_retries_a_blocked_hook_and_stop_runs_for_the_blocked_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let stop_marker = dir.path().join("stop.log");
+    let mut config = base_config();
+    config.hooks.entries.insert(
+        "a-ok".into(),
+        hook_config(HookEvent::SessionStart, "allow_escalate.sh", 0),
+    );
+    config.hooks.entries.insert(
+        "z-block".into(),
+        hook_config(HookEvent::SessionStart, "block_exit2.sh", 0),
+    );
+    config.hooks.entries.insert(
+        "stop".into(),
+        HookConfig {
+            event: HookEvent::Stop,
+            command: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                format!(
+                    "tee -a '{}' >/dev/null; echo >> '{}'",
+                    stop_marker.display(),
+                    stop_marker.display()
+                ),
+            ],
+            timeout_secs: 0,
+            on_error: None,
+        },
+    );
+    let harness = harness_config(dir.path(), vec![text_script("model ran")], config);
+
+    for turn in 1..=2 {
+        let (outcome, events) = run(&harness, "hi").await;
+        assert_eq!(outcome.status, TurnStatus::Blocked, "turn {turn}");
+        assert_eq!(
+            harness.provider.requests.lock().unwrap().len(),
+            0,
+            "the blocked startup must never call the model"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::TurnDone(_))),
+            "turn {turn} still ends with a done event"
+        );
+    }
+
+    let starts = hook_invocations(&harness.session, "session_start");
+    let blocks = starts
+        .iter()
+        .filter(|entry| entry.payload["hook"] == "z-block")
+        .count();
+    assert_eq!(blocks, 2, "the blocked hook is retried, not skipped");
+    let stops = hook_invocations(&harness.session, "stop");
+    assert_eq!(stops.len(), 2, "stop runs for each blocked startup");
+    let marker = std::fs::read_to_string(&stop_marker).unwrap();
+    let payloads: Vec<&str> = marker
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    assert_eq!(payloads.len(), 2, "{marker}");
+    for line in payloads {
+        assert!(line.contains("\"status\":\"blocked\""), "{line}");
+    }
 }
 
 #[tokio::test]

@@ -22,7 +22,7 @@ use anyhow::{Result, bail};
 use serde_json::{Map, Value};
 
 use crate::tools::undo::content_hash;
-use crate::tools::write::{atomic_write, file_mode};
+use crate::tools::write::{atomic_restore, atomic_write, file_mode};
 
 use super::{CustomData, Entry, EntryKind, Session};
 
@@ -324,8 +324,18 @@ pub fn apply(session: &mut Session, plan: &RewindPlan, force: bool) -> Result<Re
         forced_overwrites,
         ..RewindReport::default()
     };
-    for file in &plan.files {
-        match &file.content {
+    let originals: Vec<Option<(Vec<u8>, u32)>> = plan
+        .files
+        .iter()
+        .zip(&current)
+        .map(|(file, bytes)| {
+            bytes
+                .as_ref()
+                .map(|bytes| (bytes.clone(), file_mode(&file.path)))
+        })
+        .collect();
+    for (index, file) in plan.files.iter().enumerate() {
+        let result = match &file.content {
             Some(content) => {
                 if let Some(parent) = file.path.parent()
                     && !parent.as_os_str().is_empty()
@@ -339,21 +349,49 @@ pub fn apply(session: &mut Session, plan: &RewindPlan, force: bool) -> Result<Re
                     })?;
                 }
                 atomic_write(&file.path, content.as_bytes(), file_mode(&file.path))
-                    .map_err(|err| anyhow::anyhow!("cannot restore {}: {err}", file.display))?;
-                report.restored.push(file.display.clone());
+                    .map_err(|err| anyhow::anyhow!("cannot restore {}: {err}", file.display))
             }
             None => match std::fs::remove_file(&file.path) {
-                Ok(()) => report.deleted.push(file.display.clone()),
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                    report.deleted.push(file.display.clone());
-                }
-                Err(err) => {
-                    bail!(
-                        "cannot delete {} (it was created after the target): {err}",
-                        file.display
-                    )
-                }
+                Ok(()) => Ok(()),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(err) => Err(anyhow::anyhow!(
+                    "cannot delete {} (it was created after the target): {err}",
+                    file.display
+                )),
             },
+        };
+        if let Err(error) = result {
+            // Earlier files were already changed. Put their original bytes
+            // back so a retry is not refused by the plan's expected hashes.
+            let mut rollback_errors = Vec::new();
+            for (done, original) in originals[..index].iter().enumerate().rev() {
+                let path = &plan.files[done].path;
+                let outcome = match original {
+                    Some((bytes, mode)) => atomic_restore(path, bytes, *mode),
+                    None => match std::fs::remove_file(path) {
+                        Ok(()) => Ok(()),
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                        Err(err) => Err(err),
+                    },
+                };
+                if let Err(err) = outcome {
+                    rollback_errors.push(format!("{}: {err}", path.display()));
+                }
+            }
+            if rollback_errors.is_empty() {
+                bail!(
+                    "{error}; rolled back {} earlier file(s), so the conversation did not move",
+                    index
+                );
+            }
+            bail!(
+                "{error}; rollback also failed for {}; inspect the working tree before retrying",
+                rollback_errors.join(", ")
+            );
+        }
+        match &file.content {
+            Some(_) => report.restored.push(file.display.clone()),
+            None => report.deleted.push(file.display.clone()),
         }
         report.reverted.extend(file.changes.iter().copied());
     }
@@ -385,7 +423,11 @@ pub fn target_before_turn(session: &Session, turns: usize) -> Result<String, Str
     let users: Vec<&Entry> = session
         .branch_entries()
         .into_iter()
-        .filter(|entry| !entry.is_checkout() && matches!(entry.kind, EntryKind::User(_)))
+        .filter(|entry| {
+            !entry.is_checkout()
+                && matches!(entry.kind, EntryKind::User(_))
+                && entry.provenance.as_deref() != Some(crate::provenance::CONTINUATION)
+        })
         .collect();
     if turns > users.len() {
         return Err(format!(

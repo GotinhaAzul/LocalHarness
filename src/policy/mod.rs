@@ -288,10 +288,14 @@ impl Rule {
         {
             return false;
         }
-        if let Some(path) = &self.path
-            && !call.paths.iter().any(|candidate| path.is_match(candidate))
-        {
-            return false;
+        if let Some(path) = &self.path {
+            // Every path the call touches must match. A `git stage` of one
+            // allowed and one unrelated file must not sneak the second past a
+            // path-scoped allow rule.
+            if call.paths.is_empty() || !call.paths.iter().all(|candidate| path.is_match(candidate))
+            {
+                return false;
+            }
         }
         if let Some(command) = &self.command
             && !call
@@ -709,6 +713,35 @@ mod tests {
         );
         assert!(matches!(
             policy.decide(PermissionMode::Ask, &bash("cargo build")),
+            Decision::Ask(_)
+        ));
+    }
+
+    #[test]
+    fn a_path_scoped_allow_requires_every_path_to_match() {
+        let policy = Policy::compile(&[RuleConfig {
+            id: Some("allow-src".into()),
+            path: Some("src/**".into()),
+            ..rule(Some("git"), None, RuleAction::Allow)
+        }])
+        .unwrap();
+        let call = |paths: Value| {
+            CallFacts::new(
+                "git",
+                false,
+                &json!({"action": "stage", "paths": paths}),
+                Path::new("/w"),
+            )
+        };
+        assert_eq!(
+            policy.decide(PermissionMode::Ask, &call(json!(["src/a.rs"]))),
+            Decision::Allow
+        );
+        assert!(matches!(
+            policy.decide(
+                PermissionMode::Ask,
+                &call(json!(["src/a.rs", "secret.env"]))
+            ),
             Decision::Ask(_)
         ));
     }

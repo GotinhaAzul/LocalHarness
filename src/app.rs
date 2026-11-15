@@ -540,7 +540,9 @@ pub async fn create_runtime(
     let artifacts = session.artifacts.clone();
     let reads = Arc::new(Mutex::new(ReadTracker::default()));
     let bg = Arc::new(Mutex::new(BgRegistry::new()));
-    let provenance = Arc::new(Mutex::new(crate::provenance::ProvenanceState::default()));
+    let provenance = Arc::new(Mutex::new(crate::provenance::ProvenanceState::restore(
+        &session,
+    )));
     let session_handle: Handle = Arc::new(Mutex::new(session));
 
     // The gateway may be down. Start it in the background so the TUI does not

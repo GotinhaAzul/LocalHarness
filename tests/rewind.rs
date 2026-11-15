@@ -98,6 +98,19 @@ impl Fixture {
             .id
     }
 
+    fn continuation(&self, text: &str) -> String {
+        self.lock()
+            .append_tagged(
+                EntryKind::User(UserData {
+                    attachments: Vec::new(),
+                    content: text.into(),
+                }),
+                Some(localharness::provenance::CONTINUATION.to_string()),
+            )
+            .unwrap()
+            .id
+    }
+
     /// Run a mutating tool and record its `fs-change` entry the way the agent
     /// loop does, so undo and rewind see the same session shape.
     async fn mutate(&self, tool: &dyn Tool, args: serde_json::Value) {
@@ -305,5 +318,78 @@ async fn rewind_of_a_session_without_file_changes_is_a_pure_checkout() {
     assert!(
         !ids.iter().any(|id| id == "e3"),
         "the abandoned user message is gone: {ids:?}"
+    );
+}
+
+#[test]
+fn synthetic_continuation_prompts_are_not_rewind_turns() {
+    let fixture = Fixture::new();
+    let real = fixture.user("real request");
+    fixture.assistant();
+    fixture.continuation("[localharness] review nudge: call the review tool");
+    fixture.assistant();
+
+    let session = fixture.lock();
+    assert_eq!(
+        rewind::target_before_turn(&session, 1).unwrap(),
+        "s0",
+        "the injected continuation is not the last user turn"
+    );
+    let error = rewind::target_before_turn(&session, 2).unwrap_err();
+    assert!(error.contains("1 user message"), "{error}");
+    assert_eq!(session.tree.get(&real).unwrap().id, real);
+}
+
+#[tokio::test]
+async fn a_failed_multi_file_rewind_rolls_back_earlier_files() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = Fixture::new();
+    fixture.write("a.rs", "let a = 1;\n");
+    std::fs::create_dir_all(fixture.dir.join("sub")).unwrap();
+    fixture.write("sub/b.rs", "let b = 1;\n");
+    ReadTool.call(&fixture.ctx, json!({"path": "a.rs"})).await;
+    ReadTool
+        .call(&fixture.ctx, json!({"path": "sub/b.rs"}))
+        .await;
+
+    fixture.user("edit both");
+    fixture.assistant();
+    fixture
+        .mutate(&EditTool, json!({"path": "a.rs", "old": "1", "new": "2"}))
+        .await;
+    fixture
+        .mutate(
+            &EditTool,
+            json!({"path": "sub/b.rs", "old": "1", "new": "2"}),
+        )
+        .await;
+    let leaf = fixture.lock().active_leaf_id().unwrap();
+
+    let plan = {
+        let session = fixture.lock();
+        let target = rewind::target_before_turn(&session, 1).unwrap();
+        rewind::plan(&session, &target).unwrap()
+    };
+    assert_eq!(plan.files[0].display, "a.rs", "first file is the restore");
+    assert_eq!(plan.files.len(), 2);
+
+    // The second restore cannot create its temporary file.
+    let sub = fixture.dir.join("sub");
+    std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let error = {
+        let mut session = fixture.lock();
+        rewind::apply(&mut session, &plan, false).unwrap_err()
+    };
+    std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let message = format!("{error:#}");
+    assert!(message.contains("rolled back 1 earlier file"), "{message}");
+    assert_eq!(fixture.read("a.rs").as_deref(), Some("let a = 2;\n"));
+    assert_eq!(fixture.read("sub/b.rs").as_deref(), Some("let b = 2;\n"));
+    assert_eq!(
+        fixture.lock().active_leaf_id().unwrap(),
+        leaf,
+        "the conversation did not move"
     );
 }

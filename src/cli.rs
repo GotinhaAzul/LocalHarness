@@ -1224,7 +1224,8 @@ async fn run_hooks(config: &Config, paths: &Paths, action: &HooksCommand) -> Res
                     println!("output artifact: {artifact}");
                 }
             }
-            Ok(if outcome.is_blocked() { 1 } else { 0 })
+            let failed = !matches!(invocation.outcome, crate::hooks::InvocationOutcome::Ok);
+            Ok(if failed || outcome.is_blocked() { 1 } else { 0 })
         }
     }
 }

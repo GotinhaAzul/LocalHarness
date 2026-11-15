@@ -15,7 +15,7 @@ use std::time::Instant;
 use serde_json::Value;
 
 use crate::agent::Core;
-use crate::session::{CustomData, EntryKind, ToolCall};
+use crate::session::{CustomData, EntryKind, Session, ToolCall};
 use crate::tools::ToolApproval;
 
 /// Stable provenance tags written into session entries.
@@ -24,6 +24,9 @@ pub const REPO: &str = "repo";
 pub const SKILL: &str = "skill";
 pub const AGENTS_MD: &str = "agents_md";
 pub const EXTERNAL: &str = "external";
+/// An internal continuation prompt (a gate or recovery nudge), not a message
+/// the person typed. Rewind skips these when counting turns.
+pub const CONTINUATION: &str = "continuation";
 
 /// Where a message or result came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -303,18 +306,74 @@ pub struct ProvenanceState {
 }
 
 impl ProvenanceState {
+    /// Rebuild the pending gate from the session branch. A warning recorded
+    /// before a grant or denial must survive a resume, or the next sensitive
+    /// call would run without approval.
+    pub fn restore(session: &Session) -> Self {
+        let mut state = Self::default();
+        for entry in session.branch_entries() {
+            let EntryKind::Custom(custom) = &entry.kind else {
+                continue;
+            };
+            match custom.kind.as_str() {
+                "provenance-warning" => {
+                    let origin = custom
+                        .payload
+                        .get("origin")
+                        .and_then(Value::as_str)
+                        .unwrap_or("tool");
+                    let patterns = custom
+                        .payload
+                        .get("patterns")
+                        .and_then(Value::as_array)
+                        .map(|patterns| {
+                            patterns
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .map(str::to_string)
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let excerpt = custom
+                        .payload
+                        .get("excerpt")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    state.note_raw(origin, patterns, excerpt);
+                }
+                "provenance-approval"
+                    if custom.payload.get("decision").and_then(Value::as_str)
+                        == Some("granted") =>
+                {
+                    state.clear();
+                }
+                _ => {}
+            }
+        }
+        state
+    }
+
     /// Record a warning. The first unapproved warning owns the gate; later
     /// hits are still visible but do not extend it.
     pub fn note(&mut self, origin: &str, detection: &Detection) {
+        self.note_raw(
+            origin,
+            detection
+                .patterns
+                .iter()
+                .map(|p| (*p).to_string())
+                .collect(),
+            detection.excerpt.clone(),
+        );
+    }
+
+    fn note_raw(&mut self, origin: &str, patterns: Vec<String>, excerpt: String) {
         if self.pending.is_none() {
             self.pending = Some(PendingWarning {
                 origin: origin.to_string(),
-                patterns: detection
-                    .patterns
-                    .iter()
-                    .map(|pattern| (*pattern).to_string())
-                    .collect(),
-                excerpt: detection.excerpt.clone(),
+                patterns,
+                excerpt,
             });
         }
     }
@@ -734,5 +793,38 @@ mod tests {
         assert!(state.take_approved().is_some());
         assert!(state.pending().is_none());
         assert!(state.take_approved().is_none());
+    }
+
+    #[test]
+    fn a_resumed_session_restores_a_pending_warning() {
+        use crate::session::{Session, SessionData};
+        let dir = tempfile::tempdir().unwrap();
+        let mut paths = crate::paths::Paths::discover(dir.path()).unwrap();
+        paths.config_dir = dir.path().join("config");
+        paths.data_dir = dir.path().join("data");
+        let mut session = Session::create(&paths, SessionData::default(), true).unwrap();
+        session
+            .append(EntryKind::Custom(
+                CustomData::new("provenance-warning")
+                    .with("origin", "tool:read")
+                    .with("patterns", serde_json::json!(["run-command"]))
+                    .with("excerpt", "run this command")
+                    .with("approval", "required"),
+            ))
+            .unwrap();
+        let restored = ProvenanceState::restore(&session);
+        assert_eq!(
+            restored.pending().map(|pending| pending.origin.as_str()),
+            Some("tool:read")
+        );
+
+        session
+            .append(EntryKind::Custom(
+                CustomData::new("provenance-approval")
+                    .with("tool", "bash")
+                    .with("decision", "granted"),
+            ))
+            .unwrap();
+        assert!(ProvenanceState::restore(&session).pending().is_none());
     }
 }

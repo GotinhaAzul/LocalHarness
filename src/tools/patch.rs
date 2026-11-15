@@ -312,13 +312,15 @@ fn parse_hash_ops(args: &Value) -> Result<Vec<HashOp>, ToolResult> {
                 "`hash` must be the 8-hex content hash printed before that line by read",
             ));
         }
-        let count = object.get("count").and_then(Value::as_u64).unwrap_or(1);
-        if count == 0 {
-            return Err(invalid_op(
-                index,
-                "`count` must be at least 1; omit it for a single line",
-            ));
-        }
+        let count = match object.get("count") {
+            None => 1,
+            Some(value) => value.as_u64().filter(|count| *count > 0).ok_or_else(|| {
+                invalid_op(
+                    index,
+                    "`count` must be a positive integer; omit it for a single line",
+                )
+            })?,
+        };
         let text = object
             .get("text")
             .and_then(Value::as_str)
@@ -1106,6 +1108,32 @@ mod tests {
         .await;
         assert!(!result.is_error, "{}", result.content);
         assert_eq!(on_disk(&dir), "alpha\nblank\nomega\n");
+    }
+
+    #[tokio::test]
+    async fn an_invalid_count_is_rejected_instead_of_defaulting_to_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, read) = hash_ready(&dir, "one\ntwo\nthree\n").await;
+        let (snapshot, hashes) = annotations(&read);
+        for bad in [json!("2"), json!(0), json!(-1), json!(2.5)] {
+            let result = hash_patch(
+                &ctx,
+                &snapshot,
+                json!([{"op": "CUT", "line": 1, "hash": hashes[&1], "count": bad}]),
+            )
+            .await;
+            assert!(
+                result.content.starts_with("[invalid_args]"),
+                "{bad}: {}",
+                result.content
+            );
+            assert!(
+                result.content.contains("positive integer"),
+                "{}",
+                result.content
+            );
+            assert_eq!(on_disk(&dir), "one\ntwo\nthree\n");
+        }
     }
 
     #[tokio::test]
