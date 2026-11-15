@@ -139,7 +139,7 @@ workflow renders it with real checksums and attaches `localharness.rb`; a tap
 maintainer can also do it by hand:
 
 ```sh
-sh packaging/homebrew/render.sh 0.1.0 SHA256SUMS <source-sha256> > localharness.rb
+sh packaging/homebrew/render.sh 0.2.0 SHA256SUMS <source-sha256> > localharness.rb
 ```
 
 Linux installs the prebuilt static binary. macOS is best-effort and builds from

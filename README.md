@@ -61,7 +61,7 @@ lh --version
 Download and read `install.sh` instead of piping it into a shell. It detects the
 architecture, downloads the matching static binary, verifies it against the
 release `SHA256SUMS`, and refuses to install anything on a checksum mismatch.
-Set `LH_VERSION=0.1.0` to pin a release and `LH_INSTALL_DIR` to change the
+Set `LH_VERSION=0.2.0` to pin a release and `LH_INSTALL_DIR` to change the
 prefix. Bash, zsh, and fish completions and the `lh.1` man page are installed
 under `$XDG_DATA_HOME` (default `~/.local/share`).
 

@@ -27,7 +27,7 @@ body:
     attributes:
       label: Version
       description: Output of `lh --version`. Add the commit if you built from source.
-      placeholder: "lh 0.1.0 (339650a)"
+      placeholder: "lh 0.2.0 (339650a)"
     validations:
       required: true
 
