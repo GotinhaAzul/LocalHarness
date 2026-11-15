@@ -556,15 +556,10 @@ fn validate_at(schema: &Value, value: &Value, path: &str) -> Result<(), String> 
                         }
                     }
                     if let Some(Value::Bool(false)) = object.get("additionalProperties") {
-                        if let Some(properties) =
-                            object.get("properties").and_then(Value::as_object)
-                        {
-                            for key in map.keys() {
-                                if !properties.contains_key(key) {
-                                    return Err(format!(
-                                        "{path}: property {key:?} is not declared"
-                                    ));
-                                }
+                        let properties = object.get("properties").and_then(Value::as_object);
+                        for key in map.keys() {
+                            if !properties.is_some_and(|properties| properties.contains_key(key)) {
+                                return Err(format!("{path}: property {key:?} is not declared"));
                             }
                         }
                     } else if let Some(additional) = object.get("additionalProperties")
@@ -610,21 +605,39 @@ fn validate_at(schema: &Value, value: &Value, path: &str) -> Result<(), String> 
                 }
                 Value::Number(number) => {
                     let number = number.as_f64().unwrap_or(0.0);
-                    if let Some(minimum) = object
-                        .get("minimum")
-                        .and_then(Value::as_f64)
-                        .or_else(|| object.get("exclusiveMinimum").and_then(Value::as_f64))
+                    if let Some(minimum) = object.get("minimum").and_then(Value::as_f64)
                         && number < minimum
                     {
                         return Err(format!("{path}: {number} is below the minimum {minimum}"));
                     }
-                    if let Some(maximum) = object
-                        .get("maximum")
-                        .and_then(Value::as_f64)
-                        .or_else(|| object.get("exclusiveMaximum").and_then(Value::as_f64))
+                    if let Some(minimum) = object.get("exclusiveMinimum").and_then(Value::as_f64)
+                        && number <= minimum
+                    {
+                        return Err(format!(
+                            "{path}: {number} must be greater than the exclusive minimum {minimum}"
+                        ));
+                    }
+                    if let Some(maximum) = object.get("maximum").and_then(Value::as_f64)
                         && number > maximum
                     {
                         return Err(format!("{path}: {number} is above the maximum {maximum}"));
+                    }
+                    if let Some(maximum) = object.get("exclusiveMaximum").and_then(Value::as_f64)
+                        && number >= maximum
+                    {
+                        return Err(format!(
+                            "{path}: {number} must be less than the exclusive maximum {maximum}"
+                        ));
+                    }
+                    if let Some(multiple) = object.get("multipleOf").and_then(Value::as_f64)
+                        && multiple > 0.0
+                    {
+                        let remainder = (number / multiple).fract().abs();
+                        if remainder > 1e-9 && (1.0 - remainder) > 1e-9 {
+                            return Err(format!(
+                                "{path}: {number} is not a multiple of {multiple}"
+                            ));
+                        }
                     }
                 }
                 _ => {}
@@ -948,5 +961,43 @@ mod tests {
             .validate_response(r#"{"name":"a","count":2.5}"#)
             .unwrap_err();
         assert!(err.contains("expected integer"), "{err}");
+    }
+
+    #[test]
+    fn empty_objects_and_exclusive_numeric_bounds_are_enforced() {
+        let closed = plan(
+            Engine::Vllm,
+            "reply",
+            &json!({"type": "object", "additionalProperties": false}),
+        )
+        .unwrap();
+        assert!(closed.validate_response("{}").is_ok());
+        let err = closed.validate_response(r#"{"extra":1}"#).unwrap_err();
+        assert!(err.contains("not declared"), "{err}");
+
+        let numeric = plan(
+            Engine::Vllm,
+            "reply",
+            &json!({
+                "type": "object",
+                "properties": {
+                    "n": {
+                        "type": "number",
+                        "exclusiveMinimum": 0,
+                        "exclusiveMaximum": 10,
+                        "multipleOf": 2
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        assert!(numeric.validate_response(r#"{"n":2}"#).is_ok());
+        assert!(numeric.validate_response(r#"{"n":8}"#).is_ok());
+        let err = numeric.validate_response(r#"{"n":0}"#).unwrap_err();
+        assert!(err.contains("greater than the exclusive minimum"), "{err}");
+        let err = numeric.validate_response(r#"{"n":10}"#).unwrap_err();
+        assert!(err.contains("less than the exclusive maximum"), "{err}");
+        let err = numeric.validate_response(r#"{"n":3}"#).unwrap_err();
+        assert!(err.contains("not a multiple of"), "{err}");
     }
 }

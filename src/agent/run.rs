@@ -1394,23 +1394,6 @@ fn recover_output(
         .tool_calls
         .as_ref()
         .is_some_and(|calls| !calls.is_empty());
-    if let Some(schema) = &core.structured
-        && !has_native
-    {
-        let content = assistant.content.as_deref().unwrap_or("");
-        if let Err(error) = schema.validate_response(content) {
-            out.structured_invalid = true;
-            out.notice = Some(format!(
-                "structured output did not match {:?}: {error}; asking the model to repair it",
-                schema.name
-            ));
-            out.nudge = Some(format!(
-                "[localharness] structured output rejected: {error}. Reply with exactly one JSON document that matches the schema {}. No prose and no Markdown fence.",
-                serde_json::to_string(&schema.schema).unwrap_or_default()
-            ));
-            return out;
-        }
-    }
     if !has_native
         && core.model_profile.tool_mode != crate::config::ToolMode::Native
         && let Some(content) = assistant.content.as_deref()
@@ -1436,6 +1419,30 @@ fn recover_output(
             }
             assistant.content = (!found.prose.is_empty()).then_some(found.prose);
             assistant.tool_calls = Some(calls);
+        }
+    }
+
+    // Schema validation applies to final answers only. A tool call recovered
+    // from assistant text above is an intermediate step, not a finished reply.
+    let has_native = assistant
+        .tool_calls
+        .as_ref()
+        .is_some_and(|calls| !calls.is_empty());
+    if let Some(schema) = &core.structured
+        && !has_native
+    {
+        let content = assistant.content.as_deref().unwrap_or("");
+        if let Err(error) = schema.validate_response(content) {
+            out.structured_invalid = true;
+            out.notice = Some(format!(
+                "structured output did not match {:?}: {error}; asking the model to repair it",
+                schema.name
+            ));
+            out.nudge = Some(format!(
+                "[localharness] structured output rejected: {error}. Reply with exactly one JSON document that matches the schema {}. No prose and no Markdown fence.",
+                serde_json::to_string(&schema.schema).unwrap_or_default()
+            ));
+            return out;
         }
     }
 

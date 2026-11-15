@@ -1014,6 +1014,51 @@ async fn structured_output_repairs_invalid_json_or_blocks_the_turn() {
 }
 
 #[tokio::test]
+async fn structured_output_lets_recovered_text_calls_execute() {
+    let schema = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["answer"],
+        "properties": {"answer": {"type": "string"}}
+    });
+    let plan = localharness::provider::structured::plan(
+        localharness::provider::Engine::Vllm,
+        "reply",
+        &schema,
+    )
+    .expect("plan");
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.rs"), "fn main() {}\n").unwrap();
+    let mut harness = harness(
+        dir.path(),
+        vec![
+            text_script(
+                "Reading it.\n<tool_call>{\"name\":\"read\",\"arguments\":{\"path\":\"a.rs\"}}</tool_call>",
+            ),
+            text_script("{\"answer\":\"ok\"}"),
+        ],
+        &["read"],
+    );
+    Arc::get_mut(&mut harness.core)
+        .expect("unique core")
+        .structured = Some(plan);
+    let (outcome, events) = run(&harness, "answer").await;
+    assert_eq!(outcome.status, TurnStatus::Done, "{:?}", outcome.error);
+    let results = tool_results(&harness.session);
+    assert_eq!(results.len(), 1, "the text call must run");
+    assert!(results[0].contains("fn main() {}"), "{}", results[0]);
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Notice(notice) if notice.contains("structured output did not match")
+        )),
+        "an intermediate tool call is not final output to validate"
+    );
+    assert_eq!(last_assistant(&harness.session), "{\"answer\":\"ok\"}");
+}
+
+#[tokio::test]
 async fn a_sampler_preset_prevents_the_loop_the_global_sampling_reproduces() {
     // Deterministic fixture: with a hot request the scripted endpoint emits
     // the same 16-byte phrase 80 times (1,280 bytes, above the repetition
