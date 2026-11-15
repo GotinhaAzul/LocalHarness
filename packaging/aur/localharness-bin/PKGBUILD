@@ -4,7 +4,7 @@
 # renders this file with real sha256sums and attaches it to the release; update
 # the SKIP placeholders before pushing to the AUR.
 pkgname=localharness-bin
-pkgver=0.1.0
+pkgver=0.2.0
 pkgrel=1
 pkgdesc='Local-first agent harness for coding and security work'
 arch=('x86_64' 'aarch64')
