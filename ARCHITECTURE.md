@@ -116,7 +116,13 @@ Streaming:
   into one normalized `Completion` (`fold_stream`).
 - Parse `usage` and llama.cpp `timings` from any chunk; reports are merged and
   surfaced once per completion.
-- Parse `reasoning_content` and `reasoning` fields. A model profile decides
+- Parse reasoning from the configured `reasoning_field`, then
+  `reasoning_content`, `reasoning`, and `thinking`. Inline `<think>` blocks and gpt-oss
+  `<|channel|>analysis` messages join the same stream, and reasoning markup is
+  stripped from assistant content at context assembly. `usage` may carry
+  `reasoning_tokens` (reported, else estimated). A per-profile
+  `thinking = auto|on|off` policy merges `thinking_control` into `extra_body`
+  when thinking is off. A model profile decides
   whether reasoning is shown, kept in context, or stripped after the turn.
 - `finish_reason`: `stop`, `length`, `tool_calls`, `content_filter`.
 
@@ -643,7 +649,7 @@ deletes entries.
 - `session-id` is `YYYYMMDD-HHMMSS-<pid>` or a short random suffix.
 - One advisory lock per session file. A second process refuses to write and
   names the lock holder.
-- Flush each entry to the file. `fsync` at turn end and after compaction.
+- Flush each entry to the file. `fsync` once at turn end; compactions inside a turn are covered by that fsync.
 - On load, ignore a malformed final line, drop orphan entries with a warning,
   and validate that every `parent` exists.
 - Export: `/export [path]` writes Markdown for the active branch. Findings have

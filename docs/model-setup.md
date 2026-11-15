@@ -126,19 +126,58 @@ tool_mode = "repair"        # native | repair | auto
   prints a notice; if it keeps appearing, enable native tool calling on the
   server.
 - `context_window` sets the prompt budget when probes are unavailable.
-- `strip_reasoning` controls reasoning display/retention; reasoning is never
-  sent back to the provider. `<think>`/`<thinking>` blocks that arrive in
+- `strip_reasoning` (default `true`) controls retention. Reasoning always
+  streams live to the reasoning pane (Ctrl+R); with `true` it is dropped before
+  the assistant entry is written, so session files stay small and a resumed
+  session has no reasoning to replay. Set `false` to persist it and see it
+  again in Ctrl+R after `--continue`. Reasoning is never sent back to the
+  provider. `<think>`/`<thinking>` blocks that arrive in
   content (a server without a reasoning parser) are moved to reasoning, as is
   text before a lone `</think>` from templates that open the block in the
   prompt.
-- `reasoning_field` names the streaming field (`reasoning_content` by default,
-  falling back to `reasoning`).
+- `reasoning_field` names the streaming field to prefer. The decoder then
+  falls back in this order: `reasoning_content`, `reasoning`, `thinking`
+  (Ollama). Any other value prints a startup warning naming the accepted
+  fields and the default order is used.
+- Inline reasoning is normalized into the same stream as the reasoning
+  fields: `<think>`/`<thinking>` blocks, text before a lone `</think>`, and
+  gpt-oss harmony `<|channel|>analysis<|message|>…<|end|>` messages (the
+  `<|channel|>final<|message|>` text becomes the answer). Assistant content is
+  stripped of these blocks again when the context is assembled, so a session
+  written by an older build cannot replay chain-of-thought into the prompt.
+- `thinking = "auto" | "on" | "off"` (default `auto`) decides whether the model
+  thinks. When the resolved policy is off, the table in `thinking_control` is
+  deep-merged into `extra_body`; the engine's own switch goes there:
+
+  ```toml
+  [model_profile.qwen3]
+  thinking = "auto"
+  thinking_breaks_tools = true
+  thinking_control = { chat_template_kwargs = { enable_thinking = false } }  # vLLM, SGLang, llama.cpp --jinja
+  # thinking_control = { think = false }                                     # Ollama
+  ```
+
+  `auto` turns thinking off only when tools are active and
+  `thinking_breaks_tools = true` (models documented to call tools only in
+  non-thinking mode). `thinking = "off"` with no `thinking_control` refuses
+  the turn with a `thinking_policy` error naming the key, instead of sending a
+  request that silently keeps thinking.
+- A reply with reasoning but no text and no tool call is not treated as an
+  answer: the TUI shows a `reasoning_only` warning and the loop retries once
+  with an empty-response nudge. Repeats usually mean the server's reasoning
+  parser swallowed the answer or the tool call.
 - `stop` adds stop sequences.
 - `extra_body` merges server-specific fields into every request, for example
   `chat_template_kwargs`.
 - `parallel_tool_calls` is recorded for compatibility; tools run sequentially.
 
 ## Context and token accounting
+
+Reasoning tokens are reported separately in the header meter (`think N`):
+the server's `usage.completion_tokens_details.reasoning_tokens` when present,
+otherwise an estimate from the reasoning text with the calibrated
+characters-per-token ratio. The headless `--json` `usage` event carries the
+same `reasoning_tokens` field.
 
 An engine can report three different context sizes, and they are not
 interchangeable:

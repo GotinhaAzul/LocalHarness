@@ -104,6 +104,12 @@ impl CallAccumulator {
         self.slots.is_empty()
     }
 
+    /// Whether any slot has received a function name, i.e. the reply holds at
+    /// least one tool call that `into_calls` would return.
+    pub fn has_named_call(&self) -> bool {
+        self.slots.iter().any(|slot| !slot.name.trim().is_empty())
+    }
+
     /// Buffer one fragment for stream index `index`.
     pub fn push(
         &mut self,

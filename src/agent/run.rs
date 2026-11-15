@@ -507,6 +507,21 @@ async fn run_loop(
         } else if let Some(reason) = &core.vision.blocked {
             ChatMessage::strip_images(&mut messages, reason);
         }
+        let extra_body = match core
+            .model_profile
+            .request_extra_body(!core.tool_specs.is_empty())
+        {
+            Ok(body) => body,
+            Err(message) => {
+                append_error(&core.session, "thinking_policy", &message, false);
+                let _ = tx.send(AgentEvent::Error {
+                    code: "thinking_policy".into(),
+                    message: message.clone(),
+                    recoverable: false,
+                });
+                return TurnOutcome::error("thinking_policy", message);
+            }
+        };
         let request = ChatRequest {
             model: core.provider.model().to_string(),
             messages,
@@ -523,11 +538,7 @@ async fn run_loop(
             // than the window holds makes some servers reject the request.
             max_tokens: budget.max_output_tokens,
             stop: core.model_profile.stop.clone(),
-            extra_body: core
-                .model_profile
-                .extra_body
-                .as_ref()
-                .and_then(|value| serde_json::to_value(value).ok()),
+            extra_body,
             include_usage: true,
             reasoning_field: core.model_profile.reasoning_field.clone(),
         };
@@ -1204,7 +1215,7 @@ fn recover_output(
             ));
         }
     } else if calls.is_empty() && content_empty {
-        out.nudge = Some("[localharness] empty response: you returned no text and no tool call. Make the next tool call, or give your final answer.".into());
+        out.nudge = Some("[localharness] empty response: you returned no text and no tool call (reasoning alone is not an answer). Make the next tool call, or give your final answer outside the reasoning block.".into());
     }
     out
 }
@@ -1220,6 +1231,9 @@ struct StreamAccum {
     reasoning_loop: super::output::RepetitionGuard,
     /// Set when the repetition guard stopped the stream.
     degenerate: bool,
+    /// The model profile's `strip_reasoning`: reasoning is shown live but
+    /// never persisted in the session entry.
+    strip_reasoning: bool,
     /// When the request was sent, and when tokens first and last arrived.
     sent: Instant,
     first_token: Option<Instant>,
@@ -1230,7 +1244,8 @@ impl StreamAccum {
     /// Content streamed so far, without tool calls, for a cancelled or failed
     /// generation. Keeps the branch useful after an interruption.
     fn partial(&self) -> Option<AssistantData> {
-        if self.content.trim().is_empty() && self.reasoning.trim().is_empty() {
+        let keep_reasoning = !self.strip_reasoning && !self.reasoning.is_empty();
+        if self.content.trim().is_empty() && !keep_reasoning {
             return None;
         }
         Some(AssistantData {
@@ -1239,11 +1254,7 @@ impl StreamAccum {
             } else {
                 Some(self.content.clone())
             },
-            reasoning: if self.reasoning.is_empty() {
-                None
-            } else {
-                Some(self.reasoning.clone())
-            },
+            reasoning: keep_reasoning.then(|| self.reasoning.clone()),
             tool_calls: None,
             usage: self.usage.clone(),
             stop_reason: Some("cancelled".into()),
@@ -1261,6 +1272,7 @@ impl StreamAccum {
             content_loop: super::output::RepetitionGuard::default(),
             reasoning_loop: super::output::RepetitionGuard::default(),
             degenerate: false,
+            strip_reasoning: false,
             sent: Instant::now(),
             first_token: None,
             last_token: None,
@@ -1294,6 +1306,35 @@ impl StreamAccum {
             if secs >= 0.2 {
                 usage.tokens_per_sec = Some((f64::from(usage.completion_tokens - 1) / secs) as f32);
             }
+        }
+    }
+
+    /// A reply that only reasoned (no text, no tool call) is a parser or
+    /// thinking-policy problem, not an answer: say so visibly. The loop's
+    /// empty-response nudge then retries instead of completing the turn.
+    fn warn_reasoning_only(&self, tx: &UnboundedSender<AgentEvent>) {
+        let cut_short = matches!(self.finish.as_deref(), Some("length") | Some("max_tokens"));
+        if self.content.trim().is_empty()
+            && !self.calls.has_named_call()
+            && !self.reasoning.trim().is_empty()
+            && !cut_short
+            && !self.degenerate
+        {
+            let _ = tx.send(AgentEvent::Guard {
+                code: "reasoning_only".into(),
+                message: "the model replied with reasoning only: no answer text and no tool call. Retrying with a nudge. If this repeats, the server's reasoning parser may be swallowing the answer or tool call (check reasoning_field and the engine's reasoning parser), or set thinking = \"off\" with a thinking_control in the model profile.".into(),
+            });
+        }
+    }
+
+    /// Count reasoning tokens from the text when the server reported usage
+    /// without them, so the token meter shows them for every engine.
+    fn estimate_reasoning_tokens(&mut self, budget: &TokenBudget) {
+        if let Some(usage) = self.usage.as_mut()
+            && usage.reasoning_tokens.is_none()
+            && !self.reasoning.trim().is_empty()
+        {
+            usage.reasoning_tokens = Some(budget.estimate_text(&self.reasoning));
         }
     }
 
@@ -1385,7 +1426,7 @@ impl StreamAccum {
             } else {
                 Some(self.content)
             },
-            reasoning: if self.reasoning.is_empty() {
+            reasoning: if self.reasoning.is_empty() || self.strip_reasoning {
                 None
             } else {
                 Some(self.reasoning)
@@ -1426,6 +1467,7 @@ async fn stream_assistant(
         provider.chat_stream(request, etx, child).await;
     });
     let mut accum = StreamAccum::new();
+    accum.strip_reasoning = core.model_profile.strip_reasoning();
     let mut failure: Option<ProviderError> = None;
     while let Some(item) = erx.recv().await {
         if let Some(err) = handle_stream_item(
@@ -1449,6 +1491,8 @@ async fn stream_assistant(
     let _ = task.await;
     accum.settle_reasoning(tx);
     accum.measure();
+    accum.estimate_reasoning_tokens(budget);
+    accum.warn_reasoning_only(tx);
     if let Some(usage) = &accum.usage {
         let _ = tx.send(AgentEvent::Usage(usage.clone()));
     }
@@ -2437,7 +2481,8 @@ fn compact_session(
         thread_id,
         keep_from: keep_from.clone(),
     }))?;
-    session.fsync()?;
+    // No fsync here: compaction runs inside a turn and the turn end fsyncs
+    // once, so a turn that compacts costs one fsync, not one per compaction.
     Ok(Compacted {
         summary: summary.summary,
         tokens_before: summary.tokens_before,

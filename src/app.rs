@@ -225,6 +225,10 @@ pub async fn create_runtime(
     let probe_provider = OpenAiCompatProvider::new(&config.model, model.clone())?;
 
     let (_, mut profile) = config.model_profile();
+    if let Some(warning) = profile.reasoning_field_warning() {
+        tracing::warn!("{warning}");
+        startup_warnings.push(warning);
+    }
     let window_cache: Arc<Mutex<std::collections::HashMap<String, u32>>> = Default::default();
     let resolved = resolve_window_truth(&config, &probe_provider, &window_cache).await;
     let context_window = resolved.window;
