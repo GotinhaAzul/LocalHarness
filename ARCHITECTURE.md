@@ -900,24 +900,53 @@ profile, budgets, prompt additions, and UI defaults.
 
 ### 7.2 Skills
 
-Markdown with YAML frontmatter:
+A skill is a directory with `SKILL.md`: YAML frontmatter and Markdown, following
+the Agent Skills specification. The native `when` field and the `shadow: true`
+override marker are extensions; unknown frontmatter is preserved.
 
 ```markdown
 ---
 name: security-red
 description: Authorized offensive security workflow
 when: engagement scope is set and the task is active testing
+allowed-tools: read grep bash
 ---
 
 ... instructions ...
 ```
 
-- Global skills live in `~/.config/localharness/skills/<name>/SKILL.md`.
-- Project skills live in `.harness/skills/` and require trust.
-- The harness injects a compact index (name, one line, when) into the system
-  prompt. Full text loads on `/skill <name>` or when a workflow names it.
-- Skills are instructions, not executable code. They cannot change scope, tool
-  lists, or gates.
+- Global native skills live in `~/.config/localharness/skills/<name>/SKILL.md`.
+- Standard roots also load: `~/.claude/skills`, `~/.agents/skills`,
+  `.claude/skills`, `.agents/skills`.
+- Project skills live in `.harness/skills/`, `.claude/skills/`, or
+  `.agents/skills/` and require trust.
+- Precedence, lowest first: bundled, `~/.claude/skills`, `~/.agents/skills`,
+  `~/.config/localharness/skills`, project `.claude/skills`, project
+  `.agents/skills`, `.harness/skills`. Native beats standard at the same level;
+  every collision is recorded as a shadow. `lh skill lint --all` fails a
+  duplicate unless the winner sets `shadow: true`.
+- `name` is 1-64 lowercase letters, digits, or hyphens; `description` is at most
+  1,024 characters. Discovery reads only name, description, and `when`; the
+  body loads on activation and a reference only when named.
+- `allowed-tools` is intersected with the active profile. It can never add a
+  tool the profile did not select.
+- The harness injects a compact index (name, description, when) into the system
+  prompt. Full text loads on `/skill <name>`, when the `skill` tool loads it, or
+  when a workflow names it.
+- Skills are instructions, not executable code. A script shipped in a skill
+  directory is never run automatically; `bash`/`bg` targeting one requires
+  per-execution approval with the command shown.
+- `lh skill add|update|remove|list` installs into the global native directory
+  with `skills.lock` (source, requested and resolved ref, per-file SHA-256,
+  install time). Replaced and removed copies move to `skills-trash/`; nothing is
+  deleted. `--frozen` fails on digest drift.
+- `lh skill lint [name|--all]` and `lh skill eval --fixtures <dir>` share the
+  loader's validator. Lint errors: bad name, long description, body over 500
+  lines, missing/unreadable/oversize reference, grant-shaped frontmatter, and
+  duplicate names. Warnings: body over 300 lines, more than ten references,
+  home paths, and secret shapes. Eval runs a deterministic fake provider and
+  reports trigger precision/recall, average loaded tokens, and false-load cost;
+  a skip fixture that loads exits 1.
 
 ### 7.3 Workflows
 
@@ -1458,6 +1487,8 @@ non-read-only tool call.
 | Global config | `~/.config/localharness/config.toml` |
 | Global profiles | `~/.config/localharness/profiles/` |
 | Global skills | `~/.config/localharness/skills/` |
+| Skills lockfile | `~/.config/localharness/skills.lock` |
+| Skills trash | `~/.config/localharness/skills-trash/` |
 | Global workflows | `~/.config/localharness/workflows/` |
 | Global tools | `~/.config/localharness/tools/` |
 | Themes | `~/.config/localharness/themes/` |
@@ -1646,7 +1677,8 @@ src/
   acp/
     mod.rs                JSON-RPC loop, capabilities, reverse requests
     session.rs            roots, turns, updates, permission callback
-  skills/                 bundled red/blue and coding skill text (embedded)
+  skills/                 bundled skills (embedded) plus discovery, validation,
+                          install/lockfile, lint, and eval
   workflows/
     mod.rs                workflow schema, validation, bundled set, loader
     engine.rs             steps: conditions, retries, approvals, artifacts, resume

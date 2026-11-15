@@ -690,15 +690,81 @@ async fn lint_warns_on_a_long_body_and_many_references() {
 }
 
 #[tokio::test]
-async fn lint_all_checks_bundled_skills_without_a_model() {
+async fn lint_all_checks_bundled_global_and_trusted_project_skills() {
     let env = env();
-    let output = run(&env, &["skill", "lint", "--all", "--json"]).await;
+    write_skill(
+        &env.config.join("skills"),
+        "global-skill",
+        "Global skill",
+        "global body",
+    );
+    write_skill(
+        &env.cwd.join(".harness/skills"),
+        "project-skill",
+        "Project skill",
+        "project body",
+    );
+    let output = run(&env, &["--trust", "skill", "lint", "--all", "--json"]).await;
     assert_ok(&output);
     let value = json(&output);
     assert_eq!(value["errors"], 0, "{value}");
     let skills = value["skills"].as_array().unwrap();
-    assert_eq!(skills.len(), 11);
-    assert!(skills.iter().all(|skill| skill["origin"] == "bundled"));
+    assert_eq!(skills.len(), 13);
+    let origins: Vec<&str> = skills
+        .iter()
+        .filter_map(|skill| skill["origin"].as_str())
+        .collect();
+    assert!(origins.contains(&"bundled"));
+    assert!(origins.contains(&"~/.config/localharness/skills"));
+    assert!(origins.contains(&".harness/skills"));
+}
+
+#[tokio::test]
+async fn install_refuses_invalid_metadata_before_copying() {
+    let env = env();
+    let source = env._dir.path().join("source/bad");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(
+        source.join("SKILL.md"),
+        format!(
+            "---\nname: Bad_Name\ndescription: {}\n---\n\nBody\n",
+            "x".repeat(1_025)
+        ),
+    )
+    .unwrap();
+    let output = run(&env, &["skill", "add", source.to_str().unwrap()]).await;
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("[name]"), "{stderr}");
+    assert!(stderr.contains("[description]"), "{stderr}");
+    assert!(!env.config.join("skills/Bad_Name").exists());
+    assert!(!env.config.join("skills.lock").exists());
+}
+
+#[tokio::test]
+async fn lint_rejects_frontmatter_that_claims_tools_or_scope() {
+    let env = env();
+    write_raw_skill(
+        &env.config.join("skills"),
+        "grant",
+        "name: grant\ndescription: Claims a grant\ntools: bash\nscope: 10.0.0.0/8",
+        "Body",
+    );
+    let output = run(&env, &["skill", "lint", "grant", "--json"]).await;
+    assert_eq!(output.status.code(), Some(1));
+    let value = json(&output);
+    let diagnostics = value["skills"][0]["diagnostics"].as_array().unwrap();
+    let codes: Vec<&str> = diagnostics
+        .iter()
+        .filter_map(|diagnostic| diagnostic["code"].as_str())
+        .collect();
+    assert_eq!(
+        codes
+            .iter()
+            .filter(|code| **code == "skill_frontmatter_grants")
+            .count(),
+        2
+    );
 }
 
 #[tokio::test]

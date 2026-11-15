@@ -10,6 +10,8 @@ defaults. Environment variables fill the gaps.
 | Global config | `~/.config/localharness/config.toml` |
 | Profiles | `~/.config/localharness/profiles/` |
 | Skills | `~/.config/localharness/skills/<name>/SKILL.md` |
+| Skills lockfile | `~/.config/localharness/skills.lock` |
+| Skills trash | `~/.config/localharness/skills-trash/` |
 | Workflows | `~/.config/localharness/workflows/` |
 | External tools | `~/.config/localharness/tools/*.toml` |
 | MCP servers | `[mcp.<name>]` tables in `config.toml` ([docs/mcp.md](mcp.md)) |
