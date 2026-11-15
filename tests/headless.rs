@@ -250,14 +250,27 @@ fn env() -> Env {
 }
 
 async fn run_lh(env: &Env, base: &str, extra: &[&str]) -> std::process::Output {
+    run_lh_with_session(env, base, extra, false).await
+}
+
+/// Like [`run_lh`], but persists the session and artifacts so a test can
+/// inspect what reached disk.
+async fn run_lh_persistent(env: &Env, base: &str, extra: &[&str]) -> std::process::Output {
+    run_lh_with_session(env, base, extra, true).await
+}
+
+async fn run_lh_with_session(
+    env: &Env,
+    base: &str,
+    extra: &[&str],
+    persist: bool,
+) -> std::process::Output {
     let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_lh"));
     command
         .arg("--endpoint")
         .arg(base)
         .arg("--model")
         .arg("test-model")
-        .arg("--no-session")
-        .args(extra)
         .current_dir(&env.cwd)
         .env("LH_CONFIG_DIR", &env.config_dir)
         .env("LH_DATA_DIR", &env.data_dir)
@@ -267,6 +280,10 @@ async fn run_lh(env: &Env, base: &str, extra: &[&str]) -> std::process::Output {
         .env_remove("LH_API_KEY")
         .env_remove("LH_PROFILE")
         .env_remove("LH_TRUST");
+    if !persist {
+        command.arg("--no-session");
+    }
+    command.args(extra);
     tokio::time::timeout(std::time::Duration::from_secs(30), command.output())
         .await
         .expect("lh timed out")
@@ -754,4 +771,177 @@ async fn print_executes_a_tool_call_and_writes_a_file() {
         "hello"
     );
     assert!(fake.requests.load(Ordering::SeqCst) >= 2);
+}
+
+/// A credential-shaped value built at runtime, so no secret-looking literal
+/// lives in the repository. It matches the AWS-key shape used by the
+/// redactor without naming a real key.
+fn fake_aws_key() -> String {
+    let pid = u64::from(std::process::id());
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .subsec_nanos() as u64;
+    format!("AKIA{:016X}", (pid << 32) ^ nanos)
+}
+
+#[derive(Clone)]
+struct SecretFake {
+    calls: std::sync::Arc<AtomicUsize>,
+    key: String,
+}
+
+async fn secret_chat(State(fake): State<SecretFake>) -> Response {
+    let call = fake.calls.fetch_add(1, Ordering::SeqCst);
+    let frames = if call == 0 {
+        let command = format!("echo {}; seq 1 800", fake.key);
+        let arguments = serde_json::json!({ "command": command }).to_string();
+        format!(
+            "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+            serde_json::json!({
+                "choices": [{"delta": {"tool_calls": [{
+                    "index": 0,
+                    "id": "call_1",
+                    "function": {"name": "bash", "arguments": arguments}
+                }]}}]
+            }),
+            serde_json::json!({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}),
+        )
+    } else {
+        concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"redaction done\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        )
+        .to_string()
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream"),
+        )
+        .body(Body::from_stream(stream::iter(
+            frames
+                .as_bytes()
+                .chunks(11)
+                .map(|chunk| Ok::<Bytes, Infallible>(Bytes::copy_from_slice(chunk)))
+                .collect::<Vec<_>>(),
+        )))
+        .unwrap()
+}
+
+async fn spawn_secret_server(key: &str) -> (String, SecretFake) {
+    let fake = SecretFake {
+        calls: std::sync::Arc::new(AtomicUsize::new(0)),
+        key: key.to_string(),
+    };
+    let app = Router::new()
+        .route("/v1/chat/completions", post(secret_chat))
+        .route("/v1/models", axum::routing::get(models))
+        .with_state(fake.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (format!("http://{address}"), fake)
+}
+
+fn files_with_suffix(root: &std::path::Path, suffix: &str) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().ends_with(suffix))
+            {
+                out.push(path);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+#[tokio::test]
+async fn print_persists_only_redacted_secrets_in_session_and_artifacts() {
+    let key = fake_aws_key();
+    let (base, fake) = spawn_secret_server(&key).await;
+    let env = env();
+    let output = run_lh_persistent(&env, &base, &["--print", "echo the token"]).await;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert_eq!(fake.calls.load(Ordering::SeqCst), 2);
+
+    let sessions = files_with_suffix(&env.data_dir.join("sessions"), ".jsonl");
+    assert_eq!(sessions.len(), 1, "{sessions:?}");
+    let raw = std::fs::read_to_string(&sessions[0]).unwrap();
+    assert!(!raw.contains(&key), "session JSONL kept the secret:\n{raw}");
+    assert!(raw.contains("[REDACTED:aws:AKIA..."), "{raw}");
+    let header: serde_json::Value =
+        serde_json::from_str(raw.lines().next().expect("header")).unwrap();
+    assert_eq!(header["data"]["redact"], true, "{header}");
+
+    let artifacts = files_with_suffix(&env.data_dir.join("sessions"), ".txt");
+    assert!(!artifacts.is_empty(), "expected an archived tool result");
+    let mut redacted_artifact = false;
+    for path in &artifacts {
+        let stored = std::fs::read_to_string(path).unwrap();
+        assert!(
+            !stored.contains(&key),
+            "artifact {} kept the secret:\n{stored}",
+            path.display()
+        );
+        redacted_artifact |= stored.contains("[REDACTED:aws:AKIA...");
+    }
+    assert!(redacted_artifact, "no artifact held the redacted form");
+}
+
+#[tokio::test]
+async fn no_redact_keeps_raw_output_and_is_recorded_in_the_header() {
+    let key = fake_aws_key();
+    let (base, _fake) = spawn_secret_server(&key).await;
+    let env = env();
+    let output =
+        run_lh_persistent(&env, &base, &["--no-redact", "--print", "echo the token"]).await;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+
+    let sessions = files_with_suffix(&env.data_dir.join("sessions"), ".jsonl");
+    assert_eq!(sessions.len(), 1, "{sessions:?}");
+    let raw = std::fs::read_to_string(&sessions[0]).unwrap();
+    assert!(
+        raw.contains(&key),
+        "no-redact should keep the raw value:\n{raw}"
+    );
+    let header: serde_json::Value =
+        serde_json::from_str(raw.lines().next().expect("header")).unwrap();
+    assert_eq!(header["data"]["redact"], false, "{header}");
+
+    let artifacts = files_with_suffix(&env.data_dir.join("sessions"), ".txt");
+    assert!(
+        artifacts.iter().any(|path| {
+            std::fs::read_to_string(path).is_ok_and(|stored| stored.contains(&key))
+        }),
+        "no-redact should keep the raw value in the artifact at {}",
+        env.data_dir.display()
+    );
 }
