@@ -1027,78 +1027,83 @@ async fn run_headless(runtime: crate::app::Runtime, prompt: String, json: bool) 
     })
 }
 
+/// One stable JSON object for a `--json` event.
+fn event_json(event: &AgentEvent) -> serde_json::Value {
+    match event {
+        AgentEvent::TurnStarted {
+            model,
+            profile,
+            tool_mode,
+        } => {
+            json!({"type":"started","model":model,"profile":profile,"tool_mode":tool_mode})
+        }
+        AgentEvent::State(state) => json!({"type":"state","state":format!("{state:?}")}),
+        AgentEvent::TextDelta(text) => json!({"type":"text","text":text}),
+        AgentEvent::ReasoningDelta(text) => json!({"type":"reasoning","text":text}),
+        AgentEvent::ToolStarted {
+            call_id,
+            name,
+            summary,
+        } => json!({"type":"tool_started","call_id":call_id,"name":name,"summary":summary}),
+        AgentEvent::ToolFinished {
+            call_id,
+            name,
+            is_error,
+            duration_ms,
+            preview,
+            artifact,
+        } => {
+            json!({"type":"tool_finished","call_id":call_id,"name":name,"is_error":is_error,"duration_ms":duration_ms,"preview":preview,"artifact":artifact})
+        }
+        AgentEvent::Usage(usage) => {
+            json!({"type":"usage","prompt_tokens":usage.prompt_tokens,"completion_tokens":usage.completion_tokens})
+        }
+        AgentEvent::Context { used, window } => {
+            json!({"type":"context","used":used,"window":window})
+        }
+        AgentEvent::WindowDetected { window, source } => {
+            json!({"type":"window_detected","window":window,"source":source})
+        }
+        AgentEvent::Compacted {
+            summary,
+            tokens_before,
+        } => json!({"type":"compacted","summary":summary,"tokens_before":tokens_before}),
+        AgentEvent::Notice(message) => json!({"type":"notice","message":message}),
+        AgentEvent::Provenance {
+            call_id,
+            origin,
+            warning,
+            approval_required,
+        } => json!({
+            "type": "provenance",
+            "call_id": call_id,
+            "origin": origin,
+            "warning": warning,
+            "approval_required": approval_required,
+        }),
+        AgentEvent::Guard { code, message } => {
+            json!({"type":"guard","code":code,"message":message})
+        }
+        AgentEvent::Error {
+            code,
+            message,
+            recoverable,
+        } => json!({"type":"error","code":code,"message":message,"recoverable":recoverable}),
+        AgentEvent::TurnDone(outcome) => {
+            json!({"type":"done","status":format!("{:?}", outcome.status)})
+        }
+    }
+}
+
 /// Render one event in plain or JSON mode. Returns the final status when done.
 fn render_event(event: AgentEvent, json: bool) -> Result<Option<TurnStatus>> {
     if json {
-        let value = match &event {
-            AgentEvent::TurnStarted {
-                model,
-                profile,
-                tool_mode,
-            } => {
-                json!({"type":"started","model":model,"profile":profile,"tool_mode":tool_mode})
-            }
-            AgentEvent::State(state) => json!({"type":"state","state":format!("{state:?}")}),
-            AgentEvent::TextDelta(text) => json!({"type":"text","text":text}),
-            AgentEvent::ReasoningDelta(text) => json!({"type":"reasoning","text":text}),
-            AgentEvent::ToolStarted {
-                call_id,
-                name,
-                summary,
-            } => json!({"type":"tool_started","call_id":call_id,"name":name,"summary":summary}),
-            AgentEvent::ToolFinished {
-                call_id,
-                name,
-                is_error,
-                duration_ms,
-                preview,
-                artifact,
-            } => {
-                json!({"type":"tool_finished","call_id":call_id,"name":name,"is_error":is_error,"duration_ms":duration_ms,"preview":preview,"artifact":artifact})
-            }
-            AgentEvent::Usage(usage) => {
-                json!({"type":"usage","prompt_tokens":usage.prompt_tokens,"completion_tokens":usage.completion_tokens})
-            }
-            AgentEvent::Context { used, window } => {
-                json!({"type":"context","used":used,"window":window})
-            }
-            AgentEvent::WindowDetected { window, source } => {
-                json!({"type":"window_detected","window":window,"source":source})
-            }
-            AgentEvent::Compacted {
-                summary,
-                tokens_before,
-            } => json!({"type":"compacted","summary":summary,"tokens_before":tokens_before}),
-            AgentEvent::Notice(message) => json!({"type":"notice","message":message}),
-            AgentEvent::Provenance {
-                call_id,
-                origin,
-                warning,
-                approval_required,
-            } => json!({
-                "type": "provenance",
-                "call_id": call_id,
-                "origin": origin,
-                "warning": warning,
-                "approval_required": approval_required,
-            }),
-            AgentEvent::Guard { code, message } => {
-                json!({"type":"guard","code":code,"message":message})
-            }
-            AgentEvent::Error {
-                code,
-                message,
-                recoverable,
-            } => json!({"type":"error","code":code,"message":message,"recoverable":recoverable}),
-            AgentEvent::TurnDone(outcome) => {
-                json!({"type":"done","status":format!("{:?}", outcome.status)})
-            }
+        let done = match &event {
+            AgentEvent::TurnDone(outcome) => Some(outcome.status),
+            _ => None,
         };
-        println!("{}", serde_json::to_string(&value)?);
-        if let AgentEvent::TurnDone(outcome) = event {
-            return Ok(Some(outcome.status));
-        }
-        return Ok(None);
+        println!("{}", serde_json::to_string(&event_json(&event))?);
+        return Ok(done);
     }
 
     match event {
@@ -1180,6 +1185,22 @@ fn init_logging(paths: &Paths, debug: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provenance_event_json_exposes_the_tag_and_warning() {
+        let event = AgentEvent::Provenance {
+            call_id: "call_0001".into(),
+            origin: "tool:read".into(),
+            warning: Some("[provenance] untrusted content".into()),
+            approval_required: true,
+        };
+        let value = event_json(&event);
+        assert_eq!(value["type"], "provenance");
+        assert_eq!(value["call_id"], "call_0001");
+        assert_eq!(value["origin"], "tool:read");
+        assert_eq!(value["warning"], "[provenance] untrusted content");
+        assert_eq!(value["approval_required"], true);
+    }
 
     #[test]
     fn no_redact_is_an_explicit_global_flag() {

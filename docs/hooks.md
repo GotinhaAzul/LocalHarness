@@ -30,6 +30,9 @@ command = ["notify-send", "LocalHarness", "turn finished"]
 shell: `"echo hi | tee out"` is not a command line, and shell syntax is never
 interpreted. Use `["sh", "-c", "..."]` only if you want a shell yourself.
 
+`timeout_secs` and `max_output_bytes` are reserved keys under `[hooks]`; they
+set defaults and cannot be hook names.
+
 ## Events
 
 | Event | Runs | Typical use |
@@ -42,9 +45,11 @@ interpreted. Use `["sh", "-c", "..."]` only if you want a shell yourself.
 | `stop` | once when a turn ends, for every status | notifications, cleanup |
 
 `session_start` is recorded in the session, so resuming a session does not
-repeat it. `stop` is advisory: the turn has already stopped, so its block is
-shown but cannot undo work. `pre_compact` runs for the main compaction; the
-`thread` split has its own compaction path and does not run it.
+repeat it (a blocked `session_start` is retried on the next turn). `stop` runs
+when the turn loop ends, for normal completion, budget, stall, cancellation, or
+error; it is advisory, so its block is shown but cannot undo work. `pre_compact`
+runs for the main compaction; the `thread` split has its own compaction path
+and does not run it.
 
 ## Protocol
 

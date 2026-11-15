@@ -292,6 +292,7 @@ fn start_recorded(session: &SessionHandle) -> bool {
                 &entry.kind,
                 EntryKind::Custom(custom)
                     if custom.payload.get("event").and_then(Value::as_str) == Some("session_start")
+                        && custom.payload.get("outcome").and_then(Value::as_str) == Some("ok")
             )
         })
 }

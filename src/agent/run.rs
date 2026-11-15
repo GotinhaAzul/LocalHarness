@@ -1820,7 +1820,7 @@ async fn execute_batch(
         let mut evidence_args: Option<Value> = None;
         let mut result;
         let mut repaired = None;
-        let mut pre_context: Vec<(String, String)> = Vec::new();
+        let mut pre_notes: Vec<String> = Vec::new();
         let mut executed = false;
 
         if tool.is_none() {
@@ -1939,12 +1939,14 @@ async fn execute_batch(
                         let pre = crate::hooks::pre_tool(&hooks, &call.name, &args).await;
                         for warning in &pre.warnings {
                             let _ = tx.send(AgentEvent::Notice(format!("[hook] {warning}")));
+                            pre_notes.push(format!("[hook warning] {warning}"));
                         }
-                        pre_context = pre
-                            .contexts
-                            .into_iter()
-                            .map(|context| (context.hook, context.text))
-                            .collect();
+                        for context in pre.contexts {
+                            pre_notes.push(format!(
+                                "[hook context from {}]\n{}",
+                                context.hook, context.text
+                            ));
+                        }
                         if let Some(block) = pre.blocked {
                             let message = format!(
                                 "hook {:?} blocked this {} call: {}. The call did not run.",
@@ -2006,6 +2008,10 @@ async fn execute_batch(
 
         let duration_ms = started.elapsed().as_millis() as u64;
 
+        // Scan the raw tool output, not text a hook later adds: hooks are
+        // configured code and must not trip their own detector.
+        let scan_output = result.content.clone();
+
         // Lifecycle hook: post_tool sees the raw result. Its context is added
         // to the result; a block turns the result into an error.
         if executed {
@@ -2048,7 +2054,7 @@ async fn execute_batch(
         if executed
             && !result.is_error
             && crate::provenance::scans(&call.name)
-            && let Some(detection) = crate::provenance::detect(&result.content)
+            && let Some(detection) = crate::provenance::detect(&scan_output)
         {
             let line = crate::provenance::warning_line(&origin.tag(), &detection);
             result.content = format!("{line}\n\n{}", result.content);
@@ -2085,8 +2091,8 @@ async fn execute_batch(
         if let Some(note) = routed_note {
             result.content = format!("{note}\n{}", result.content);
         }
-        for (hook, text) in pre_context {
-            result.content = format!("[hook context from {hook}]\n{text}\n\n{}", result.content);
+        for note in pre_notes {
+            result.content = format!("{note}\n\n{}", result.content);
         }
         result.content = format!(
             "[tool] {} - {}\n{}",

@@ -1049,8 +1049,8 @@ Feature flags: `coding`, `security`, `lsp`. The binary is a thin wrapper.
   recorded as a `hook-invocation` custom entry with duration, outcome, and
   reason.
 - Hooks run after the harness gates. They cannot enable a denied tool or change
-  scope, the tool list, the endpoint, or the permission mode. `stop` is
-  advisory because the turn has already ended.
+  scope, the tool list, the endpoint, or the permission mode. `stop` runs when
+  the turn loop ends and is advisory because the turn has already stopped.
 - `lh hooks list` and `lh hooks test <name>` exercise hooks without a model
   turn. See `docs/hooks.md`.
 

@@ -370,6 +370,21 @@ mod tests {
     }
 
     #[test]
+    fn old_entries_without_provenance_still_load() {
+        let json = serde_json::json!({
+            "v": 1,
+            "seq": 1,
+            "id": "e1",
+            "parent": null,
+            "ts": "2026-01-01T00:00:00Z",
+            "type": "user",
+            "data": {"content": "hello"}
+        });
+        let entry: Entry = serde_json::from_value(json).unwrap();
+        assert!(entry.provenance.is_none());
+    }
+
+    #[test]
     fn custom_payload_is_flat() {
         let entry = Entry {
             v: 1,

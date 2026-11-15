@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use localharness::agent::{AgentEvent, Core, TurnStatus, run_turn};
 use localharness::config::{
-    Config, HookConfig, HookEvent, ProfileConfig, VerifyConfig, VerifyStep,
+    Config, HookConfig, HookEvent, HookOnError, ProfileConfig, VerifyConfig, VerifyStep,
 };
 use localharness::context::TokenBudget;
 use localharness::paths::Paths;
@@ -2384,4 +2384,73 @@ async fn untrusted_text_cannot_enable_a_tool_or_change_permissions() {
     assert_eq!(harness.core.tools[0].name(), "read");
     assert_eq!(harness.core.config.model.endpoint, "http://127.0.0.1:0");
     assert!(harness.core.provenance.lock().unwrap().pending().is_some());
+}
+
+#[tokio::test]
+async fn session_start_hook_runs_once_and_its_context_reaches_the_model() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = base_config();
+    config.profiles.get_mut("test").unwrap().tools = vec!["bash".into()];
+    config.hooks.entries.insert(
+        "startup".into(),
+        hook_config(HookEvent::SessionStart, "allow_escalate.sh", 0),
+    );
+    let harness = harness_config(
+        dir.path(),
+        vec![text_script("first"), text_script("second")],
+        config,
+    );
+    run(&harness, "one").await;
+    run(&harness, "two").await;
+
+    assert_eq!(
+        hook_invocations(&harness.session, "session_start").len(),
+        1,
+        "session_start is recorded once per session"
+    );
+    let requests = harness.provider.requests.lock().unwrap();
+    let system = requests[0]
+        .messages
+        .iter()
+        .find_map(|message| match message {
+            ChatMessage::System { content } => Some(content.clone()),
+            _ => None,
+        })
+        .expect("system message");
+    assert!(
+        system.contains("[hook context: startup]"),
+        "hook context joins the system turn: {system}"
+    );
+    assert!(system.contains("pre-hook note"), "{system}");
+}
+
+#[tokio::test]
+async fn failed_pre_tool_hook_with_warn_is_visible_but_does_not_block() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = base_config();
+    config.profiles.get_mut("test").unwrap().tools = vec!["bash".into()];
+    let mut hook = hook_config(HookEvent::PreTool, "fail.sh", 0);
+    hook.on_error = Some(HookOnError::Warn);
+    config.hooks.entries.insert("broken".into(), hook);
+    let harness = harness_config(
+        dir.path(),
+        vec![
+            tool_script("bash", json!({"command": "touch warn-ran.txt"})),
+            text_script("done"),
+        ],
+        config,
+    );
+    let (outcome, events) = run(&harness, "run it").await;
+    assert_eq!(outcome.status, TurnStatus::Done);
+    assert!(dir.path().join("warn-ran.txt").exists(), "warn continues");
+    let (content, is_error, _) = tool_result_entry(&harness.session, "call_0001");
+    assert!(!is_error);
+    assert!(content.contains("[hook warning]"), "{content}");
+    assert!(content.contains("this hook is broken"), "{content}");
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::Notice(message) if message.contains("this hook is broken")
+    )));
+    let invocations = hook_invocations(&harness.session, "pre_tool");
+    assert_eq!(invocations[0].payload["outcome"], "error");
 }
