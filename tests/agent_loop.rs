@@ -1966,3 +1966,65 @@ async fn shell_profile_reads_edits_and_tests_with_bash_only() {
         "shell must never expose a non-bash tool"
     );
 }
+
+#[tokio::test]
+async fn hash_edit_mode_wires_read_anchors_into_patch() {
+    use localharness::config::{EditMode, ModelProfile};
+    use localharness::tools::read::{line_hash, snapshot_hash};
+
+    let dir = tempfile::tempdir().unwrap();
+    let body = "alpha\nbeta\n";
+    std::fs::write(dir.path().join("a.txt"), body).unwrap();
+
+    let mut config = base_config();
+    config.model_profiles.insert(
+        "hash".into(),
+        ModelProfile {
+            edit_mode: EditMode::Hash,
+            ..ModelProfile::default()
+        },
+    );
+    let profile = config.profiles.get_mut("test").expect("test profile");
+    profile.model_profile = Some("hash".into());
+    profile.tools = vec!["read".into(), "patch".into()];
+    let snapshot = snapshot_hash(body.as_bytes());
+
+    let harness = harness_config(
+        dir.path(),
+        vec![
+            tool_script("read", json!({"path": "a.txt"})),
+            tool_script(
+                "patch",
+                json!({
+                    "path": format!("a.txt#{snapshot}"),
+                    "ops": [{"op": "PUT", "line": 2, "hash": line_hash("beta"), "text": "BETA"}],
+                }),
+            ),
+            text_script("done"),
+        ],
+        config,
+    );
+    let (outcome, _) = run(&harness, "patch beta with hash anchors").await;
+    assert_eq!(outcome.status, TurnStatus::Done, "{:?}", outcome.error);
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+        "alpha\nBETA\n"
+    );
+    let results = tool_results(&harness.session);
+    assert_eq!(results.len(), 2, "{results:?}");
+    assert!(
+        results[0].contains(&format!("[a.txt#{snapshot}]")),
+        "read must expose the snapshot: {}",
+        results[0]
+    );
+    assert!(
+        results[0].contains(&format!("2  {}  beta", line_hash("beta"))),
+        "read must annotate each line: {}",
+        results[0]
+    );
+    assert!(
+        results[1].contains(&format!("[a.txt#{}]", snapshot_hash(b"alpha\nBETA\n"))),
+        "patch must return fresh anchors: {}",
+        results[1]
+    );
+}
