@@ -10,6 +10,18 @@ use std::sync::{Arc, Mutex};
 
 use crate::security::redact::Redactor;
 
+/// Upper bound for raw copies of redacted artifacts kept in memory. Only
+/// artifacts that redaction changed are kept, so ordinary output costs
+/// nothing; past the bound, reads fall back to the redacted file on disk.
+const RAW_CACHE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Raw text of artifacts whose stored form was redacted, for this process.
+#[derive(Debug, Default)]
+struct RawCache {
+    texts: HashMap<String, String>,
+    bytes: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct Artifact {
     pub id: String,
@@ -51,6 +63,10 @@ pub struct ArtifactStore {
     /// Image bytes: the only copy without a root, a read cache with one.
     images: Mutex<HashMap<String, Arc<Vec<u8>>>>,
     redactor: Redactor,
+    /// Redaction applies to the file on disk only. The model reads artifacts
+    /// back through `recall` and `undo` restores snapshots from them, so the
+    /// raw text stays available here for the live session.
+    raw: Mutex<RawCache>,
 }
 
 impl ArtifactStore {
@@ -99,6 +115,7 @@ impl ArtifactStore {
             image_counter: AtomicU64::new(next_image),
             images: Mutex::new(HashMap::new()),
             redactor: Redactor::new(redact),
+            raw: Mutex::new(RawCache::default()),
         })
     }
 
@@ -115,6 +132,7 @@ impl ArtifactStore {
             image_counter: AtomicU64::new(0),
             images: Mutex::new(HashMap::new()),
             redactor: Redactor::new(redact),
+            raw: Mutex::new(RawCache::default()),
         }
     }
 
@@ -126,18 +144,19 @@ impl ArtifactStore {
         self.root.as_deref()
     }
 
-    /// Redact text with this session's redaction setting. Used by tools that
-    /// read files outside [`ArtifactStore::write`] (for example live `bg`
-    /// logs).
+    /// Redact text with this session's redaction setting, for callers that
+    /// persist text outside [`ArtifactStore::write`] (for example finding
+    /// evidence copied from a tool result).
     pub fn redact_owned(&self, text: &str) -> String {
         self.redactor.redact_owned(text)
     }
 
+    /// Archive `content`. The file on disk is redacted; reads in this process
+    /// return the original text. `bytes` is the size the model reads back.
     pub fn write(&self, content: &str) -> io::Result<Artifact> {
         let n = self.counter.fetch_add(1, Ordering::SeqCst) + 1;
         let id = format!("out-{n}");
-        let content = self.redactor.redact(content);
-        self.write_stored(&id, content.as_ref())?;
+        self.write_named_unchecked(&id, content)?;
         Ok(Artifact {
             id,
             bytes: content.len(),
@@ -146,8 +165,36 @@ impl ArtifactStore {
 
     pub fn write_named(&self, id: &str, content: &str) -> io::Result<()> {
         validate_id(id).map_err(io::Error::other)?;
-        let content = self.redactor.redact(content);
-        self.write_stored(id, content.as_ref())
+        self.write_named_unchecked(id, content)
+    }
+
+    fn write_named_unchecked(&self, id: &str, content: &str) -> io::Result<()> {
+        if self.root.is_none() {
+            // Nothing is persisted; keep the original.
+            return self.write_stored(id, content);
+        }
+        let stored = self.redactor.redact(content);
+        self.write_stored(id, stored.as_ref())?;
+        let mut raw = self.raw.lock().expect("artifact raw cache poisoned");
+        if let Some(old) = raw.texts.remove(id) {
+            raw.bytes -= old.len();
+        }
+        if matches!(stored, std::borrow::Cow::Owned(_))
+            && raw.bytes + content.len() <= RAW_CACHE_BYTES
+        {
+            raw.bytes += content.len();
+            raw.texts.insert(id.to_string(), content.to_string());
+        }
+        Ok(())
+    }
+
+    fn raw_text(&self, id: &str) -> Option<String> {
+        self.raw
+            .lock()
+            .expect("artifact raw cache poisoned")
+            .texts
+            .get(id)
+            .cloned()
     }
 
     fn write_stored(&self, id: &str, content: &str) -> io::Result<()> {
@@ -230,6 +277,9 @@ impl ArtifactStore {
 
     /// Approximate byte size of an artifact.
     pub fn size(&self, id: &str) -> Option<usize> {
+        if let Some(raw) = self.raw_text(id) {
+            return Some(raw.len());
+        }
         match &self.root {
             Some(root) => std::fs::metadata(root.join(format!("{id}.txt")))
                 .ok()
@@ -290,8 +340,13 @@ impl ArtifactStore {
         })
     }
 
+    /// Full text of an artifact: the original for one written by this
+    /// process, otherwise what is stored (redacted for a persisted session).
     pub fn read_all(&self, id: &str) -> Result<String, ArtifactError> {
         validate_id(id).map_err(ArtifactError::InvalidId)?;
+        if let Some(raw) = self.raw_text(id) {
+            return Ok(raw);
+        }
         match &self.root {
             Some(root) => {
                 let path = root.join(format!("{id}.txt"));
@@ -320,6 +375,9 @@ impl ArtifactStore {
     pub fn clean_all(&self) -> io::Result<usize> {
         if let Ok(mut images) = self.images.lock() {
             images.clear();
+        }
+        if let Ok(mut raw) = self.raw.lock() {
+            *raw = RawCache::default();
         }
         let Some(root) = &self.root else {
             if let Ok(mut memory) = self.memory.lock() {
@@ -501,16 +559,33 @@ mod tests {
     }
 
     #[test]
-    fn artifacts_are_redacted_before_storage() {
+    fn artifacts_are_redacted_on_disk_but_read_back_raw_in_this_process() {
+        const KEY: &str = "AKIAIOSFODNN7EXAMPLE";
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("artifacts");
+        let store = ArtifactStore::new("s", Some(root.clone())).unwrap();
+        let raw = format!("aws_access_key_id = {KEY}\nname = Column(Text)\n");
+        let a = store.write(&raw).unwrap();
+        assert_eq!(a.bytes, raw.len());
+        let stored = std::fs::read_to_string(root.join(format!("{}.txt", a.id))).unwrap();
+        assert!(!stored.contains(KEY), "{stored}");
+        assert!(stored.contains("[REDACTED:aws:AKIA..."), "{stored}");
+        assert!(stored.contains("name = Column(Text)"), "{stored}");
+        // recall and undo read the original.
+        assert_eq!(store.read_all(&a.id).unwrap(), raw);
+        assert_eq!(store.size(&a.id), Some(raw.len()));
+        // A later process (resume) only has the redacted file.
+        let reopened = ArtifactStore::new("s", Some(root)).unwrap();
+        assert_eq!(reopened.read_all(&a.id).unwrap(), stored);
+    }
+
+    #[test]
+    fn ephemeral_artifacts_keep_the_original() {
         const KEY: &str = "AKIAIOSFODNN7EXAMPLE";
         let store = ArtifactStore::ephemeral();
-        let a = store
-            .write(&format!("aws_access_key_id = {KEY}\n"))
-            .unwrap();
-        let content = store.read_all(&a.id).unwrap();
-        assert!(!content.contains(KEY), "{content}");
-        assert!(content.contains("[REDACTED:aws:AKIA..."), "{content}");
-        assert!(content.contains("aws_access_key_id"), "{content}");
+        let raw = format!("aws_access_key_id = {KEY}\n");
+        let a = store.write(&raw).unwrap();
+        assert_eq!(store.read_all(&a.id).unwrap(), raw);
     }
 
     #[test]

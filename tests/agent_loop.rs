@@ -345,7 +345,7 @@ async fn bash_records_evidence_and_findings_link_to_it() {
 }
 
 #[tokio::test]
-async fn bash_secrets_are_redacted_in_session_and_evidence() {
+async fn bash_secrets_are_redacted_in_evidence_but_not_in_what_the_model_reads() {
     const KEY: &str = "AKIAIOSFODNN7EXAMPLE";
     let dir = tempfile::tempdir().unwrap();
     let harness = harness(
@@ -372,9 +372,13 @@ async fn bash_secrets_are_redacted_in_session_and_evidence() {
             .into_iter()
             .find(|entry| entry.is_tool_result())
             .expect("tool result");
+        // The in-memory tree is what the model reads, so it keeps the raw
+        // output (this session is not persisted). Redaction applies to the
+        // evidence written to disk below, and to session files (see
+        // tests/redaction.rs).
         let content = &entry.tool_result().expect("tool result data").content;
-        assert!(!content.contains(KEY), "{content}");
-        assert!(content.contains("[REDACTED:aws:AKIA..."), "{content}");
+        assert!(content.contains(KEY), "{content}");
+        assert!(!content.contains("[REDACTED"), "{content}");
     }
 
     let state = harness.core.security.lock().unwrap();
