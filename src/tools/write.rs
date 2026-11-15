@@ -271,9 +271,16 @@ pub(crate) fn file_mode(path: &Path) -> u32 {
 /// Every harness file mutation (`write`, `edit`, `patch`, `undo`) goes
 /// through here, so this is also where redaction placeholders are refused.
 pub(crate) fn atomic_write(path: &Path, bytes: &[u8], mode: u32) -> std::io::Result<()> {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-
     refuse_new_placeholders(path, bytes)?;
+    atomic_restore(path, bytes, mode)
+}
+
+/// Put back bytes that were on disk moments ago in this process, for example
+/// when a failed multi-file apply rolls back. This skips the placeholder
+/// guard: the bytes are the file's own previous state, not new content, and a
+/// file that legitimately held placeholder text must be restorable.
+pub(crate) fn atomic_restore(path: &Path, bytes: &[u8], mode: u32) -> std::io::Result<()> {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let name = path
@@ -313,7 +320,7 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8], mode: u32) -> std::io::Res
 /// writing one the file does not already hold would corrupt the file. The
 /// live session never shows the model a placeholder, but a resumed session or
 /// an old artifact can.
-fn refuse_new_placeholders(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn refuse_new_placeholders(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let after = String::from_utf8_lossy(bytes);
     if !crate::security::redact::contains_placeholder(&after) {
         return Ok(());

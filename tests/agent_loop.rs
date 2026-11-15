@@ -4017,3 +4017,96 @@ async fn a_provenance_warning_beats_an_allow_rule_and_a_gated_call_keeps_the_app
         .count();
     assert_eq!(granted, 1);
 }
+
+// ---------------------------------------------------------------------------
+// Hunk review (#56) behind the decision seam (#15): a call the policy denies
+// is never buffered or shown for review.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_policy_denied_edit_is_refused_before_hunk_review() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_files(dir.path());
+    let reviewer = scripted_reviewer(Vec::new());
+    let mut config = base_config();
+    config.review = localharness::config::ReviewMode::Always;
+    config.profiles.get_mut("test").expect("test profile").tools =
+        ["read", "edit"].map(str::to_string).to_vec();
+    config.permissions.rules = vec![localharness::policy::RuleConfig {
+        id: Some("keep-a".into()),
+        tool: Some("edit".into()),
+        path: Some("a.txt".into()),
+        command: None,
+        network: None,
+        action: localharness::policy::RuleAction::Deny,
+    }];
+    let harness = harness_config(dir.path(), two_file_edit_scripts(), config);
+    harness.core.set_reviewer(reviewer.clone());
+
+    let (outcome, _) = run(&harness, "edit both").await;
+    assert_eq!(outcome.status, TurnStatus::Done, "{:?}", outcome.error);
+    let (a, b) = file_contents(dir.path());
+    assert_eq!(a, "one\n", "the denied edit never ran");
+    assert_eq!(b, "two\n", "the allowed edit was reviewed and applied");
+    let requests = reviewer.requests.lock().unwrap();
+    let files: Vec<String> = requests
+        .iter()
+        .flat_map(|request| request.hunks.iter().map(|hunk| hunk.file.clone()))
+        .collect();
+    assert_eq!(
+        files,
+        vec!["b.txt".to_string()],
+        "only b.txt reached review"
+    );
+    drop(requests);
+    let results = tool_results(&harness.session);
+    assert!(
+        results
+            .iter()
+            .any(|result| result.contains("[DENIED]") && result.contains("keep-a")),
+        "{results:#?}"
+    );
+}
+
+#[tokio::test]
+async fn a_reviewed_edit_still_runs_post_tool_hooks() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+    let reviewer = scripted_reviewer(Vec::new());
+    let mut config = base_config();
+    config.review = localharness::config::ReviewMode::Always;
+    config.profiles.get_mut("test").expect("test profile").tools =
+        ["read", "edit"].map(str::to_string).to_vec();
+    config.hooks.entries.insert(
+        "after".into(),
+        hook_config(HookEvent::PostTool, "allow_escalate.sh", 0),
+    );
+    let harness = harness_config(
+        dir.path(),
+        vec![
+            call_script("read_a", "read", json!({"path": "a.txt"})),
+            call_script(
+                "edit_a",
+                "edit",
+                json!({"path": "a.txt", "old": "one", "new": "two"}),
+            ),
+            text_script("ok"),
+        ],
+        config,
+    );
+    harness.core.set_reviewer(reviewer.clone());
+
+    let (outcome, _) = run(&harness, "edit one file").await;
+    assert_eq!(outcome.status, TurnStatus::Done, "{:?}", outcome.error);
+    assert_eq!(reviewer.requests.lock().unwrap().len(), 1);
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+        "two\n"
+    );
+    // One for the read, one for the reviewed edit.
+    let invocations = hook_invocations(&harness.session, "post_tool");
+    assert_eq!(invocations.len(), 2, "{invocations:#?}");
+    let results = tool_results(&harness.session);
+    let edit_result = results.last().expect("edit result");
+    assert!(edit_result.contains("pre-hook note"), "{edit_result}");
+}

@@ -25,7 +25,7 @@ use async_trait::async_trait;
 use similar::{DiffOp, TextDiff};
 use tokio_util::sync::CancellationToken;
 
-use crate::tools::write::{atomic_write, file_mode};
+use crate::tools::write::{atomic_restore, atomic_write, file_mode};
 
 /// One proposed file write, captured before it lands.
 #[derive(Debug, Clone)]
@@ -73,6 +73,9 @@ pub(crate) fn mutation_write(
     // A file that exists but has no readable text (not UTF-8, or over 4 MB)
     // cannot be diffed; write it as before rather than failing the review.
     if current_capture().is_some() && (before.is_some() || !path.exists()) {
+        // Refuse a redaction placeholder now, as an uncaptured write would,
+        // instead of showing it for review and failing the whole apply.
+        crate::tools::write::refuse_new_placeholders(path, after.as_bytes())?;
         let capture = current_capture().expect("checked above");
         let mut writes = capture.lock().map_err(|_| {
             std::io::Error::other("the review buffer is poisoned; restart the turn")
@@ -347,7 +350,7 @@ fn rollback(written: &[(PathBuf, Option<Vec<u8>>, u32)]) {
     for (path, previous, mode) in written.iter().rev() {
         match previous {
             Some(bytes) => {
-                let _ = atomic_write(path, bytes, *mode);
+                let _ = atomic_restore(path, bytes, *mode);
             }
             None => {
                 let _ = std::fs::remove_file(path);
@@ -637,6 +640,57 @@ mod tests {
             .unwrap_err();
         assert!(error.contains("rolled back"), "{error}");
         assert_eq!(std::fs::read_to_string(&good).unwrap(), "old\n");
+    }
+
+    fn placeholder() -> String {
+        // Built through the redactor so the test follows its real format.
+        let redacted = crate::security::redact::Redactor::new(true)
+            .redact_owned(&format!("aws_key = AKIA{}", "Q".repeat(16)));
+        redacted.trim_start_matches("aws_key = ").to_string()
+    }
+
+    #[tokio::test]
+    async fn a_captured_write_refuses_a_new_placeholder_before_review() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.py");
+        std::fs::write(&path, "name = Column(Text)\n").unwrap();
+        let capture = Capture::default();
+        let corrupted = format!("name = {} Text)\n", placeholder());
+        let result = with_capture(capture.clone(), async {
+            mutation_write(&path, Some("name = Column(Text)\n"), &corrupted, 0o600)
+        })
+        .await;
+        let error = result.unwrap_err();
+        assert!(
+            error.to_string().contains("redaction placeholder"),
+            "{error}"
+        );
+        assert!(capture.lock().unwrap().is_empty(), "nothing is buffered");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "name = Column(Text)\n"
+        );
+    }
+
+    #[test]
+    fn rollback_restores_a_file_that_held_placeholder_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = dir.path().join("fixture.txt");
+        let original = format!("expected = {}\n", placeholder());
+        std::fs::write(&good, &original).unwrap();
+        let bad = Path::new("/proc/localharness-rewind-test/child.txt").to_path_buf();
+        let set = HunkSet::new(
+            vec![
+                proposal(&good, Some(&original), "expected = 1\n"),
+                proposal(&bad, None, "new\n"),
+            ],
+            dir.path(),
+        );
+        let error = set
+            .commit(&HunkDecision::accept_all(set.views().len()))
+            .unwrap_err();
+        assert!(error.contains("rolled back"), "{error}");
+        assert_eq!(std::fs::read_to_string(&good).unwrap(), original);
     }
 
     #[test]

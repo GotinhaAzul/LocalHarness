@@ -1790,10 +1790,14 @@ struct BatchOutcome {
 /// decision is applied.
 struct BufferedCall {
     call: ToolCall,
+    /// Repaired arguments, as the `post_tool` hook sees them.
+    args: Value,
     result: ToolResult,
     writes: Vec<crate::tools::hunk::PendingWrite>,
     started: Instant,
     summary_args: String,
+    /// Hook warnings and context from the pre-dispatch decision.
+    notes: Vec<String>,
 }
 
 fn is_file_mutation(name: &str) -> bool {
@@ -2212,10 +2216,14 @@ async fn execute_batch(
             if !writes.is_empty() {
                 buffered.push(BufferedCall {
                     call: call.clone(),
+                    args: evidence_args
+                        .clone()
+                        .unwrap_or_else(|| call.arguments.clone()),
                     result,
                     writes,
                     started,
                     summary_args: summary_args.clone(),
+                    notes: std::mem::take(&mut pre_notes),
                 });
                 if !review_done && last_reviewed == Some(position) {
                     review_done = true;
@@ -2747,6 +2755,39 @@ async fn finish_review(
                     }
                 }
             }
+        }
+
+        // The call ran against the capture and its hunks have now landed (or
+        // been rejected): run post_tool exactly as for an unreviewed call.
+        let post = crate::hooks::post_tool(
+            &hook_env(core),
+            &call.call.name,
+            &call.args,
+            &result.content,
+            result.is_error,
+            call.started.elapsed().as_millis() as u64,
+        )
+        .await;
+        for warning in &post.warnings {
+            let _ = tx.send(AgentEvent::Notice(format!("[hook] {warning}")));
+            result.content = format!("[hook warning] {warning}\n\n{}", result.content);
+        }
+        for context in post.contexts {
+            result.content.push_str(&format!(
+                "\n\n[hook context from {}]\n{}",
+                context.hook, context.text
+            ));
+        }
+        if let Some(block) = post.blocked {
+            let message = format!(
+                "hook {:?} blocked the {} result: {}. The change was not undone.",
+                block.hook, call.call.name, block.reason
+            );
+            let _ = tx.send(AgentEvent::Notice(message.clone()));
+            result = ToolResult::err("hook_block", message);
+        }
+        for note in &call.notes {
+            result.content = format!("{note}\n\n{}", result.content);
         }
 
         let text = format!(
