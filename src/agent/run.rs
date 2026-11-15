@@ -1734,7 +1734,20 @@ async fn execute_batch(
                     repaired = Some(args.clone());
                     result = ToolResult::ok("");
 
-                    if read_available
+                    // Permission policy first: a denial (rule, plan mode)
+                    // stops the call before any other gate. An ask waits
+                    // until the harness gates pass.
+                    let mut pending_ask = None;
+                    match super::authorize::decide(core, tool.as_deref().unwrap(), &args) {
+                        crate::policy::Decision::Allow => {}
+                        crate::policy::Decision::Ask(request) => pending_ask = Some(request),
+                        crate::policy::Decision::Deny { code, message } => {
+                            result = ToolResult::err(&code, message);
+                        }
+                    }
+
+                    if !result.is_error
+                        && read_available
                         && matches!(call.name.as_str(), "edit" | "write" | "patch")
                         && let Some(path) = &args_path
                     {
@@ -1791,6 +1804,13 @@ async fn execute_batch(
                         if let Err(message) = gate {
                             result = ToolResult::err("SEC_SCOPE", message);
                         }
+                    }
+
+                    if !result.is_error
+                        && let Some(request) = pending_ask.take()
+                        && let Err(denied) = super::authorize::confirm(core, request, cancel).await
+                    {
+                        result = denied;
                     }
 
                     // The frontend (ACP) may add its own approval gate. It
@@ -2582,6 +2602,7 @@ mod tests {
                 app: "test".into(),
                 redact: true,
                 context: None,
+                permissions: None,
             },
             true,
         )
@@ -2605,6 +2626,9 @@ mod tests {
             crate::app::measure_static_prompt(&budget, &system_prompt, tool_specs_cost, Some(""));
         Core {
             approver: None,
+            permissions: std::sync::Arc::new(crate::policy::Permissions::with_mode(
+                crate::policy::PermissionMode::Yolo,
+            )),
             config,
             paths: paths.clone(),
             provider: Arc::new(ProbeProvider {

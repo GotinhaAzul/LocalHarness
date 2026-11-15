@@ -285,6 +285,7 @@ observable.
 
 | Guard | Behavior |
 |---|---|
+| Permission policy | Evaluated first for every repaired call (`agent/authorize.rs`, `policy/`). Ordered `[permissions]` rules match on tool glob, path glob, command regex, and network; the last matching rule wins, except that a `deny` holds against any later `allow`/`ask` that is not strictly more specific. No match falls back to the mode: `ask`, `accept-edits`, `plan`, `dont-ask`, or `yolo` (flag only). A deny or plan-mode refusal returns `DENIED`/`plan_mode` with the rule id and the turn continues; an `ask` is resolved after the other gates pass, and an approval covers exactly that command or path for the session. See 8.13. |
 | Read-before-edit | `edit`/`patch` on an existing file require a prior `read` with a matching stat stamp (`mtime`, size). `write` also requires full-line coverage of the existing file, or an explicit `overwrite: true`; a result capped by the result or batch limit marks coverage incomplete. A changed file requires a re-read. Creation is allowed. A successful `edit`/`patch`/`write` re-stamps only the file it wrote, so consecutive edits need no re-read while any outside change still does. |
 | Scope gate | Security-sensitive commands are checked against the user-set engagement scope. No scope blocks with `SEC_SCOPE` and the `/sec scope add` call. Best-effort, not a sandbox. |
 | Sandbox | When `--sandbox` is set, `bash` and `bg` run in a bubblewrap namespace (or the Landlock fallback): read-only root, hidden `$HOME`, private `/tmp`, no network, and `.git` read-only in `workspace-write`. Startup fails closed when no backend exists; a per-command wrap failure returns `SANDBOX_UNAVAILABLE`. Commands never fall back to an unsandboxed run. |
@@ -508,13 +509,13 @@ Entry fields:
 
 | Type | Data |
 |---|---|
-| `session` | cwd, endpoint, model, profile, app version |
+| `session` | cwd, endpoint, model, profile, app version, redact, context?, permissions? (`mode`, `rules_hash`, `rules`) |
 | `user` | content |
 | `assistant` | content, reasoning?, tool_calls?, usage?, stop_reason? |
 | `tool_result` | call_id, content, is_error, details?, artifact? |
 | `compaction` | summary, tokens_before, reason, thread_id? |
 | `checkout` | target, reason (`tree`, `fork`, `resume`) |
-| `custom` | kind plus payload (`fs-change`, `verify-config`, `verify-result`, `todo-state`, `finding`, `thread-state`, `guard-trip`, `profile-change`, `model-change`) |
+| `custom` | kind plus payload (`fs-change`, `verify-config`, `verify-result`, `todo-state`, `finding`, `thread-state`, `guard-trip`, `profile-change`, `model-change`, `permissions`, `permission-mode`, `plan`) |
 | `error` | code, message, recoverable |
 
 An assistant entry with `tool_calls` is a batch. The tool results that answer it
@@ -1237,6 +1238,37 @@ input characters. Missing input and unreadable files return prescriptive errors.
 
 ---
 
+### 8.13 Permission policy and plan mode
+
+`policy/` holds the engine; `agent/authorize.rs` is the single pre-dispatch
+decision point. `authorize::decide` returns `Allow`, `Ask` (exact subject plus
+preview), or `Deny` (code and reason) before any other gate; a deny stops the
+call at once and `authorize::confirm` resolves an ask after the harness gates
+pass. Lifecycle hooks and provenance checks add their inputs inside `decide`
+so the loop keeps one decision point.
+
+- Policy comes from the global config and, only when trusted, the project
+  config. Rules from both are kept, global first. Skills, workflows, and the
+  model cannot change the mode or rules; workflows only select profiles.
+- Each call is classified: read-only (read-only tools, allowlisted `bash`
+  commands with no redirection or substitution, read-only `git` actions),
+  session (`todo`, `thread`, `finding`), edit (`write`, `edit`, `patch`,
+  `undo`), or exec (everything else, including MCP and external tools).
+  Read-only and session calls run in every mode unless a rule says otherwise.
+- `ask` asks for edits and exec; `accept-edits` runs edits unasked;
+  `dont-ask` denies instead of asking; `yolo` runs everything a deny rule does
+  not block. `yolo` is accepted only from `--yolo`, never from a config file,
+  and is recorded in the session header plus a `permission-mode` entry.
+- Asking needs a frontend: the TUI prompts, ACP defers to the client's
+  permission request, and headless runs deny.
+- `plan` refuses every call that is not read-only (or `todo`) with
+  `plan_mode`, before rules run, so no allow rule re-enables a mutation. Every
+  core build in plan mode also removes tools that can only mutate (`bash` and
+  `git` stay; each call is checked) and adds `todo`. A tool removed this way
+  is still refused with `plan_mode`, not `unknown_tool`. A plan-mode turn
+  cannot settle without a `todo` plan; the plan is stored as a `plan` session
+  entry (`proposed`, then `approved` or `discarded`).
+
 ## 9. Interfaces: TUI, headless, and ACP
 
 ### 9.1 Layout
@@ -1373,7 +1405,11 @@ cursor = "#c0caf5"
 - `Ctrl+L` redraws the whole screen.
 - Slash commands: `/help`, `/quit`, `/login`, `/model`, `/profile`, `/theme`,
   `/tree`, `/fork`, `/sessions`, `/compact`, `/tools`, `/skill`, `/workflow`,
-  `/sec`, `/trust`, `/commit`, `/pr`, `/export`, `/clear`, `/debug`. `/commit`
+  `/sec`, `/trust`, `/commit`, `/pr`, `/plan`, `/export`, `/clear`, `/debug`.
+  `/plan` enters plan mode (or shows the plan), `/plan approve` restores the
+  previous mode and tool set, `/plan exit` discards the plan. A permission
+  `ask` appears in the transcript with the exact command or path and a diff
+  preview; `y` allows, `n` or `Esc` denies, other keys are ignored. `/commit`
   and `/pr` show, edit, approve (`confirm`) or drop (`cancel`) what the `git`
   and `pr` tools previewed; `/commit` alone drafts a message from the staged
   diff without a model. `/login` validates and saves
@@ -1413,7 +1449,10 @@ cursor = "#c0caf5"
 `lh --print "<prompt>"` runs one turn without the TUI, streams to stdout, and
 exits with the turn status. `--json` emits newline-delimited events for
 scripting. The same core and session code is used. This is not a second
-implementation.
+implementation. Nobody can answer a permission `ask` headless, so it is denied
+with `DENIED`; pass `--mode accept-edits`, add allow rules, or `--yolo`.
+`--plan --print` runs one plan-mode turn, prints the stored plan (a `plan`
+event with `--json`), and exits 0 without touching the workspace.
 
 ### 9.8 Agent Client Protocol
 

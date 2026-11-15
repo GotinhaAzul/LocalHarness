@@ -661,7 +661,13 @@ async fn spawn_tool_server() -> (String, ToolFake) {
 async fn print_executes_a_tool_call_and_writes_a_file() {
     let (base, fake) = spawn_tool_server().await;
     let env = env();
-    let output = run_lh(&env, &base, &["--print", "create made.txt"]).await;
+    // Headless runs cannot ask, so file edits need an explicit mode.
+    let output = run_lh(
+        &env,
+        &base,
+        &["--mode", "accept-edits", "--print", "create made.txt"],
+    )
+    .await;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
@@ -671,4 +677,123 @@ async fn print_executes_a_tool_call_and_writes_a_file() {
         "hello"
     );
     assert!(fake.requests.load(Ordering::SeqCst) >= 2);
+}
+
+// ---------------------------------------------------------------------------
+// Permission modes and plan mode
+// ---------------------------------------------------------------------------
+
+/// `lh` with a persisted session (unlike `run_lh`, which passes --no-session).
+async fn run_lh_with_session(env: &Env, base: &str, extra: &[&str]) -> std::process::Output {
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_lh"));
+    command
+        .arg("--endpoint")
+        .arg(base)
+        .arg("--model")
+        .arg("test-model")
+        .args(extra)
+        .current_dir(&env.cwd)
+        .env("LH_CONFIG_DIR", &env.config_dir)
+        .env("LH_DATA_DIR", &env.data_dir)
+        .env("LH_SKIP_TOOL_PROBE", "1")
+        .env_remove("LH_ENDPOINT")
+        .env_remove("LH_MODEL")
+        .env_remove("LH_API_KEY")
+        .env_remove("LH_PROFILE")
+        .env_remove("LH_TRUST");
+    tokio::time::timeout(std::time::Duration::from_secs(30), command.output())
+        .await
+        .expect("lh timed out")
+        .expect("cannot run lh")
+}
+
+fn session_lines(env: &Env) -> Vec<serde_json::Value> {
+    fn find(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                find(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "jsonl") {
+                out.push(path);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    find(&env.data_dir, &mut files);
+    assert_eq!(files.len(), 1, "sessions: {files:?}");
+    std::fs::read_to_string(&files[0])
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn print_denies_an_edit_it_cannot_ask_about_and_still_answers() {
+    let (base, _) = spawn_tool_server().await;
+    let env = env();
+    let output = run_lh(&env, &base, &["--print", "create made.txt"]).await;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
+    assert!(stdout.contains("wrote it"), "stdout: {stdout}");
+    assert!(!env.cwd.join("made.txt").exists());
+}
+
+#[tokio::test]
+async fn the_session_header_records_the_mode_and_rule_hash() {
+    let (base, _) = spawn().await;
+    let env = env();
+    std::fs::create_dir_all(&env.config_dir).unwrap();
+    std::fs::write(
+        env.config_dir.join("config.toml"),
+        "[permissions]\nmode = \"accept-edits\"\n\n[[permissions.rules]]\nid = \"no-push\"\ntool = \"bash\"\ncommand = 'git\\s+push'\naction = \"deny\"\n",
+    )
+    .unwrap();
+    let output = run_lh_with_session(&env, &base, &["--print", "hi"]).await;
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let lines = session_lines(&env);
+    let permissions = &lines[0]["data"]["permissions"];
+    assert_eq!(lines[0]["type"], "session");
+    assert_eq!(permissions["mode"], "accept-edits");
+    assert_eq!(permissions["rules"], 1);
+    let hash = permissions["rules_hash"].as_str().unwrap();
+    assert_eq!(hash.len(), 16);
+    assert!(hash.chars().all(|c| c.is_ascii_hexdigit()), "{hash}");
+}
+
+#[tokio::test]
+async fn yolo_is_explicit_and_logged_in_the_session() {
+    let (base, _) = spawn().await;
+    let env = env();
+    // A config file cannot select yolo.
+    std::fs::create_dir_all(&env.config_dir).unwrap();
+    std::fs::write(
+        env.config_dir.join("config.toml"),
+        "[permissions]\nmode = \"yolo\"\n",
+    )
+    .unwrap();
+    let refused = run_lh(&env, &base, &["--print", "hi"]).await;
+    assert_ne!(refused.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("--yolo"));
+    let refused = run_lh(&env, &base, &["--mode", "yolo", "--print", "hi"]).await;
+    assert_ne!(refused.status.code(), Some(0));
+
+    std::fs::remove_file(env.config_dir.join("config.toml")).unwrap();
+    let output = run_lh_with_session(&env, &base, &["--yolo", "--print", "hi"]).await;
+    assert_eq!(output.status.code(), Some(0));
+    let lines = session_lines(&env);
+    assert_eq!(lines[0]["data"]["permissions"]["mode"], "yolo");
+    assert!(
+        lines.iter().any(|line| line["type"] == "custom"
+            && line["data"]["kind"] == "permission-mode"
+            && line["data"]["mode"] == "yolo"
+            && line["data"]["source"] == "--yolo"),
+        "{lines:#?}"
+    );
 }

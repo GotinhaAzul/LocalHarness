@@ -1,5 +1,6 @@
 //! Agent loop: context assembly, model streaming, tool batch execution, gates.
 
+pub mod authorize;
 pub mod calls;
 pub mod gates;
 pub mod limits;
@@ -97,6 +98,9 @@ pub struct Core {
     /// Optional frontend approval gate for tool calls (ACP). It runs after
     /// the harness gates and can only deny.
     pub approver: Option<Arc<dyn crate::tools::ToolApprover>>,
+    /// Permission mode, rules, and session approvals, shared across core
+    /// rebuilds. Consulted before every dispatch (see [`authorize`]).
+    pub permissions: Arc<crate::policy::Permissions>,
 }
 
 /// One-time endpoint bring-up that outlives the launch path. The TUI opens

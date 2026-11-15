@@ -980,3 +980,61 @@ async fn login_configures_a_model_and_model_command_lists_choices() {
     assert_eq!(parsed["model"]["endpoint"].as_str(), Some(single.as_str()));
     assert_eq!(parsed["model"]["model"].as_str(), Some("only-model"));
 }
+
+#[tokio::test]
+async fn a_permission_prompt_shows_the_exact_command_and_answers_with_y_or_n() {
+    let (_dir, mut app) = test_app().await;
+    let ask = |subject: &str| {
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        let pending = permission::PendingAsk {
+            request: crate::policy::AskRequest {
+                tool: "bash".into(),
+                subject: subject.into(),
+                preview: None,
+                rule: Some("push-asks".into()),
+                key: format!("bash\0{subject}"),
+            },
+            reply,
+        };
+        (pending, answer)
+    };
+
+    let (pending, answer) = ask("git push origin feature/x");
+    app.show_permission_request(pending);
+    let mut screen = EmulatedScreen::new(100, 30);
+    screen.frame(&mut app, "ask shown");
+    let shown = screen.parser.screen().contents();
+    assert!(shown.contains("$ git push origin feature/x"), "{shown}");
+    assert!(shown.contains("push-asks"), "{shown}");
+    assert!(shown.contains("y allow"), "{shown}");
+    // A stray key does not answer; y does.
+    app.handle_key(key(KeyCode::Char('q'))).await;
+    assert!(app.pending_ask.is_some());
+    app.handle_key(key(KeyCode::Char('y'))).await;
+    assert_eq!(answer.await.unwrap(), crate::policy::AskAnswer::Allow);
+
+    let (pending, answer) = ask("rm -rf build");
+    app.show_permission_request(pending);
+    app.handle_key(key(KeyCode::Char('n'))).await;
+    assert_eq!(answer.await.unwrap(), crate::policy::AskAnswer::Deny);
+    assert!(app.pending_ask.is_none());
+}
+
+#[test]
+fn ask_text_includes_the_diff_preview() {
+    let request = crate::policy::AskRequest {
+        tool: "edit".into(),
+        subject: "src/lib.rs".into(),
+        preview: crate::policy::preview(
+            "edit",
+            &serde_json::json!({"path": "src/lib.rs", "old": "a\n", "new": "b\n"}),
+            std::path::Path::new("/w"),
+            40,
+        ),
+        rule: None,
+        key: String::new(),
+    };
+    let text = permission::ask_text(&request);
+    assert!(text.starts_with("edit: src/lib.rs"), "{text}");
+    assert!(text.contains("-a") && text.contains("+b"), "{text}");
+}

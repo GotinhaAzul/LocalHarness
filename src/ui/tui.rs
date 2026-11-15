@@ -50,6 +50,7 @@ use crate::workflows::{self, WorkflowSpec};
 mod commands;
 mod git_commands;
 mod keys;
+mod permission;
 mod support;
 mod terminal;
 #[cfg(test)]
@@ -143,6 +144,8 @@ enum BgEvent {
         switch: Switch,
         result: std::result::Result<Arc<Core>, String>,
     },
+    /// A running turn asks the user to approve one call.
+    Permission(permission::PendingAsk),
 }
 
 /// A config switch running in the background.
@@ -406,6 +409,8 @@ struct App {
     theme_before_preview: Option<String>,
     /// Clear the screen and repaint every cell on the next frame.
     repaint: bool,
+    /// A permission question from the running turn, waiting for y/n.
+    pending_ask: Option<permission::PendingAsk>,
     /// The last frame as drawn, for tests that check the screen.
     #[cfg(test)]
     last_frame: Option<ratatui::buffer::Buffer>,
@@ -492,9 +497,11 @@ impl App {
             switching: None,
             theme_before_preview: None,
             repaint: false,
+            pending_ask: None,
             #[cfg(test)]
             last_frame: None,
         };
+        app.install_asker();
         app.no_color = app.options.no_color;
         app.transcript = Transcript::new(app.config.ui.show_reasoning);
         app.refresh_session_blocks();
@@ -616,6 +623,7 @@ impl App {
                     view.replace_items(model_items(&models));
                 }
             }
+            BgEvent::Permission(pending) => self.show_permission_request(pending),
             BgEvent::Rebuilt { switch, result } => {
                 self.switching = None;
                 let core = match result {
@@ -868,6 +876,7 @@ impl App {
         self.used_tokens = estimate_used(&runtime.core);
         self.header.used = self.used_tokens;
         self.sync_banner();
+        self.install_asker();
     }
 
     /// Returns whether the header changed (the watcher reports every few
@@ -1003,7 +1012,9 @@ impl App {
     fn footer(&self) -> FooterData {
         // Login and trust state live in the info bar; the footer is hints or
         // a transient notice only.
-        let (status, status_role) = (String::new(), Role::Muted);
+        let (status, status_role) = self
+            .permission_status()
+            .unwrap_or((String::new(), Role::Muted));
         let hints = if !self.transcript.follow {
             "End or Ctrl+End to return to the bottom · wheel/pgup/pgdn scroll".to_string()
         } else if self.turn_active {
@@ -1290,6 +1301,10 @@ impl App {
     }
 
     fn finish_turn(&mut self, outcome: Option<TurnOutcome>) {
+        // An unanswered question dies with its turn.
+        if let Some(pending) = self.pending_ask.take() {
+            let _ = pending.reply.send(crate::policy::AskAnswer::Deny);
+        }
         self.turn_active = false;
         self.cancelling = false;
         self.turn_state = None;

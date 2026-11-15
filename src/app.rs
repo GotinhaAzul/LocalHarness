@@ -18,6 +18,7 @@ use crate::provider::{OpenAiCompatProvider, Provider, probe};
 use crate::security::SecurityState;
 use crate::session::{
     APP_VERSION, CustomData, EntryKind, Session, SessionContextWindow, SessionData,
+    SessionPermissions,
 };
 use crate::skills::SkillIndex;
 use crate::tools::{BgRegistry, ReadTracker, SessionHandle, SessionHandle as Handle, ToolRegistry};
@@ -242,6 +243,18 @@ pub async fn create_runtime(
         redact,
     )?));
 
+    let policy =
+        crate::policy::Policy::compile(&config.permissions.rules).map_err(anyhow::Error::msg)?;
+    let permissions = Arc::new(crate::policy::Permissions::new(
+        policy,
+        config.permissions.mode,
+    ));
+    let session_permissions = SessionPermissions {
+        mode: permissions.mode().label().to_string(),
+        rules_hash: permissions.policy().hash().to_string(),
+        rules: permissions.policy().len(),
+    };
+
     if !options.no_session {
         paths.ensure_dirs()?;
     }
@@ -286,10 +299,39 @@ pub async fn create_runtime(
                 app: APP_VERSION.to_string(),
                 redact,
                 context: session_context(window_truth.as_ref()),
+                permissions: Some(session_permissions.clone()),
             },
             options.no_session,
         )?,
     };
+    // A resumed session keeps its original header; record the policy this
+    // run uses when it differs.
+    if session
+        .header()
+        .and_then(|header| header.permissions.as_ref())
+        != Some(&session_permissions)
+        && let Err(error) = session.append(EntryKind::Custom(
+            CustomData::new("permissions")
+                .with("mode", session_permissions.mode.as_str())
+                .with("rules_hash", session_permissions.rules_hash.as_str())
+                .with("rules", session_permissions.rules),
+        ))
+    {
+        tracing::warn!(%error, "cannot record the permission mode in the session");
+    }
+    if permissions.mode() == crate::policy::PermissionMode::Yolo {
+        // Config files cannot select yolo; only the explicit flag reaches here.
+        if let Err(error) = session.append(EntryKind::Custom(
+            CustomData::new("permission-mode")
+                .with("mode", "yolo")
+                .with("source", "--yolo"),
+        )) {
+            tracing::warn!(%error, "cannot record --yolo in the session");
+        }
+        session.warnings.push(
+            "--yolo: every tool call runs without asking; only deny rules still apply".into(),
+        );
+    }
     session.warnings.extend(startup_warnings);
     let recorded_redact = session.header().map(|header| header.redact).unwrap_or(true);
     if recorded_redact != redact {
@@ -361,6 +403,7 @@ pub async fn create_runtime(
     registry.configure_git(&config.git);
     let mcp = Arc::new(crate::mcp::McpManager::new());
     let (tools, mcp_warnings) = select_tools(&registry, &config, &paths, &mcp).await?;
+    let tools = permissions.filter_tools(tools, &registry);
     session.warnings.extend(mcp_warnings);
     let mut tool_specs = ToolRegistry::specs_with(&tools, profile.short_tool_schemas());
     // With a background `model.start_command`, the server may not be up yet;
@@ -544,6 +587,7 @@ pub async fn create_runtime(
         startup,
         mcp,
         approver: options.approver.clone(),
+        permissions,
     };
 
     Ok(Runtime {
@@ -655,7 +699,30 @@ pub async fn rebuild_core(old: &Arc<Core>, mut config: Config) -> Result<Arc<Cor
     let mut registry = ToolRegistry::builtin();
     registry.lsp().set_gate(config.lsp.gate);
     registry.configure_git(&config.git);
+    // Rules change only when the config files do (for example `/trust`
+    // loading the project config); workflows and profiles cannot touch them.
+    let policy =
+        crate::policy::Policy::compile(&config.permissions.rules).map_err(anyhow::Error::msg)?;
+    let permissions = if policy.hash() == old.permissions.policy().hash() {
+        old.permissions.clone()
+    } else {
+        let permissions = Arc::new(old.permissions.with_policy(policy));
+        if let Ok(mut session) = old.session.lock()
+            && let Err(error) = session.append(EntryKind::Custom(
+                CustomData::new("permissions")
+                    .with("mode", permissions.mode().label())
+                    .with("rules_hash", permissions.policy().hash())
+                    .with("rules", permissions.policy().len()),
+            ))
+        {
+            tracing::warn!(%error, "cannot record the permission rules in the session");
+        }
+        permissions
+    };
     let (tools, mcp_warnings) = select_tools(&registry, &config, &old.paths, &old.mcp).await?;
+    // Plan mode filters every rebuild, so a workflow or profile switch cannot
+    // bring a mutating tool back while it is active.
+    let tools = permissions.filter_tools(tools, &registry);
     if !mcp_warnings.is_empty() {
         for warning in &mcp_warnings {
             tracing::warn!("{warning}");
@@ -778,6 +845,7 @@ pub async fn rebuild_core(old: &Arc<Core>, mut config: Config) -> Result<Arc<Cor
         window_cache: old.window_cache.clone(),
         mcp: old.mcp.clone(),
         approver: old.approver.clone(),
+        permissions,
         // Endpoint bring-up is not retried on `/model` or `/login`; only a
         // still-running bring-up for the same target carries over.
         startup: if same_target {

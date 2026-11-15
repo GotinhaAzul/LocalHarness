@@ -121,6 +121,16 @@ pub struct Cli {
     /// pre-sandbox behavior; recorded in the session.
     #[arg(long, global = true, conflicts_with = "sandbox")]
     pub no_sandbox: bool,
+
+    /// Permission mode for unmatched calls: ask, accept-edits, plan, or
+    /// dont-ask. Overrides `[permissions] mode`; rules still apply.
+    #[arg(long, global = true, value_name = "MODE", conflicts_with = "yolo")]
+    pub mode: Option<String>,
+
+    /// Run every tool call without asking; only deny rules still apply.
+    /// Never the default; recorded in the session.
+    #[arg(long, global = true)]
+    pub yolo: bool,
 }
 
 #[derive(Debug, clap::Subcommand)]
@@ -244,6 +254,20 @@ pub async fn run(cli: Cli) -> Result<i32> {
     if cli.no_sandbox {
         config.sandbox = crate::config::SandboxMode::Off;
         config.sandbox_explicit = true;
+    }
+    if let Some(mode) = &cli.mode {
+        config.permissions.mode = match crate::policy::PermissionMode::parse(mode) {
+            Some(crate::policy::PermissionMode::Yolo) => {
+                bail!("--mode yolo is not accepted; pass --yolo explicitly")
+            }
+            Some(mode) => mode,
+            None => {
+                bail!("unknown permission mode {mode:?}; use ask, accept-edits, plan, or dont-ask")
+            }
+        };
+    }
+    if cli.yolo {
+        config.permissions.mode = crate::policy::PermissionMode::Yolo;
     }
     config.trust = trust;
     config.session.no_session |= cli.no_session;

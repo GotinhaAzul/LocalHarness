@@ -34,6 +34,29 @@ obfuscation can bypass it. The rules of engagement are the real control. For
 process-level isolation use `--sandbox`; for VM-grade isolation, run the
 harness itself in a container.
 
+## Permissions
+
+A policy engine runs before every tool call (see
+[configuration.md](configuration.md#permissions)). Modes (`ask`,
+`accept-edits`, `plan`, `dont-ask`, `yolo`) and ordered allow/ask/deny rules on
+tool, path, command, and network decide whether a call runs, asks the user
+with the exact command or path, or returns `DENIED` with the rule id. A `deny`
+cannot be undone by a later, less specific `allow`, and it applies in every
+mode, including `--yolo`.
+
+The policy is read only from the global config and a trusted project config.
+Skills and workflows cannot change it: a workflow that lists `bash` still hits a
+`git push` deny, and a workflow that lists `write` cannot bring it back in plan
+mode. `--yolo` is never the default, is not accepted from a config file, and is
+recorded in the session header.
+
+Rules are not a sandbox. Command matching sees the command text, so
+`sh -c "$(echo Z2l0IHB1c2g= | base64 -d)"` is not a `git push` to a regex;
+default to `ask` for commands and keep `--sandbox` as the process boundary.
+Read-only classification for plan mode is an allowlist that refuses
+redirection, substitution, and subshells; anything it does not understand is
+treated as mutating.
+
 ## Sandbox
 
 `--sandbox` puts `bash` and `bg` behind an OS-level boundary. The primary

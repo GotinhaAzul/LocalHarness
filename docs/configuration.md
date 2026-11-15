@@ -79,6 +79,15 @@ commit = "ask"                  # ask: /commit confirm approves; allow: commit a
 pr = "ask"                      # ask: /pr confirm approves drafts and comments
 subject_max = 72                # longest accepted commit subject
 
+[permissions]
+mode = "ask"                    # ask | accept-edits | plan | dont-ask (yolo: --yolo only)
+
+[[permissions.rules]]           # ordered; see "Permissions" below
+id = "no-push"
+tool = "bash"
+command = '\bgit\s+push\b'
+action = "deny"
+
 # `coding` is the built-in default. `full` adds the security pack; `security`
 # and `minimal` narrow it further. `strict` and `shell` are weak-model presets.
 [profile.coding]
@@ -190,6 +199,72 @@ while the staged diff still matches the preview. `allow` runs the action at
 once and suits unattended runs; headless `--print` has no way to approve, so
 `ask` leaves the preview unapplied there.
 
+## Permissions
+
+Every tool call is checked against `[permissions]` before it runs. Policy is
+read from the global config and, only when the project is trusted, from
+`.harness/config.toml`; rules from both apply, global first. Skills, workflows,
+and the model cannot change it.
+
+**Modes** decide calls that no rule matches. Read-only calls (read-only tools,
+allowlisted shell commands such as `ls`, `rg`, `git status`/`log`/`diff` with
+no redirection or substitution, and read-only `git` tool actions) and harness
+bookkeeping (`todo`, `thread`, `finding`) always run.
+
+| Mode | File edits (`write`, `edit`, `patch`, `undo`) | Commands, network, MCP/external tools |
+|---|---|---|
+| `ask` (default) | ask | ask |
+| `accept-edits` | run | ask |
+| `plan` | refused (`plan_mode`) | refused unless read-only |
+| `dont-ask` | denied | denied |
+| `yolo` | run | run |
+
+`yolo` is never the default and cannot be set in a config file; only `--yolo`
+selects it, and the session records it. Deny rules still apply in every mode.
+
+**Rules** are an ordered list. Every field a rule sets must match:
+
+| Field | Matches |
+|---|---|
+| `tool` | tool name glob: `bash`, `write`, `github__*`, `*` |
+| `path` | path glob relative to the working directory: `src/**`, `**/.env` |
+| `command` | regex searched in the exact command (`bash`, `bg`); `git <action>` for the `git` tool; `gh pr <action>` for `pr` |
+| `network` | `true` for calls classified as network access (`curl`, `ssh`, `git push`/`fetch`, package installs, `pr`) |
+| `action` | `allow`, `ask`, or `deny` |
+| `id` | name reported in a denial; `rule-<n>` when absent |
+
+The last matching rule wins, with one exception: a `deny` holds against any
+later `allow` or `ask` that is not strictly more specific (sets more of tool,
+path, command, network). So a later `tool = "bash", command = "^cargo test"`
+allow beats an earlier `tool = "bash"` ask, but a later broad `tool = "bash"`
+allow does not undo a `git push` deny. The network classifier is a heuristic;
+`--sandbox` is the hard network boundary.
+
+A denied call returns `[DENIED]` with the rule id to the model and the turn
+continues. In the TUI an `ask` shows the exact command or path, with a diff for
+file edits; `y` allows, `n` or `Esc` denies. An approval covers exactly that
+command or path for the rest of the session: approving `git push origin main`
+does not approve `git push origin main --force`. Headless runs cannot ask, so
+an `ask` is denied there; use `--mode accept-edits`, allow rules, or `--yolo`.
+ACP forwards the question to the editor.
+
+The session header records the mode and a 16-digit hash of the rules
+(`permissions.mode`, `permissions.rules_hash`). Rules are reloaded when the
+config is (for example on `/trust confirm`); the change is recorded.
+
+### Plan mode
+
+`/plan` (or `--plan` at launch) enters plan mode: the model may investigate but
+not change anything. Tools that can only mutate are removed from the tool set,
+`bash` and `git` stay but only their read-only forms run, and `todo` is added.
+Any mutating call, including one a workflow or skill asks for, is refused at
+dispatch with `plan_mode` and the approve command. A plan-mode turn cannot end
+without a `todo` plan; the plan is stored as a `plan` session entry and shown
+by `/plan`. `/plan approve` restores the previous mode and exactly the
+previous tool set and records the approval; `/plan exit` does the same and
+records the plan as discarded. `lh --plan --print "..."` runs one plan-mode
+turn, prints the plan, and exits 0.
+
 ## LSP gate
 
 `[lsp] gate` controls what happens when a `write`, `edit`, or `patch` introduces
@@ -296,7 +371,8 @@ Steps run sequentially without a shell and stop at the first failure.
 `--theme`, `--api-key`, `--trust`, `--no-session`, `--no-redact`, `--continue`,
 `--resume`, `--path-jail`, `--sandbox [read-only|workspace-write]`,
 `--no-sandbox`, `--engagement`, `--no-color`, `--keep-artifacts`,
-`--clean-artifacts`, `--allow-remote-images`, `--keep-exif`, `--debug`.
+`--clean-artifacts`, `--allow-remote-images`, `--keep-exif`, `--debug`,
+`--mode <ask|accept-edits|plan|dont-ask>`, `--yolo`, `--plan`.
 
 `lh doctor [--json] [--fix]` prints the engine capability manifest without
 sending a chat completion. See [model-setup.md](model-setup.md).

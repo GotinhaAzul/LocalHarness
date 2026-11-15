@@ -14,8 +14,8 @@ use chrono::Utc;
 pub use artifact::{Artifact, ArtifactError, ArtifactSlice, ArtifactStore};
 pub use entry::{
     AssistantData, Attachment, CheckoutData, CompactionData, CustomData, Entry, EntryKind,
-    ErrorData, FORMAT_VERSION, ImageRef, SessionContextWindow, SessionData, ToolCall,
-    ToolResultData, UserData,
+    ErrorData, FORMAT_VERSION, ImageRef, SessionContextWindow, SessionData, SessionPermissions,
+    ToolCall, ToolResultData, UserData,
 };
 pub use store::{SessionStore, StoreError};
 pub use tree::{CheckoutError, SessionTree};
@@ -437,6 +437,7 @@ mod tests {
             app: APP_VERSION.into(),
             redact: true,
             context: None,
+            permissions: None,
         }
     }
 
