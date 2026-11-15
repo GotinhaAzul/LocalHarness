@@ -4280,3 +4280,45 @@ async fn a_hash_patch_cannot_write_a_redaction_placeholder() {
         );
     }
 }
+
+#[tokio::test]
+async fn a_path_deny_rule_matches_a_hash_patch_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = {
+        let mut harness = hash_patch_harness(
+            dir.path(),
+            "alpha\nbeta\n",
+            "BETA",
+            localharness::config::ReviewMode::Off,
+        );
+        // Rebuild the permissions with a deny rule on the plain file name.
+        let mut core = Arc::try_unwrap(harness.core).unwrap_or_else(|_| panic!("sole owner"));
+        core.permissions = Arc::new(Permissions::new(
+            Policy::compile(&[localharness::policy::RuleConfig {
+                id: Some("keep-a".into()),
+                tool: Some("patch".into()),
+                path: Some("a.txt".into()),
+                command: None,
+                network: None,
+                action: localharness::policy::RuleAction::Deny,
+            }])
+            .unwrap(),
+            PermissionMode::Yolo,
+        ));
+        harness.core = Arc::new(core);
+        harness
+    };
+    let (outcome, _) = run(&harness, "patch beta").await;
+    assert_eq!(outcome.status, TurnStatus::Done, "{:?}", outcome.error);
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+        "alpha\nbeta\n",
+        "a.txt#<snapshot> is a.txt to the policy"
+    );
+    let results = tool_results(&harness.session);
+    assert!(
+        results[1].contains("[DENIED]") && results[1].contains("keep-a"),
+        "{}",
+        results[1]
+    );
+}

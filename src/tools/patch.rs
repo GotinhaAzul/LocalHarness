@@ -203,9 +203,10 @@ fn split_snapshot(raw: &str) -> Option<(&str, &str)> {
     Some((path, tag))
 }
 
-/// The filesystem path the LSP gate snapshots. In hash mode the tag is
-/// metadata, not part of the filename.
-fn gate_path(raw: &str, mode: EditMode) -> &str {
+/// The filesystem path a patch targets, for the LSP gate, the permission
+/// rules, and hunk review. In hash mode the `#snapshot` tag is metadata, not
+/// part of the filename.
+pub(crate) fn gate_path(raw: &str, mode: EditMode) -> &str {
     match mode {
         EditMode::Hash => split_snapshot(raw).map(|(path, _)| path).unwrap_or(raw),
         EditMode::Text => raw,
