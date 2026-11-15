@@ -1,15 +1,25 @@
-//! Secret redaction for anything that is persisted or replayed.
+//! Secret redaction for what LocalHarness writes to disk or sends off the
+//! machine on the user's behalf.
 //!
-//! Session entries, artifacts, evidence, and exported reports pass through
-//! [`Redactor`] before they reach disk. Detection is deliberately shape-based:
-//! private key blocks, provider token prefixes, bearer/authorization headers,
-//! secret-like `.env` assignments, and the exact values of environment
-//! variables whose names look secret. Replacements keep the value comparable
-//! without exposing it:
+//! Session files, archived artifacts, evidence, findings evidence, exported
+//! reports, PR bodies, and the staged-diff commit check pass through
+//! [`Redactor`]. Detection is deliberately shape-based: private key blocks,
+//! provider token prefixes, bearer/authorization headers, secret-like `.env`
+//! assignments, and the exact values of environment variables whose names
+//! look secret. Replacements keep the value comparable without exposing it:
 //!
 //! ```text
 //! [REDACTED:<kind>:<first4>...<hash8>]
 //! ```
+//!
+//! Redaction is a persistence transform only. It is never applied to text the
+//! model reads in the live session (tool results, `recall`, `bg` logs, its own
+//! earlier tool-call arguments), because a model that sees a placeholder in
+//! place of file content writes the placeholder back and corrupts the file.
+//! This holds even for correct matches: rewriting a `.env` file the model saw
+//! redacted would destroy the real values. Text replayed from disk after a
+//! resume can still carry placeholders; [`new_placeholders`] lets the file
+//! writers refuse to introduce them.
 //!
 //! File paths and command names are never matched on their own; only values
 //! are replaced. The module uses the existing `regex` and `sha2` dependencies.
@@ -50,11 +60,13 @@ const PATTERN: &str = concat!(
         r#"(?P<env_value>"[^"\r\n]*"|'[^'\r\n]*'|[^\s#\r\n]+)"#,
     ),
     // `.env` files also carry connection strings and opaque tokens under names
-    // that do not contain a marker word. Redact only values that look
-    // sensitive; paths and ordinary settings stay readable.
+    // that do not contain a marker word. Only env-style (upper-case) names are
+    // considered, so `name = Column(Text)` in source code never matches, and
+    // only values that look sensitive are redacted; paths, code, and ordinary
+    // settings stay readable.
     concat!(
         r"|(?m:^[ \t]*(?:[+\-][ \t]*)?(?:\d+[ \t]+)?(?:export[ \t]+)?",
-        r"(?P<env_generic_name>[A-Za-z_][A-Za-z0-9_]*)[ \t]*=[ \t]*)",
+        r"(?P<env_generic_name>[A-Z_][A-Z0-9_]*)[ \t]*=[ \t]*)",
         r#"(?P<env_generic_value>"[^"\r\n]*"|'[^'\r\n]*'|[^\s#;\r\n]+)"#,
     ),
 );
@@ -135,7 +147,11 @@ impl Redactor {
                 last = whole.end();
                 continue;
             };
-            if should_redact(raw_kind, value.as_str(), whole.as_str()) {
+            let name = caps
+                .name("env_name")
+                .or_else(|| caps.name("env_generic_name"))
+                .map_or("", |name| name.as_str());
+            if should_redact(raw_kind, name, value.as_str(), whole.as_str()) {
                 let kind = refine_kind(raw_kind, value.as_str());
                 changed = true;
                 replaced.push_str(&text[whole.start()..value.start()]);
@@ -285,7 +301,7 @@ fn refine_kind(kind: &str, value: &str) -> &'static str {
     }
 }
 
-fn should_redact(kind: &str, value: &str, whole: &str) -> bool {
+fn should_redact(kind: &str, name: &str, value: &str, whole: &str) -> bool {
     if value.is_empty() || is_placeholder(value) {
         return false;
     }
@@ -300,9 +316,74 @@ fn should_redact(kind: &str, value: &str, whole: &str) -> bool {
                 looks_high_entropy(value)
             }
         }
-        "env_generic" => looks_sensitive_assignment(value),
+        "env" if !name.is_empty() => looks_secret_assignment(name, value),
+        "env_generic" => !looks_like_code(value) && looks_sensitive_assignment(value),
         _ => true,
     }
+}
+
+/// A value assigned to a secret-named variable (`DB_PASSWORD=...`,
+/// `api_key = ...`). Quoted literals are redacted as before. Unquoted values
+/// that are code (`primary_key = compute(a, b)`, `secret_key =
+/// os.environ["X"]`, `token = settings.token`) are not. Env-style upper-case
+/// names keep any other value; lower-case names, which are usually source
+/// code or INI keys, additionally need an opaque, high-entropy value.
+fn looks_secret_assignment(name: &str, value: &str) -> bool {
+    if is_quoted(value) {
+        return true;
+    }
+    if looks_like_code(value) {
+        return false;
+    }
+    if is_env_style_name(name) {
+        return true;
+    }
+    // A provider token keeps its shape wherever it appears.
+    if refine_kind("env", value) != "env" {
+        return true;
+    }
+    !is_code_reference(value) && looks_high_entropy(value)
+}
+
+fn is_quoted(value: &str) -> bool {
+    value.len() >= 2
+        && ((value.starts_with('"') && value.ends_with('"'))
+            || (value.starts_with('\'') && value.ends_with('\'')))
+}
+
+/// `NAME` or `NAME_2`: no lower-case letters, the shape of `.env` and shell
+/// variables rather than source-code identifiers.
+fn is_env_style_name(name: &str) -> bool {
+    !name.is_empty() && !name.chars().any(|ch| ch.is_ascii_lowercase())
+}
+
+/// Unquoted values with call, index, collection, or comparison syntax, or a
+/// shell expansion, are expressions rather than secret literals. Credentials
+/// in `.env` files do not carry these characters unquoted.
+fn looks_like_code(value: &str) -> bool {
+    if is_quoted(value) {
+        return false;
+    }
+    value.starts_with('=')
+        || value.contains(['(', ')', '[', ']', '{', '}', ',', '<', '>', ';', '$', '`'])
+}
+
+/// `self.value` or `os.environ` (a dotted attribute path), or a plain
+/// identifier without digits such as `getToken`. Opaque tokens such as
+/// `Zx81Kq0LmP2vB7wR` are identifier-shaped too, so a single segment with a
+/// digit is left to the entropy check.
+fn is_code_reference(value: &str) -> bool {
+    if !value.contains('.') && value.chars().any(|ch| ch.is_ascii_digit()) {
+        return false;
+    }
+    !value.is_empty()
+        && value.split('.').all(|part| {
+            let mut chars = part.chars();
+            chars
+                .next()
+                .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+                && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        })
 }
 
 /// A generic `.env` value is redacted only when it looks like a credential or
@@ -370,6 +451,38 @@ fn shannon_entropy(chars: &[char]) -> f64 {
         let probability = *count as f64 / len;
         entropy - probability * probability.log2()
     })
+}
+
+static PLACEHOLDER: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\[REDACTED:[a-z_]+:[^\r\n]{0,4}?\.\.\.[0-9a-f]{8}\]")
+        .expect("placeholder pattern compiles")
+});
+
+/// True when `text` holds at least one redaction placeholder of the exact
+/// shape this module writes.
+pub fn contains_placeholder(text: &str) -> bool {
+    PLACEHOLDER.is_match(text)
+}
+
+/// Placeholders in `after` that `before` does not already hold (counted, so a
+/// second copy of an existing placeholder is also new). File writers use this
+/// to refuse writing a placeholder a model copied from a replayed, redacted
+/// tool result, while files that legitimately contain placeholder text (such
+/// as this module's tests) stay editable.
+pub fn new_placeholders<'a>(before: &str, after: &'a str) -> Vec<&'a str> {
+    use std::collections::HashMap;
+    let mut existing: HashMap<&str, usize> = HashMap::new();
+    for found in PLACEHOLDER.find_iter(before) {
+        *existing.entry(found.as_str()).or_insert(0) += 1;
+    }
+    let mut new = Vec::new();
+    for found in PLACEHOLDER.find_iter(after) {
+        match existing.get_mut(found.as_str()) {
+            Some(count) if *count > 0 => *count -= 1,
+            _ => new.push(found.as_str()),
+        }
+    }
+    new
 }
 
 fn is_placeholder(value: &str) -> bool {
@@ -508,6 +621,60 @@ mod tests {
             "{redacted}"
         );
         assert!(redacted.contains("export API_KEY="), "{redacted}");
+    }
+
+    /// The exact lines from the CyberTiel report, plus code under
+    /// secret-looking names. None of it is a secret.
+    const PYTHON_SOURCE: &str = "from sqlalchemy import Column, Integer, Text\nfrom sqlalchemy.orm import declarative_base\n\nBase = declarative_base()\n\nclass Task(Base):\n    id = Column(Integer, primary_key=True)\n    name = Column(Text)\n\n    def get(self, task_id, user_id):\n        task = self.getbyid(task_id, user_id)\n        data = open(path).read()\n        return task\n\nprimary_key = compute(a, b)\nsecret_key = os.environ[\"SECRET_KEY\"]\napi_key = settings.api_key\ntoken = response.json()\nBASE = declarative_base()\nAPI_TOKEN = os.getenv(\"API_TOKEN\")\nif primary_key == other_key:\n    pass\n";
+
+    #[test]
+    fn source_code_assignments_are_never_redacted() {
+        let redacted = redactor().redact_owned(PYTHON_SOURCE);
+        assert_eq!(redacted, PYTHON_SOURCE);
+        // `read` prefixes line numbers; the result must be the same.
+        let numbered: String = PYTHON_SOURCE
+            .lines()
+            .enumerate()
+            .map(|(index, line)| format!("{:>3}  {line}\n", index + 1))
+            .collect();
+        assert_eq!(redactor().redact_owned(&numbered), numbered);
+    }
+
+    #[test]
+    fn secret_literals_in_source_are_still_redacted() {
+        let text = "secret_key = \"django-insecure-0aZ9bY8cX7\"\naws_secret = AKIAZZZZZZZZZZZZZZZZ\nclient_token = Zx81Kq0LmP2vB7wR\n";
+        let redacted = redactor().redact_owned(text);
+        assert!(
+            !redacted.contains("django-insecure-0aZ9bY8cX7"),
+            "{redacted}"
+        );
+        assert!(!redacted.contains("Zx81Kq0LmP2vB7wR"), "{redacted}");
+        assert!(
+            redacted.contains("secret_key = [REDACTED:env:"),
+            "{redacted}"
+        );
+    }
+
+    #[test]
+    fn placeholders_are_detected_by_exact_shape() {
+        let long = placeholder("env", "Column(Text)");
+        assert!(contains_placeholder(&long), "{long}");
+        assert!(contains_placeholder(&placeholder("env", "short")));
+        assert!(!contains_placeholder("see [REDACTED:env:...] in the docs"));
+        assert!(!contains_placeholder("[REDACTED]"));
+    }
+
+    #[test]
+    fn new_placeholders_ignores_ones_already_in_the_file() {
+        let one = placeholder("aws", "AKIAZZZZZZZZZZZZZZZZ");
+        let two = placeholder("env", "Column(Text)");
+        let before = format!("fixture = \"{one}\"\n");
+        let kept = format!("fixture = \"{one}\"\nother = 1\n");
+        assert!(new_placeholders(&before, &kept).is_empty());
+        let added = format!("fixture = \"{one}\"\nname = {two}\n");
+        assert_eq!(new_placeholders(&before, &added), vec![two.as_str()]);
+        let doubled = format!("{one}\n{one}\n");
+        assert_eq!(new_placeholders(&before, &doubled), vec![one.as_str()]);
     }
 
     #[test]
