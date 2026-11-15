@@ -232,6 +232,7 @@ Everything at the edge is configurable; the loop itself stays small and auditabl
 - **Skills** are Markdown instructions. The model loads a matching skill with the `skill` tool, or you load one with `/skill <name>`. Bundled security skills advertise only when the security pack is active and remain loadable by name; eight bundled coding skills advertise with the coding pack.
 - **Workflows** are playbooks plus a profile and tool allowlist. Optional `[[step]]` tables add conditions, bounded retries, approval gates, declared artifacts, and resume; `lh workflow run <name>` executes them. The bundled set covers coding, review, general assistance, and security.
 - **External tools** are any executable speaking one JSON object in, one JSON object out. No plugin ABI, no second runtime.
+- **Lifecycle hooks** run your command at `session_start`, `user_prompt`, `pre_tool`, `post_tool`, `pre_compact`, and `stop`. They can add context or block; a missing hook is visible and `pre_tool` fails closed. `lh hooks test <name>` exercises one.
 - **MCP servers** plug in over stdio or Streamable HTTP with one `[mcp.<name>]` table. Their tools join the profile as `<server>__<tool>`; `lh mcp list` and `/mcp` show what connected.
 - **Themes** are TOML files of semantic color tokens. `default` is bundled with four alternatives; `omarchy` is an alias for existing configs.
 

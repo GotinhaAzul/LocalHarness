@@ -192,7 +192,7 @@ pub fn detect(text: &str) -> Option<Detection> {
     }
     // Bound the work on a huge file. Tool results are normally capped far
     // below this; the cap only keeps a pathological read from stalling a turn.
-    const MAX_SCAN_CHARS: usize = 1_048_576;
+    const MAX_SCAN_CHARS: usize = 262_144;
     let text = match text.char_indices().nth(MAX_SCAN_CHARS) {
         Some((end, _)) => &text[..end],
         None => text,

@@ -2472,3 +2472,30 @@ async fn failed_pre_tool_hook_with_warn_is_visible_but_does_not_block() {
     let invocations = hook_invocations(&harness.session, "pre_tool");
     assert_eq!(invocations[0].payload["outcome"], "error");
 }
+
+#[tokio::test]
+async fn malformed_hook_output_fails_closed_on_pre_tool() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = base_config();
+    config.profiles.get_mut("test").unwrap().tools = vec!["bash".into()];
+    config.hooks.entries.insert(
+        "bad-output".into(),
+        hook_config(HookEvent::PreTool, "malformed.sh", 0),
+    );
+    let harness = harness_config(
+        dir.path(),
+        vec![
+            tool_script("bash", json!({"command": "touch malformed-ran.txt"})),
+            text_script("done"),
+        ],
+        config,
+    );
+    let (outcome, _) = run(&harness, "run it").await;
+    assert_eq!(outcome.status, TurnStatus::Done);
+    assert!(!dir.path().join("malformed-ran.txt").exists());
+    let (content, is_error, _) = tool_result_entry(&harness.session, "call_0001");
+    assert!(is_error);
+    assert!(content.contains("malformed output"), "{content}");
+    let invocations = hook_invocations(&harness.session, "pre_tool");
+    assert_eq!(invocations[0].payload["outcome"], "error");
+}
