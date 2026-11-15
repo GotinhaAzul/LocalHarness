@@ -51,7 +51,12 @@ impl FindingTool {
                     "evidence is required when the branch has no tool result; pass {\"evidence\":\"...\"} or run a tool first",
                 ));
             };
-            evidence = Some(clip(&content, MAX_EVIDENCE_CHARS));
+            // The session tree holds raw tool output; findings are written
+            // to disk, so redact the copy here.
+            evidence = Some(clip(
+                &ctx.artifacts.redact_owned(&content),
+                MAX_EVIDENCE_CHARS,
+            ));
             let reference = EvidenceRef {
                 evidence: None,
                 session: session_id.clone(),
