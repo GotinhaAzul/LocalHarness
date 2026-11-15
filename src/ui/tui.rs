@@ -51,6 +51,7 @@ use crate::workflows::{self, WorkflowSpec};
 mod commands;
 mod git_commands;
 mod keys;
+mod permission;
 mod review;
 mod support;
 mod terminal;
@@ -79,11 +80,16 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("compact", "append a deterministic compaction"),
     ("commit", "review, edit, or approve the staged commit"),
     ("pr", "review or approve a pending pull request action"),
+    ("plan", "plan mode: investigate and propose, change nothing"),
     ("tools", "show the active tools"),
     ("mcp", "show MCP server status"),
     ("skill", "pick a skill and append its instructions"),
     ("workflow", "pick a workflow to start on a new branch"),
     ("sec", "engagement summary, scope, or report"),
+    (
+        "approve",
+        "approve the next sensitive action after a provenance warning",
+    ),
     ("trust", "show the trust state"),
     ("export", "write the branch as Markdown"),
     ("clear", "clear the transcript view"),
@@ -105,9 +111,11 @@ fn command_usage(name: &str) -> &'static str {
         "sec" => {
             "/sec [summary|report|scope add|remove <target>|scope clear]   (no argument: pick)"
         }
+        "approve" => "/approve   (after a provenance warning; one action)",
         "trust" => "/trust [confirm]",
         "commit" => "/commit [confirm|cancel|edit <message>]   (no argument: show or draft)",
         "pr" => "/pr [confirm|cancel]   (no argument: show the pending action)",
+        "plan" => "/plan [approve|exit]   (no argument: enter plan mode, or show the plan)",
         "export" => "/export [path]",
         _ => "",
     }
@@ -116,9 +124,10 @@ fn command_usage(name: &str) -> &'static str {
 const HELP: &str = "\
 Commands: /help [command] /quit /login [endpoint] [model] [api-key] /model [name]
 /profile [name] /theme [name|save] /tree /rewind [turns] [force] /fork /new
-/resume [id|last] /sessions /compact /tools /mcp /commit [confirm|cancel|edit <message>]
-/pr [confirm|cancel] /skill [name] /workflow [name] /sec [...] /trust [confirm]
-/export [path] /clear /debug
+/resume [id|last] /sessions /compact /tools /mcp
+/commit [confirm|cancel|edit <message>] /pr [confirm|cancel] /plan [approve|exit]
+/skill [name] /workflow [name] /sec [...] /approve /trust [confirm] /export [path]
+/clear /debug
 A command that chooses from a list opens a picker when run without an
 argument: type to filter, arrows to move, Enter to pick.
 
@@ -150,6 +159,8 @@ enum BgEvent {
         switch: Switch,
         result: std::result::Result<Arc<Core>, String>,
     },
+    /// A running turn asks the user to approve one call.
+    Permission(permission::PendingAsk),
 }
 
 /// A config switch running in the background.
@@ -424,6 +435,8 @@ struct App {
     hunk_edit: Option<HunkEdit>,
     /// Clear the screen and repaint every cell on the next frame.
     repaint: bool,
+    /// A permission question from the running turn, waiting for y/n.
+    pending_ask: Option<permission::PendingAsk>,
     /// The last frame as drawn, for tests that check the screen.
     #[cfg(test)]
     last_frame: Option<ratatui::buffer::Buffer>,
@@ -463,6 +476,7 @@ impl App {
             used,
             window,
             completion: 0,
+            reasoning: 0,
             tok_s: 0.0,
             cache: None,
             session: short_session_id(&session_id),
@@ -514,9 +528,11 @@ impl App {
             reviewer,
             hunk_edit: None,
             repaint: false,
+            pending_ask: None,
             #[cfg(test)]
             last_frame: None,
         };
+        app.install_asker();
         app.no_color = app.options.no_color;
         app.transcript = Transcript::new(app.config.ui.show_reasoning);
         app.refresh_session_blocks();
@@ -638,6 +654,7 @@ impl App {
                     view.replace_items(model_items(&models));
                 }
             }
+            BgEvent::Permission(pending) => self.show_permission_request(pending),
             BgEvent::Rebuilt { switch, result } => {
                 self.switching = None;
                 let core = match result {
@@ -890,6 +907,7 @@ impl App {
         self.used_tokens = estimate_used(&runtime.core);
         self.header.used = self.used_tokens;
         self.sync_banner();
+        self.install_asker();
     }
 
     /// Returns whether the header changed (the watcher reports every few
@@ -1027,7 +1045,9 @@ impl App {
     fn footer(&self) -> FooterData {
         // Login and trust state live in the info bar; the footer is hints or
         // a transient notice only.
-        let (status, status_role) = (String::new(), Role::Muted);
+        let (status, status_role) = self
+            .permission_status()
+            .unwrap_or((String::new(), Role::Muted));
         let hints = if !self.transcript.follow {
             "End or Ctrl+End to return to the bottom · wheel/pgup/pgdn scroll".to_string()
         } else if self.turn_active {
@@ -1295,6 +1315,7 @@ impl App {
         self.stream_phase = StreamPhase::Waiting;
         self.running_tools.clear();
         self.completion_tokens = 0;
+        self.header.reasoning = 0;
         self.tok_s = 0.0;
         self.token_events.clear();
         self.notice = None;
@@ -1315,6 +1336,10 @@ impl App {
     }
 
     fn finish_turn(&mut self, outcome: Option<TurnOutcome>) {
+        // An unanswered question dies with its turn.
+        if let Some(pending) = self.pending_ask.take() {
+            let _ = pending.reply.send(crate::policy::AskAnswer::Deny);
+        }
         self.turn_active = false;
         self.cancelling = false;
         self.turn_state = None;
@@ -1449,12 +1474,13 @@ impl App {
                 if usage.prompt_tokens > 0 {
                     self.used_tokens = usage.prompt_tokens;
                     self.header.used = usage.prompt_tokens;
+                    self.header.cache = usage
+                        .cached_tokens
+                        .map(|cached| (cached.min(usage.prompt_tokens), usage.prompt_tokens));
                 }
                 self.completion_tokens = usage.completion_tokens;
                 self.header.completion = usage.completion_tokens;
-                if usage.cache_percent().is_some() {
-                    self.header.cache = usage.cache_percent();
-                }
+                self.header.reasoning = usage.reasoning_tokens.unwrap_or(0);
                 self.last_usage = Some(usage);
             }
             AgentEvent::Context { used, window } => {
@@ -1501,6 +1527,24 @@ impl App {
                     "review the proposed hunks · a accept · r reject · e edit · Enter apply",
                     Role::Accent,
                 );
+            }
+            AgentEvent::Provenance {
+                origin,
+                warning,
+                approval_required,
+                ..
+            } => {
+                if let Some(warning) = warning {
+                    self.transcript.turn_note("provenance", &warning, true);
+                    self.set_notice(
+                        if approval_required {
+                            format!("{origin}: injection warning; approve the next sensitive action with /approve")
+                        } else {
+                            format!("{origin}: injection warning")
+                        },
+                        Role::Warning,
+                    );
+                }
             }
             AgentEvent::Guard { code, message } => {
                 self.transcript.turn_note(&code, &message, true);

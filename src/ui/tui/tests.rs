@@ -34,8 +34,9 @@ fn header(model: &str, session: &str) -> HeaderData {
         used: 12400,
         window: 64000,
         completion: 0,
+        reasoning: 0,
         tok_s: 24.0,
-        cache: Some(91),
+        cache: Some((940, 1000)),
         session: session.into(),
         trust: true,
         window_guess: false,
@@ -105,6 +106,10 @@ fn header_at_120_contains_cwd_model_and_context() {
     assert!(text.contains("qwen3.5-35b-a3b"), "model missing:\n{text}");
     assert!(text.contains("12.4k/64k"), "context missing:\n{text}");
     assert!(text.contains("tok/s"));
+    assert!(
+        text.contains("cache 940/1000"),
+        "cached and total prompt tokens missing:\n{text}"
+    );
     assert!(text.contains("▰"), "context gauge missing:\n{text}");
 }
 
@@ -1108,4 +1113,137 @@ async fn login_configures_a_model_and_model_command_lists_choices() {
     let parsed: toml::Value = toml::from_str(&saved).unwrap();
     assert_eq!(parsed["model"]["endpoint"].as_str(), Some(single.as_str()));
     assert_eq!(parsed["model"]["model"].as_str(), Some("only-model"));
+}
+
+fn tool_names(app: &App) -> Vec<&'static str> {
+    app.core()
+        .unwrap()
+        .tools
+        .iter()
+        .map(|tool| tool.name())
+        .collect()
+}
+
+#[tokio::test]
+async fn plan_approve_restores_exactly_the_prior_tool_set() {
+    let (_dir, mut app) = test_app().await;
+    let before = tool_names(&app);
+    assert!(before.contains(&"write"));
+
+    app.run_command("/plan").await;
+    let planning = tool_names(&app);
+    for removed in ["write", "edit", "patch", "undo", "bg"] {
+        assert!(!planning.contains(&removed), "{removed} in {planning:?}");
+    }
+    assert!(planning.contains(&"read") && planning.contains(&"todo"));
+    assert!(
+        app.footer().status.contains("/plan approve"),
+        "{}",
+        app.footer().status
+    );
+
+    // A workflow that lists write cannot bring it back while planning.
+    let mut config = app.config.clone();
+    let workflow = WorkflowSpec {
+        name: "writer".into(),
+        description: None,
+        profile: None,
+        prompt: "write".into(),
+        skills: vec![],
+        tools: vec!["write".into(), "read".into()],
+        steps: vec![],
+        artifacts: vec![],
+    };
+    workflow.apply_to_config(&mut config).unwrap();
+    app.rebuild_core_with(config).await.unwrap();
+    assert!(!tool_names(&app).contains(&"write"));
+    app.rebuild_core_with({
+        let mut config = app.config.clone();
+        config.profile_name = "coding".into();
+        config
+    })
+    .await
+    .unwrap();
+
+    app.run_command("/plan approve").await;
+    assert_eq!(tool_names(&app), before);
+    assert_eq!(
+        app.core().unwrap().permissions.mode(),
+        crate::policy::PermissionMode::Ask
+    );
+    let approved = app
+        .runtime
+        .as_ref()
+        .unwrap()
+        .session
+        .lock()
+        .ok()
+        .and_then(|session| crate::tools::todo::latest_plan(&session));
+    assert_eq!(
+        approved.map(|(status, _)| status).as_deref(),
+        Some("approved")
+    );
+
+    // /plan exit also restores the tools and discards the plan.
+    app.run_command("/plan").await;
+    app.run_command("/plan exit").await;
+    assert_eq!(tool_names(&app), before);
+}
+
+#[tokio::test]
+async fn a_permission_prompt_shows_the_exact_command_and_answers_with_y_or_n() {
+    let (_dir, mut app) = test_app().await;
+    let ask = |subject: &str| {
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        let pending = permission::PendingAsk {
+            request: crate::policy::AskRequest {
+                tool: "bash".into(),
+                subject: subject.into(),
+                preview: None,
+                rule: Some("push-asks".into()),
+                key: format!("bash\0{subject}"),
+            },
+            reply,
+        };
+        (pending, answer)
+    };
+
+    let (pending, answer) = ask("git push origin feature/x");
+    app.show_permission_request(pending);
+    let mut screen = EmulatedScreen::new(100, 30);
+    screen.frame(&mut app, "ask shown");
+    let shown = screen.parser.screen().contents();
+    assert!(shown.contains("$ git push origin feature/x"), "{shown}");
+    assert!(shown.contains("push-asks"), "{shown}");
+    assert!(shown.contains("y allow"), "{shown}");
+    // A stray key does not answer; y does.
+    app.handle_key(key(KeyCode::Char('q'))).await;
+    assert!(app.pending_ask.is_some());
+    app.handle_key(key(KeyCode::Char('y'))).await;
+    assert_eq!(answer.await.unwrap(), crate::policy::AskAnswer::Allow);
+
+    let (pending, answer) = ask("rm -rf build");
+    app.show_permission_request(pending);
+    app.handle_key(key(KeyCode::Char('n'))).await;
+    assert_eq!(answer.await.unwrap(), crate::policy::AskAnswer::Deny);
+    assert!(app.pending_ask.is_none());
+}
+
+#[test]
+fn ask_text_includes_the_diff_preview() {
+    let request = crate::policy::AskRequest {
+        tool: "edit".into(),
+        subject: "src/lib.rs".into(),
+        preview: crate::policy::preview(
+            "edit",
+            &serde_json::json!({"path": "src/lib.rs", "old": "a\n", "new": "b\n"}),
+            std::path::Path::new("/w"),
+            40,
+        ),
+        rule: None,
+        key: String::new(),
+    };
+    let text = permission::ask_text(&request);
+    assert!(text.starts_with("edit: src/lib.rs"), "{text}");
+    assert!(text.contains("-a") && text.contains("+b"), "{text}");
 }

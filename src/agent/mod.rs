@@ -1,5 +1,7 @@
 //! Agent loop: context assembly, model streaming, tool batch execution, gates.
 
+pub mod agents_md;
+pub mod authorize;
 pub mod calls;
 pub mod gates;
 pub mod limits;
@@ -47,6 +49,9 @@ pub struct Core {
     pub reads: Arc<Mutex<ReadTracker>>,
     pub bg: Arc<Mutex<BgRegistry>>,
     pub security: Arc<Mutex<SecurityState>>,
+    /// Instruction-provenance warnings waiting for approval. Shared across
+    /// core rebuilds so `/model` does not clear a gate.
+    pub provenance: Arc<Mutex<crate::provenance::ProvenanceState>>,
     /// OS sandbox for `bash` and `bg`, shared with every tool context.
     pub sandbox: Option<Arc<crate::sandbox::Sandbox>>,
     pub budget: TokenBudget,
@@ -101,6 +106,9 @@ pub struct Core {
     /// surface (headless, ACP): review auto-accepts, which matches the
     /// pre-review behavior. The TUI installs itself after the core is built.
     pub reviewer: std::sync::RwLock<Option<Arc<dyn crate::tools::hunk::HunkReviewer>>>,
+    /// Permission mode, rules, and session approvals, shared across core
+    /// rebuilds. Consulted before every dispatch (see [`authorize`]).
+    pub permissions: Arc<crate::policy::Permissions>,
 }
 
 /// One-time endpoint bring-up that outlives the launch path. The TUI opens
@@ -332,6 +340,14 @@ pub enum AgentEvent {
     Compacted {
         summary: String,
         tokens_before: u64,
+    },
+    /// The provenance tag of a tool result, and any injection warning it
+    /// raised. Emitted for every executed tool so `--json` shows the source.
+    Provenance {
+        call_id: String,
+        origin: String,
+        warning: Option<String>,
+        approval_required: bool,
     },
     Notice(String),
     /// A reviewed batch is waiting for the frontend's hunk decisions. The

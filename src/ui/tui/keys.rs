@@ -63,6 +63,10 @@ impl App {
             return;
         }
 
+        if self.handle_permission_key(&key) {
+            return;
+        }
+
         if self.modal.is_some() {
             self.handle_modal_key(key).await;
             return;

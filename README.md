@@ -162,13 +162,15 @@ lh --rewind last:e42          # latest session, before entry e42
 lh --rewind 20261107-…:e9 --force
 ```
 
-Compaction is deterministic, not model-written. Tool output is archived with an id, and `recall` reads an exact range. `--no-session` writes nothing: no session file, no artifacts. Persisted session entries, artifacts, evidence, and reports redact secret-shaped values by default; `--no-redact` is the explicit opt-out and is recorded in the session header.
+Compaction is deterministic, not model-written. Tool output is archived with an id, and `recall` reads an exact range. The request prefix is cache-stable: tool order and schema key order do not drift, volatile session facts sit at the end of the system block, and a compaction logs how much of the prefix the engine can keep. `--no-session` writes nothing: no session file, no artifacts. Session files, artifacts, evidence, and reports are redacted on disk by default; `--no-redact` is the explicit opt-out and is recorded in the session header. Redaction applies only to what is written to disk: in a live session the model sees the real tool output, so it has no placeholder to copy into a file. A resumed session replays the saved, redacted form with a note, and `write`/`edit`/`patch`/`undo` refuse content that adds a `[REDACTED:...]` placeholder the file does not already hold.
+
+`AGENTS.md` is read hierarchically: the chain from the git repository root to the working directory, nearest last, each with a source-path header. Files are capped at 12 KiB each and 32 KiB total, with deterministic truncation and a warning; a symlink that resolves outside the repository is refused. `lh context --show` prints the manifest (path, bytes, SHA-256, loaded/skipped/truncated), and `lh context --json` emits the same data for scripts. `--no-agents-md` or `LH_AGENTS_MD=0` skips the chain. The files are advisory: they cannot add a tool, relax a gate, or change the profile.
 
 ## 04 · One binary, two front ends
 
 ### The TUI
 
-The terminal interface is the default. Tool calls render as cards, diffs and streamed Markdown are styled, and the context gauge stays visible.
+The terminal interface is the default. Tool calls render as cards, diffs and streamed Markdown are styled, and the context gauge stays visible. When the engine reports a prefix-cache hit, the header also shows `cache <cached>/<prompt>` tokens; `--json` usage events carry the same counts.
 
 | Key | Action |
 |---|---|
@@ -189,18 +191,21 @@ Tab completes the token at the cursor: commands, arguments (themes, profiles, sk
 
 Write `@path` in a prompt to attach a file: `fix the panic in @src/parser.rs`. The file is read through the same path as the `read` tool and appended to your message, so the model can edit it without another read. Up to eight files per prompt, within a quarter of the usable context. `@shot.png` attaches a screenshot: a model with vision input sees the image, and a text-only model can get a description from a local vision model; the `read` tool opens images too. Images are checked by content, stripped of EXIF, and sent only to local endpoints unless you opt in. See [docs/images.md](docs/images.md).
 
-Slash commands: `/help /quit /login /model /profile /theme /tree /rewind /fork /new /resume /sessions /compact /tools /mcp /skill /workflow /sec /trust /commit /pr /export /clear /debug`.
+Slash commands: `/help /quit /login /model /profile /theme /tree /rewind /fork /new /resume /sessions /compact /tools /mcp /skill /workflow /sec /trust /commit /pr /plan /export /clear /debug`.
+
+Every tool call passes a permission policy first. The default mode `ask` runs read-only calls and asks before edits and commands, showing the exact command or path and a diff; `y` approves exactly that call for the session. `/plan` switches to plan mode: mutating tools are removed and refused at dispatch until `/plan approve`. Modes, rules, and `--yolo` are in [docs/configuration.md](docs/configuration.md#permissions).
 
 ### Headless
 
 ```sh
-lh --print "Fix the failing parser test"
+lh --mode accept-edits --print "Fix the failing parser test"
 lh --print "Summarize this repo" --json
+lh --plan --print "Plan the parser refactor"   # read-only; prints the plan
 lh --continue                  # most recent session
 lh --resume 20261107-201500-1234
 ```
 
-`--print` streams text to stdout, diagnostics to stderr, and exits with the turn status: `0` done, `1` error/blocked, `2` budget/stalled, `130` cancelled. `--json` emits newline-delimited events for scripts and CI.
+`--print` streams text to stdout, diagnostics to stderr, and exits with the turn status: `0` done, `1` error/blocked, `2` budget/stalled, `130` cancelled. `--json` emits newline-delimited events for scripts and CI. A headless run cannot answer a permission prompt, so calls that would ask are denied: pass `--mode accept-edits`, add allow rules, or use `--yolo` (explicit, recorded in the session).
 
 ### Editors
 
@@ -227,11 +232,13 @@ Security is opt-in. The default `coding` profile has no security tools or postur
 
 Security work is for authorized labs, CTFs, and engagements only. Scope is set by the user with `/sec scope add|remove|clear`; there is no model tool for it. The scope gate blocks a known set of active-testing tools when no scope is set or when an extracted target is outside it. It is a speed bump; `--sandbox` is the process boundary.
 
-- **Evidence.** `bash`, `bg`, and external tool runs append an evidence entry with target, command, timestamps, exit status, output artifact, and SHA-256. Secret values are redacted before session, artifact, evidence, and report writes; `--no-redact` is the explicit, recorded opt-out.
+Repository files and tool output are tagged with their source. A cheap detector warns when untrusted content contains instruction-shaped phrases, and the next sensitive action needs `/approve`. Untrusted content cannot enable a tool, change scope, change the endpoint, or change permissions; that is enforced at dispatch, not in the prompt.
+
+- **Evidence.** `bash`, `bg`, and external tool runs append an evidence entry with target, command, timestamps, exit status, output artifact, and SHA-256. Secret values are redacted before session, artifact, evidence, finding, and report writes (never in what the model reads); `--no-redact` is the explicit, recorded opt-out.
 - **Surface.** `surface` parses nmap/HTTP/TLS output into one inventory; `attack_path` queries the graph derived from surface, findings, and evidence.
 - **Findings.** `finding add` auto-links the last evidence entry. A finding can carry bounded `poc_steps`; `finding verify` replays them locally and stores `reproduced`/`confirmed`, `not_reproduced`/`rejected`, or `error|skipped`/`inconclusive`.
 - **Detection.** `detect` validates and runs a Sigma subset against local JSONL logs or plain-text samples.
-- **Boundaries.** `--sandbox` runs `bash` and `bg` in an OS sandbox with bubblewrap or Landlock. `--path-jail` restricts file tools to the working directory. `--no-sandbox` is the explicit opt-out.
+- **Boundaries.** `--sandbox` runs `bash` and `bg` in an OS sandbox with bubblewrap or Landlock. `--path-jail` restricts file tools to the working directory. `--no-sandbox` is the explicit opt-out. `[permissions]` rules allow, ask, or deny calls by tool, path, command, or network before they run.
 
 Read [docs/security.md](docs/security.md) before using it on client work.
 
@@ -240,10 +247,11 @@ Read [docs/security.md](docs/security.md) before using it on client work.
 Everything at the edge is configurable; the loop itself stays small and auditable.
 
 - **Profiles** select packs and tools. Built-ins are `coding` (default), `full`, `security`, `minimal`, `strict` (six tools, one call per message for weak models), and experimental `shell` (bash only); add your own in `profiles/*.toml` or `.harness/profiles/`.
-- **Prompt** customization lives in `[prompt]`: replace the one-line identity, append inline instructions, or point at a Markdown file. Per-profile prompts still apply on top.
+- **Prompt** customization lives in `[prompt]`: replace the one-line identity, append inline instructions, point at a Markdown file, or disable the hierarchical `AGENTS.md` chain with `agents_md = false`. Per-profile prompts still apply on top.
 - **Skills** are Markdown instructions. The model loads a matching skill with the `skill` tool, or you load one with `/skill <name>`. Bundled security skills advertise only when the security pack is active and remain loadable by name; eight bundled coding skills advertise with the coding pack.
 - **Workflows** are playbooks plus a profile and tool allowlist. Optional `[[step]]` tables add conditions, bounded retries, approval gates, declared artifacts, and resume; `lh workflow run <name>` executes them. The bundled set covers coding, review, general assistance, and security.
 - **External tools** are any executable speaking one JSON object in, one JSON object out. No plugin ABI, no second runtime.
+- **Lifecycle hooks** run your command at `session_start`, `user_prompt`, `pre_tool`, `post_tool`, `pre_compact`, and `stop`. They can add context or block; a missing hook is visible and `pre_tool` fails closed. `lh hooks test <name>` exercises one.
 - **MCP servers** plug in over stdio or Streamable HTTP with one `[mcp.<name>]` table. Their tools join the profile as `<server>__<tool>`; `lh mcp list` and `/mcp` show what connected.
 - **Themes** are TOML files of semantic color tokens. `default` is bundled with four alternatives; `omarchy` is an alias for existing configs.
 
@@ -280,6 +288,7 @@ Global config: `~/.config/localharness/config.toml`. A trusted project `.harness
 | `LH_PROFILE`, `LH_MODEL_PROFILE` | Tool profile and model profile |
 | `LH_THEME` | Theme name |
 | `LH_NO_SESSION`, `LH_TRUST` | Disable persistence; trust project config |
+| `LH_AGENTS_MD` | Set to `0` to skip the AGENTS.md chain |
 | `LH_CONFIG_DIR`, `LH_DATA_DIR` | Override config and data roots |
 | `LH_SKIP_TOOL_PROBE` | Skip the one-shot tool-call conformance probe |
 
@@ -293,6 +302,7 @@ Global config: `~/.config/localharness/config.toml`. A trusted project `.harness
 | [Model setup](docs/model-setup.md) | llama.cpp, Ollama, vLLM, profiles, context accounting, `lh doctor` |
 | [Skills and workflows](docs/skills-workflows.md) | Skill format, references, bundled playbooks, tool allowlists |
 | [Security](docs/security.md) | Authorization, scope, evidence, findings, PoC replay, sandbox |
+| [Lifecycle hooks](docs/hooks.md) | `session_start` through `stop`, JSON protocol, fail-closed guards, `lh hooks test` |
 | [External tools](docs/external-tools.md) | Manifest format, protocol, schemas, scope gating |
 | [MCP servers](docs/mcp.md) | stdio and HTTP servers, tool naming, profiles, `lh mcp` |
 | [Editor integration](docs/acp.md) | `lh acp`, Zed setup, permissions, roots, stop reasons, limitations |
