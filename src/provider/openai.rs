@@ -583,7 +583,86 @@ fn merge_leading_system(messages: &[ChatMessage]) -> Vec<ChatMessage> {
     merged
 }
 
+/// How the session's internal call ids are written for the active model.
+///
+/// The session stores harness-owned ids (`call_0001`, ...), plus whatever
+/// older sessions recorded. Most templates accept any string, but Mistral's
+/// tokenizer (`mistral_common`, used by vLLM and Mistral-format templates)
+/// rejects any `tool_call_id` that is not exactly nine ASCII alphanumerics.
+/// The mapping is deterministic and injective per session, so a call and its
+/// result always carry the same wire id and the prompt prefix stays stable
+/// for the server's KV cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WireIds {
+    AsIs,
+    Mistral,
+}
+
+impl WireIds {
+    fn for_model(model: &str) -> Self {
+        let model = model.to_ascii_lowercase();
+        const MISTRAL: [&str; 7] = [
+            "mistral",
+            "mixtral",
+            "devstral",
+            "magistral",
+            "codestral",
+            "ministral",
+            "pixtral",
+        ];
+        if MISTRAL.iter().any(|family| model.contains(family)) {
+            WireIds::Mistral
+        } else {
+            WireIds::AsIs
+        }
+    }
+
+    fn render(self, id: &str) -> String {
+        match self {
+            WireIds::AsIs => id.to_string(),
+            WireIds::Mistral => mistral_call_id(id),
+        }
+    }
+}
+
+/// Nine alphanumerics. Internal ids keep their order as zero-padded digits
+/// (`call_0007` → `000000007`), so engines that sort tool messages by id
+/// still see call order. Any other id (an engine id an older session stored)
+/// is hashed behind a leading letter, which cannot collide with the digit
+/// form.
+fn mistral_call_id(id: &str) -> String {
+    if let Some(digits) = id.strip_prefix("call_")
+        && digits.len() >= 4
+        && digits.bytes().all(|byte| byte.is_ascii_digit())
+        && let Ok(number) = digits.parse::<u64>()
+        && number < 1_000_000_000
+    {
+        return format!("{number:09}");
+    }
+    if id.len() == 9
+        && id.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        && !id.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return id.to_string();
+    }
+    // FNV-1a: stable across builds, unlike the std hasher.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in id.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    const ALPHABET: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut out = String::with_capacity(9);
+    out.push('z');
+    for _ in 0..8 {
+        out.push(ALPHABET[(hash % 36) as usize] as char);
+        hash /= 36;
+    }
+    out
+}
+
 fn build_body(req: &ChatRequest, include_usage: bool) -> Result<Value, ProviderError> {
+    let wire_ids = WireIds::for_model(&req.model);
     let normalized = merge_leading_system(&req.messages);
     debug_assert!(
         normalized
@@ -625,7 +704,7 @@ fn build_body(req: &ChatRequest, include_usage: bool) -> Result<Value, ProviderE
                         .iter()
                         .map(|call| {
                             json!({
-                                "id": call.id,
+                                "id": wire_ids.render(&call.id),
                                 "type": "function",
                                 "function": {
                                     "name": call.name,
@@ -639,7 +718,7 @@ fn build_body(req: &ChatRequest, include_usage: bool) -> Result<Value, ProviderE
                 Value::Object(object)
             }
             ChatMessage::Tool { call_id, content } => {
-                json!({"role":"tool","tool_call_id":call_id,"content":content})
+                json!({"role":"tool","tool_call_id":wire_ids.render(call_id),"content":content})
             }
         })
         .collect();
@@ -1235,6 +1314,25 @@ mod tests {
             body["messages"][1]["tool_calls"][0]["function"]["arguments"],
             "{\"path\":\"a.rs\"}"
         );
+    }
+
+    #[test]
+    fn mistral_models_get_nine_character_call_ids() {
+        assert_eq!(WireIds::for_model("Devstral-Small-2507"), WireIds::Mistral);
+        assert_eq!(WireIds::for_model("qwen3-coder"), WireIds::AsIs);
+        assert_eq!(mistral_call_id("call_0007"), "000000007");
+        assert_eq!(mistral_call_id("call_12345"), "000012345");
+        assert_eq!(mistral_call_id("aB3dE6gH9"), "aB3dE6gH9");
+        for legacy in ["call_1", "chatcmpl-tool-abc", "", "000000007"] {
+            let wire = mistral_call_id(legacy);
+            assert_eq!(wire.len(), 9, "{legacy:?} -> {wire}");
+            assert!(wire.bytes().all(|b| b.is_ascii_alphanumeric()), "{wire}");
+            assert!(wire.starts_with('z'), "{wire}");
+            assert_eq!(wire, mistral_call_id(legacy), "deterministic");
+        }
+        assert_ne!(mistral_call_id("call_1"), mistral_call_id("call_2"));
+        // Order is kept for engines that sort tool messages by id.
+        assert!(mistral_call_id("call_0009") < mistral_call_id("call_0010"));
     }
 
     #[test]

@@ -15,8 +15,8 @@ use bytes::Bytes;
 use futures_util::stream;
 use localharness::config::ModelConfig;
 use localharness::provider::{
-    ChatMessage, ChatRequest, Completion, ErrorClass, OpenAiCompatProvider, StreamEvent, Usage,
-    collect_stream, fold_stream,
+    ChatMessage, ChatRequest, Completion, ErrorClass, OpenAiCompatProvider, StreamEvent, ToolCall,
+    Usage, collect_stream, fold_stream,
 };
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
@@ -778,4 +778,37 @@ async fn object_arguments_from_a_gateway_are_accepted() {
     ]);
     let completion = fold(&body, false).await.unwrap();
     assert_eq!(completion.calls[0].arguments, READ_ARGS);
+}
+
+#[tokio::test]
+async fn mistral_models_receive_nine_character_call_ids() {
+    let (base, state) = spawn().await;
+    state.script.lock().unwrap().push_back(Script {
+        status: 200,
+        body: SSE_OK.into(),
+        chunked: false,
+    });
+    let config = ModelConfig {
+        endpoint: base.clone(),
+        ..ModelConfig::default()
+    };
+    let provider = OpenAiCompatProvider::new(&config, "mistral-small-3.2").unwrap();
+    let mut req = request();
+    req.model = "mistral-small-3.2".into();
+    req.messages.push(ChatMessage::Assistant {
+        content: None,
+        tool_calls: vec![ToolCall {
+            id: "call_0001".into(),
+            name: "read".into(),
+            arguments: json!({"path": "a.rs"}),
+        }],
+    });
+    req.messages.push(ChatMessage::Tool {
+        call_id: "call_0001".into(),
+        content: "ok".into(),
+    });
+    collect_stream(&provider, req, CancellationToken::new()).await;
+    let sent = state.requests.lock().unwrap()[0].clone();
+    assert_eq!(sent["messages"][1]["tool_calls"][0]["id"], "000000001");
+    assert_eq!(sent["messages"][2]["tool_call_id"], "000000001");
 }
