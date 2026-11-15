@@ -214,6 +214,58 @@ fn tool_schema_cost_uses_json_density_and_is_fixed() {
 }
 
 #[test]
+fn full_profile_first_call_estimate_is_within_eight_percent() {
+    const PROSE_CHARS_PER_TOKEN: f64 = 3.2;
+    let dir = tempfile::tempdir().unwrap();
+    let (config, profile) = full_profile();
+    let tools = full_tools(&profile);
+    let specs = ToolRegistry::specs(&tools);
+    let json = tools_json(&specs);
+    let prompt = build_system_prompt(
+        &config,
+        &paths(dir.path()),
+        &SkillIndex::bundled(),
+        &tools,
+        None,
+    );
+    let user = "Read src/context/budget.rs and explain how the token estimate is assembled.";
+    let mut session = session(dir.path());
+    session
+        .append(EntryKind::User(UserData {
+            attachments: Vec::new(),
+            content: user.into(),
+        }))
+        .unwrap();
+
+    // A first call against a tokenizer that spends 3.2 characters per token on
+    // prose. The build path calibrates once from a `/tokenize` sample.
+    let mut budget = TokenBudget::new(32_768, 4_096);
+    let measured_system = (prompt.chars().count() as f64 / PROSE_CHARS_PER_TOKEN).ceil() as u32;
+    budget.calibrate(prompt.chars().count(), measured_system);
+    let cost = ToolSpecCost::from_json(&json, &budget);
+    let assembled = assemble(&prompt, &session, None, &budget);
+    let estimate = assembled.estimated_tokens + cost.tokens;
+    let measured_tools = (json.chars().count() as f64 / JSON_CHARS_PER_TOKEN).round() as u32;
+    let measured_user = (user.chars().count() as f64 / PROSE_CHARS_PER_TOKEN).ceil() as u32;
+    let actual = measured_system + measured_tools + measured_user + 8;
+    let error = |tokens: u32| (f64::from(tokens) - f64::from(actual)).abs() / f64::from(actual);
+    assert!(
+        error(estimate) < 0.08,
+        "first-call estimate {estimate} vs prompt {actual}: {:.3}",
+        error(estimate)
+    );
+
+    // The old prose ratio for the same schemas misses the target, which is
+    // why the JSON density is a separate constant.
+    let old_json_estimate = budget.estimate_char_len(json.chars().count());
+    let old_estimate = assembled.estimated_tokens + old_json_estimate;
+    assert!(
+        error(old_estimate) > 0.08,
+        "prose-priced schemas must not pass: {old_estimate} vs {actual}"
+    );
+}
+
+#[test]
 fn same_branch_assembles_a_byte_identical_prefix_and_hash() {
     let dir = tempfile::tempdir().unwrap();
     let (config, profile) = full_profile();
