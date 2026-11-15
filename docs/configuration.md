@@ -10,6 +10,8 @@ defaults. Environment variables fill the gaps.
 | Global config | `~/.config/localharness/config.toml` |
 | Profiles | `~/.config/localharness/profiles/` |
 | Skills | `~/.config/localharness/skills/<name>/SKILL.md` |
+| Skills lockfile | `~/.config/localharness/skills.lock` |
+| Skills trash | `~/.config/localharness/skills-trash/` |
 | Workflows | `~/.config/localharness/workflows/` |
 | External tools | `~/.config/localharness/tools/*.toml` |
 | MCP servers | `[mcp.<name>]` tables in `config.toml` ([docs/mcp.md](mcp.md)) |
@@ -573,6 +575,7 @@ Steps run sequentially without a shell and stop at the first failure.
 | `LH_TRUST` | Trust project config |
 | `LH_AGENTS_MD` | Set to `0` to skip the AGENTS.md chain |
 | `LH_CONFIG_DIR`, `LH_DATA_DIR` | Override roots |
+| `LH_HOME` | Home used for `~/.claude/skills` and `~/.agents/skills` discovery |
 | `LH_SKIP_TOOL_PROBE` | Skip the one-shot tool-call conformance probe |
 | `NO_COLOR` | Disable color |
 | `LH_DEBUG_CONTENT` | Allow content in debug logs (warns) |

@@ -728,6 +728,7 @@ mod tests {
             cwd: dir.to_path_buf(),
             project_id: "test".to_string(),
             sessions_dir_override: None,
+            home_dir: None,
         };
         let header = SessionData {
             cwd: dir.display().to_string(),

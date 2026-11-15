@@ -2138,6 +2138,26 @@ async fn execute_batch(
                     if !result.is_error
                         && matches!(call.name.as_str(), "bash" | "bg")
                         && let Some(command) = args.get("command").and_then(|v| v.as_str())
+                        && let Some(script) = crate::skills::bundled_script_in_command(
+                            &core.paths,
+                            core.config.trust,
+                            &ctx.cwd,
+                            command,
+                        )
+                        && core.approver.is_none()
+                    {
+                        // A frontend with an approval channel gets the call
+                        // through the normal approver below. Without one, the
+                        // script is never run and the exact command is shown.
+                        result = ToolResult::err(
+                            "SKILL_SCRIPT_APPROVAL",
+                            crate::skills::approval_required(&script),
+                        );
+                    }
+
+                    if !result.is_error
+                        && matches!(call.name.as_str(), "bash" | "bg")
+                        && let Some(command) = args.get("command").and_then(|v| v.as_str())
                     {
                         let gate = core.security.lock().expect("security state").gate(command);
                         if let Err(message) = gate {

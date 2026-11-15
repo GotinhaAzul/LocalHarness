@@ -1351,6 +1351,7 @@ mod tests {
             cwd,
             project_id: "test".into(),
             sessions_dir_override: None,
+            home_dir: None,
         };
         let mut config = Config::builtin();
         config.model.endpoint = gateway(65_536).await;
@@ -1569,6 +1570,7 @@ mod tests {
             cwd,
             project_id: "test".into(),
             sessions_dir_override: None,
+            home_dir: None,
         };
         let mut config = Config::builtin();
         config.model.endpoint = endpoint;
@@ -1683,6 +1685,7 @@ mod tests {
             cwd,
             project_id: "test".into(),
             sessions_dir_override: None,
+            home_dir: None,
         }
     }
 

@@ -360,6 +360,7 @@ pub(crate) fn test_context(dir: &Path) -> ToolContext {
         cwd: cwd.clone(),
         project_id: "test".into(),
         sessions_dir_override: None,
+        home_dir: None,
     };
     let header = SessionData {
         cwd: cwd.display().to_string(),

@@ -187,11 +187,73 @@ pub enum Command {
     },
     /// Serve the Agent Client Protocol v1 on stdio for editor integrations.
     Acp,
+    /// Install, update, remove, list, lint, and evaluation-test skills.
+    Skill {
+        #[command(subcommand)]
+        action: SkillCommand,
+    },
     /// Inspect context assembly inputs: the hierarchical AGENTS.md manifest.
     Context {
         /// Print the manifest with each loaded file, its bytes, and SHA-256.
         #[arg(long, required_unless_present = "json")]
         show: bool,
+        /// Emit one stable JSON object.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, clap::Subcommand)]
+pub enum SkillCommand {
+    /// Install a skill from a local directory or a git URL with an optional #ref.
+    Add {
+        /// Directory, or `git-url#ref`. The ref is a branch, tag, or commit.
+        source: String,
+        /// Replace an existing copy; the old copy moves to the trash directory.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Update one skill, or every locked skill.
+    Update {
+        /// Skill name; omit to update every locked skill.
+        name: Option<String>,
+        /// Replace a locally edited copy; the old copy moves to the trash directory.
+        #[arg(long)]
+        force: bool,
+        /// Fail when the lockfile and installed files disagree; change nothing.
+        #[arg(long)]
+        frozen: bool,
+    },
+    /// Move an installed skill to the trash directory and drop its lock entry.
+    Remove {
+        /// Skill name as shown by `lh skill list`.
+        name: String,
+    },
+    /// List installed skills with source, pinned ref, and digest.
+    List {
+        /// Emit one stable JSON object.
+        #[arg(long)]
+        json: bool,
+        /// Fail when the lockfile and installed files disagree.
+        #[arg(long)]
+        frozen: bool,
+    },
+    /// Validate skill names, descriptions, bodies, references, and duplicates.
+    Lint {
+        /// Lint one skill by name.
+        name: Option<String>,
+        /// Lint bundled, global, and trusted project skills.
+        #[arg(long, conflicts_with = "name")]
+        all: bool,
+        /// Emit one stable JSON object.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Measure trigger precision and recall over prompt fixtures.
+    Eval {
+        /// Directory of .toml or .json fixtures.
+        #[arg(long, value_name = "DIR")]
+        fixtures: PathBuf,
         /// Emit one stable JSON object.
         #[arg(long)]
         json: bool,
@@ -361,6 +423,10 @@ pub async fn run(cli: Cli) -> Result<i32> {
         init_logging(&paths, true);
     } else {
         init_logging(&paths, false);
+    }
+
+    if let Some(Command::Skill { action }) = &cli.command {
+        return run_skill_command(&paths, trust, action);
     }
 
     if matches!(&cli.command, Some(Command::Acp)) {
@@ -687,6 +753,290 @@ async fn run_mcp(config: &Config, paths: &Paths, action: &McpCommand) -> Result<
                     Ok(1)
                 }
             }
+        }
+    }
+}
+
+/// `lh skill`: the package manager, linter, and trigger eval.
+fn run_skill_command(paths: &Paths, trust: bool, action: &SkillCommand) -> Result<i32> {
+    use crate::skills::{eval, lint, manager};
+
+    match action {
+        SkillCommand::Add { source, force } => {
+            let report = manager::add(paths, source, *force).map_err(anyhow::Error::msg)?;
+            for warning in &report.warnings {
+                eprintln!("warning: {warning}");
+            }
+            println!(
+                "{} skill `{}` at {} ({} file{}, digest {})",
+                match report.action {
+                    manager::Action::Installed => "installed",
+                    manager::Action::Updated => "updated",
+                    manager::Action::UpToDate => "unchanged",
+                    manager::Action::FrozenVerified => "verified",
+                },
+                report.name,
+                report.path.display(),
+                report.files.len(),
+                if report.files.len() == 1 { "" } else { "s" },
+                &report.digest[..12.min(report.digest.len())]
+            );
+            if let Some(commit) = &report.resolved_commit {
+                println!("commit: {commit}");
+            }
+            if let Some(trash) = &report.trash {
+                println!("previous copy moved to: {}", trash.display());
+            }
+            println!("lockfile: {}", paths.skills_lock_file().display());
+            Ok(0)
+        }
+        SkillCommand::Update {
+            name,
+            force,
+            frozen,
+        } => {
+            let outcome = manager::update(paths, name.as_deref(), *force, *frozen)
+                .map_err(anyhow::Error::msg)?;
+            if outcome.frozen {
+                let lock = manager::LockFile::load(&paths.skills_lock_file())
+                    .map_err(anyhow::Error::msg)?;
+                println!(
+                    "skills.lock agrees with {} installed skill{}",
+                    lock.skills.len(),
+                    if lock.skills.len() == 1 { "" } else { "s" }
+                );
+                return Ok(0);
+            }
+            for report in &outcome.reports {
+                for warning in &report.warnings {
+                    eprintln!("warning: {warning}");
+                }
+                println!(
+                    "{} `{}` ({})",
+                    match report.action {
+                        manager::Action::Installed => "installed",
+                        manager::Action::Updated => "updated",
+                        manager::Action::UpToDate => "up to date",
+                        manager::Action::FrozenVerified => "verified",
+                    },
+                    report.name,
+                    if let Some(commit) = &report.resolved_commit {
+                        commit[..12.min(commit.len())].to_string()
+                    } else {
+                        report.source.clone()
+                    }
+                );
+                if let Some(trash) = &report.trash {
+                    println!("  previous copy moved to: {}", trash.display());
+                }
+            }
+            Ok(0)
+        }
+        SkillCommand::Remove { name } => {
+            let report = manager::remove(paths, name).map_err(anyhow::Error::msg)?;
+            println!("removed skill `{}`", report.name);
+            if let Some(trash) = &report.trash {
+                println!("moved to: {}", trash.display());
+            }
+            if report.lock_removed {
+                println!("lockfile: entry removed");
+            }
+            Ok(0)
+        }
+        SkillCommand::List { json, frozen } => {
+            let rows = manager::list(paths).map_err(anyhow::Error::msg)?;
+            let mut drift = Vec::new();
+            if *frozen {
+                let lock = manager::LockFile::load(&paths.skills_lock_file())
+                    .map_err(anyhow::Error::msg)?;
+                drift = manager::verify_lock(paths, &lock, None);
+            }
+            if *json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "lockfile": paths.skills_lock_file().display().to_string(),
+                        "frozen": frozen,
+                        "drift": drift.iter().map(|drift| json!({
+                            "skill": drift.name,
+                            "file": drift.file,
+                            "reason": drift.reason,
+                        })).collect::<Vec<_>>(),
+                        "skills": rows.iter().map(|row| json!({
+                            "name": row.name,
+                            "source": row.source,
+                            "source_kind": row.source_kind,
+                            "ref": row.requested_ref,
+                            "requested_ref": row.requested_ref,
+                            "pinned_ref": row.resolved_commit,
+                            "resolved_commit": row.resolved_commit,
+                            "digest": row.digest,
+                            "installed_at": row.installed_at,
+                            "path": row.path.display().to_string(),
+                            "installed": row.installed,
+                            "modified": row.modified,
+                            "files": row.files,
+                        })).collect::<Vec<_>>(),
+                    }))?
+                );
+            } else if rows.is_empty() {
+                println!(
+                    "no skills installed; `lh skill add <dir|git-url#ref>` installs one into {}",
+                    paths.skills_dir().display()
+                );
+            } else {
+                for row in &rows {
+                    let mut line = row.name.to_string();
+                    if let Some(source) = &row.source {
+                        line.push_str(&format!(" · {source}"));
+                    } else {
+                        line.push_str(" · installed by hand");
+                    }
+                    if let Some(reference) = &row.requested_ref {
+                        line.push_str(&format!(" · ref {reference}"));
+                    }
+                    if let Some(commit) = &row.resolved_commit {
+                        line.push_str(&format!(" · {}", &commit[..12.min(commit.len())]));
+                    }
+                    if let Some(digest) = &row.digest {
+                        line.push_str(&format!(" · sha256 {}", &digest[..12.min(digest.len())]));
+                    }
+                    if row.modified {
+                        line.push_str(" · MODIFIED");
+                    }
+                    if !row.installed {
+                        line.push_str(" · MISSING");
+                    }
+                    println!("{line}");
+                }
+            }
+            if !drift.is_empty() {
+                eprintln!("{}", manager::format_drift(&drift));
+                return Ok(1);
+            }
+            Ok(0)
+        }
+        SkillCommand::Lint { name, all, json } => {
+            let target = match name {
+                Some(name) => lint::Target::Name(name.clone()),
+                None if *all => lint::Target::All,
+                None => lint::Target::Installed,
+            };
+            let report = lint::run(paths, trust, &target).map_err(anyhow::Error::msg)?;
+            if *json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "clean": report.is_clean(),
+                        "errors": report.errors(),
+                        "warnings": report.warnings(),
+                        "skills": report.skills.iter().map(|skill| json!({
+                            "name": skill.name,
+                            "path": skill.path.as_ref().map(|path| path.display().to_string()),
+                            "origin": skill.origin.label(),
+                            "errors": skill.errors(),
+                            "warnings": skill.warnings(),
+                            "diagnostics": skill.diagnostics.iter().map(|diagnostic| diagnostic.to_json()).collect::<Vec<_>>(),
+                        })).collect::<Vec<_>>(),
+                        "duplicates": report.duplicates.iter().map(|diagnostic| diagnostic.to_json()).collect::<Vec<_>>(),
+                    }))?
+                );
+            } else {
+                for skill in &report.skills {
+                    if skill.diagnostics.is_empty() {
+                        println!("{} ({}): clean", skill.name, skill.origin.label());
+                        continue;
+                    }
+                    println!(
+                        "{} ({}): {} error{}, {} warning{}",
+                        skill.name,
+                        skill.origin.label(),
+                        skill.errors(),
+                        if skill.errors() == 1 { "" } else { "s" },
+                        skill.warnings(),
+                        if skill.warnings() == 1 { "" } else { "s" },
+                    );
+                    for diagnostic in &skill.diagnostics {
+                        println!(
+                            "  {} [{}] {}: {}",
+                            diagnostic.severity,
+                            diagnostic.field,
+                            diagnostic.code,
+                            diagnostic.message
+                        );
+                    }
+                }
+                if !report.duplicates.is_empty() {
+                    println!("\nduplicate names:");
+                    for diagnostic in &report.duplicates {
+                        println!(
+                            "  {} [{}] {}: {}",
+                            diagnostic.severity,
+                            diagnostic.field,
+                            diagnostic.code,
+                            diagnostic.message
+                        );
+                    }
+                }
+                println!(
+                    "\n{} skill{}, {} error{}, {} warning{}",
+                    report.skills.len(),
+                    if report.skills.len() == 1 { "" } else { "s" },
+                    report.errors(),
+                    if report.errors() == 1 { "" } else { "s" },
+                    report.warnings(),
+                    if report.warnings() == 1 { "" } else { "s" },
+                );
+            }
+            Ok(if report.is_clean() { 0 } else { 1 })
+        }
+        SkillCommand::Eval { fixtures, json } => {
+            let report = eval::run(paths, trust, fixtures).map_err(anyhow::Error::msg)?;
+            if *json {
+                println!("{}", serde_json::to_string_pretty(&report.to_json())?);
+            } else {
+                println!(
+                    "skill eval ({} provider): {} fixture{}, {} failure{}",
+                    report.provider,
+                    report.fixtures.len(),
+                    if report.fixtures.len() == 1 { "" } else { "s" },
+                    report.failures,
+                    if report.failures == 1 { "" } else { "s" },
+                );
+                for fixture in &report.fixtures {
+                    println!(
+                        "  {} {}: {}",
+                        if fixture.passed { "PASS" } else { "FAIL" },
+                        fixture.name,
+                        fixture.failure.as_deref().unwrap_or("expected outcome")
+                    );
+                }
+                for metrics in &report.skills {
+                    println!(
+                        "  {}: precision {}, recall {} (tp {} fp {} fn {} tn {})",
+                        metrics.skill,
+                        metrics
+                            .precision
+                            .map(|value| format!("{value:.2}"))
+                            .unwrap_or_else(|| "n/a".into()),
+                        metrics
+                            .recall
+                            .map(|value| format!("{value:.2}"))
+                            .unwrap_or_else(|| "n/a".into()),
+                        metrics.true_positives,
+                        metrics.false_positives,
+                        metrics.false_negatives,
+                        metrics.true_negatives,
+                    );
+                }
+                println!(
+                    "average loaded tokens: {:.0}; total loaded tokens: {}; false-load cost: {}",
+                    report.average_loaded_tokens,
+                    report.total_loaded_tokens,
+                    report.false_load_cost
+                );
+            }
+            Ok(if report.passed { 0 } else { 1 })
         }
     }
 }
