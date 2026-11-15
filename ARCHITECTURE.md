@@ -100,13 +100,42 @@ Streaming:
 
 - SSE frames: `data: {...}`, `data: [DONE]`, comments, CRLF, multi-line data,
   frames split across chunks, multiple frames per chunk.
-- Accumulate tool calls by `index`: `id`, `function.name`, and
-  `function.arguments` fragments. Handle providers that emit a complete call in
-  one frame.
-- Parse `usage` from the final chunk when present.
+- Accumulate tool calls in one state machine (`provider/accum.rs`): each call
+  is a slot that is `Open` while fragments for its stream index arrive and
+  `Closed` when the stream ends or a new whole call takes over the index (a
+  name plus arguments while the open arguments are already a complete JSON
+  object, or a different engine id). Handles SGLang fragments, vLLM whole
+  calls, Ollama calls without `id` or `index`, and object-valued `arguments`.
+- JSON is validated at close. When `finish_reason` is `length` (or
+  `max_tokens`) and a call's arguments are empty or incomplete, the turn fails
+  with `tool_call_truncated` and the call is never executed.
+- An in-stream `error` object (`{"error":{...}}` or `{"error":"..."}`) aborts
+  the turn with the server's message, even after an HTTP 200.
+- A server that ignores `stream: true` and answers `application/json` is
+  emitted as the same events, so streamed and non-streamed completions fold
+  into one normalized `Completion` (`fold_stream`).
+- Parse `usage` and llama.cpp `timings` from any chunk; reports are merged and
+  surfaced once per completion.
 - Parse `reasoning_content` and `reasoning` fields. A model profile decides
   whether reasoning is shown, kept in context, or stripped after the turn.
 - `finish_reason`: `stop`, `length`, `tool_calls`, `content_filter`.
+
+Tool-call ids:
+
+- The session never stores an engine id. `agent/calls.rs` (`CallLedger`)
+  assigns `call_0001`, `call_0002`, ... in arrival order, continuing after the
+  highest internal id anywhere in the session tree, so ids are unique and
+  sortable across turns, branches and compaction. The engine id is mapped to
+  the internal id for the current request only.
+- Before each request the replayed history must have exactly one result per
+  call and one call per result; otherwise the turn fails with a typed error
+  (`tool_result_missing`, `tool_result_duplicate`, `tool_result_orphan`,
+  `tool_call_duplicate`) and nothing is sent.
+- Ids are rendered per model at the wire: Mistral-family models
+  (`mistral_common` tokenizers) get nine alphanumerics (`call_0007` →
+  `000000007`; ids an older session stored are hashed to `z` + 8 characters).
+  Other models receive the internal id unchanged. Older session files replay
+  unchanged.
 
 ### 2.2 Optional probes
 
@@ -1599,6 +1628,7 @@ src/
   text.rs                 shared clipping, one-line, slug, byte excerpts
   provider/
     mod.rs                Provider trait and error types
+    accum.rs              tool-call accumulator and normalized completion
     openai.rs             OpenAI-compatible client
     sse.rs                SSE framing and parsing
     types.rs              request/response/stream types
