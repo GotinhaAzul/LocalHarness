@@ -2180,6 +2180,50 @@ done
     }
 
     #[tokio::test]
+    async fn hash_patch_rolls_back_through_the_block_gate() {
+        use crate::config::{EditMode, LspGate};
+        use crate::tools::read::{line_hash, snapshot_hash};
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        rust_project(dir.path());
+        let file = dir.path().join("src/lib.rs");
+        let original = "pub fn value() -> u32 { 1 }\n";
+        std::fs::write(&file, original).expect("source");
+        let mut ctx = crate::tools::write::test_context(dir.path());
+        ctx.edit_mode = EditMode::Hash;
+        ctx.lsp = fake_service("rust-analyzer", dir.path());
+        ctx.lsp.set_gate(LspGate::Block);
+        warm(&ctx, "src/lib.rs").await;
+        let read = crate::tools::read::ReadTool
+            .call(&ctx, json!({"path": "src/lib.rs"}))
+            .await;
+        assert!(!read.is_error, "{}", read.content);
+
+        let snapshot = snapshot_hash(original.as_bytes());
+        let result = crate::tools::patch::PatchTool
+            .call(
+                &ctx,
+                json!({
+                    "path": format!("src/lib.rs#{snapshot}"),
+                    "ops": [{
+                        "op": "PUT",
+                        "line": 1,
+                        "hash": line_hash("pub fn value() -> u32 { 1 }"),
+                        "text": "pub fn value() -> u32 { LH_BAD }"
+                    }]
+                }),
+            )
+            .await;
+        assert!(result.is_error, "{}", result.content);
+        assert!(
+            result.content.starts_with("[EDIT_REGRESSION]"),
+            "{}",
+            result.content
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), original);
+    }
+
+    #[tokio::test]
     async fn clean_edit_adds_no_diagnostic_text() {
         let dir = tempfile::tempdir().expect("temp dir");
         rust_project(dir.path());
