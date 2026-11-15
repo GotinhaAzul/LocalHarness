@@ -399,6 +399,15 @@ pub async fn create_runtime(
         tracing::warn!("{warning}");
         session.warnings.push(warning);
     }
+    let structured = resolve_structured(
+        &config,
+        &paths,
+        provider.as_ref(),
+        engine,
+        !tool_specs.is_empty(),
+        &mut session.warnings,
+    )
+    .await?;
     let skills =
         SkillIndex::load(&paths, config.trust).advertised_for(&crate::tools::active_packs(&tools));
     let repo_brief = registry
@@ -410,6 +419,9 @@ pub async fn create_runtime(
     // prompt; name the exact wire format the repair layer can execute.
     let mut system_prompt = system_prompt;
     if let Some(text) = repair_protocol(tool_probe.as_ref(), &tools, !tool_specs.is_empty()) {
+        system_prompt.push_str(&text);
+    }
+    if let Some(text) = structured_protocol(structured.as_ref()) {
         system_prompt.push_str(&text);
     }
     let mut budget = TokenBudget::new(context_window, config.model.max_output_tokens);
@@ -538,6 +550,7 @@ pub async fn create_runtime(
         vision,
         tool_probe,
         engine,
+        structured,
         cancel: CancellationToken::new(),
         tool_timeout: Duration::from_secs(660),
         path_jail: options.path_jail,
@@ -710,7 +723,25 @@ pub async fn rebuild_core(old: &Arc<Core>, mut config: Config) -> Result<Arc<Cor
             }
         }
     }
+    let mut structured_warnings = Vec::new();
+    let structured = resolve_structured(
+        &config,
+        &old.paths,
+        provider.as_ref(),
+        engine,
+        !tool_specs.is_empty(),
+        &mut structured_warnings,
+    )
+    .await?;
+    if !structured_warnings.is_empty()
+        && let Ok(mut session) = old.session.lock()
+    {
+        session.warnings.extend(structured_warnings);
+    }
     if let Some(text) = repair_protocol(tool_probe.as_ref(), &tools, !tool_specs.is_empty()) {
+        system_prompt.push_str(&text);
+    }
+    if let Some(text) = structured_protocol(structured.as_ref()) {
         system_prompt.push_str(&text);
     }
     let mut budget = TokenBudget::new(context_window, config.model.max_output_tokens);
@@ -788,6 +819,7 @@ pub async fn rebuild_core(old: &Arc<Core>, mut config: Config) -> Result<Arc<Cor
         vision,
         tool_probe,
         engine,
+        structured,
         cancel: old.cancel.clone(),
         tool_timeout: old.tool_timeout,
         path_jail: old.path_jail,
@@ -1071,6 +1103,78 @@ fn apply_tool_probe(
     if probe.outcome == probe::ToolProbeOutcome::Rejected400 {
         tool_specs.clear();
     }
+}
+
+/// Load, validate, and lower `[model] response_schema` for this engine.
+/// An unsupported keyword is a hard error naming the keyword; a missing
+/// grammar backend is a visible fallback to the repair loop.
+async fn resolve_structured(
+    config: &Config,
+    paths: &Paths,
+    provider: &dyn Provider,
+    engine: crate::provider::Engine,
+    tools_present: bool,
+    warnings: &mut Vec<String>,
+) -> anyhow::Result<Option<crate::provider::StructuredRequest>> {
+    let configured = config.model.response_schema.trim();
+    if configured.is_empty() {
+        return Ok(None);
+    }
+    let path = [
+        paths.cwd.join(configured),
+        paths.config_dir.join(configured),
+        PathBuf::from(configured),
+    ]
+    .into_iter()
+    .find(|path| path.is_file())
+    .ok_or_else(|| {
+        anyhow::anyhow!(
+            "response schema {configured:?} does not exist; put it next to the project or pass an absolute --json-schema path"
+        )
+    })?;
+    let text = std::fs::read_to_string(&path)
+        .with_context(|| format!("cannot read response schema {}", path.display()))?;
+    let schema: serde_json::Value = serde_json::from_str(&text)
+        .with_context(|| format!("response schema {} is not JSON", path.display()))?;
+    let name = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("response")
+        .to_string();
+    let mut request = crate::provider::structured::plan(engine, &name, &schema)
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    if let Some(refusal) =
+        crate::provider::structured::tools_conflict(engine, &request, tools_present)
+    {
+        bail!("{refusal}");
+    }
+    if request.mode == crate::provider::StructuredMode::KoboldGrammar {
+        match crate::provider::structured::kobold_grammar(provider, &request.schema).await {
+            Ok(grammar) => request.grammar = Some(grammar),
+            Err(error) => {
+                let warning = format!(
+                    "koboldcpp json_to_grammar failed ({error}); using the locally lowered GBNF instead"
+                );
+                tracing::warn!("{warning}");
+                warnings.push(warning);
+            }
+        }
+    } else if let Some(notice) = request.notice() {
+        tracing::warn!("{notice}");
+        warnings.push(notice);
+    }
+    Ok(Some(request))
+}
+
+/// Tell the model the exact shape and that prose is not accepted. The
+/// grammar constrains tokens but never reaches the prompt on llama.cpp, so
+/// the schema is repeated as data.
+fn structured_protocol(request: Option<&crate::provider::StructuredRequest>) -> Option<String> {
+    let request = request?;
+    Some(format!(
+        "\n\n## Structured output\nReturn exactly one JSON document, with no prose and no Markdown fence. It must validate against this JSON Schema:\n{}\n",
+        serde_json::to_string_pretty(&request.schema).unwrap_or_default()
+    ))
 }
 
 fn warn_if_remote(endpoint: &str) {
@@ -1580,6 +1684,57 @@ mod tests {
             message: outcome.code().into(),
             checked: "2026-11-11T00:00:00Z".into(),
         }
+    }
+
+    #[tokio::test]
+    async fn unsupported_schema_keyword_is_refused_and_mlx_falls_back_to_repair() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(dir.path());
+        let schema_path = paths.cwd.join("reply.json");
+        std::fs::write(
+            &schema_path,
+            r#"{"oneOf":[{"type":"object"},{"type":"string"}]}"#,
+        )
+        .unwrap();
+        let mut config = Config::builtin();
+        config.model.response_schema = schema_path.display().to_string();
+        let provider = OpenAiCompatProvider::new(&config.model, "qwen3-coder").unwrap();
+        let error = resolve_structured(
+            &config,
+            &paths,
+            &provider,
+            crate::provider::Engine::Vllm,
+            false,
+            &mut Vec::new(),
+        )
+        .await
+        .expect_err("oneOf must be rejected");
+        assert!(error.to_string().contains("oneOf"), "{error}");
+
+        std::fs::write(
+            &schema_path,
+            r#"{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"]}"#,
+        )
+        .unwrap();
+        let mut warnings = Vec::new();
+        let structured = resolve_structured(
+            &config,
+            &paths,
+            &provider,
+            crate::provider::Engine::Mlx,
+            false,
+            &mut warnings,
+        )
+        .await
+        .expect("mlx fallback")
+        .expect("schema");
+        assert_eq!(structured.mode, crate::provider::StructuredMode::Repair);
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("no grammar backend")),
+            "{warnings:?}"
+        );
     }
 
     #[test]

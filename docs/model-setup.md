@@ -147,6 +147,45 @@ tool_mode = "repair"        # native | repair | auto
   `chat_template_kwargs`.
 - `parallel_tool_calls` is recorded for compatibility; tools run sequentially.
 
+## Structured output
+
+Point `[model] response_schema` at a JSON Schema file, or pass `--json-schema
+<file>` for one run:
+
+```toml
+[model]
+response_schema = "schemas/reply.json"
+```
+
+```json
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["answer"],
+  "properties": {
+    "answer": {"type": "string", "minLength": 1}
+  }
+}
+```
+
+The adapter validates the schema before sending: `oneOf`, `anyOf`, `allOf`,
+`patternProperties`, remote refs, recursive refs, `not`, conditionals, and
+unknown keywords are refused with the keyword named. Local non-recursive
+`$ref`s under `$defs`/`definitions` work.
+
+Each engine gets its own dialect: GBNF for llama.cpp, `structured_outputs` for
+vLLM, `response_format` for SGLang/Ollama/LM Studio, and
+`/api/extra/json_to_grammar` for KoboldCpp. MLX, TabbyAPI, and an unidentified
+engine have no grammar backend; the harness says so, writes the schema into the
+prompt, validates every reply, and repairs mismatches. After three failed
+repairs the turn ends with `structured_output`; an invalid document is never
+returned as the final answer.
+
+A strict response format is refused together with `tools[]` on engines that do
+not support both (llama.cpp, Ollama, LM Studio, TabbyAPI, MLX, generic). Remove
+the tools for that run or remove the schema. `lh doctor` reports the detected
+`structured_output` dialect (`json_schema`, `grammar`, `none`, or `unknown`).
+
 ## Context and token accounting
 
 An engine can report three different context sizes, and they are not
@@ -255,7 +294,7 @@ scripted tests).
 | `tool_parser` | Parser name the server reports, if any. |
 | `tool_probe` | Last forced-tool conformance result (`native_ok`, `prose_fallback`, `rejected_400`, `tools_dropped`, `empty_call`), its effective `mode`, model, build, message, and check time; `null` when none is cached. |
 | `reasoning_field` | Streaming reasoning field the server reports, if any. |
-| `structured_output` | `json_schema`, `grammar`, `none`, or `unknown`; unknown when the server does not report it. |
+| `structured_output` | `json_schema`, `grammar`, `none`, or `unknown`, from the engine fingerprint: llama.cpp/KoboldCpp report `grammar`, vLLM/SGLang/Ollama/LM Studio `json_schema`, MLX/TabbyAPI `none`. |
 | `cache_mode` | Engine cache mode, if reported (for example TabbyAPI's `cache_mode`). |
 | `slots` | Parallel slot count, if reported (llama.cpp `/props`). |
 | `tokenizer_route` | `"/tokenize"` when exact tokenization works, else `null`. |

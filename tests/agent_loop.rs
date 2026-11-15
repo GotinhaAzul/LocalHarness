@@ -262,6 +262,7 @@ fn harness_with_extra(
         vision: Default::default(),
         tool_probe: None,
         engine: localharness::provider::Engine::Generic,
+        structured: None,
         cancel: CancellationToken::new(),
         tool_timeout: std::time::Duration::from_secs(10),
         path_jail: false,
@@ -783,6 +784,71 @@ async fn repetition_loops_are_cut_and_nudged() {
             .any(|e| matches!(e, AgentEvent::Notice(n) if n.contains("looping")))
     );
     assert_eq!(last_assistant(&harness.session), "Done.");
+}
+
+#[tokio::test]
+async fn structured_output_repairs_invalid_json_or_blocks_the_turn() {
+    let schema = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["answer"],
+        "properties": {"answer": {"type": "string"}}
+    });
+    let plan = localharness::provider::structured::plan(
+        localharness::provider::Engine::Vllm,
+        "reply",
+        &schema,
+    )
+    .expect("plan");
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut harness = harness_config(
+        dir.path(),
+        vec![
+            text_script("not json at all"),
+            text_script("{\"answer\":\"ok\"}"),
+        ],
+        base_config(),
+    );
+    Arc::get_mut(&mut harness.core)
+        .expect("unique core")
+        .structured = Some(plan.clone());
+    let (outcome, events) = run(&harness, "answer").await;
+    assert_eq!(outcome.status, TurnStatus::Done, "{:?}", outcome.error);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::Notice(notice) if notice.contains("structured output did not match")
+    )));
+    assert_eq!(last_assistant(&harness.session), "{\"answer\":\"ok\"}");
+    assert_eq!(
+        harness.provider.requests.lock().unwrap().len(),
+        2,
+        "one repair call"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut harness = harness_config(
+        dir.path(),
+        (0..4).map(|_| text_script("still not json")).collect(),
+        base_config(),
+    );
+    Arc::get_mut(&mut harness.core)
+        .expect("unique core")
+        .structured = Some(plan);
+    let (outcome, events) = run(&harness, "answer").await;
+    assert_eq!(outcome.status, TurnStatus::Blocked);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::Error { code, .. } if code == "structured_output"
+    )));
+    let session = harness.session.lock().unwrap();
+    assert!(
+        session
+            .branch_entries()
+            .iter()
+            .any(|entry| matches!(&entry.kind, EntryKind::Error(data) if data.code == "structured_output")),
+        "an invalid document is never accepted as the final answer"
+    );
 }
 
 #[tokio::test]

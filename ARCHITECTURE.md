@@ -140,7 +140,12 @@ Capabilities are detected and cached per `(base_url, model)`:
 - `reasoning`
 - `native_tools`
 - `constrained_tools` (`response_format` JSON schema, GBNF grammar, or guided
-  decoding)
+  decoding) and its engine dialect: `structured_outputs` on vLLM, GBNF on
+  llama.cpp, `response_format` on SGLang/Ollama/LM Studio, KoboldCpp's
+  `json_to_grammar`, and `none` on MLX/TabbyAPI. One schema subset is validated
+  before sending (unsupported keywords are rejected by name) and every
+  structured reply is validated again after parsing. A strict format is
+  refused with `tools[]` on engines that do not document both.
 
 A missing capability degrades behavior, never fails the turn. Two compatibility
 fallbacks are explicit:
@@ -174,7 +179,15 @@ tool_mode = "repair"
 ```
 
 `model_profile = "auto"` matches by model-name prefix if a profile declares
-`match = ["qwen3", "qwen3.5"]`; otherwise the `default` profile is used.
+`match = ["qwen3", "qwen3.5"]`; otherwise the `default` profile is used. A
+user-defined profile always beats a bundled preset.
+
+Per-model samplers (`temperature`, `top_p`, `min_p`, `repeat_penalty`,
+`dry_multiplier`, `dry_base`, `xtc_probability`, `seed`) override the global
+`[model]` fields one by one. They are lowered to the engine's own key names
+(`repeat_penalty` vs `repetition_penalty`); fields the engine does not accept
+are omitted, never sent as unknown keys, and `lh doctor` warns about each
+omission. Bundled presets: `qwen-coding`, `gemma-chat`, `glm-agent`.
 
 ### 2.5 Errors and timeouts
 

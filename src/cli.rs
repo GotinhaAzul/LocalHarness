@@ -45,6 +45,11 @@ pub struct Cli {
     #[arg(long = "model-profile", global = true, value_name = "NAME")]
     pub model_profile: Option<String>,
 
+    /// JSON Schema file that constrains the final answer. The schema is
+    /// lowered to the engine's grammar dialect and every reply is validated.
+    #[arg(long = "json-schema", global = true, value_name = "FILE")]
+    pub json_schema: Option<PathBuf>,
+
     /// Tool profile (coding, full, security, minimal, or a custom profile).
     #[arg(long, global = true, value_name = "NAME")]
     pub profile: Option<String>,
@@ -231,6 +236,9 @@ pub async fn run(cli: Cli) -> Result<i32> {
     }
     if let Some(profile) = cli.model_profile {
         config.model_profile_override = Some(profile);
+    }
+    if let Some(schema) = cli.json_schema {
+        config.model.response_schema = schema.display().to_string();
     }
     if let Some(theme) = cli.theme {
         config.ui.theme = theme;

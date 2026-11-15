@@ -560,6 +560,9 @@ pub struct ModelConfig {
     pub dry_base: Option<f32>,
     pub xtc_probability: Option<f32>,
     pub seed: Option<i64>,
+    /// Path to a JSON Schema that constrains the final answer. Empty disables
+    /// structured output. `--json-schema` overrides it.
+    pub response_schema: String,
     pub max_output_tokens: u32,
     pub request_timeout_secs: u64,
     pub connect_timeout_secs: u64,
@@ -584,6 +587,7 @@ impl Default for ModelConfig {
             dry_base: None,
             xtc_probability: None,
             seed: None,
+            response_schema: String::new(),
             max_output_tokens: 4096,
             request_timeout_secs: 900,
             connect_timeout_secs: 5,

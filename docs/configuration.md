@@ -44,6 +44,7 @@ top_p = 0.95
 # dry_base = 1.75
 # xtc_probability = 0.0
 # seed = 0
+# response_schema = ""          # path to a JSON Schema for the final answer
 max_output_tokens = 4096
 request_timeout_secs = 900
 connect_timeout_secs = 5
@@ -185,6 +186,51 @@ The streaming repetition guard remains the last line of defense, not the first.
 
 `--debug` records the exact request body in the diagnostic log
 (`localharness::provider::request`), with the configured bearer token redacted.
+
+### Structured output
+
+`response_schema` (or `--json-schema FILE`) points at a JSON Schema that
+constrains the final answer:
+
+```toml
+[model]
+response_schema = "schemas/reply.json"
+```
+
+The schemas must stay inside a small, lowerable subset. `oneOf`, `anyOf`,
+`allOf`, `patternProperties`, remote `$ref`s, recursive `$ref`s, `not`,
+conditionals, and unknown keywords are rejected before any request is sent, and
+the error names the keyword. Local `$ref`s under `$defs`/`definitions` are
+allowed when they are not recursive. Supported keywords: `type`, `properties`,
+`required`, `additionalProperties`, `items`, `enum`, `const`, `minItems`,
+`maxItems`, `minLength`, `maxLength`, `minimum`, `maximum`,
+`exclusiveMinimum`, `exclusiveMaximum`, `multipleOf`, and `format` (annotation
+only).
+
+The same schema is lowered per engine:
+
+| Engine | Wire shape |
+|---|---|
+| llama.cpp | GBNF `grammar` |
+| vLLM | `structured_outputs: { json: <schema> }` |
+| SGLang | `response_format` with `json_schema` |
+| Ollama / LM Studio | `response_format` with `json_schema` |
+| KoboldCpp | `/api/extra/json_to_grammar`, then `grammar` |
+| MLX / TabbyAPI / unknown | no grammar backend: repair fallback |
+
+A strict response format and `tools[]` cannot ride together on llama.cpp,
+Ollama, LM Studio, TabbyAPI, MLX, or an unidentified engine. The harness
+refuses that combination with an actionable error instead of entering the
+reasoning loop documented in llama.cpp #30377. vLLM, SGLang, and KoboldCpp are
+treated as supporting both.
+
+When the engine has no grammar backend (MLX), the schema is not sent; the
+harness adds a visible warning, still writes the schema into the prompt, and
+validates every reply. A reply that is not valid JSON or does not match the
+schema is repaired; after three failed repairs the turn ends with
+`structured_output` and no invalid JSON is accepted as the final answer. The
+same validation runs on every engine, including those with decode-time
+grammars.
 
 ```toml
 [vision]
@@ -338,10 +384,11 @@ Steps run sequentially without a shell and stop at the first failure.
 ## Flags
 
 `--print`, `--json`, `--endpoint`, `--model`, `--model-profile`, `--profile`,
-`--theme`, `--api-key`, `--trust`, `--no-session`, `--no-redact`, `--continue`,
-`--resume`, `--path-jail`, `--sandbox [read-only|workspace-write]`,
-`--no-sandbox`, `--engagement`, `--no-color`, `--keep-artifacts`,
-`--clean-artifacts`, `--allow-remote-images`, `--keep-exif`, `--debug`.
+`--json-schema <file>`, `--theme`, `--api-key`, `--trust`, `--no-session`,
+`--no-redact`, `--continue`, `--resume`, `--path-jail`,
+`--sandbox [read-only|workspace-write]`, `--no-sandbox`, `--engagement`,
+`--no-color`, `--keep-artifacts`, `--clean-artifacts`, `--allow-remote-images`,
+`--keep-exif`, `--debug`.
 
 `lh doctor [--json] [--fix]` prints the engine capability manifest without
 sending a chat completion. See [model-setup.md](model-setup.md).

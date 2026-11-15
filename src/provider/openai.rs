@@ -560,6 +560,14 @@ fn build_body(req: &ChatRequest, include_usage: bool) -> Result<Value, ProviderE
             body["parallel_tool_calls"] = json!(parallel);
         }
     }
+    if let Some(schema) = &req.response_schema {
+        if let Some(refusal) =
+            super::structured::tools_conflict(req.engine, schema, !req.tools.is_empty())
+        {
+            return Err(ProviderError::new(ErrorClass::BadRequest, refusal));
+        }
+        schema.apply(&mut body, req.engine);
+    }
     if !req.stop.is_empty() {
         body["stop"] = json!(req.stop);
     }
@@ -1012,6 +1020,7 @@ mod tests {
                 ..Default::default()
             },
             engine: crate::provider::Engine::Generic,
+            response_schema: None,
             max_tokens: 16,
             stop: vec![],
             extra_body: None,
@@ -1054,6 +1063,7 @@ mod tests {
                 ..Default::default()
             },
             engine: crate::provider::Engine::Generic,
+            response_schema: None,
             max_tokens: 128,
             stop: vec![],
             extra_body: None,
@@ -1103,6 +1113,7 @@ mod tests {
                 ..Default::default()
             },
             engine: crate::provider::Engine::Generic,
+            response_schema: None,
             max_tokens: 128,
             stop: vec!["<|im_end|>".into()],
             extra_body: None,
@@ -1140,6 +1151,7 @@ mod tests {
                 ..Default::default()
             },
             engine: crate::provider::Engine::LlamaCpp,
+            response_schema: None,
             max_tokens: 16,
             stop: vec![],
             extra_body: None,
@@ -1178,6 +1190,7 @@ mod tests {
                 ..Default::default()
             },
             engine: crate::provider::Engine::Generic,
+            response_schema: None,
             max_tokens: 16,
             stop: vec![],
             extra_body: Some(json!({"temperature": 0.9})),

@@ -141,7 +141,7 @@ impl SamplerSettings {
             .into_iter()
             .map(|field| {
                 format!(
-                    "sampler profile sets {}, but {} does not accept it on the OpenAI-compatible API; the field is omitted. Remove {} from the model profile, or set [model] engine to the real server if this is a gateway.",
+                    "sampler profile sets {}, but {} does not accept it on the OpenAI-compatible API; the field is omitted. Remove {} from the model profile or [model] config, or set [model] engine to the real server if this is a gateway.",
                     field.name(),
                     engine.label(),
                     field.name()

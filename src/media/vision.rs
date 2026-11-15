@@ -203,6 +203,7 @@ pub async fn describe(
             ..Default::default()
         },
         engine: crate::provider::Engine::Generic,
+        response_schema: None,
         max_tokens: 1024,
         stop: Vec::new(),
         extra_body: None,

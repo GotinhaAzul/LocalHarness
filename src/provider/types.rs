@@ -177,6 +177,8 @@ pub struct ChatRequest {
     /// Engine fingerprint; decides sampler names and structured-output
     /// dialect.
     pub engine: super::Engine,
+    /// Optional response schema, already lowered for `engine`.
+    pub response_schema: Option<super::structured::StructuredRequest>,
     pub max_tokens: u32,
     pub stop: Vec<String>,
     pub extra_body: Option<Value>,

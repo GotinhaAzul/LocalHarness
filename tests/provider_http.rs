@@ -116,6 +116,7 @@ fn request() -> ChatRequest {
             ..Default::default()
         },
         engine: localharness::provider::Engine::Generic,
+        response_schema: None,
         max_tokens: 128,
         stop: vec![],
         extra_body: None,
@@ -573,6 +574,160 @@ async fn tool_conformance_probe_classifies_every_outcome_against_fixture_servers
     assert_eq!(rejected.outcome, ToolProbeOutcome::Rejected400);
     assert!(rejected.message.contains("--enable-auto-tool-choice"));
     assert!(rejected.message.contains("--tool-call-parser"));
+}
+
+#[tokio::test]
+async fn structured_schema_uses_each_engine_dialect_and_never_sends_strict_with_tools() {
+    use localharness::provider::StructuredMode;
+    use localharness::provider::structured::plan;
+
+    let schema = serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["answer"],
+        "properties": {"answer": {"type": "string"}}
+    });
+
+    async fn chat_body(
+        engine: localharness::provider::Engine,
+        schema: &serde_json::Value,
+    ) -> serde_json::Value {
+        let (base, state) = spawn().await;
+        state.script.lock().unwrap().push_back(Script {
+            status: 200,
+            body: "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n"
+                .into(),
+            chunked: false,
+        });
+        let mut req = request();
+        req.tools.clear();
+        req.tool_choice = None;
+        req.engine = engine;
+        req.response_schema = Some(plan(engine, "reply", schema).expect("plan"));
+        let events = collect_stream(&provider(&base), req, CancellationToken::new()).await;
+        assert!(events.iter().all(|event| event.is_ok()));
+        state.requests.lock().unwrap()[0].clone()
+    }
+
+    // llama.cpp gets the GBNF grammar.
+    let llama = chat_body(localharness::provider::Engine::LlamaCpp, &schema).await;
+    let grammar = llama["grammar"].as_str().expect("grammar");
+    assert!(grammar.contains("root ::="), "{grammar}");
+    assert!(grammar.contains("\"answer\""), "{grammar}");
+
+    // vLLM gets structured_outputs, not response_format.
+    let vllm = chat_body(localharness::provider::Engine::Vllm, &schema).await;
+    assert_eq!(vllm["structured_outputs"]["json"]["type"], "object");
+    assert!(vllm.get("response_format").is_none());
+
+    // SGLang gets its response_format dialect.
+    let sglang = chat_body(localharness::provider::Engine::Sglang, &schema).await;
+    assert_eq!(sglang["response_format"]["type"], "json_schema");
+    assert_eq!(
+        sglang["response_format"]["json_schema"]["schema"]["type"],
+        "object"
+    );
+
+    // MLX has no grammar backend: the request carries no strict field and the
+    // plan is a visible repair fallback.
+    let mlx = chat_body(localharness::provider::Engine::Mlx, &schema).await;
+    assert!(mlx.get("grammar").is_none());
+    assert!(mlx.get("response_format").is_none());
+    assert!(mlx.get("structured_outputs").is_none());
+    let mlx_plan = plan(localharness::provider::Engine::Mlx, "reply", &schema).unwrap();
+    assert_eq!(mlx_plan.mode, StructuredMode::Repair);
+    assert!(mlx_plan.notice().unwrap().contains("repair"));
+
+    // A strict schema plus tools on llama.cpp is refused before the request.
+    let mut req = request();
+    req.engine = localharness::provider::Engine::LlamaCpp;
+    req.response_schema =
+        Some(plan(localharness::provider::Engine::LlamaCpp, "reply", &schema).unwrap());
+    let events = collect_stream(
+        &provider("http://127.0.0.1:9"),
+        req,
+        CancellationToken::new(),
+    )
+    .await;
+    let error = events
+        .into_iter()
+        .find_map(|event| event.err())
+        .expect("refusal");
+    assert_eq!(error.class, ErrorClass::BadRequest);
+    assert!(error.message.contains("cannot combine tools[]"), "{error}");
+    assert!(error.message.contains("llama.cpp"), "{error}");
+
+    // The same combination is allowed on vLLM.
+    let mut req = request();
+    req.engine = localharness::provider::Engine::Vllm;
+    req.response_schema =
+        Some(plan(localharness::provider::Engine::Vllm, "reply", &schema).unwrap());
+    let (base, state) = spawn().await;
+    state.script.lock().unwrap().push_back(Script {
+        status: 200,
+        body: "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n".into(),
+        chunked: false,
+    });
+    let events = collect_stream(&provider(&base), req, CancellationToken::new()).await;
+    assert!(events.iter().all(|event| event.is_ok()));
+    let sent = state.requests.lock().unwrap()[0].clone();
+    assert_eq!(sent["structured_outputs"]["json"]["type"], "object");
+    assert_eq!(sent["tools"][0]["function"]["name"], "read");
+}
+
+#[tokio::test]
+async fn koboldcpp_grammar_endpoint_supplies_the_request_grammar() {
+    use localharness::provider::structured::{kobold_grammar, plan};
+
+    let state = FakeState::default();
+    let chat_state = state.clone();
+    let app = Router::new()
+        .route(
+            "/api/extra/json_to_grammar",
+            post(|| async {
+                axum::Json(serde_json::json!({
+                    "grammar": "root ::= \"from-kobold\""
+                }))
+            }),
+        )
+        .route(
+            "/v1/chat/completions",
+            post(move |body: String| {
+                let state = chat_state.clone();
+                async move {
+                    let value: serde_json::Value =
+                        serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
+                    state.requests.lock().unwrap().push(value);
+                    Body::from(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n",
+                    )
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let schema = serde_json::json!({"type": "object"});
+    let grammar = kobold_grammar(&provider(&base), &schema)
+        .await
+        .expect("converted grammar");
+    assert_eq!(grammar, "root ::= \"from-kobold\"");
+    let mut structured =
+        plan(localharness::provider::Engine::KoboldCpp, "reply", &schema).expect("plan");
+    structured.grammar = Some(grammar);
+
+    let mut req = request();
+    req.tools.clear();
+    req.tool_choice = None;
+    req.engine = localharness::provider::Engine::KoboldCpp;
+    req.response_schema = Some(structured);
+    let events = collect_stream(&provider(&base), req, CancellationToken::new()).await;
+    assert!(events.iter().all(|event| event.is_ok()));
+    let sent = state.requests.lock().unwrap()[0].clone();
+    assert_eq!(sent["grammar"], "root ::= \"from-kobold\"");
 }
 
 #[tokio::test]
