@@ -187,6 +187,7 @@ mod tests {
         let mut paths = crate::paths::Paths::discover(dir).unwrap();
         paths.config_dir = dir.join("config");
         paths.data_dir = dir.join("data");
+        paths.home_dir = Some(dir.join("home"));
         let session = Session::create(
             &paths,
             SessionData {

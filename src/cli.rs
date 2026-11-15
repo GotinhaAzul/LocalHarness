@@ -759,7 +759,7 @@ fn run_skill_command(paths: &Paths, trust: bool, action: &SkillCommand) -> Resul
                 );
             } else {
                 for row in &rows {
-                    let mut line = format!("{}", row.name);
+                    let mut line = row.name.to_string();
                     if let Some(source) = &row.source {
                         line.push_str(&format!(" · {source}"));
                     } else {

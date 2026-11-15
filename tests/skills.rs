@@ -346,12 +346,14 @@ async fn native_and_standard_skills_resolve_deterministically_and_record_the_sha
     let (base, fake) = spawn_fake(vec![text_frame("ok")]).await;
     let output = run_print(&env, &base, &["--print", "hello"]).await;
     assert_ok(&output);
-    let requests = fake.requests.lock().unwrap();
-    let system = requests[0]["messages"][0]["content"]
-        .as_str()
-        .expect("system prompt");
-    assert!(system.contains("Native description"), "{system}");
-    assert!(!system.contains("Claude description"), "{system}");
+    {
+        let requests = fake.requests.lock().unwrap();
+        let system = requests[0]["messages"][0]["content"]
+            .as_str()
+            .expect("system prompt");
+        assert!(system.contains("Native description"), "{system}");
+        assert!(!system.contains("Claude description"), "{system}");
+    }
 
     // The duplicate is visible to lint and names both origins.
     let output = run(&env, &["skill", "lint", "--all", "--json"]).await;
@@ -428,12 +430,7 @@ async fn installing_from_a_directory_and_a_git_ref_writes_a_lockfile() {
 async fn frozen_detects_a_changed_file_and_changes_nothing() {
     let env = env();
     let source = env._dir.path().join("source/deploy");
-    write_skill(
-        &source.parent().unwrap().to_path_buf(),
-        "deploy",
-        "Deploy",
-        "original",
-    );
+    write_skill(source.parent().unwrap(), "deploy", "Deploy", "original");
     let output = run(&env, &["skill", "add", source.to_str().unwrap()]).await;
     assert_ok(&output);
     let installed = env.config.join("skills/deploy/SKILL.md");
@@ -470,12 +467,7 @@ async fn frozen_detects_a_changed_file_and_changes_nothing() {
 async fn update_refuses_local_edits_and_force_backs_up_the_old_copy() {
     let env = env();
     let source = env._dir.path().join("source/deploy");
-    write_skill(
-        &source.parent().unwrap().to_path_buf(),
-        "deploy",
-        "Deploy",
-        "original",
-    );
+    write_skill(source.parent().unwrap(), "deploy", "Deploy", "original");
     let output = run(&env, &["skill", "add", source.to_str().unwrap()]).await;
     assert_ok(&output);
     let installed = env.config.join("skills/deploy/SKILL.md");
@@ -572,12 +564,7 @@ async fn install_never_runs_a_bundled_script_and_execution_needs_approval() {
 async fn removing_a_skill_backs_it_up_and_the_session_still_starts() {
     let env = env();
     let source = env._dir.path().join("source/deploy");
-    write_skill(
-        &source.parent().unwrap().to_path_buf(),
-        "deploy",
-        "Deploy",
-        "body",
-    );
+    write_skill(source.parent().unwrap(), "deploy", "Deploy", "body");
     assert_ok(&run(&env, &["skill", "add", source.to_str().unwrap()]).await);
     let output = run(&env, &["skill", "remove", "deploy"]).await;
     assert_ok(&output);

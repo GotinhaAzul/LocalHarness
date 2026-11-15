@@ -227,6 +227,7 @@ async fn spawn_sized(window: u64) -> (String, SizedFake) {
 
 struct Env {
     _dir: tempfile::TempDir,
+    home: std::path::PathBuf,
     config_dir: std::path::PathBuf,
     data_dir: std::path::PathBuf,
     cwd: std::path::PathBuf,
@@ -234,12 +235,15 @@ struct Env {
 
 fn env() -> Env {
     let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
     let config_dir = dir.path().join("config");
     let data_dir = dir.path().join("data");
     let cwd = dir.path().join("work");
+    std::fs::create_dir_all(&home).unwrap();
     std::fs::create_dir_all(&cwd).unwrap();
     Env {
         _dir: dir,
+        home,
         config_dir,
         data_dir,
         cwd,
@@ -256,6 +260,8 @@ async fn run_lh(env: &Env, base: &str, extra: &[&str]) -> std::process::Output {
         .arg("--no-session")
         .args(extra)
         .current_dir(&env.cwd)
+        .env("HOME", &env.home)
+        .env("LH_HOME", &env.home)
         .env("LH_CONFIG_DIR", &env.config_dir)
         .env("LH_DATA_DIR", &env.data_dir)
         .env("LH_SKIP_TOOL_PROBE", "1")
@@ -278,6 +284,8 @@ async fn run_lh_no_model(env: &Env, base: &str, extra: &[&str]) -> std::process:
         .arg("--no-session")
         .args(extra)
         .current_dir(&env.cwd)
+        .env("HOME", &env.home)
+        .env("LH_HOME", &env.home)
         .env("LH_CONFIG_DIR", &env.config_dir)
         .env("LH_DATA_DIR", &env.data_dir)
         .env("LH_SKIP_TOOL_PROBE", "1")

@@ -194,29 +194,32 @@ pub fn add(paths: &Paths, raw_source: &str, force: bool) -> Result<InstallReport
     let resolved = resolve_source(paths, &spec)?;
     let (skill, skill_root) = inspect(&resolved.root)?;
     print_approval(&skill, &skill_root, paths)?;
-    if let Some(target) = install_target(paths, &skill.name) {
-        if target.exists() && !force {
-            bail!(
-                "skill `{}` is already installed at {}; run `lh skill update {}` or `lh skill add {} --force` (the old copy is moved to {})",
-                skill.name,
-                target.display(),
-                skill.name,
-                raw_source,
-                paths.skills_trash_dir().display()
-            );
-        }
+    if let Some(target) = install_target(paths, &skill.name)
+        && target.exists()
+        && !force
+    {
+        bail!(
+            "skill `{}` is already installed at {}; run `lh skill update {}` or `lh skill add {} --force` (the old copy is moved to {})",
+            skill.name,
+            target.display(),
+            skill.name,
+            raw_source,
+            paths.skills_trash_dir().display()
+        );
     }
     let mut lock = LockFile::load(&paths.skills_lock_file())?;
     materialize(
         paths,
-        &spec,
-        &resolved,
-        &skill,
-        &skill_root,
-        force,
-        false,
+        Materialize {
+            spec: &spec,
+            resolved: &resolved,
+            skill: &skill,
+            skill_root: &skill_root,
+            force,
+            updating: false,
+            action: Action::Installed,
+        },
         &mut lock,
-        Action::Installed,
     )
 }
 
@@ -320,14 +323,16 @@ pub fn update(
         }
         let mut report = materialize(
             paths,
-            &spec,
-            &resolved,
-            &skill,
-            &skill_root,
-            true,
-            true,
+            Materialize {
+                spec: &spec,
+                resolved: &resolved,
+                skill: &skill,
+                skill_root: &skill_root,
+                force: true,
+                updating: true,
+                action: Action::Updated,
+            },
             &mut lock,
-            Action::Updated,
         )?;
         report.warnings.extend(
             drift
@@ -791,17 +796,30 @@ fn print_approval(skill: &Skill, root: &Path, paths: &Paths) -> Result<()> {
     Ok(())
 }
 
-fn materialize(
-    paths: &Paths,
-    spec: &SourceSpec,
-    resolved: &ResolvedSource,
-    skill: &Skill,
-    skill_root: &Path,
+struct Materialize<'a> {
+    spec: &'a SourceSpec,
+    resolved: &'a ResolvedSource,
+    skill: &'a Skill,
+    skill_root: &'a Path,
     force: bool,
     updating: bool,
-    lock: &mut LockFile,
     action: Action,
+}
+
+fn materialize(
+    paths: &Paths,
+    request: Materialize<'_>,
+    lock: &mut LockFile,
 ) -> Result<InstallReport> {
+    let Materialize {
+        spec,
+        resolved,
+        skill,
+        skill_root,
+        force,
+        updating,
+        action,
+    } = request;
     std::fs::create_dir_all(paths.skills_dir())
         .with_context(|| format!("cannot create {}", paths.skills_dir().display()))?;
     let target = install_target(paths, &skill.name)

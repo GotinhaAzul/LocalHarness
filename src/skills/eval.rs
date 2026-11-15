@@ -289,7 +289,7 @@ fn best_match(index: &SkillIndex, prompt: &str) -> (Option<String>, f64) {
     }
 }
 
-fn choose_reference<'a>(skill: &'a Skill, prompt: &str) -> Option<super::SkillReference> {
+fn choose_reference(skill: &Skill, prompt: &str) -> Option<super::SkillReference> {
     let prompt_terms = terms(prompt);
     let mut best: Option<(super::SkillReference, f64)> = None;
     for reference in skill.references() {

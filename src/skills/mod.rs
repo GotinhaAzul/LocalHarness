@@ -412,7 +412,7 @@ pub fn discover(paths: &Paths, trust: bool) -> Discovery {
 
 /// Read one skill directory, for lint and the package manager. `dir` may be a
 /// directory containing `SKILL.md`, or a loose native `.md` file.
-pub fn read_skill_dir(dir: &Path, origin: SkillOrigin) -> Result<Skill, InvalidSkill> {
+pub fn read_skill_dir(dir: &Path, origin: SkillOrigin) -> Result<Skill, Box<InvalidSkill>> {
     if dir.is_file() {
         return parse_skill_file(dir, None, origin);
     }
@@ -424,7 +424,7 @@ pub fn read_skill_dir(dir: &Path, origin: SkillOrigin) -> Result<Skill, InvalidS
     if let Some(main) = main {
         return parse_skill_file(&main, Some(dir.to_path_buf()), origin);
     }
-    Err(InvalidSkill {
+    Err(Box::new(InvalidSkill {
         path: dir.to_path_buf(),
         origin,
         name: dir
@@ -440,7 +440,7 @@ pub fn read_skill_dir(dir: &Path, origin: SkillOrigin) -> Result<Skill, InvalidS
             ),
         )],
         skill: None,
-    })
+    }))
 }
 
 fn scan_root(discovery: &mut Discovery, root: &Path, origin: SkillOrigin, native: bool) {
@@ -470,7 +470,7 @@ fn scan_root(discovery: &mut Discovery, root: &Path, origin: SkillOrigin, native
                     origin,
                 ) {
                     Ok(skill) => discovery.skills.push(skill),
-                    Err(invalid) => discovery.invalid.push(invalid),
+                    Err(invalid) => discovery.invalid.push(*invalid),
                 }
             }
         } else if native && path.extension().is_some_and(|extension| extension == "md") {
@@ -478,7 +478,7 @@ fn scan_root(discovery: &mut Discovery, root: &Path, origin: SkillOrigin, native
             // skills directory. Keep that shape working.
             match parse_skill_file(&path, None, origin) {
                 Ok(skill) => discovery.skills.push(skill),
-                Err(invalid) => discovery.invalid.push(invalid),
+                Err(invalid) => discovery.invalid.push(*invalid),
             }
         }
     }
@@ -488,11 +488,11 @@ fn parse_skill_file(
     path: &Path,
     dir: Option<PathBuf>,
     origin: SkillOrigin,
-) -> Result<Skill, InvalidSkill> {
+) -> Result<Skill, Box<InvalidSkill>> {
     let raw = match std::fs::read_to_string(path) {
         Ok(raw) => raw,
         Err(error) => {
-            return Err(InvalidSkill {
+            return Err(Box::new(InvalidSkill {
                 path: path.to_path_buf(),
                 origin,
                 name: dir
@@ -507,7 +507,7 @@ fn parse_skill_file(
                     format!("cannot read {}: {error}", path.display()),
                 )],
                 skill: None,
-            });
+            }));
         }
     };
     let fallback_dir = dir.clone().or_else(|| path.parent().map(Path::to_path_buf));
@@ -518,18 +518,18 @@ fn parse_skill_file(
                 .iter()
                 .any(|diagnostic| diagnostic.severity == validate::Severity::Error)
             {
-                Err(InvalidSkill {
+                Err(Box::new(InvalidSkill {
                     path: path.to_path_buf(),
                     origin,
                     name: Some(skill.name.clone()),
                     diagnostics,
                     skill: Some(skill),
-                })
+                }))
             } else {
                 Ok(skill)
             }
         }
-        Err(message) => Err(InvalidSkill {
+        Err(message) => Err(Box::new(InvalidSkill {
             path: path.to_path_buf(),
             origin,
             name: None,
@@ -539,7 +539,7 @@ fn parse_skill_file(
                 message,
             )],
             skill: None,
-        }),
+        })),
     }
 }
 
