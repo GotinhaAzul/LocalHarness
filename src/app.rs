@@ -402,8 +402,20 @@ pub async fn create_runtime(
     let repo_brief = registry
         .repo()
         .brief(&paths.cwd, crate::tools::repo_map::BRIEF_BUDGET);
-    let system_prompt =
-        prompt::build_system_prompt(&config, &paths, &skills, &tools, Some(&repo_brief));
+    let agents = crate::agent::agents_md::AgentsMd::load(&paths.cwd, config.prompt.agents_md);
+    for warning in &agents.warnings {
+        if !session.warnings.contains(warning) {
+            session.warnings.push(warning.clone());
+        }
+    }
+    let system_prompt = prompt::build_system_prompt_with_agents(
+        &config,
+        &paths,
+        &skills,
+        &tools,
+        Some(&repo_brief),
+        &agents,
+    );
     // A server without native tool calls still lists the tools in the system
     // prompt; name the exact wire format the repair layer can execute.
     let mut system_prompt = system_prompt;
@@ -675,8 +687,22 @@ pub async fn rebuild_core(old: &Arc<Core>, mut config: Config) -> Result<Arc<Cor
     let repo_brief = registry
         .repo()
         .brief(&old.paths.cwd, crate::tools::repo_map::BRIEF_BUDGET);
-    let mut system_prompt =
-        prompt::build_system_prompt(&config, &old.paths, &skills, &tools, Some(&repo_brief));
+    let agents = crate::agent::agents_md::AgentsMd::load(&old.paths.cwd, config.prompt.agents_md);
+    if let Ok(mut session) = old.session.lock() {
+        for warning in &agents.warnings {
+            if !session.warnings.contains(warning) {
+                session.warnings.push(warning.clone());
+            }
+        }
+    }
+    let mut system_prompt = prompt::build_system_prompt_with_agents(
+        &config,
+        &old.paths,
+        &skills,
+        &tools,
+        Some(&repo_brief),
+        &agents,
+    );
     // Same target: keep the conformance result unless it never ran. A model
     // switch probes again so the mode tracks the newly loaded server.
     let tool_probe = if same_target && old.tool_probe.is_some() {

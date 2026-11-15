@@ -151,6 +151,8 @@ One append-only JSONL file per session tree under `~/.local/share/localharness/s
 
 Compaction is deterministic, not model-written. Tool output is archived with an id, and `recall` reads an exact range. The request prefix is cache-stable: tool order and schema key order do not drift, volatile session facts sit at the end of the system block, and a compaction logs how much of the prefix the engine can keep. `--no-session` writes nothing: no session file, no artifacts. Session files, artifacts, evidence, and reports are redacted on disk by default; `--no-redact` is the explicit opt-out and is recorded in the session header. Redaction applies only to what is written to disk: in a live session the model sees the real tool output, so it has no placeholder to copy into a file. A resumed session replays the saved, redacted form with a note, and `write`/`edit`/`patch`/`undo` refuse content that adds a `[REDACTED:...]` placeholder the file does not already hold.
 
+`AGENTS.md` is read hierarchically: the chain from the git repository root to the working directory, nearest last, each with a source-path header. Files are capped at 12 KiB each and 32 KiB total, with deterministic truncation and a warning; a symlink that resolves outside the repository is refused. `lh context --show` prints the manifest (path, bytes, SHA-256, loaded/skipped/truncated), and `lh context --json` emits the same data for scripts. `--no-agents-md` or `LH_AGENTS_MD=0` skips the chain. The files are advisory: they cannot add a tool, relax a gate, or change the profile.
+
 ## 04 · One binary, two front ends
 
 ### The TUI
@@ -226,7 +228,7 @@ Read [docs/security.md](docs/security.md) before using it on client work.
 Everything at the edge is configurable; the loop itself stays small and auditable.
 
 - **Profiles** select packs and tools. Built-ins are `coding` (default), `full`, `security`, `minimal`, `strict` (six tools, one call per message for weak models), and experimental `shell` (bash only); add your own in `profiles/*.toml` or `.harness/profiles/`.
-- **Prompt** customization lives in `[prompt]`: replace the one-line identity, append inline instructions, or point at a Markdown file. Per-profile prompts still apply on top.
+- **Prompt** customization lives in `[prompt]`: replace the one-line identity, append inline instructions, point at a Markdown file, or disable the hierarchical `AGENTS.md` chain with `agents_md = false`. Per-profile prompts still apply on top.
 - **Skills** are Markdown instructions. The model loads a matching skill with the `skill` tool, or you load one with `/skill <name>`. Bundled security skills advertise only when the security pack is active and remain loadable by name; eight bundled coding skills advertise with the coding pack.
 - **Workflows** are playbooks plus a profile and tool allowlist. Optional `[[step]]` tables add conditions, bounded retries, approval gates, declared artifacts, and resume; `lh workflow run <name>` executes them. The bundled set covers coding, review, general assistance, and security.
 - **External tools** are any executable speaking one JSON object in, one JSON object out. No plugin ABI, no second runtime.
@@ -266,6 +268,7 @@ Global config: `~/.config/localharness/config.toml`. A trusted project `.harness
 | `LH_PROFILE`, `LH_MODEL_PROFILE` | Tool profile and model profile |
 | `LH_THEME` | Theme name |
 | `LH_NO_SESSION`, `LH_TRUST` | Disable persistence; trust project config |
+| `LH_AGENTS_MD` | Set to `0` to skip the AGENTS.md chain |
 | `LH_CONFIG_DIR`, `LH_DATA_DIR` | Override config and data roots |
 | `LH_SKIP_TOOL_PROBE` | Skip the one-shot tool-call conformance probe |
 

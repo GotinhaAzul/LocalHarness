@@ -241,7 +241,8 @@ impl Config {
     }
 
     /// Environment overrides. `LH_ENDPOINT`, `LH_MODEL`, `LH_API_KEY`,
-    /// `LH_PROFILE`, `LH_MODEL_PROFILE`, `LH_THEME` are read.
+    /// `LH_PROFILE`, `LH_MODEL_PROFILE`, `LH_THEME`, and `LH_AGENTS_MD` are
+    /// read.
     pub fn apply_env(&mut self) {
         if let Ok(v) = std::env::var("LH_ENDPOINT")
             && !v.trim().is_empty()
@@ -268,6 +269,13 @@ impl Config {
             && !v.trim().is_empty()
         {
             self.ui.theme = v;
+        }
+        if let Ok(value) = std::env::var("LH_AGENTS_MD") {
+            match value.trim().to_ascii_lowercase().as_str() {
+                "0" | "false" | "off" | "no" => self.prompt.agents_md = false,
+                "1" | "true" | "on" | "yes" => self.prompt.agents_md = true,
+                _ => {}
+            }
         }
         if std::env::var("LH_NO_SESSION").is_ok() {
             self.session.no_session = true;
@@ -679,7 +687,7 @@ impl Default for BudgetConfig {
 }
 
 /// Global prompt customization. Empty fields keep the built-in text.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PromptConfig {
     /// Replaces the built-in one-line identity when non-empty.
@@ -688,6 +696,20 @@ pub struct PromptConfig {
     pub instructions: String,
     /// Extra instructions file, resolved like a profile prompt.
     pub file: PathBuf,
+    /// Load the hierarchical `AGENTS.md` chain into the system prompt.
+    /// `--no-agents-md` and `LH_AGENTS_MD=0` disable it.
+    pub agents_md: bool,
+}
+
+impl Default for PromptConfig {
+    fn default() -> Self {
+        Self {
+            identity: String::new(),
+            instructions: String::new(),
+            file: PathBuf::new(),
+            agents_md: true,
+        }
+    }
 }
 
 /// One Model Context Protocol server. Exactly one of `command` (stdio) or

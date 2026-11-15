@@ -886,6 +886,7 @@ code and, where useful, the exact call shape.
 | `attack_path` | 400 nodes for full betweenness; 5000 simple paths |
 | `iocs` | 100 per category, 2,000,000 input chars |
 | tool result | 2500 chars per result, 8000 chars per batch |
+| `AGENTS.md` | 32 KiB total, 12 KiB per file; chain from repo root to cwd |
 | compaction | `clamp(usable prompt / 3, 1200, 4500)` chars, max 40% of usable |
 
 Limits are constants or config values, not model-controlled.
@@ -1207,8 +1208,14 @@ input characters. Missing input and unreadable files return prescriptive errors.
 - Project `.harness/` config, profiles, skills, workflows, tools, and verify
   steps are ignored unless `--trust` is set or the TUI `/trust` confirmation is
   accepted. Trust is per session and shown in the status bar.
-- `AGENTS.md` is read as untrusted project instructions. It cannot change
-  scope, tools, gates, or the endpoint.
+- `AGENTS.md` is read as untrusted project instructions from the chain between
+  the git repository root and the working directory, nearest last, each under a
+  source-path header. The chain is capped at 32 KiB total and 12 KiB per file
+  with deterministic truncation and a warning. Symlinks that resolve outside
+  the repository are refused. `lh context --show` prints path, bytes, SHA-256,
+  and loaded/skipped/truncated for each file; `--no-agents-md` and
+  `LH_AGENTS_MD=0` disable the chain. It cannot change scope, tools, gates, or
+  the endpoint.
 - A trusted project still cannot grant security scope.
 - Model input from repository files and tool output is delimited and labeled as
   untrusted data in the system prompt. This reduces, but does not eliminate,
@@ -1612,9 +1619,11 @@ strip_reasoning = true
   prompts/
 ```
 
-`AGENTS.md` at the repository root is read as untrusted project instructions. It
-is data, not executable, and it cannot change scope, tools, gates, or the
-endpoint.
+`AGENTS.md` files between the repository root and the working directory are
+read as untrusted project instructions, nearest last. They are data, not
+executable, and cannot change scope, tools, gates, or the endpoint. `lh context
+--show` reports the chain and its hashes; `[prompt] agents_md = false`,
+`--no-agents-md`, and `LH_AGENTS_MD=0` disable loading.
 
 ### 10.5 Permissions and secrets
 
@@ -1656,6 +1665,8 @@ src/
   agent/
     mod.rs                AgentHandle, events
     run.rs                turn state machine
+    prompt.rs             system prompt construction
+    agents_md.rs          hierarchical AGENTS.md chain, caps, manifest
     repair.rs             tool argument repair
     gates.rs              settle gates and guard orchestration
     limits.rs             run budgets and stall detection
