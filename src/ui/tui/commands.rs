@@ -35,6 +35,7 @@ impl App {
             "profile" => self.command_profile(rest).await,
             "theme" => self.command_theme(rest),
             "tree" => self.command_tree(),
+            "rewind" => self.command_rewind(rest),
             "fork" => self.command_fork(),
             "new" => self.command_new().await,
             "resume" => self.command_resume(rest).await,
@@ -589,6 +590,83 @@ impl App {
             return;
         }
         self.modal = Some(ModalData::Tree(view));
+    }
+
+    pub(super) fn command_rewind(&mut self, argument: &str) {
+        let Some(runtime) = &self.runtime else {
+            return;
+        };
+        let core = runtime.core.clone();
+        let session_handle = runtime.session.clone();
+        let mut turns = 1usize;
+        let mut force = false;
+        for word in argument.split_whitespace() {
+            if word.eq_ignore_ascii_case("force") || word == "--force" {
+                force = true;
+            } else if let Ok(turns_parsed) = word.parse::<usize>() {
+                turns = turns_parsed;
+            } else {
+                self.set_notice(
+                    format!("usage: /rewind [turns] [force] (got {word:?})"),
+                    Role::Error,
+                );
+                return;
+            }
+        }
+        let mut session = match session_handle.lock() {
+            Ok(session) => session,
+            Err(poison) => poison.into_inner(),
+        };
+        let target = match crate::session::rewind::target_before_turn(&session, turns) {
+            Ok(target) => target,
+            Err(message) => {
+                drop(session);
+                self.set_notice(message.clone(), Role::Warning);
+                self.transcript.push_note("rewind", message, true);
+                return;
+            }
+        };
+        let plan = match crate::session::rewind::plan(&session, &target) {
+            Ok(plan) => plan,
+            Err(error) => {
+                drop(session);
+                let message = format!("{error:#}");
+                self.set_notice(message.clone(), Role::Error);
+                self.transcript.push_note("rewind", message, true);
+                return;
+            }
+        };
+        let paths: Vec<_> = plan
+            .files
+            .iter()
+            .filter(|file| file.content.is_some())
+            .map(|file| file.path.clone())
+            .collect();
+        let report = match crate::session::rewind::apply(&mut session, &plan, force) {
+            Ok(report) => report,
+            Err(error) => {
+                drop(session);
+                let message = format!("{error:#}");
+                self.set_notice(
+                    message.lines().next().unwrap_or(&message).to_string(),
+                    Role::Error,
+                );
+                self.transcript.push_note("rewind", message, true);
+                return;
+            }
+        };
+        let _ = session.fsync();
+        drop(session);
+        // Restored bytes are what the harness itself wrote now; the model does
+        // not have to re-read them before the next edit.
+        let ctx = core.tool_context();
+        for path in &paths {
+            crate::tools::write::record_own_write(&ctx, path);
+        }
+        self.refresh_session_blocks();
+        let message = format!("rewound to {}: {}", report.target, report.summary());
+        self.transcript.push_note("rewind", message.clone(), false);
+        self.set_notice(message, Role::Success);
     }
 
     pub(super) fn command_fork(&mut self) {

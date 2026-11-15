@@ -102,6 +102,10 @@ pub struct Core {
     /// Optional frontend approval gate for tool calls (ACP). It runs after
     /// the harness gates and can only deny.
     pub approver: Option<Arc<dyn crate::tools::ToolApprover>>,
+    /// Frontend hunk reviewer for file mutations. `None` means no interactive
+    /// surface (headless, ACP): review auto-accepts, which matches the
+    /// pre-review behavior. The TUI installs itself after the core is built.
+    pub reviewer: std::sync::RwLock<Option<Arc<dyn crate::tools::hunk::HunkReviewer>>>,
     /// Permission mode, rules, and session approvals, shared across core
     /// rebuilds. Consulted before every dispatch (see [`authorize`]).
     pub permissions: Arc<crate::policy::Permissions>,
@@ -250,6 +254,22 @@ impl Core {
         self.tool_context_with(self.cancel.clone())
     }
 
+    /// The installed hunk reviewer, if this frontend has one.
+    pub fn reviewer(&self) -> Option<Arc<dyn crate::tools::hunk::HunkReviewer>> {
+        self.reviewer
+            .read()
+            .ok()
+            .and_then(|guard| guard.as_ref().cloned())
+    }
+
+    /// Install the frontend hunk reviewer. Called by the TUI after building
+    /// the runtime; the headless paths leave it unset.
+    pub fn set_reviewer(&self, reviewer: Arc<dyn crate::tools::hunk::HunkReviewer>) {
+        if let Ok(mut guard) = self.reviewer.write() {
+            *guard = Some(reviewer);
+        }
+    }
+
     /// Tool context bound to a specific turn's cancellation token. Each turn
     /// gets a child of `Core::cancel`, so cancelling one turn does not poison
     /// later turns.
@@ -330,6 +350,12 @@ pub enum AgentEvent {
         approval_required: bool,
     },
     Notice(String),
+    /// A reviewed batch is waiting for the frontend's hunk decisions. The
+    /// answer goes back through `HunkReviewer::submit`/`cancel` with `id`.
+    HunkReview {
+        id: u64,
+        hunks: Vec<crate::tools::hunk::HunkView>,
+    },
     Guard {
         code: String,
         message: String,

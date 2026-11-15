@@ -742,6 +742,135 @@ async fn screen_never_drifts_from_what_ratatui_drew() {
 }
 
 #[tokio::test]
+async fn hunk_review_modal_accepts_rejects_edits_and_submits() {
+    use crate::tools::hunk::{HunkChoice, HunkDecision, HunkView};
+
+    fn hunk(file: &str, line: usize) -> HunkView {
+        HunkView {
+            file: file.into(),
+            start_line: line,
+            end_line: line,
+            added: 1,
+            removed: 1,
+            rationale: format!("change line {line}"),
+            text: format!("new {line}\n"),
+        }
+    }
+
+    let (_dir, mut app) = test_app().await;
+    app.handle_agent_event(AgentEvent::HunkReview {
+        id: 9,
+        hunks: vec![hunk("a.rs", 1), hunk("b.rs", 2)],
+    });
+    assert!(matches!(&app.modal, Some(ModalData::HunkReview(_))));
+
+    // Reject the first hunk, then edit the second.
+    app.handle_modal_key(key(KeyCode::Char('r'))).await;
+    app.handle_modal_key(key(KeyCode::Down)).await;
+    app.handle_modal_key(key(KeyCode::Char('e'))).await;
+    assert!(app.hunk_edit.is_some(), "e opens the prompt editor");
+    assert_eq!(app.input.text(), "new 2\n");
+    app.input.set_text("edited\n");
+    app.handle_key(key(KeyCode::Enter)).await;
+    match &app.modal {
+        Some(ModalData::HunkReview(view)) => {
+            assert_eq!(view.choices[0], HunkChoice::Reject);
+            assert_eq!(view.choices[1], HunkChoice::Edit("edited\n".into()));
+        }
+        other => panic!("expected the review modal, got {other:?}"),
+    }
+
+    app.handle_modal_key(key(KeyCode::Enter)).await;
+    assert!(app.modal.is_none());
+    let decision = app.reviewer.submitted().expect("a submitted decision");
+    assert_eq!(decision.choices[0], HunkChoice::Reject);
+    assert_eq!(decision.choices[1], HunkChoice::Edit("edited\n".into()));
+
+    // Esc is reject-all: nothing lands and the model is told.
+    app.handle_agent_event(AgentEvent::HunkReview {
+        id: 10,
+        hunks: vec![hunk("a.rs", 1), hunk("b.rs", 2)],
+    });
+    app.handle_modal_key(key(KeyCode::Esc)).await;
+    assert!(app.modal.is_none());
+    let decision = app.reviewer.submitted().expect("a submitted decision");
+    assert_eq!(decision, HunkDecision::reject_all(2));
+}
+
+#[tokio::test]
+async fn rewind_restores_files_moves_the_leaf_and_keeps_the_old_branch() {
+    let (_dir, mut app) = test_app().await;
+    let cwd = app.cwd_path();
+    let session = app.runtime.as_ref().unwrap().session.clone();
+    std::fs::write(cwd.join("a.txt"), "changed\n").unwrap();
+    let (old_leaf, first_turn, first_user) = {
+        let mut session = session.lock().unwrap();
+        let first = session
+            .append(EntryKind::User(UserData {
+                attachments: Vec::new(),
+                content: "first turn".into(),
+            }))
+            .unwrap();
+        let assistant = session
+            .append(EntryKind::Assistant(crate::session::AssistantData {
+                content: Some("ok".into()),
+                ..Default::default()
+            }))
+            .unwrap();
+        let snapshot = session.artifacts.write("original\n").unwrap();
+        let hash = crate::tools::undo::content_hash(b"changed\n");
+        let leaf = session
+            .append(EntryKind::Custom(
+                crate::session::CustomData::new("fs-change")
+                    .with("path", "a.txt")
+                    .with("snapshot", snapshot.id)
+                    .with("after_sha256", hash),
+            ))
+            .unwrap();
+        (leaf.id, assistant.id, first.id)
+    };
+    assert_eq!(
+        app.runtime
+            .as_ref()
+            .unwrap()
+            .session
+            .lock()
+            .unwrap()
+            .active_leaf_id()
+            .as_deref(),
+        Some(old_leaf.as_str())
+    );
+
+    app.command_rewind("1");
+
+    assert_eq!(
+        std::fs::read_to_string(cwd.join("a.txt")).unwrap(),
+        "original\n"
+    );
+    let session = session.lock().unwrap();
+    assert!(
+        session.latest_custom_on_path("rewind").is_some(),
+        "the rewind marker is on the new branch"
+    );
+    let ids: Vec<String> = session
+        .context_path()
+        .iter()
+        .map(|entry| entry.id.clone())
+        .collect();
+    assert!(
+        !ids.contains(&old_leaf),
+        "the abandoned turn is out of context: {ids:?}"
+    );
+    assert!(session.tree.get(&first_turn).is_some());
+    assert!(session.tree.get(&first_user).is_some());
+    let rows = crate::ui::tree::TreeView::new(&session).rows;
+    assert!(
+        rows.iter().any(|row| row.preview == "first turn"),
+        "{rows:?}"
+    );
+}
+
+#[tokio::test]
 async fn list_commands_open_pickers_and_pick_without_typing() {
     let (_dir, mut app) = test_app().await;
     let enter = key(KeyCode::Enter);

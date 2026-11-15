@@ -13,6 +13,7 @@ use crate::agent::{AgentEvent, TurnStatus, run_turn};
 use crate::app::{RuntimeOptions, create_runtime};
 use crate::config::{ColorMode, Config};
 use crate::paths::Paths;
+use crate::session::Session;
 use crate::ui::{self, UiOptions};
 
 #[derive(Debug, Parser)]
@@ -81,6 +82,16 @@ pub struct Cli {
     /// Resume a session by id or path.
     #[arg(long, value_name = "ID|PATH")]
     pub resume: Option<String>,
+
+    /// Restore harness-written files and the conversation to
+    /// <SESSION>:<ENTRY>. SESSION may be "last". Refuses when a file changed
+    /// outside the harness; add --force to back it up first.
+    #[arg(long, value_name = "SESSION:ENTRY", conflicts_with = "print")]
+    pub rewind: Option<String>,
+
+    /// With --rewind, back up externally changed files before overwriting.
+    #[arg(long, requires = "rewind")]
+    pub force: bool,
 
     /// Restrict file tools to the working directory (bash is not restricted).
     #[arg(long, global = true)]
@@ -378,6 +389,10 @@ pub async fn run(cli: Cli) -> Result<i32> {
         )
         .await;
     }
+    if let Some(spec) = &cli.rewind {
+        return run_rewind(&paths, spec, cli.force);
+    }
+
     if let Some(Command::Hooks { action }) = &cli.command {
         return run_hooks(&config, &paths, action).await;
     }
@@ -1049,6 +1064,56 @@ fn print_workflow_event(event: &crate::workflows::engine::Event, json: bool) {
     }
 }
 
+/// `lh --rewind <session>:<entry>`: restore harness-written files and move the
+/// conversation leaf, without starting a model turn.
+fn run_rewind(paths: &Paths, spec: &str, force: bool) -> Result<i32> {
+    let (session_part, entry) = spec.rsplit_once(':').ok_or_else(|| {
+        anyhow::anyhow!("--rewind expects <session>:<entry>, for example `lh --rewind last:e12`")
+    })?;
+    let entry = entry.trim();
+    if entry.is_empty() {
+        bail!("--rewind needs an entry id after the colon; run /tree in the TUI to see ids");
+    }
+    let session_part = session_part.trim();
+    let session_path = match session_part {
+        "" | "last" => Session::latest_path(paths)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "no sessions in {}; pass <session>:<entry> from another project",
+                paths.project_sessions_dir().display()
+            )
+        })?,
+        value => {
+            let direct = PathBuf::from(value);
+            if direct.is_file() {
+                direct
+            } else {
+                let candidate = paths.project_sessions_dir().join(format!("{value}.jsonl"));
+                if candidate.is_file() {
+                    candidate
+                } else {
+                    bail!(
+                        "no session {value:?} in {}; use `lh --rewind last:{entry}` for the latest",
+                        paths.project_sessions_dir().display()
+                    );
+                }
+            }
+        }
+    };
+    let mut session = Session::open(&session_path)
+        .with_context(|| format!("cannot open {}", session_path.display()))?;
+    let plan = crate::session::rewind::plan(&session, entry)?;
+    let report = crate::session::rewind::apply(&mut session, &plan, force)?;
+    session.fsync()?;
+    println!(
+        "rewound session {} to {} (seq {}): {}",
+        session.id,
+        report.target,
+        plan.target_seq,
+        report.summary()
+    );
+    Ok(0)
+}
+
 async fn run_headless(runtime: crate::app::Runtime, prompt: String, json: bool) -> Result<i32> {
     let cancel = CancellationToken::new();
     let (tx, mut rx) = mpsc::unbounded_channel();
@@ -1162,6 +1227,9 @@ fn event_json(event: &AgentEvent) -> serde_json::Value {
             tokens_before,
         } => json!({"type":"compacted","summary":summary,"tokens_before":tokens_before}),
         AgentEvent::Notice(message) => json!({"type":"notice","message":message}),
+        AgentEvent::HunkReview { id, hunks } => {
+            json!({"type":"hunk_review","id":id,"hunks":hunks.len()})
+        }
         AgentEvent::Provenance {
             call_id,
             origin,
@@ -1306,5 +1374,89 @@ mod tests {
         let cli = Cli::try_parse_from(["lh", "--no-redact"]).unwrap();
         assert!(cli.no_redact);
         assert!(!Cli::try_parse_from(["lh"]).unwrap().no_redact);
+    }
+
+    #[test]
+    fn rewind_takes_a_session_and_entry_and_force_needs_it() {
+        let cli = Cli::try_parse_from(["lh", "--rewind", "last:e12"]).unwrap();
+        assert_eq!(cli.rewind.as_deref(), Some("last:e12"));
+        assert!(!cli.force);
+        let cli = Cli::try_parse_from(["lh", "--rewind", "abc:e3", "--force"]).unwrap();
+        assert!(cli.force);
+        assert!(
+            Cli::try_parse_from(["lh", "--force"]).is_err(),
+            "--force only means something with --rewind"
+        );
+        assert!(
+            Cli::try_parse_from(["lh", "--rewind", "last:e3", "--print", "hi"]).is_err(),
+            "--rewind and --print are separate modes"
+        );
+    }
+
+    #[test]
+    fn run_rewind_restores_files_and_reports_the_target() {
+        use crate::session::{CustomData, EntryKind, SessionData, UserData};
+
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().canonicalize().unwrap();
+        std::fs::write(cwd.join("a.txt"), "after\n").unwrap();
+        let mut paths = Paths::discover(&cwd).unwrap();
+        paths.config_dir = dir.path().join("config");
+        paths.data_dir = dir.path().join("data");
+        paths.sessions_dir_override = Some(dir.path().join("sessions"));
+        paths.ensure_dirs().unwrap();
+        let mut session = Session::create(
+            &paths,
+            SessionData {
+                cwd: cwd.display().to_string(),
+                endpoint: "test".into(),
+                model: "test".into(),
+                profile: "test".into(),
+                app: "test".into(),
+                redact: true,
+                context: None,
+                permissions: None,
+            },
+            false,
+        )
+        .unwrap();
+        session
+            .append(EntryKind::User(UserData {
+                attachments: Vec::new(),
+                content: "edit it".into(),
+            }))
+            .unwrap();
+        let target = session
+            .append(EntryKind::Assistant(crate::session::AssistantData {
+                content: Some("done".into()),
+                ..Default::default()
+            }))
+            .unwrap();
+        let snapshot = session.artifacts.write("before\n").unwrap();
+        session
+            .append(EntryKind::Custom(
+                CustomData::new("fs-change")
+                    .with("path", "a.txt")
+                    .with("snapshot", snapshot.id)
+                    .with("after_sha256", crate::tools::undo::content_hash(b"after\n")),
+            ))
+            .unwrap();
+        session.fsync().unwrap();
+        drop(session);
+
+        assert_eq!(
+            run_rewind(&paths, &format!("last:{}", target.id), false).unwrap(),
+            0
+        );
+        assert_eq!(
+            std::fs::read_to_string(cwd.join("a.txt")).unwrap(),
+            "before\n"
+        );
+        let reopened = Session::open(&Session::latest_path(&paths).unwrap().unwrap()).unwrap();
+        assert_eq!(
+            reopened.active_leaf_id().as_deref(),
+            Some(reopened.tree.last().unwrap().id.as_str())
+        );
+        assert!(reopened.latest_custom_on_path("rewind").is_some());
     }
 }

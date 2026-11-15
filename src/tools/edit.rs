@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use similar::{ChangeTag, DiffTag, TextDiff};
 
 use crate::tools::read::split_lines;
-use crate::tools::write::{atomic_write, file_mode, lock_reads, record_own_write};
+use crate::tools::write::{file_mode, lock_reads, record_own_write};
 use crate::tools::{
     Tool, ToolContext, ToolPack, ToolResult, display_path, optional_bool, required_str,
 };
@@ -138,7 +138,7 @@ fn run(ctx: &ToolContext, args: &Value) -> Result<ToolResult, ToolResult> {
     let (diff, added, removed) = diff_report(&before, &after, MAX_DIFF_LINES);
 
     let change = crate::tools::undo::record_change(ctx, Ok(Some(&before)), &after);
-    atomic_write(&path, after.as_bytes(), file_mode(&path))
+    crate::tools::hunk::mutation_write(&path, Some(&before), &after, file_mode(&path))
         .map_err(|err| ToolResult::err("EDIT_FAILED", format!("cannot write {display}: {err}")))?;
     record_own_write(ctx, &path);
 

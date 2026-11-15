@@ -138,11 +138,7 @@ fn walk(
     if depth > 256 {
         return;
     }
-    let children: Vec<&Entry> = tree
-        .children(&entry.id)
-        .into_iter()
-        .filter(|child| is_displayed(child))
-        .collect();
+    let children: Vec<&Entry> = visible_children(tree, &entry.id);
     let last = children.len().saturating_sub(1);
     for (index, child) in children.into_iter().enumerate() {
         let child_last = index == last;
@@ -160,6 +156,21 @@ fn walk(
             rows,
         );
     }
+}
+
+/// Displayed children of `id`, looking through entries the tree does not show
+/// (`fs-change`, rewind markers, session headers). A hidden entry is
+/// structural, not a branch: its visible descendants stay on the same level.
+fn visible_children<'a>(tree: &'a SessionTree, id: &str) -> Vec<&'a Entry> {
+    let mut out = Vec::new();
+    for child in tree.children(id) {
+        if is_displayed(child) {
+            out.push(child);
+        } else {
+            out.extend(visible_children(tree, &child.id));
+        }
+    }
+    out
 }
 
 /// Coarse token estimate: characters divided by four.
@@ -340,6 +351,29 @@ mod tests {
         view.home();
         view.ensure_visible(2);
         assert_eq!(view.scroll, 0);
+    }
+
+    #[test]
+    fn hidden_entries_do_not_break_the_visible_branch() {
+        let mut tree = SessionTree::new();
+        tree.push(user(1, "e1", None, "go"));
+        tree.push(entry(
+            2,
+            "e2",
+            Some("e1"),
+            EntryKind::Custom(crate::session::CustomData::new("fs-change").with("path", "a.rs")),
+        ));
+        tree.push(assistant(3, "e3", "e2", 0, "edited"));
+        let view = TreeView::from_tree(&tree, Some("e3"));
+        assert_eq!(
+            view.rows
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            ["e1", "e3"],
+            "the assistant below a hidden fs-change entry stays visible"
+        );
+        assert_eq!(view.rows[1].depth, 1);
     }
 
     #[test]

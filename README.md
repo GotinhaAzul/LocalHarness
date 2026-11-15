@@ -132,6 +132,7 @@ Twenty-four built-ins in three packs. `coding` (core + coding) is the default; `
 - **`test`** detects vitest, jest, go, cargo, pytest, or an npm test script and returns only the first failure.
 - **`review`** reads the working tree and checks the diff before the session settles.
 - **`undo`** reverts the last `edit`, `patch`, or `write` from session snapshots, and refuses when the file changed after the harness wrote it. Changes made through `bash` are not tracked.
+- **Hunk review.** `review = "multi_file"` (the default) pauses before a turn's second file mutation, shows the proposed hunks in the TUI, and writes only what you accept. Rejected hunks are reported back to the model with their ranges, accepted hunks land atomically, and `undo` still steps back over them. `always` reviews every mutation; `off` restores immediate writes. Headless `--print` has no reviewer, so it auto-accepts and never blocks.
 - **`read`/`grep`/`glob`** respect ignore files and keep results small; oversized output is archived and available through `recall`.
 
 Tool results are capped, archived, and retrievable. The model never has to guess where an excerpt came from.
@@ -142,11 +143,23 @@ One append-only JSONL file per session tree under `~/.local/share/localharness/s
 
 ```text
 /tree       show branches and switch
+/rewind     restore files and the conversation to an earlier turn
 /fork       branch from the current leaf
 /new        start a fresh session
 /resume     pick a previous session by prefix or suffix
 /sessions   list every session for this project
 /export     write a Markdown transcript
+```
+
+`/rewind [turns]` restores every file the harness wrote after the target to its
+snapshot there, then moves the leaf; the old branch stays in `/tree`. An edit
+made outside the harness refuses the rewind and is named; `/rewind 1 force`
+backs such files up before restoring them. `lh --rewind <session>:<entry>`
+does the same headlessly.
+
+```sh
+lh --rewind last:e42          # latest session, before entry e42
+lh --rewind 20261107-…:e9 --force
 ```
 
 Compaction is deterministic, not model-written. Tool output is archived with an id, and `recall` reads an exact range. The request prefix is cache-stable: tool order and schema key order do not drift, volatile session facts sit at the end of the system block, and a compaction logs how much of the prefix the engine can keep. `--no-session` writes nothing: no session file, no artifacts. Session files, artifacts, evidence, and reports are redacted on disk by default; `--no-redact` is the explicit opt-out and is recorded in the session header. Redaction applies only to what is written to disk: in a live session the model sees the real tool output, so it has no placeholder to copy into a file. A resumed session replays the saved, redacted form with a note, and `write`/`edit`/`patch`/`undo` refuse content that adds a `[REDACTED:...]` placeholder the file does not already hold.
@@ -172,12 +185,13 @@ The terminal interface is the default. Tool calls render as cards, diffs and str
 | `Ctrl+L` | redraw the whole screen |
 | `/` | slash-command completion |
 | `Tab` / `Shift+Tab` | complete commands, arguments, and paths; move back through choices |
+| Review: `a` / `r` / `e` | accept, reject, or edit the selected hunk (`A`/`R` all, `Enter` apply, `Esc` reject all) |
 
 Tab completes the token at the cursor: commands, arguments (themes, profiles, skills, workflows, session ids, models, `/login` endpoints, `/help` topics, `/sec` subcommands), and file paths. Ambiguous matches first extend to their shared prefix, then open a picker. Every command that chooses from a list — `/model`, `/profile`, `/theme` (with live preview), `/skill`, `/workflow`, `/sec`, `/resume` — opens a filterable menu when run without an argument: type to filter, arrows to move, Enter to pick. Model and profile switches load in the background, so the TUI stays responsive while the server swaps models.
 
 Write `@path` in a prompt to attach a file: `fix the panic in @src/parser.rs`. The file is read through the same path as the `read` tool and appended to your message, so the model can edit it without another read. Up to eight files per prompt, within a quarter of the usable context. `@shot.png` attaches a screenshot: a model with vision input sees the image, and a text-only model can get a description from a local vision model; the `read` tool opens images too. Images are checked by content, stripped of EXIF, and sent only to local endpoints unless you opt in. See [docs/images.md](docs/images.md).
 
-Slash commands: `/help /quit /login /model /profile /theme /tree /fork /new /resume /sessions /compact /tools /mcp /skill /workflow /sec /trust /commit /pr /plan /export /clear /debug`.
+Slash commands: `/help /quit /login /model /profile /theme /tree /rewind /fork /new /resume /sessions /compact /tools /mcp /skill /workflow /sec /trust /commit /pr /plan /export /clear /debug`.
 
 Every tool call passes a permission policy first. The default mode `ask` runs read-only calls and asks before edits and commands, showing the exact command or path and a diff; `y` approves exactly that call for the session. `/plan` switches to plan mode: mutating tools are removed and refused at dispatch until `/plan approve`. Modes, rules, and `--yolo` are in [docs/configuration.md](docs/configuration.md#permissions).
 

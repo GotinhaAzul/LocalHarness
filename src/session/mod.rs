@@ -2,13 +2,14 @@
 
 pub mod artifact;
 pub mod entry;
+pub mod rewind;
 pub mod store;
 pub mod tree;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use chrono::Utc;
 
 pub use artifact::{Artifact, ArtifactError, ArtifactSlice, ArtifactStore};
@@ -17,6 +18,7 @@ pub use entry::{
     ErrorData, FORMAT_VERSION, ImageRef, SessionContextWindow, SessionData, SessionPermissions,
     ToolCall, ToolResultData, UserData,
 };
+pub use rewind::{RewindPlan, RewindReport};
 pub use store::{SessionStore, StoreError};
 pub use tree::{CheckoutError, SessionTree};
 
@@ -297,6 +299,20 @@ impl Session {
             message: message.into(),
             recoverable,
         }))
+    }
+
+    /// Move the active leaf to an already-validated entry. Unlike
+    /// [`Session::checkout`] this accepts the session header, which a rewind
+    /// of the first turn targets, and does not resolve a batch boundary.
+    pub fn move_leaf(&mut self, target: &str, reason: &str) -> Result<()> {
+        if self.tree.get(target).is_none() {
+            bail!("entry {target} does not exist");
+        }
+        self.append(EntryKind::Checkout(CheckoutData {
+            target: target.to_string(),
+            reason: reason.to_string(),
+        }))?;
+        Ok(())
     }
 
     /// Checkout the resolved target and record a marker.
