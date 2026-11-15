@@ -177,10 +177,11 @@ pub fn is_read_only(command: &str) -> bool {
             return false;
         }
         if name == "git" {
-            return git_subcommand(args).is_some_and(|sub| READ_ONLY_GIT.contains(&sub))
-                && !args
-                    .iter()
-                    .any(|a| a == "--output" || a.starts_with("--output="));
+            return git_subcommand(args).is_some_and(|sub| {
+                READ_ONLY_GIT.contains(&sub) && (sub != "reflog" || reflog_is_read_only(args))
+            }) && !args
+                .iter()
+                .any(|a| a == "--output" || a.starts_with("--output="));
         }
         if name == "env" && !args.is_empty() {
             // `env cmd` runs another program.
@@ -190,14 +191,35 @@ pub fn is_read_only(command: &str) -> bool {
             return false;
         }
         if let Some((_, flags)) = WRITING_FLAGS.iter().find(|(p, _)| *p == name) {
-            return !args.iter().any(|arg| {
-                flags
-                    .iter()
-                    .any(|flag| arg == flag || arg.starts_with(&format!("{flag}=")))
-            });
+            return !args
+                .iter()
+                .any(|arg| flags.iter().any(|flag| flag_matches(arg, flag)));
         }
         true
     })
+}
+
+/// Whether `arg` selects `flag`, including an attached short-option value
+/// (`sort -oFILE`) and the `--flag=value` form.
+fn flag_matches(arg: &str, flag: &str) -> bool {
+    arg == flag
+        || arg.starts_with(&format!("{flag}="))
+        || (flag.starts_with('-')
+            && !flag.starts_with("--")
+            && arg.len() > flag.len()
+            && arg.starts_with(flag))
+}
+
+/// `git reflog` is read-only only for `show` (or no action). `expire`,
+/// `delete`, and `drop` rewrite the recovery log.
+fn reflog_is_read_only(args: &[String]) -> bool {
+    let Some(position) = args.iter().position(|arg| arg == "reflog") else {
+        return false;
+    };
+    args.iter()
+        .skip(position + 1)
+        .find(|arg| !arg.starts_with('-'))
+        .is_none_or(|action| action == "show")
 }
 
 /// True when some simple command in `command` is a known network client, a
@@ -260,6 +282,8 @@ mod tests {
             "rg 'fn main' src && wc -l src/main.rs",
             "grep \"a>b\" file.txt",
             "find . -name '*.rs'",
+            "git reflog",
+            "git reflog show --date=iso",
         ] {
             assert!(is_read_only(command), "{command}");
         }
@@ -282,6 +306,10 @@ mod tests {
             "FOO=1 make",
             "env rm x",
             "sort -o out in",
+            "sort -oout in",
+            "sort -o/tmp/out in",
+            "git reflog expire --expire=now --all",
+            "git reflog delete HEAD@{1}",
             "(cd x && ls)",
             "",
         ] {

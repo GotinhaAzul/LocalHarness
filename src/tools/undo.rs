@@ -273,7 +273,7 @@ fn run(ctx: &ToolContext, args: &Value) -> Result<ToolResult, ToolResult> {
             format!("the last change to {display} has no snapshot. Fix it with edit."),
         ));
     };
-    let restored = ctx.artifacts.read_all(snapshot).map_err(|err| {
+    let (restored, trusted) = ctx.artifacts.read_for_undo(snapshot).map_err(|err| {
         ToolResult::err(
             "SNAPSHOT_MISSING",
             format!(
@@ -281,7 +281,15 @@ fn run(ctx: &ToolContext, args: &Value) -> Result<ToolResult, ToolResult> {
             ),
         )
     })?;
-    atomic_write(&path, restored.as_bytes(), file_mode(&path))
+    // A raw in-process snapshot is the exact pre-change text, even when the
+    // file legitimately contained a redaction-shaped string. A copy read back
+    // from disk is redacted and must still pass the placeholder guard.
+    let written = if trusted {
+        crate::tools::write::atomic_restore(&path, restored.as_bytes(), file_mode(&path))
+    } else {
+        atomic_write(&path, restored.as_bytes(), file_mode(&path))
+    };
+    written
         .map_err(|err| ToolResult::err("UNDO_FAILED", format!("cannot write {display}: {err}")))?;
     record_own_write(ctx, &path);
     let (diff, added, removed) = diff_report(&current, &restored, MAX_DIFF_LINES);
@@ -379,6 +387,39 @@ mod tests {
             refused.content
         );
         assert_eq!(on_disk(&dir, "settings.py").unwrap(), before_undo);
+    }
+
+    #[tokio::test]
+    async fn undo_restores_a_file_that_legitimately_contains_a_placeholder() {
+        let dir = tempfile::tempdir().unwrap();
+        let placeholder = crate::security::redact::Redactor::new(true)
+            .redact_owned("aws_key = AKIAZZZZZZZZZZZZZZZZ")
+            .trim_start_matches("aws_key = ")
+            .to_string();
+        let original = format!("expected = {placeholder}\nkeep = 1\n");
+        std::fs::write(dir.path().join("fixture.txt"), &original).unwrap();
+        let ctx = test_context(dir.path());
+        ReadTool.call(&ctx, json!({"path": "fixture.txt"})).await;
+
+        let edited = mutate(
+            &ctx,
+            &EditTool,
+            json!({
+                "path": "fixture.txt",
+                "old": format!("expected = {placeholder}\n"),
+                "new": ""
+            }),
+        )
+        .await;
+        assert!(!edited.is_error, "{}", edited.content);
+        assert_eq!(
+            on_disk(&dir, "fixture.txt").unwrap(),
+            "keep = 1\n".to_string()
+        );
+
+        let undone = mutate(&ctx, &UndoTool, json!({"path": "fixture.txt"})).await;
+        assert!(!undone.is_error, "{}", undone.content);
+        assert_eq!(on_disk(&dir, "fixture.txt").unwrap(), original);
     }
 
     #[tokio::test]

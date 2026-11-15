@@ -343,14 +343,22 @@ impl ArtifactStore {
     /// Full text of an artifact: the original for one written by this
     /// process, otherwise what is stored (redacted for a persisted session).
     pub fn read_all(&self, id: &str) -> Result<String, ArtifactError> {
+        self.read_for_undo(id).map(|(text, _)| text)
+    }
+
+    /// Read an artifact for restoring a file, with whether the bytes came from
+    /// the in-process raw cache (trusted) or from the redacted stored copy. An
+    /// undo of a change made in this process may legitimately contain a
+    /// redaction-shaped string; a copy read back after a restart may not.
+    pub fn read_for_undo(&self, id: &str) -> Result<(String, bool), ArtifactError> {
         validate_id(id).map_err(ArtifactError::InvalidId)?;
         if let Some(raw) = self.raw_text(id) {
-            return Ok(raw);
+            return Ok((raw, true));
         }
         match &self.root {
             Some(root) => {
                 let path = root.join(format!("{id}.txt"));
-                std::fs::read_to_string(&path).map_err(|source| {
+                let text = std::fs::read_to_string(&path).map_err(|source| {
                     if source.kind() == io::ErrorKind::NotFound {
                         ArtifactError::NotFound(id.to_string())
                     } else {
@@ -359,7 +367,8 @@ impl ArtifactStore {
                             source,
                         }
                     }
-                })
+                })?;
+                Ok((text, false))
             }
             None => self
                 .memory
@@ -367,6 +376,7 @@ impl ArtifactStore {
                 .expect("artifact memory poisoned")
                 .get(id)
                 .cloned()
+                .map(|text| (text, true))
                 .ok_or_else(|| ArtifactError::NotFound(id.to_string())),
         }
     }

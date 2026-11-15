@@ -85,8 +85,55 @@ struct TurnContext {
 }
 
 /// Run one turn to settlement. Appends everything to the session branch;
-/// streams UI events.
+/// streams UI events. The `stop` hook and the terminal `State`/`TurnDone`
+/// events run here for every outcome, including a turn stopped before the
+/// loop by startup, budget, or a blocking hook.
 pub async fn run_turn(
+    core: std::sync::Arc<Core>,
+    user_text: String,
+    tx: UnboundedSender<AgentEvent>,
+    cancel: CancellationToken,
+) -> TurnOutcome {
+    let outcome = run_turn_inner(core.clone(), user_text, tx.clone(), cancel).await;
+
+    // Lifecycle hook: stop runs once for every turn ending, including budget,
+    // stall, cancellation, and errors. It is advisory: a block is visible but
+    // cannot rewrite what already happened.
+    let status = match outcome.status {
+        TurnStatus::Done => "done",
+        TurnStatus::Cancelled => "cancelled",
+        TurnStatus::Budget => "budget",
+        TurnStatus::Stalled => "stalled",
+        TurnStatus::ContextTruncated => "context_truncated",
+        TurnStatus::Error => "error",
+        TurnStatus::Blocked => "blocked",
+    };
+    let stop_hooks = crate::hooks::stop(&hook_env(&core), status).await;
+    hook_notices(&tx, &stop_hooks);
+    if let Some(block) = stop_hooks.blocked {
+        let _ = tx.send(AgentEvent::Notice(format!(
+            "hook {:?} asked to block at turn end, but the turn already stopped: {}",
+            block.hook, block.reason
+        )));
+    }
+    if let Ok(mut session) = core.session.lock()
+        && let Err(err) = session.fsync()
+    {
+        let _ = tx.send(AgentEvent::Notice(format!("session fsync failed: {err}")));
+    }
+    let _ = tx.send(AgentEvent::State(match outcome.status {
+        TurnStatus::Done => AgentState::Done,
+        TurnStatus::Cancelled => AgentState::Cancelled,
+        TurnStatus::Error | TurnStatus::ContextTruncated => AgentState::Error,
+        _ => AgentState::Done,
+    }));
+    let _ = tx.send(AgentEvent::TurnDone(outcome.clone()));
+    outcome
+}
+
+/// The turn body. Every early return goes through the wrapper, which owns the
+/// `stop` hook and the terminal events.
+async fn run_turn_inner(
     core: std::sync::Arc<Core>,
     user_text: String,
     tx: UnboundedSender<AgentEvent>,
@@ -102,10 +149,7 @@ pub async fn run_turn(
             ));
         }
         if gate.ready(&cancel).await.is_none() {
-            let outcome = TurnOutcome::ok(TurnStatus::Cancelled);
-            let _ = tx.send(AgentEvent::State(AgentState::Cancelled));
-            let _ = tx.send(AgentEvent::TurnDone(outcome.clone()));
-            return outcome;
+            return TurnOutcome::ok(TurnStatus::Cancelled);
         }
     }
 
@@ -130,10 +174,7 @@ pub async fn run_turn(
             message: message.clone(),
             recoverable: false,
         });
-        let outcome = TurnOutcome::ok(TurnStatus::Blocked);
-        let _ = tx.send(AgentEvent::State(AgentState::Error));
-        let _ = tx.send(AgentEvent::TurnDone(outcome.clone()));
-        return outcome;
+        return TurnOutcome::ok(TurnStatus::Blocked);
     }
 
     // Resolve the window and tokenizer after bring-up. A deferred startup
@@ -161,10 +202,7 @@ pub async fn run_turn(
             message: message.clone(),
             recoverable: false,
         });
-        let outcome = TurnOutcome::budget(&code, message);
-        let _ = tx.send(AgentEvent::State(AgentState::Error));
-        let _ = tx.send(AgentEvent::TurnDone(outcome.clone()));
-        return outcome;
+        return TurnOutcome::budget(&code, message);
     }
 
     // `@path` mentions attach file snapshots, within a quarter of the
@@ -223,47 +261,10 @@ pub async fn run_turn(
             message: message.clone(),
             recoverable: false,
         });
-        let outcome = TurnOutcome::ok(TurnStatus::Blocked);
-        let _ = tx.send(AgentEvent::State(AgentState::Error));
-        let _ = tx.send(AgentEvent::TurnDone(outcome.clone()));
-        return outcome;
+        return TurnOutcome::ok(TurnStatus::Blocked);
     }
 
-    let outcome = run_loop(&core, &tx, &cancel, turn_start, turn).await;
-
-    // Lifecycle hook: stop runs once for every turn ending, including budget,
-    // stall, cancellation, and errors. It is advisory: a block is visible but
-    // cannot rewrite what already happened.
-    let status = match outcome.status {
-        TurnStatus::Done => "done",
-        TurnStatus::Cancelled => "cancelled",
-        TurnStatus::Budget => "budget",
-        TurnStatus::Stalled => "stalled",
-        TurnStatus::ContextTruncated => "context_truncated",
-        TurnStatus::Error => "error",
-        TurnStatus::Blocked => "blocked",
-    };
-    let stop_hooks = crate::hooks::stop(&hook_env(&core), status).await;
-    hook_notices(&tx, &stop_hooks);
-    if let Some(block) = stop_hooks.blocked {
-        let _ = tx.send(AgentEvent::Notice(format!(
-            "hook {:?} asked to block at turn end, but the turn already stopped: {}",
-            block.hook, block.reason
-        )));
-    }
-    if let Ok(mut session) = core.session.lock()
-        && let Err(err) = session.fsync()
-    {
-        let _ = tx.send(AgentEvent::Notice(format!("session fsync failed: {err}")));
-    }
-    let _ = tx.send(AgentEvent::State(match outcome.status {
-        TurnStatus::Done => AgentState::Done,
-        TurnStatus::Cancelled => AgentState::Cancelled,
-        TurnStatus::Error | TurnStatus::ContextTruncated => AgentState::Error,
-        _ => AgentState::Done,
-    }));
-    let _ = tx.send(AgentEvent::TurnDone(outcome.clone()));
-    outcome
+    run_loop(&core, &tx, &cancel, turn_start, turn).await
 }
 
 /// A hook environment bound to this core's config, session, and artifacts.
@@ -531,6 +532,16 @@ async fn run_loop(
                 !force_compact,
             );
             if let Ok(compacted) = &result {
+                // A tail-less compaction starts the context path at the new
+                // compaction entry. Re-record the hook's context after it so
+                // the promise that hook context reaches the model still holds.
+                if !compacted.kept_tail {
+                    crate::hooks::record_contexts(
+                        &hook_env(core),
+                        crate::config::HookEvent::PreCompact,
+                        &compact_hooks,
+                    );
+                }
                 assembled = assemble_context(core, &budget, findings.as_ref(), tool_specs_cost);
                 // The kept exchange is optional; drop it before declaring
                 // that compaction cannot converge.
@@ -540,6 +551,11 @@ async fn run_loop(
                     result =
                         compact_session(&core.session, findings.as_ref(), reason, &budget, false);
                     if result.is_ok() {
+                        crate::hooks::record_contexts(
+                            &hook_env(core),
+                            crate::config::HookEvent::PreCompact,
+                            &compact_hooks,
+                        );
                         assembled =
                             assemble_context(core, &budget, findings.as_ref(), tool_specs_cost);
                     }
@@ -1860,6 +1876,33 @@ fn is_file_mutation(name: &str) -> bool {
     matches!(name, "edit" | "patch" | "write")
 }
 
+/// The canonical tool name the executor will use for a raw call.
+fn routed_tool_name(name: &str, active: &[&str]) -> String {
+    match super::repair::resolve_tool_name(name, active) {
+        super::repair::ToolName::Exact(name) => name.to_string(),
+        super::repair::ToolName::Routed { to, .. } => to.to_string(),
+        super::repair::ToolName::Unknown { .. } => name.to_string(),
+    }
+}
+
+/// The file a mutating call targets, before or after argument repair. The
+/// repair aliases turn `file_path` into `path`, but review runs first.
+fn mutation_path(args: &Value) -> Option<&str> {
+    args.get("path")
+        .or_else(|| args.get("file_path"))
+        .and_then(Value::as_str)
+}
+
+/// Calls that will hit the mutating-tool path, after name routing.
+fn mutation_call_indexes(calls: &[ToolCall], active: &[&str]) -> Vec<usize> {
+    calls
+        .iter()
+        .enumerate()
+        .filter(|(_, call)| is_file_mutation(&routed_tool_name(&call.name, active)))
+        .map(|(index, _)| index)
+        .collect()
+}
+
 struct ThreadSplit {
     kickoff: Option<String>,
 }
@@ -1901,12 +1944,7 @@ async fn execute_batch(
     } else {
         core.reviewer()
     };
-    let mutation_calls: Vec<usize> = calls
-        .iter()
-        .enumerate()
-        .filter(|(_, call)| is_file_mutation(&call.name))
-        .map(|(index, _)| index)
-        .collect();
+    let mutation_calls = mutation_call_indexes(calls, &active);
     let mut review_active = false;
     if reviewer.is_some() {
         let mut files: HashSet<String> = gates::analyze_turn_since(
@@ -1918,7 +1956,7 @@ async fn execute_batch(
         .into_iter()
         .collect();
         for index in &mutation_calls {
-            if let Some(raw) = calls[*index].arguments.get("path").and_then(Value::as_str)
+            if let Some(raw) = mutation_path(&calls[*index].arguments)
                 && let Ok(path) = ctx.resolve(raw)
             {
                 files.insert(display_path(&ctx.cwd, &path));
@@ -3017,7 +3055,14 @@ fn fingerprint(name: &str, args: &str, content: &str) -> String {
 }
 
 fn append_user(session: &crate::tools::SessionHandle, text: &str) -> anyhow::Result<()> {
-    append_user_with(session, text, Vec::new())
+    session.lock().expect("session lock").append_tagged(
+        EntryKind::User(UserData {
+            attachments: Vec::new(),
+            content: text.to_string(),
+        }),
+        Some(crate::provenance::CONTINUATION.to_string()),
+    )?;
+    Ok(())
 }
 
 fn append_user_with(
@@ -3143,6 +3188,10 @@ struct CacheWatch {
     last_prefix: Option<String>,
     cold_calls: u32,
     warned: bool,
+    /// The cause observed when the streak began (or a compaction reported on
+    /// a later sample), so the delayed notice does not blame the rewrite the
+    /// first cold observation already explained.
+    cold_invalidator: Option<&'static str>,
 }
 
 impl CacheWatch {
@@ -3160,21 +3209,28 @@ impl CacheWatch {
         if percent >= 70 {
             self.cold_calls = 0;
             self.warned = false;
+            self.cold_invalidator = None;
             return None;
         }
         self.cold_calls += 1;
+        let prefix_changed = previous.is_some_and(|hash| hash != prefix.hash);
+        if compaction_reason.is_some() {
+            self.cold_invalidator = Some("the compaction rewrote the system block");
+        } else if prefix_changed
+            && self.cold_invalidator != Some("the compaction rewrote the system block")
+        {
+            self.cold_invalidator = Some("the prompt prefix (system prompt or tool list) changed");
+        } else if self.cold_invalidator.is_none() {
+            self.cold_invalidator =
+                Some("the server evicted the prefix or moved the request to another slot");
+        }
         if self.cold_calls < 2 || self.warned {
             return None;
         }
         self.warned = true;
-        let prefix_changed = previous.is_some_and(|hash| hash != prefix.hash);
-        let invalidator = if compaction_reason.is_some() {
-            "the compaction rewrote the system block"
-        } else if prefix_changed {
-            "the prompt prefix (system prompt or tool list) changed"
-        } else {
-            "the server evicted the prefix or moved the request to another slot"
-        };
+        let invalidator = self
+            .cold_invalidator
+            .unwrap_or("the server evicted the prefix or moved the request to another slot");
         Some(CacheCold {
             percent,
             invalidator,
@@ -3749,6 +3805,25 @@ mod tests {
     }
 
     #[test]
+    fn review_preflight_uses_routed_names_and_alias_paths() {
+        let active = ["write", "edit", "patch", "read"];
+        let calls = vec![
+            ToolCall {
+                id: "call_0001".into(),
+                name: "write_file".into(),
+                arguments: json!({"file_path": "a.rs", "content": "x"}),
+            },
+            ToolCall {
+                id: "call_0002".into(),
+                name: "read".into(),
+                arguments: json!({"path": "b.rs"}),
+            },
+        ];
+        assert_eq!(mutation_call_indexes(&calls, &active), vec![0]);
+        assert_eq!(mutation_path(&calls[0].arguments), Some("a.rs"));
+    }
+
+    #[test]
     fn cold_cache_alarm_names_a_changed_prefix_or_compaction() {
         let first = crate::context::prompt_prefix("system", "[]");
         let second = crate::context::prompt_prefix("system changed", "[]");
@@ -3769,6 +3844,16 @@ mod tests {
             .observe(Some(&cold), &first, Some("auto"))
             .expect("compaction alarm");
         assert!(report.invalidator.contains("compaction"));
+        // The compaction was reported on the first cold sample; the delayed
+        // notice must keep it even though the second sample no longer sees the
+        // rewritten prefix as a change.
+        let mut watch = CacheWatch::default();
+        let rewritten = crate::context::prompt_prefix("system after compaction", "[]");
+        watch.observe(Some(&cold), &first, Some("auto"));
+        let report = watch
+            .observe(Some(&cold), &rewritten, None)
+            .expect("delayed compaction alarm");
+        assert!(report.invalidator.contains("compaction"), "{report:?}");
         // An engine that does not report cached tokens never guesses.
         let mut watch = CacheWatch::default();
         let unknown = Usage::new(100, 1);

@@ -811,7 +811,7 @@ async fn hooks_test_runs_one_named_hook_with_a_sample_payload() {
     std::fs::write(
         env.config_dir.join("config.toml"),
         format!(
-            "[hooks.allow]\nevent = \"pre_tool\"\ncommand = [\"{HOOK_FIXTURES}/allow_escalate.sh\"]\n\n[hooks.guard]\nevent = \"pre_tool\"\ncommand = [\"{HOOK_FIXTURES}/block_exit2.sh\"]\n"
+            "[hooks.allow]\nevent = \"pre_tool\"\ncommand = [\"{HOOK_FIXTURES}/allow_escalate.sh\"]\n\n[hooks.guard]\nevent = \"pre_tool\"\ncommand = [\"{HOOK_FIXTURES}/block_exit2.sh\"]\n\n[hooks.warn]\nevent = \"pre_tool\"\ncommand = [\"{HOOK_FIXTURES}/fail.sh\"]\non_error = \"warn\"\n"
         ),
     )
     .unwrap();
@@ -833,6 +833,14 @@ async fn hooks_test_runs_one_named_hook_with_a_sample_payload() {
         stdout.contains("blocked by policy: no writes on main"),
         "{stdout}"
     );
+
+    // A warn-mode failure is visible but does not block. The test command
+    // still exits 1 so CI cannot treat a broken hook as healthy.
+    let output = run_lh_no_model(&env, "http://127.0.0.1:9", &["hooks", "test", "warn"]).await;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert!(stdout.contains("hook warn (pre_tool): error"), "{stdout}");
+    assert!(stdout.contains("warning:"), "{stdout}");
 }
 
 // ---------------------------------------------------------------------------

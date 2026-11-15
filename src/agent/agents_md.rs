@@ -14,6 +14,7 @@
 
 use std::fs;
 use std::io;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -322,7 +323,7 @@ fn read_candidate(candidate: &Path, root: &Path) -> Result<Option<AgentsFile>, B
     };
     let is_symlink = metadata.file_type().is_symlink();
     let source = source_path(root, candidate);
-    let source_bytes = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
+    let mut source_bytes = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
 
     let resolved = match fs::canonicalize(candidate) {
         Ok(path) => path,
@@ -342,6 +343,11 @@ fn read_candidate(candidate: &Path, root: &Path) -> Result<Option<AgentsFile>, B
             )));
         }
     };
+    // `symlink_metadata` reports the link itself, not its target. The loaded
+    // bytes and the manifest size must describe the file the reader sees.
+    if let Ok(target) = fs::metadata(&resolved) {
+        source_bytes = usize::try_from(target.len()).unwrap_or(usize::MAX);
+    }
     if !resolved.starts_with(root) {
         let reason = format!(
             "{} resolves outside the repository: {}",
@@ -356,19 +362,49 @@ fn read_candidate(candidate: &Path, root: &Path) -> Result<Option<AgentsFile>, B
         )));
     }
     // Read the resolved path: the symlink check already approved it, and this
-    // avoids following the link a second time.
-    let bytes = match fs::read(&resolved) {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            return Err(Box::new(skipped_with_size(
-                candidate,
-                &source,
-                source_bytes,
-                format!("cannot read the file: {error}"),
-            )));
-        }
+    // avoids following the link a second time. Only the capped prefix is read
+    // so a pathologically large ancestor file cannot allocate its full size.
+    let truncated = source_bytes > PER_FILE_CAP_BYTES;
+    let read_limit = if truncated {
+        PER_FILE_CAP_BYTES + 4
+    } else {
+        source_bytes
     };
-    let text = match String::from_utf8(bytes) {
+    let mut bytes = Vec::with_capacity(read_limit.min(PER_FILE_CAP_BYTES + 4));
+    let read = fs::File::open(&resolved).and_then(|file| {
+        file.take(read_limit as u64)
+            .read_to_end(&mut bytes)
+            .map(|_| ())
+    });
+    if let Err(error) = read {
+        return Err(Box::new(skipped_with_size(
+            candidate,
+            &source,
+            source_bytes,
+            format!("cannot read the file: {error}"),
+        )));
+    }
+    // When the file is over the cap, `bytes` may end in a partial UTF-8
+    // sequence. Decode only complete characters up to the cap; an invalid
+    // sequence before it still marks the file as non-UTF-8.
+    let end = if truncated {
+        let limit = bytes.len().min(PER_FILE_CAP_BYTES);
+        match std::str::from_utf8(&bytes[..limit]) {
+            Ok(_) => limit,
+            Err(error) if error.error_len().is_none() => error.valid_up_to(),
+            Err(_) => {
+                return Err(Box::new(skipped_with_size(
+                    candidate,
+                    &source,
+                    source_bytes,
+                    "file is not valid UTF-8".to_string(),
+                )));
+            }
+        }
+    } else {
+        bytes.len()
+    };
+    let text = match String::from_utf8(bytes[..end].to_vec()) {
         Ok(text) => text,
         Err(_) => {
             return Err(Box::new(skipped_with_size(
@@ -379,7 +415,6 @@ fn read_candidate(candidate: &Path, root: &Path) -> Result<Option<AgentsFile>, B
             )));
         }
     };
-    let source_bytes = text.len();
     let mut file = AgentsFile {
         path: candidate.to_path_buf(),
         source,
@@ -390,6 +425,12 @@ fn read_candidate(candidate: &Path, root: &Path) -> Result<Option<AgentsFile>, B
         reason: None,
         content: text,
     };
+    if truncated {
+        file.state = FileState::Truncated;
+        file.reason = Some(format!(
+            "truncated to the {PER_FILE_CAP_BYTES} byte per-file cap"
+        ));
+    }
     if file.content.len() > PER_FILE_CAP_BYTES {
         let keep = floor_char_boundary(&file.content, PER_FILE_CAP_BYTES);
         file.content.truncate(keep);

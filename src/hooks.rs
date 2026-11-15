@@ -209,6 +209,12 @@ pub async fn fire(env: &HookEnv<'_>, event: HookEvent, payload: Value) -> Outcom
     outcome
 }
 
+/// Record hook context again after a compaction boundary, so a tail-less
+/// compaction does not hide context the hook returned for that compaction.
+pub fn record_contexts(env: &HookEnv<'_>, event: HookEvent, outcome: &Outcome) {
+    env.record_contexts(event, outcome);
+}
+
 /// Run exactly one named hook (used by `lh hooks test`). No session record.
 pub async fn test_named(env: &HookEnv<'_>, name: &str) -> Result<(Invocation, Outcome), String> {
     let hook = env
@@ -274,27 +280,44 @@ pub fn sample_payload(event: HookEvent) -> Value {
 }
 
 pub async fn session_start(env: &HookEnv<'_>) -> Outcome {
-    if env.session.is_some_and(start_recorded) {
+    let expected: Vec<String> = env
+        .config
+        .hooks_for(HookEvent::SessionStart)
+        .map(|(name, _)| name.clone())
+        .collect();
+    if env
+        .session
+        .is_some_and(|session| start_recorded(session, &expected))
+    {
         return Outcome::default();
     }
     fire(env, HookEvent::SessionStart, json!({})).await
 }
 
-fn start_recorded(session: &SessionHandle) -> bool {
+/// Startup is complete only when every configured `session_start` hook has a
+/// successful invocation. One success must not hide a later block: the block
+/// is retried on the next turn.
+fn start_recorded(session: &SessionHandle, expected: &[String]) -> bool {
+    if expected.is_empty() {
+        return false;
+    }
     let Ok(session) = session.lock() else {
         return false;
     };
-    session
+    let recorded: std::collections::HashSet<&str> = session
         .customs_on_path("hook-invocation")
         .iter()
-        .any(|entry| {
-            matches!(
-                &entry.kind,
-                EntryKind::Custom(custom)
-                    if custom.payload.get("event").and_then(Value::as_str) == Some("session_start")
-                        && custom.payload.get("outcome").and_then(Value::as_str) == Some("ok")
-            )
+        .filter_map(|entry| match &entry.kind {
+            EntryKind::Custom(custom)
+                if custom.payload.get("event").and_then(Value::as_str) == Some("session_start")
+                    && custom.payload.get("outcome").and_then(Value::as_str) == Some("ok") =>
+            {
+                custom.payload.get("hook").and_then(Value::as_str)
+            }
+            _ => None,
         })
+        .collect();
+    expected.iter().all(|hook| recorded.contains(hook.as_str()))
 }
 
 pub async fn user_prompt(env: &HookEnv<'_>, prompt: &str) -> Outcome {

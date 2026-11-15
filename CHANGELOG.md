@@ -143,11 +143,34 @@ packaging, and a local HTTP API. It includes all work merged in PRs
   model, and placeholder text can no longer be written back into a file
   ([#31](https://github.com/GotinhaAzul/LocalHarness/issues/31),
   [PR #112](https://github.com/GotinhaAzul/LocalHarness/pull/112)).
+- `undo` restores a raw in-process snapshot even when the file legitimately
+  contains a redaction-shaped string; a redacted snapshot read after a restart
+  is still refused ([PR #112](https://github.com/GotinhaAzul/LocalHarness/pull/112)).
 - Streamed tool calls survive index/id reuse, and truncated calls are never
   executed ([PR #101](https://github.com/GotinhaAzul/LocalHarness/pull/101)).
+- A delayed cache-cold notice keeps the compaction that started the streak as
+  its likely invalidator instead of blaming server eviction
+  ([PR #102](https://github.com/GotinhaAzul/LocalHarness/pull/102)).
+- The `AGENTS.md` per-file cap is applied while reading, so a very large
+  ancestor file cannot allocate its full size before truncation
+  ([PR #103](https://github.com/GotinhaAzul/LocalHarness/pull/103)).
+- Plan mode rejects attached `sort -oFILE` output flags and mutating
+  `git reflog expire|delete` forms, and a path-scoped allow rule requires every
+  path in a call to match ([PR #105](https://github.com/GotinhaAzul/LocalHarness/pull/105)).
+- Session start retries a blocked hook even after another startup hook
+  succeeded, `stop` hooks run for a blocked startup, resumed sessions restore a
+  pending provenance gate, pre-compaction hook context survives a tail-less
+  compaction, and `lh hooks test` exits 1 when a hook invocation fails in warn
+  mode ([PR #107](https://github.com/GotinhaAzul/LocalHarness/pull/107)).
+- Hunk review preflight routes tool names and path aliases before deciding,
+  `/rewind` ignores synthetic continuation prompts when counting turns, and a
+  failed multi-file rewind rolls back files it already restored
+  ([PR #111](https://github.com/GotinhaAzul/LocalHarness/pull/111)).
 - Structured-output validation now runs after text tool-call recovery, rejects
   undeclared keys when `properties` is absent, and enforces exclusive numeric
   bounds and `multipleOf` ([PR #110](https://github.com/GotinhaAzul/LocalHarness/pull/110)).
+- Hash-anchored patches reject an invalid `count` instead of applying the
+  operation to one line ([PR #106](https://github.com/GotinhaAzul/LocalHarness/pull/106)).
 - Skill-root scripts are included in the approval check, relative install
   sources are persisted as resolved absolute paths, and a skip fixture passes
   when a different skill loads ([PR #109](https://github.com/GotinhaAzul/LocalHarness/pull/109)).
