@@ -2317,11 +2317,29 @@ async fn malicious_readme_triggers_a_warning_and_an_approval_gate() {
         .unwrap()
         .approve()
         .expect("a warning is pending");
+    let benign = ToolCall {
+        id: "probe-read".into(),
+        name: "read".into(),
+        arguments: json!({"path": "README.md"}),
+    };
+    assert_eq!(
+        localharness::provenance::check(&harness.core, &benign, &benign.arguments).await,
+        localharness::provenance::Gate::Allow,
+        "a non-sensitive call does not consume the approval"
+    );
     assert_eq!(
         localharness::provenance::check(&harness.core, &call, &call.arguments).await,
         localharness::provenance::Gate::Allow,
         "/approve permits exactly the next sensitive action"
     );
+    {
+        let state = harness.core.provenance.lock().unwrap();
+        assert!(
+            state.pending().is_none(),
+            "the approval resolves the warning"
+        );
+        assert!(!state.is_approved());
+    }
 }
 
 #[tokio::test]

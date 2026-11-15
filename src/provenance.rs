@@ -190,6 +190,13 @@ pub fn detect(text: &str) -> Option<Detection> {
     if text.is_empty() {
         return None;
     }
+    // Bound the work on a huge file. Tool results are normally capped far
+    // below this; the cap only keeps a pathological read from stalling a turn.
+    const MAX_SCAN_CHARS: usize = 1_048_576;
+    let text = match text.char_indices().nth(MAX_SCAN_CHARS) {
+        Some((end, _)) => &text[..end],
+        None => text,
+    };
     let lower = text.to_ascii_lowercase();
     let mut patterns: Vec<&'static str> = Vec::new();
     let mut first: Option<usize> = None;
@@ -314,6 +321,11 @@ impl ProvenanceState {
 
     pub fn pending(&self) -> Option<&PendingWarning> {
         self.pending.as_ref()
+    }
+
+    /// Whether `/approve` already covered the next sensitive action.
+    pub fn is_approved(&self) -> bool {
+        self.approved
     }
 
     /// Mark the next sensitive action approved, from the TUI `/approve`.
@@ -479,12 +491,10 @@ pub enum Gate {
 /// widen a policy.
 pub async fn check(core: &Core, call: &ToolCall, args: &Value) -> Gate {
     let (pending, approved) = {
-        let Ok(mut state) = core.provenance.lock() else {
+        let Ok(state) = core.provenance.lock() else {
             return Gate::Allow;
         };
-        let pending = state.pending().cloned();
-        let approved = state.take_approved().is_some();
-        (pending, approved)
+        (state.pending().cloned(), state.is_approved())
     };
     let Some(pending) = pending else {
         return Gate::Allow;
@@ -499,6 +509,9 @@ pub async fn check(core: &Core, call: &ToolCall, args: &Value) -> Gate {
         return Gate::Allow;
     };
     if approved {
+        if let Ok(mut state) = core.provenance.lock() {
+            state.take_approved();
+        }
         record_approval(core, call, sensitivity, "granted", "approved by the user");
         return Gate::Allow;
     }
