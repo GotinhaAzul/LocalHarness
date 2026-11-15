@@ -142,11 +142,23 @@ One append-only JSONL file per session tree under `~/.local/share/localharness/s
 
 ```text
 /tree       show branches and switch
+/rewind     restore files and the conversation to an earlier turn
 /fork       branch from the current leaf
 /new        start a fresh session
 /resume     pick a previous session by prefix or suffix
 /sessions   list every session for this project
 /export     write a Markdown transcript
+```
+
+`/rewind [turns]` restores every file the harness wrote after the target to its
+snapshot there, then moves the leaf; the old branch stays in `/tree`. An edit
+made outside the harness refuses the rewind and is named; `/rewind 1 force`
+backs such files up before restoring them. `lh --rewind <session>:<entry>`
+does the same headlessly.
+
+```sh
+lh --rewind last:e42          # latest session, before entry e42
+lh --rewind 20261107-…:e9 --force
 ```
 
 Compaction is deterministic, not model-written. Tool output is archived with an id, and `recall` reads an exact range. `--no-session` writes nothing: no session file, no artifacts. Persisted session entries, artifacts, evidence, and reports redact secret-shaped values by default; `--no-redact` is the explicit opt-out and is recorded in the session header.
@@ -175,7 +187,7 @@ Tab completes the token at the cursor: commands, arguments (themes, profiles, sk
 
 Write `@path` in a prompt to attach a file: `fix the panic in @src/parser.rs`. The file is read through the same path as the `read` tool and appended to your message, so the model can edit it without another read. Up to eight files per prompt, within a quarter of the usable context. `@shot.png` attaches a screenshot: a model with vision input sees the image, and a text-only model can get a description from a local vision model; the `read` tool opens images too. Images are checked by content, stripped of EXIF, and sent only to local endpoints unless you opt in. See [docs/images.md](docs/images.md).
 
-Slash commands: `/help /quit /login /model /profile /theme /tree /fork /new /resume /sessions /compact /tools /mcp /skill /workflow /sec /trust /commit /pr /export /clear /debug`.
+Slash commands: `/help /quit /login /model /profile /theme /tree /rewind /fork /new /resume /sessions /compact /tools /mcp /skill /workflow /sec /trust /commit /pr /export /clear /debug`.
 
 ### Headless
 

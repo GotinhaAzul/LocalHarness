@@ -514,7 +514,7 @@ Entry fields:
 | `tool_result` | call_id, content, is_error, details?, artifact? |
 | `compaction` | summary, tokens_before, reason, thread_id? |
 | `checkout` | target, reason (`tree`, `fork`, `resume`) |
-| `custom` | kind plus payload (`fs-change`, `verify-config`, `verify-result`, `todo-state`, `finding`, `thread-state`, `guard-trip`, `profile-change`, `model-change`) |
+| `custom` | kind plus payload (`fs-change`, `rewind`, `verify-config`, `verify-result`, `todo-state`, `finding`, `thread-state`, `guard-trip`, `profile-change`, `model-change`) |
 | `error` | code, message, recoverable |
 
 An assistant entry with `tool_calls` is a batch. The tool results that answer it
@@ -584,7 +584,43 @@ e1  U  Fix the parser bug                          20:10
 resolving through its tool batch to the last result. `/tree` is a view; it never
 deletes entries.
 
-### 5.5 Storage
+### 5.5 Rewind
+
+`/rewind [turns] [force]` and `lh --rewind <session>:<entry>` move the active
+leaf to an earlier entry **and** put the working tree back to the state it had
+at that entry. `/rewind` defaults to one turn: the entry before the last user
+message, so the last turn's edits are reverted and its conversation is
+abandoned. `turns = 2` reaches before the second-to-last user message, and so
+on; the session header is a valid target for a full reset.
+
+The plan is built from the active branch's `fs-change` entries, the same data
+`undo` uses:
+
+- Changes after the target are replayed in reverse. The last write for a file
+  is its oldest post-target snapshot, which is the content it had at the
+  target; a file the reverted changes created is deleted.
+- A change an earlier `undo` reverted is ignored, exactly as undo ignores it.
+  An `undo` after the target that reverted a change made at or before the
+  target cannot be reconstructed (the harness never snapshots what an undo
+  restores) and refuses, naming the file.
+- Files with no `fs-change` entry are never touched. Changes made through
+  `bash` have no snapshot and stay as they are.
+- Before writing, each file is checked against the newest change's
+  `after_sha256`. A mismatch means the file changed outside the harness; the
+  rewind writes nothing, moves no leaf, and names every conflicting file.
+  `force` backs those files up next to the originals as
+  `<name>.lh-rewind-<nanos>.bak` before restoring them.
+- After the files, the leaf moves with a `checkout` marker (`reason =
+  "rewind"`) and a `rewind` custom entry records the target, restored and
+  deleted paths, backups, and the reverted `fs-change` seqs. The abandoned
+  branch is untouched and remains visible in `/tree`.
+- Restored bytes are re-stamped as harness-written, so the model does not have
+  to read a file again before editing it.
+
+A session with no harness file changes after the target is a pure checkout:
+only the marker and the `rewind` entry are appended.
+
+### 5.6 Storage
 
 ```
 ~/.local/share/localharness/
@@ -620,7 +656,7 @@ deletes entries.
 - Export: `/export [path]` writes Markdown for the active branch. Findings have
   their own report.
 
-### 5.6 Resume and switching
+### 5.7 Resume and switching
 
 - `lh --continue` loads the most recent session for the project.
 - `lh --resume <session-id>` loads a specific session.

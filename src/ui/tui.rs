@@ -66,6 +66,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("profile", "pick the tool profile"),
     ("theme", "pick a theme (live preview) or save it"),
     ("tree", "browse and checkout the session tree"),
+    (
+        "rewind",
+        "restore files and the conversation to an earlier turn",
+    ),
     ("fork", "checkout the latest assistant step"),
     ("new", "start a fresh session"),
     ("resume", "resume a previous session"),
@@ -93,6 +97,7 @@ fn command_usage(name: &str) -> &'static str {
         "profile" => "/profile [name]   (no name: pick from a list)",
         "theme" => "/theme [name|save]   (no name: pick with live preview)",
         "resume" => "/resume [id|last]   (no id: pick from a list)",
+        "rewind" => "/rewind [turns] [force]   (default: before the last user message)",
         "skill" => "/skill [name]   (no name: pick from a list)",
         "workflow" => "/workflow [name]   (no name: pick from a list)",
         "sec" => {
@@ -108,10 +113,10 @@ fn command_usage(name: &str) -> &'static str {
 
 const HELP: &str = "\
 Commands: /help [command] /quit /login [endpoint] [model] [api-key] /model [name]
-/profile [name] /theme [name|save] /tree /fork /new /resume [id|last] /sessions
-/compact /tools /mcp /commit [confirm|cancel|edit <message>] /pr [confirm|cancel]
-/skill [name] /workflow [name] /sec [...] /trust [confirm] /export [path]
-/clear /debug
+/profile [name] /theme [name|save] /tree /rewind [turns] [force] /fork /new
+/resume [id|last] /sessions /compact /tools /mcp /commit [confirm|cancel|edit <message>]
+/pr [confirm|cancel] /skill [name] /workflow [name] /sec [...] /trust [confirm]
+/export [path] /clear /debug
 A command that chooses from a list opens a picker when run without an
 argument: type to filter, arrows to move, Enter to pick.
 

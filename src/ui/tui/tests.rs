@@ -737,6 +737,79 @@ async fn screen_never_drifts_from_what_ratatui_drew() {
 }
 
 #[tokio::test]
+async fn rewind_restores_files_moves_the_leaf_and_keeps_the_old_branch() {
+    let (_dir, mut app) = test_app().await;
+    let cwd = app.cwd_path();
+    let session = app.runtime.as_ref().unwrap().session.clone();
+    std::fs::write(cwd.join("a.txt"), "changed\n").unwrap();
+    let (old_leaf, first_turn, first_user) = {
+        let mut session = session.lock().unwrap();
+        let first = session
+            .append(EntryKind::User(UserData {
+                attachments: Vec::new(),
+                content: "first turn".into(),
+            }))
+            .unwrap();
+        let assistant = session
+            .append(EntryKind::Assistant(crate::session::AssistantData {
+                content: Some("ok".into()),
+                ..Default::default()
+            }))
+            .unwrap();
+        let snapshot = session.artifacts.write("original\n").unwrap();
+        let hash = crate::tools::undo::content_hash(b"changed\n");
+        let leaf = session
+            .append(EntryKind::Custom(
+                crate::session::CustomData::new("fs-change")
+                    .with("path", "a.txt")
+                    .with("snapshot", snapshot.id)
+                    .with("after_sha256", hash),
+            ))
+            .unwrap();
+        (leaf.id, assistant.id, first.id)
+    };
+    assert_eq!(
+        app.runtime
+            .as_ref()
+            .unwrap()
+            .session
+            .lock()
+            .unwrap()
+            .active_leaf_id()
+            .as_deref(),
+        Some(old_leaf.as_str())
+    );
+
+    app.command_rewind("1");
+
+    assert_eq!(
+        std::fs::read_to_string(cwd.join("a.txt")).unwrap(),
+        "original\n"
+    );
+    let session = session.lock().unwrap();
+    assert!(
+        session.latest_custom_on_path("rewind").is_some(),
+        "the rewind marker is on the new branch"
+    );
+    let ids: Vec<String> = session
+        .context_path()
+        .iter()
+        .map(|entry| entry.id.clone())
+        .collect();
+    assert!(
+        !ids.contains(&old_leaf),
+        "the abandoned turn is out of context: {ids:?}"
+    );
+    assert!(session.tree.get(&first_turn).is_some());
+    assert!(session.tree.get(&first_user).is_some());
+    let rows = crate::ui::tree::TreeView::new(&session).rows;
+    assert!(
+        rows.iter().any(|row| row.preview == "first turn"),
+        "{rows:?}"
+    );
+}
+
+#[tokio::test]
 async fn list_commands_open_pickers_and_pick_without_typing() {
     let (_dir, mut app) = test_app().await;
     let enter = key(KeyCode::Enter);
