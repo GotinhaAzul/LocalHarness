@@ -53,11 +53,12 @@ async fn chat(State(fake): State<Fake>, body: String) -> Response {
         concat!(
             "data: {{\"choices\":[{{\"delta\":{{\"content\":\"Hello from fake\"}}}}]}}\n\n",
             "data: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\n",
-            "data: {{\"choices\":[],\"usage\":{{\"prompt_tokens\":{},\"completion_tokens\":3,\"total_tokens\":{}}}}}\n\n",
+            "data: {{\"choices\":[],\"usage\":{{\"prompt_tokens\":{},\"completion_tokens\":3,\"total_tokens\":{},\"prompt_tokens_details\":{{\"cached_tokens\":{}}}}}}}\n\n",
             "data: [DONE]\n\n",
         ),
         prompt_tokens,
-        prompt_tokens + 3
+        prompt_tokens + 3,
+        prompt_tokens / 2
     );
     let chunks: Vec<Result<Bytes, Infallible>> = frames
         .as_bytes()
@@ -326,6 +327,20 @@ async fn print_json_emits_done_event() {
         stdout
             .lines()
             .any(|line| line.contains("\"status\":\"Done\""))
+    );
+    // Cached and total prompt tokens travel with every usage event.
+    let usage = stdout
+        .lines()
+        .find(|line| line.contains("\"type\":\"usage\""))
+        .expect("usage event");
+    assert!(usage.contains("\"prompt_tokens\":"), "{usage}");
+    assert!(usage.contains("\"cached_tokens\":"), "{usage}");
+    assert!(usage.contains("\"cache_percent\":"), "{usage}");
+    let value: serde_json::Value = serde_json::from_str(usage).unwrap();
+    assert!(value["cached_tokens"].as_u64().unwrap() > 0, "{usage}");
+    assert_eq!(
+        value["cache_percent"].as_u64().unwrap(),
+        value["cached_tokens"].as_u64().unwrap() * 100 / value["prompt_tokens"].as_u64().unwrap()
     );
 }
 

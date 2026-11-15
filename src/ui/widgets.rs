@@ -26,8 +26,9 @@ pub struct HeaderData {
     /// Completion tokens streamed in the current turn, shown separately.
     pub completion: u32,
     pub tok_s: f32,
-    /// Share of the last prompt served from the server's prefix cache.
-    pub cache: Option<u32>,
+    /// Cached and total prompt tokens for the last call, when the engine
+    /// reported a prefix-cache hit.
+    pub cache: Option<(u32, u32)>,
     pub session: String,
     pub trust: bool,
     /// The context window is a fallback or an upper bound, not a measurement.
@@ -275,9 +276,9 @@ fn header_sides(
     if flags.throughput {
         let mut speed = format!("{:.0} tok/s", data.tok_s.max(0.0));
         if flags.cache
-            && let Some(cache) = data.cache
+            && let Some((cached, prompt)) = data.cache
         {
-            speed.push_str(&format!(" · cache {cache}%"));
+            speed.push_str(&format!(" · cache {cached}/{prompt}"));
         }
         right.push(vec![Span::styled(speed, theme.style(Role::Muted))]);
     }

@@ -1422,12 +1422,12 @@ impl App {
                 if usage.prompt_tokens > 0 {
                     self.used_tokens = usage.prompt_tokens;
                     self.header.used = usage.prompt_tokens;
+                    self.header.cache = usage
+                        .cached_tokens
+                        .map(|cached| (cached.min(usage.prompt_tokens), usage.prompt_tokens));
                 }
                 self.completion_tokens = usage.completion_tokens;
                 self.header.completion = usage.completion_tokens;
-                if usage.cache_percent().is_some() {
-                    self.header.cache = usage.cache_percent();
-                }
                 self.last_usage = Some(usage);
             }
             AgentEvent::Context { used, window } => {
