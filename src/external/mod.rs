@@ -737,6 +737,7 @@ mod tests {
             app: "test".to_string(),
             redact: true,
             context: None,
+            permissions: None,
         };
         let session = Session::create(&paths, header, true).unwrap();
         let artifacts = session.artifacts.clone();

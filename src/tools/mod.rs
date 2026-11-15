@@ -10,6 +10,7 @@ pub mod finding;
 pub mod git;
 pub mod glob;
 pub mod grep;
+pub mod hunk;
 pub mod iocs;
 pub mod lsp;
 pub mod patch;
@@ -137,7 +138,9 @@ impl ToolResult {
         path: &Path,
         snapshot: lsp::EditSnapshot,
     ) -> Self {
-        if self.is_error {
+        // A reviewed mutation has not landed yet; diagnostics taken now would
+        // describe the unchanged file.
+        if self.is_error || crate::tools::hunk::capturing() {
             return self;
         }
         let Some(verdict) = ctx.lsp.check_edit(ctx, path, &snapshot).await else {

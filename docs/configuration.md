@@ -25,6 +25,7 @@ defaults. Environment variables fill the gaps.
 
 ```toml
 default_profile = "coding"      # coding | full | security | minimal | strict | shell | custom
+review = "multi_file"           # always | multi_file | off (see below)
 
 [model]
 endpoint = "http://127.0.0.1:8080"
@@ -70,6 +71,7 @@ verify_attempts = 2
 identity = ""                   # replaces the built-in one-line identity
 instructions = ""               # extra instructions appended to the prompt
 file = ""                       # or a Markdown file, relative to the config dir
+agents_md = true                # load the hierarchical AGENTS.md chain
 
 [lsp]
 gate = "warn"                   # off | warn | block (see below)
@@ -78,6 +80,25 @@ gate = "warn"                   # off | warn | block (see below)
 commit = "ask"                  # ask: /commit confirm approves; allow: commit at once
 pr = "ask"                      # ask: /pr confirm approves drafts and comments
 subject_max = 72                # longest accepted commit subject
+
+[permissions]
+mode = "ask"                    # ask | accept-edits | plan | dont-ask (yolo: --yolo only)
+
+[[permissions.rules]]           # ordered; see "Permissions" below
+id = "no-push"
+tool = "bash"
+command = '\bgit\s+push\b'
+action = "deny"
+
+[hooks]
+timeout_secs = 5                # default deadline for one hook
+max_output_bytes = 16384        # recorded output cap; larger output is archived
+
+# One table per hook. `event` is required; see docs/hooks.md.
+[hooks.guard]
+event = "pre_tool"
+command = ["/home/me/bin/policy-check"]   # direct exec, no shell
+on_error = "block"                        # pre_tool default; warn elsewhere
 
 # `coding` is the built-in default. `full` adds the security pack; `security`
 # and `minimal` narrow it further. `strict` and `shell` are weak-model presets.
@@ -145,6 +166,29 @@ when the model profile does not set one.
 `[vision]` configures the size cap, EXIF handling, remote endpoints, and an
 optional model that describes images for text-only models. See
 [images.md](images.md).
+
+## Hunk review
+
+`review` decides whether `edit`, `patch`, and `write` land immediately or wait
+for the TUI's hunk list:
+
+- `multi_file` (default) opens the review when a turn is about to touch a
+  second file. The first file still lands immediately.
+- `always` reviews every mutation, including a single-file edit.
+- `off` writes immediately, exactly as before the feature existed.
+
+In the review modal, `a` accepts the selected hunk, `r` rejects it, `e` opens
+its replacement text in the prompt (Enter saves, Esc cancels), `A`/`R` accept
+or reject all, Enter applies, and Esc rejects the whole batch. Accepted hunks
+are written atomically: a failed write rolls back every file in the batch. A
+rejected hunk is reported to the model with its file and line range, so it can
+explain or try a different change instead of silently retrying. The decision
+is recorded as a `hunk-review` session entry; `undo` still steps back over an
+applied hunk.
+
+Headless (`--print`), ACP, and workflow sessions have no interactive reviewer,
+so review auto-accepts: the mutation lands immediately and no review entry is
+recorded. That keeps scripts and CI non-blocking.
 
 ```toml
 [vision]
@@ -253,6 +297,85 @@ while the staged diff still matches the preview. `allow` runs the action at
 once and suits unattended runs; headless `--print` has no way to approve, so
 `ask` leaves the preview unapplied there.
 
+## Permissions
+
+Every tool call is checked against `[permissions]` before it runs. Policy is
+read from the global config and, only when the project is trusted, from
+`.harness/config.toml`; rules from both apply, global first. Skills, workflows,
+and the model cannot change it.
+
+**Modes** decide calls that no rule matches. Read-only calls (read-only tools,
+allowlisted shell commands such as `ls`, `rg`, `git status`/`log`/`diff` with
+no redirection or substitution, and read-only `git` tool actions) and harness
+bookkeeping (`todo`, `thread`, `finding`) always run.
+
+| Mode | File edits (`write`, `edit`, `patch`, `undo`) | Commands, network, MCP/external tools |
+|---|---|---|
+| `ask` (default) | ask | ask |
+| `accept-edits` | run | ask |
+| `plan` | refused (`plan_mode`) | refused unless read-only |
+| `dont-ask` | denied | denied |
+| `yolo` | run | run |
+
+`yolo` is never the default and cannot be set in a config file; only `--yolo`
+selects it, and the session records it. Deny rules still apply in every mode.
+
+**Rules** are an ordered list. Every field a rule sets must match:
+
+| Field | Matches |
+|---|---|
+| `tool` | tool name glob: `bash`, `write`, `github__*`, `*` |
+| `path` | path glob relative to the working directory: `src/**`, `**/.env` |
+| `command` | regex searched in the exact command (`bash`, `bg`); `git <action>` for the `git` tool; `gh pr <action>` for `pr` |
+| `network` | `true` for calls classified as network access (`curl`, `ssh`, `git push`/`fetch`, package installs, `pr`) |
+| `action` | `allow`, `ask`, or `deny` |
+| `id` | name reported in a denial; `rule-<n>` when absent |
+
+The last matching rule wins, with one exception: a `deny` holds against any
+later `allow` or `ask` that is not strictly more specific (sets more of tool,
+path, command, network). So a later `tool = "bash", command = "^cargo test"`
+allow beats an earlier `tool = "bash"` ask, but a later broad `tool = "bash"`
+allow does not undo a `git push` deny. The network classifier is a heuristic;
+`--sandbox` is the hard network boundary.
+
+A denied call returns `[DENIED]` with the rule id to the model and the turn
+continues. In the TUI an `ask` shows the exact command or path, with a diff for
+file edits; `y` allows, `n` or `Esc` denies. An approval covers exactly that
+command or path for the rest of the session: approving `git push origin main`
+does not approve `git push origin main --force`. Headless runs cannot ask, so
+an `ask` is denied there; use `--mode accept-edits`, allow rules, or `--yolo`.
+ACP forwards the question to the editor.
+
+The session header records the mode and a 16-digit hash of the rules
+(`permissions.mode`, `permissions.rules_hash`). Rules are reloaded when the
+config is (for example on `/trust confirm`); the change is recorded.
+
+### Plan mode
+
+`/plan` (or `--plan` at launch) enters plan mode: the model may investigate but
+not change anything. Tools that can only mutate are removed from the tool set,
+`bash` and `git` stay but only their read-only forms run, and `todo` is added.
+Any mutating call, including one a workflow or skill asks for, is refused at
+dispatch with `plan_mode` and the approve command. A plan-mode turn cannot end
+without a `todo` plan; the plan is stored as a `plan` session entry and shown
+by `/plan`. `/plan approve` restores the previous mode and exactly the
+previous tool set and records the approval; `/plan exit` does the same and
+records the plan as discarded. `lh --plan --print "..."` runs one plan-mode
+turn, prints the plan, and exits 0.
+
+## Lifecycle hooks
+
+`[hooks.<name>]` runs a local command at `session_start`, `user_prompt`,
+`pre_tool`, `post_tool`, `pre_compact`, or `stop`. The command is spawned
+directly with one JSON object on stdin and one on stdout; it may add context or
+block. `timeout_secs` is per hook (0 inherits `[hooks] timeout_secs`), and
+`on_error` is `block` or `warn` — `block` by default for `pre_tool`, `warn`
+elsewhere. A missing binary, non-zero exit, timeout, or malformed JSON is
+visible in the transcript and recorded in the session; it never looks like
+approval. Hook output cannot change tools, scope, the endpoint, or the
+permission mode. See [hooks.md](hooks.md) for the payload, output schema, exit
+codes, and `lh hooks test <name>`.
+
 ## LSP gate
 
 `[lsp] gate` controls what happens when a `write`, `edit`, or `patch` introduces
@@ -281,6 +404,15 @@ the built-in operating rules and are ordinary text, not code. A relative
 directory, then the path itself; an untrusted repository cannot shadow it.
 Per-profile `prompt` files still append after that. None of these can change
 the gates, tool selection, scope, or the endpoint; those remain in code.
+
+`[prompt] agents_md` (default `true`) loads the `AGENTS.md` chain from the git
+repository root to the working directory, nearest last, each under a
+source-path header. Each file is capped at 12 KiB and the chain at 32 KiB;
+truncation is deterministic and reported as a warning. A symlink that resolves
+outside the repository is refused. `lh context --show` prints the manifest
+(path, bytes, SHA-256, loaded/skipped/truncated) and `lh context --json` emits
+it as JSON. `--no-agents-md` or `LH_AGENTS_MD=0` disables loading for one run.
+The files remain untrusted, advisory instructions.
 
 The TUI does not require `[model]` to be resolved at startup. If the endpoint is
 down or `model` is empty, the harness opens with `not logged in`; `/login`
@@ -347,6 +479,7 @@ Steps run sequentially without a shell and stop at the first failure.
 | `LH_THEME` | Theme name |
 | `LH_NO_SESSION` | Disable persistence |
 | `LH_TRUST` | Trust project config |
+| `LH_AGENTS_MD` | Set to `0` to skip the AGENTS.md chain |
 | `LH_CONFIG_DIR`, `LH_DATA_DIR` | Override roots |
 | `LH_SKIP_TOOL_PROBE` | Skip the one-shot tool-call conformance probe |
 | `NO_COLOR` | Disable color |
@@ -356,10 +489,17 @@ Steps run sequentially without a shell and stop at the first failure.
 ## Flags
 
 `--print`, `--json`, `--endpoint`, `--model`, `--model-profile`, `--profile`,
-`--theme`, `--api-key`, `--trust`, `--no-session`, `--no-redact`, `--continue`,
-`--resume`, `--path-jail`, `--sandbox [read-only|workspace-write]`,
-`--no-sandbox`, `--engagement`, `--no-color`, `--keep-artifacts`,
-`--clean-artifacts`, `--allow-remote-images`, `--keep-exif`, `--debug`.
+`--theme`, `--api-key`, `--trust`, `--no-session`, `--no-redact`,
+`--no-agents-md`, `--continue`, `--resume`, `--path-jail`,
+`--sandbox [read-only|workspace-write]`, `--no-sandbox`, `--engagement`,
+`--no-color`, `--keep-artifacts`, `--clean-artifacts`, `--allow-remote-images`,
+`--keep-exif`, `--debug`, `--mode <ask|accept-edits|plan|dont-ask>`, `--yolo`,
+`--plan`.
 
 `lh doctor [--json] [--fix]` prints the engine capability manifest without
 sending a chat completion. See [model-setup.md](model-setup.md).
+
+`lh context --show` prints the AGENTS.md chain and its manifest without
+opening a session or contacting a model; `--json` emits one stable object.
+With no AGENTS.md files in the chain, it reports an empty chain. With
+`--no-agents-md` or `LH_AGENTS_MD=0`, it reports that loading is disabled.

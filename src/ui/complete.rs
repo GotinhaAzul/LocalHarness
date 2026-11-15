@@ -143,6 +143,7 @@ pub fn takes_args(command: &str) -> bool {
             | "trust"
             | "commit"
             | "pr"
+            | "plan"
             | "export"
     )
 }
@@ -290,6 +291,10 @@ fn complete_argument(
             Candidate::new("confirm", "commit the previewed changes"),
             Candidate::new("edit", "replace the commit message"),
             Candidate::new("cancel", "drop the commit preview"),
+        ],
+        ("plan", []) => vec![
+            Candidate::new("approve", "leave plan mode and restore the previous tools"),
+            Candidate::new("exit", "leave plan mode and discard the plan"),
         ],
         ("pr", []) => vec![
             Candidate::new("confirm", "carry out the pending pull request action"),

@@ -157,7 +157,12 @@ impl Tool for RecallTool {
                 content.push_str("\n(truncated at the character cap; narrow start/end)");
             }
         }
-        let content = clip(&content, CHAR_CAP);
+        let mut content = clip(&content, CHAR_CAP);
+        // Artifacts from an earlier process are read from disk, where they
+        // were redacted. Say so, so the model does not copy a placeholder.
+        if crate::security::redact::contains_placeholder(&slice.content) {
+            content.push_str(crate::session::RESUMED_PLACEHOLDER_NOTE);
+        }
         ToolResult::ok(content).with_details(json!({
             "artifact": handle,
             "start": slice.start_line,
@@ -197,6 +202,7 @@ mod tests {
             app: "test".into(),
             redact: true,
             context: None,
+            permissions: None,
         };
         let session = Session::create(&paths, header, true).expect("session");
         let artifacts = Arc::new(ArtifactStore::ephemeral());

@@ -13,6 +13,7 @@ use crate::agent::{AgentEvent, TurnStatus, run_turn};
 use crate::app::{RuntimeOptions, create_runtime};
 use crate::config::{ColorMode, Config};
 use crate::paths::Paths;
+use crate::session::Session;
 use crate::ui::{self, UiOptions};
 
 #[derive(Debug, Parser)]
@@ -70,6 +71,10 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub no_redact: bool,
 
+    /// Do not load AGENTS.md files into the system prompt.
+    #[arg(long, global = true)]
+    pub no_agents_md: bool,
+
     /// Resume the most recent session for this project.
     #[arg(long = "continue", conflicts_with = "resume")]
     pub continue_last: bool,
@@ -77,6 +82,16 @@ pub struct Cli {
     /// Resume a session by id or path.
     #[arg(long, value_name = "ID|PATH")]
     pub resume: Option<String>,
+
+    /// Restore harness-written files and the conversation to
+    /// <SESSION>:<ENTRY>. SESSION may be "last". Refuses when a file changed
+    /// outside the harness; add --force to back it up first.
+    #[arg(long, value_name = "SESSION:ENTRY", conflicts_with = "print")]
+    pub rewind: Option<String>,
+
+    /// With --rewind, back up externally changed files before overwriting.
+    #[arg(long, requires = "rewind")]
+    pub force: bool,
 
     /// Restrict file tools to the working directory (bash is not restricted).
     #[arg(long, global = true)]
@@ -121,6 +136,22 @@ pub struct Cli {
     /// pre-sandbox behavior; recorded in the session.
     #[arg(long, global = true, conflicts_with = "sandbox")]
     pub no_sandbox: bool,
+
+    /// Permission mode for unmatched calls: ask, accept-edits, plan, or
+    /// dont-ask. Overrides `[permissions] mode`; rules still apply.
+    #[arg(long, global = true, value_name = "MODE", conflicts_with_all = ["yolo", "plan"])]
+    pub mode: Option<String>,
+
+    /// Run every tool call without asking; only deny rules still apply.
+    /// Never the default; recorded in the session.
+    #[arg(long, global = true, conflicts_with = "plan")]
+    pub yolo: bool,
+
+    /// Start in plan mode: read-only tools only, and the turn must produce a
+    /// todo plan. With --print, runs one read-only turn, prints the plan, and
+    /// exits.
+    #[arg(long, global = true)]
+    pub plan: bool,
 }
 
 #[derive(Debug, clap::Subcommand)]
@@ -144,8 +175,40 @@ pub enum Command {
         #[command(subcommand)]
         action: WorkflowCommand,
     },
+    /// List lifecycle hooks or run one with a sample payload.
+    Hooks {
+        #[command(subcommand)]
+        action: HooksCommand,
+    },
     /// Serve the Agent Client Protocol v1 on stdio for editor integrations.
     Acp,
+    /// Inspect context assembly inputs: the hierarchical AGENTS.md manifest.
+    Context {
+        /// Print the manifest with each loaded file, its bytes, and SHA-256.
+        #[arg(long, required_unless_present = "json")]
+        show: bool,
+        /// Emit one stable JSON object.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, clap::Subcommand)]
+pub enum HooksCommand {
+    /// List configured hooks.
+    List {
+        /// Emit one stable JSON object.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run one hook with a sample payload for its event.
+    Test {
+        /// Hook name from [hooks.<name>].
+        name: String,
+        /// Emit one stable JSON object.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, clap::Subcommand)]
@@ -245,10 +308,30 @@ pub async fn run(cli: Cli) -> Result<i32> {
         config.sandbox = crate::config::SandboxMode::Off;
         config.sandbox_explicit = true;
     }
+    if let Some(mode) = &cli.mode {
+        config.permissions.mode = match crate::policy::PermissionMode::parse(mode) {
+            Some(crate::policy::PermissionMode::Yolo) => {
+                bail!("--mode yolo is not accepted; pass --yolo explicitly")
+            }
+            Some(mode) => mode,
+            None => {
+                bail!("unknown permission mode {mode:?}; use ask, accept-edits, plan, or dont-ask")
+            }
+        };
+    }
+    if cli.plan {
+        config.permissions.mode = crate::policy::PermissionMode::Plan;
+    }
+    if cli.yolo {
+        config.permissions.mode = crate::policy::PermissionMode::Yolo;
+    }
     config.trust = trust;
     config.session.no_session |= cli.no_session;
     if cli.no_redact {
         config.session.redact = false;
+    }
+    if cli.no_agents_md {
+        config.prompt.agents_md = false;
     }
     if cli.keep_artifacts {
         config.session.keep_artifacts = true;
@@ -287,6 +370,9 @@ pub async fn run(cli: Cli) -> Result<i32> {
         };
         return crate::acp::run(config, paths, options).await;
     }
+    if let Some(Command::Context { json, .. }) = &cli.command {
+        return run_context(&config, &paths, *json);
+    }
     if let Some(Command::Doctor { json, fix }) = &cli.command {
         return run_doctor(&config, &paths, *json, *fix).await;
     }
@@ -302,6 +388,13 @@ pub async fn run(cli: Cli) -> Result<i32> {
             cli.engagement.clone(),
         )
         .await;
+    }
+    if let Some(spec) = &cli.rewind {
+        return run_rewind(&paths, spec, cli.force);
+    }
+
+    if let Some(Command::Hooks { action }) = &cli.command {
+        return run_hooks(&config, &paths, action).await;
     }
 
     let resume = match (&cli.resume, cli.continue_last) {
@@ -377,6 +470,21 @@ pub async fn run(cli: Cli) -> Result<i32> {
     };
     mcp.shutdown().await;
     outcome
+}
+
+/// `lh context`: print the AGENTS.md chain and its manifest. This reads local
+/// files only; it does not open a session, start a turn, or contact a model.
+fn run_context(config: &Config, paths: &Paths, json: bool) -> Result<i32> {
+    let agents = crate::agent::agents_md::AgentsMd::load(&paths.cwd, config.prompt.agents_md);
+    if json {
+        println!("{}", serde_json::to_string_pretty(&agents.manifest_json())?);
+    } else {
+        print!("{}", agents.manifest_text());
+        for warning in &agents.warnings {
+            eprintln!("warning: {warning}");
+        }
+    }
+    Ok(0)
 }
 
 /// `lh doctor`: fingerprint the engine and print a capability manifest. Only
@@ -560,6 +668,118 @@ async fn run_mcp(config: &Config, paths: &Paths, action: &McpCommand) -> Result<
                     Ok(1)
                 }
             }
+        }
+    }
+}
+
+/// `lh hooks`: list or exercise configured lifecycle hooks without a turn.
+async fn run_hooks(config: &Config, paths: &Paths, action: &HooksCommand) -> Result<i32> {
+    match action {
+        HooksCommand::List { json } => {
+            let hooks: Vec<serde_json::Value> = config
+                .hooks
+                .entries
+                .iter()
+                .map(|(name, hook)| {
+                    json!({
+                        "name": name,
+                        "event": hook.event.as_str(),
+                        "command": hook.command,
+                        "on_error": hook.on_error().label(),
+                        "timeout_secs": config.hooks.timeout(hook).as_secs(),
+                    })
+                })
+                .collect();
+            if *json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({"hooks": hooks}))?
+                );
+            } else if hooks.is_empty() {
+                println!(
+                    "no hooks configured; add a [hooks.<name>] table to {} (see docs/hooks.md)",
+                    paths.config_file().display()
+                );
+            } else {
+                for row in &hooks {
+                    println!(
+                        "{}: {} · {} · on_error={} · {}s",
+                        row["name"].as_str().unwrap_or("?"),
+                        row["event"].as_str().unwrap_or("?"),
+                        row["command"]
+                            .as_array()
+                            .map(|parts| parts
+                                .iter()
+                                .filter_map(|part| part.as_str())
+                                .collect::<Vec<_>>()
+                                .join(" "))
+                            .unwrap_or_default(),
+                        row["on_error"].as_str().unwrap_or("?"),
+                        row["timeout_secs"].as_u64().unwrap_or(0),
+                    );
+                }
+            }
+            Ok(0)
+        }
+        HooksCommand::Test { name, json } => {
+            if !config.hooks.entries.contains_key(name) {
+                bail!(
+                    "no hook named {name:?} in {}; run `lh hooks list` to see configured hooks and docs/hooks.md for the format",
+                    paths.config_file().display()
+                );
+            }
+            let env = crate::hooks::HookEnv {
+                config: &config.hooks,
+                cwd: &paths.cwd,
+                session: None,
+                artifacts: None,
+                identity: crate::hooks::HookIdentity {
+                    session_id: "hooks-test".into(),
+                    model: config.model.model.clone(),
+                    profile: config.profile_name().to_string(),
+                },
+            };
+            let (invocation, outcome) = crate::hooks::test_named(&env, name)
+                .await
+                .map_err(anyhow::Error::msg)?;
+            if *json {
+                let mut value = json!({
+                    "hook": invocation.hook,
+                    "event": invocation.event.as_str(),
+                    "outcome": invocation.outcome.label(),
+                    "duration_ms": invocation.duration_ms,
+                    "exit_code": invocation.exit_code,
+                    "reason": invocation.reason,
+                    "artifact": invocation.artifact,
+                    "warnings": outcome.warnings.clone(),
+                    "contexts": outcome.contexts.iter().map(|context| context.text.clone()).collect::<Vec<_>>(),
+                });
+                if let Some(block) = &outcome.blocked {
+                    value["blocked"] = json!({"hook": block.hook, "reason": block.reason});
+                }
+                println!("{}", serde_json::to_string_pretty(&value)?);
+            } else {
+                println!(
+                    "hook {} ({}): {} in {} ms",
+                    invocation.hook,
+                    invocation.event.as_str(),
+                    invocation.outcome.label(),
+                    invocation.duration_ms
+                );
+                if let Some(block) = &outcome.blocked {
+                    println!("blocked: {}", block.reason);
+                }
+                for warning in &outcome.warnings {
+                    println!("warning: {warning}");
+                }
+                for context in &outcome.contexts {
+                    println!("context: {} chars", context.text.chars().count());
+                }
+                if let Some(artifact) = &invocation.artifact {
+                    println!("output artifact: {artifact}");
+                }
+            }
+            Ok(if outcome.is_blocked() { 1 } else { 0 })
         }
     }
 }
@@ -844,6 +1064,56 @@ fn print_workflow_event(event: &crate::workflows::engine::Event, json: bool) {
     }
 }
 
+/// `lh --rewind <session>:<entry>`: restore harness-written files and move the
+/// conversation leaf, without starting a model turn.
+fn run_rewind(paths: &Paths, spec: &str, force: bool) -> Result<i32> {
+    let (session_part, entry) = spec.rsplit_once(':').ok_or_else(|| {
+        anyhow::anyhow!("--rewind expects <session>:<entry>, for example `lh --rewind last:e12`")
+    })?;
+    let entry = entry.trim();
+    if entry.is_empty() {
+        bail!("--rewind needs an entry id after the colon; run /tree in the TUI to see ids");
+    }
+    let session_part = session_part.trim();
+    let session_path = match session_part {
+        "" | "last" => Session::latest_path(paths)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "no sessions in {}; pass <session>:<entry> from another project",
+                paths.project_sessions_dir().display()
+            )
+        })?,
+        value => {
+            let direct = PathBuf::from(value);
+            if direct.is_file() {
+                direct
+            } else {
+                let candidate = paths.project_sessions_dir().join(format!("{value}.jsonl"));
+                if candidate.is_file() {
+                    candidate
+                } else {
+                    bail!(
+                        "no session {value:?} in {}; use `lh --rewind last:{entry}` for the latest",
+                        paths.project_sessions_dir().display()
+                    );
+                }
+            }
+        }
+    };
+    let mut session = Session::open(&session_path)
+        .with_context(|| format!("cannot open {}", session_path.display()))?;
+    let plan = crate::session::rewind::plan(&session, entry)?;
+    let report = crate::session::rewind::apply(&mut session, &plan, force)?;
+    session.fsync()?;
+    println!(
+        "rewound session {} to {} (seq {}): {}",
+        session.id,
+        report.target,
+        plan.target_seq,
+        report.summary()
+    );
+    Ok(0)
+}
+
 async fn run_headless(runtime: crate::app::Runtime, prompt: String, json: bool) -> Result<i32> {
     let cancel = CancellationToken::new();
     let (tx, mut rx) = mpsc::unbounded_channel();
@@ -880,6 +1150,25 @@ async fn run_headless(runtime: crate::app::Runtime, prompt: String, json: bool) 
     }
     let outcome = handle.await.context("agent task panicked")?;
     let status = outcome.status;
+    if runtime.core.permissions.mode() == crate::policy::PermissionMode::Plan
+        && status == TurnStatus::Done
+    {
+        let plan = runtime
+            .session
+            .lock()
+            .ok()
+            .and_then(|session| crate::tools::todo::latest_plan(&session));
+        if let Some((_, tasks)) = plan {
+            if json {
+                println!("{}", json!({"type":"plan","tasks":tasks}));
+            } else {
+                println!("\nPlan (plan mode; nothing was changed):");
+                for (index, task) in tasks.iter().enumerate() {
+                    println!("{}. {task}", index + 1);
+                }
+            }
+        }
+    }
     let _ = std::io::stdout().flush();
     Ok(match status {
         TurnStatus::Done => 0,
@@ -889,66 +1178,93 @@ async fn run_headless(runtime: crate::app::Runtime, prompt: String, json: bool) 
     })
 }
 
+/// One stable JSON object for a `--json` event.
+fn event_json(event: &AgentEvent) -> serde_json::Value {
+    match event {
+        AgentEvent::TurnStarted {
+            model,
+            profile,
+            tool_mode,
+        } => {
+            json!({"type":"started","model":model,"profile":profile,"tool_mode":tool_mode})
+        }
+        AgentEvent::State(state) => json!({"type":"state","state":format!("{state:?}")}),
+        AgentEvent::TextDelta(text) => json!({"type":"text","text":text}),
+        AgentEvent::ReasoningDelta(text) => json!({"type":"reasoning","text":text}),
+        AgentEvent::ToolStarted {
+            call_id,
+            name,
+            summary,
+        } => json!({"type":"tool_started","call_id":call_id,"name":name,"summary":summary}),
+        AgentEvent::ToolFinished {
+            call_id,
+            name,
+            is_error,
+            duration_ms,
+            preview,
+            artifact,
+        } => {
+            json!({"type":"tool_finished","call_id":call_id,"name":name,"is_error":is_error,"duration_ms":duration_ms,"preview":preview,"artifact":artifact})
+        }
+        AgentEvent::Usage(usage) => {
+            json!({
+                "type":"usage",
+                "prompt_tokens":usage.prompt_tokens,
+                "completion_tokens":usage.completion_tokens,
+                "cached_tokens":usage.cached_tokens,
+                "cache_percent":usage.cache_percent(),
+                "reasoning_tokens":usage.reasoning_tokens,
+            })
+        }
+        AgentEvent::Context { used, window } => {
+            json!({"type":"context","used":used,"window":window})
+        }
+        AgentEvent::WindowDetected { window, source } => {
+            json!({"type":"window_detected","window":window,"source":source})
+        }
+        AgentEvent::Compacted {
+            summary,
+            tokens_before,
+        } => json!({"type":"compacted","summary":summary,"tokens_before":tokens_before}),
+        AgentEvent::Notice(message) => json!({"type":"notice","message":message}),
+        AgentEvent::HunkReview { id, hunks } => {
+            json!({"type":"hunk_review","id":id,"hunks":hunks.len()})
+        }
+        AgentEvent::Provenance {
+            call_id,
+            origin,
+            warning,
+            approval_required,
+        } => json!({
+            "type": "provenance",
+            "call_id": call_id,
+            "origin": origin,
+            "warning": warning,
+            "approval_required": approval_required,
+        }),
+        AgentEvent::Guard { code, message } => {
+            json!({"type":"guard","code":code,"message":message})
+        }
+        AgentEvent::Error {
+            code,
+            message,
+            recoverable,
+        } => json!({"type":"error","code":code,"message":message,"recoverable":recoverable}),
+        AgentEvent::TurnDone(outcome) => {
+            json!({"type":"done","status":format!("{:?}", outcome.status)})
+        }
+    }
+}
+
 /// Render one event in plain or JSON mode. Returns the final status when done.
 fn render_event(event: AgentEvent, json: bool) -> Result<Option<TurnStatus>> {
     if json {
-        let value = match &event {
-            AgentEvent::TurnStarted {
-                model,
-                profile,
-                tool_mode,
-            } => {
-                json!({"type":"started","model":model,"profile":profile,"tool_mode":tool_mode})
-            }
-            AgentEvent::State(state) => json!({"type":"state","state":format!("{state:?}")}),
-            AgentEvent::TextDelta(text) => json!({"type":"text","text":text}),
-            AgentEvent::ReasoningDelta(text) => json!({"type":"reasoning","text":text}),
-            AgentEvent::ToolStarted {
-                call_id,
-                name,
-                summary,
-            } => json!({"type":"tool_started","call_id":call_id,"name":name,"summary":summary}),
-            AgentEvent::ToolFinished {
-                call_id,
-                name,
-                is_error,
-                duration_ms,
-                preview,
-                artifact,
-            } => {
-                json!({"type":"tool_finished","call_id":call_id,"name":name,"is_error":is_error,"duration_ms":duration_ms,"preview":preview,"artifact":artifact})
-            }
-            AgentEvent::Usage(usage) => {
-                json!({"type":"usage","prompt_tokens":usage.prompt_tokens,"completion_tokens":usage.completion_tokens})
-            }
-            AgentEvent::Context { used, window } => {
-                json!({"type":"context","used":used,"window":window})
-            }
-            AgentEvent::WindowDetected { window, source } => {
-                json!({"type":"window_detected","window":window,"source":source})
-            }
-            AgentEvent::Compacted {
-                summary,
-                tokens_before,
-            } => json!({"type":"compacted","summary":summary,"tokens_before":tokens_before}),
-            AgentEvent::Notice(message) => json!({"type":"notice","message":message}),
-            AgentEvent::Guard { code, message } => {
-                json!({"type":"guard","code":code,"message":message})
-            }
-            AgentEvent::Error {
-                code,
-                message,
-                recoverable,
-            } => json!({"type":"error","code":code,"message":message,"recoverable":recoverable}),
-            AgentEvent::TurnDone(outcome) => {
-                json!({"type":"done","status":format!("{:?}", outcome.status)})
-            }
+        let done = match &event {
+            AgentEvent::TurnDone(outcome) => Some(outcome.status),
+            _ => None,
         };
-        println!("{}", serde_json::to_string(&value)?);
-        if let AgentEvent::TurnDone(outcome) = event {
-            return Ok(Some(outcome.status));
-        }
-        return Ok(None);
+        println!("{}", serde_json::to_string(&event_json(&event))?);
+        return Ok(done);
     }
 
     match event {
@@ -973,11 +1289,26 @@ fn render_event(event: AgentEvent, json: bool) -> Result<Option<TurnStatus>> {
             }
         }
         AgentEvent::Notice(message) => eprintln!("[notice] {message}"),
+        AgentEvent::Provenance {
+            origin, warning, ..
+        } => {
+            if let Some(warning) = warning {
+                eprintln!("[provenance] {origin}: {warning}");
+            } else {
+                eprintln!("[provenance] {origin}");
+            }
+        }
         AgentEvent::Guard { code, message } => eprintln!("[{code}] {message}"),
         AgentEvent::Error { code, message, .. } => eprintln!("[{code}] {message}"),
         AgentEvent::Usage(usage) => {
+            let cache = match (usage.cached_tokens, usage.cache_percent()) {
+                (Some(cached), Some(percent)) => {
+                    format!(" cache {cached}/{} ({percent}%)", usage.prompt_tokens)
+                }
+                _ => String::new(),
+            };
             eprintln!(
-                "[usage] prompt {} completion {}",
+                "[usage] prompt {} completion {}{cache}",
                 usage.prompt_tokens, usage.completion_tokens
             );
         }
@@ -1023,9 +1354,109 @@ mod tests {
     use super::*;
 
     #[test]
+    fn provenance_event_json_exposes_the_tag_and_warning() {
+        let event = AgentEvent::Provenance {
+            call_id: "call_0001".into(),
+            origin: "tool:read".into(),
+            warning: Some("[provenance] untrusted content".into()),
+            approval_required: true,
+        };
+        let value = event_json(&event);
+        assert_eq!(value["type"], "provenance");
+        assert_eq!(value["call_id"], "call_0001");
+        assert_eq!(value["origin"], "tool:read");
+        assert_eq!(value["warning"], "[provenance] untrusted content");
+        assert_eq!(value["approval_required"], true);
+    }
+
+    #[test]
     fn no_redact_is_an_explicit_global_flag() {
         let cli = Cli::try_parse_from(["lh", "--no-redact"]).unwrap();
         assert!(cli.no_redact);
         assert!(!Cli::try_parse_from(["lh"]).unwrap().no_redact);
+    }
+
+    #[test]
+    fn rewind_takes_a_session_and_entry_and_force_needs_it() {
+        let cli = Cli::try_parse_from(["lh", "--rewind", "last:e12"]).unwrap();
+        assert_eq!(cli.rewind.as_deref(), Some("last:e12"));
+        assert!(!cli.force);
+        let cli = Cli::try_parse_from(["lh", "--rewind", "abc:e3", "--force"]).unwrap();
+        assert!(cli.force);
+        assert!(
+            Cli::try_parse_from(["lh", "--force"]).is_err(),
+            "--force only means something with --rewind"
+        );
+        assert!(
+            Cli::try_parse_from(["lh", "--rewind", "last:e3", "--print", "hi"]).is_err(),
+            "--rewind and --print are separate modes"
+        );
+    }
+
+    #[test]
+    fn run_rewind_restores_files_and_reports_the_target() {
+        use crate::session::{CustomData, EntryKind, SessionData, UserData};
+
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().canonicalize().unwrap();
+        std::fs::write(cwd.join("a.txt"), "after\n").unwrap();
+        let mut paths = Paths::discover(&cwd).unwrap();
+        paths.config_dir = dir.path().join("config");
+        paths.data_dir = dir.path().join("data");
+        paths.sessions_dir_override = Some(dir.path().join("sessions"));
+        paths.ensure_dirs().unwrap();
+        let mut session = Session::create(
+            &paths,
+            SessionData {
+                cwd: cwd.display().to_string(),
+                endpoint: "test".into(),
+                model: "test".into(),
+                profile: "test".into(),
+                app: "test".into(),
+                redact: true,
+                context: None,
+                permissions: None,
+            },
+            false,
+        )
+        .unwrap();
+        session
+            .append(EntryKind::User(UserData {
+                attachments: Vec::new(),
+                content: "edit it".into(),
+            }))
+            .unwrap();
+        let target = session
+            .append(EntryKind::Assistant(crate::session::AssistantData {
+                content: Some("done".into()),
+                ..Default::default()
+            }))
+            .unwrap();
+        let snapshot = session.artifacts.write("before\n").unwrap();
+        session
+            .append(EntryKind::Custom(
+                CustomData::new("fs-change")
+                    .with("path", "a.txt")
+                    .with("snapshot", snapshot.id)
+                    .with("after_sha256", crate::tools::undo::content_hash(b"after\n")),
+            ))
+            .unwrap();
+        session.fsync().unwrap();
+        drop(session);
+
+        assert_eq!(
+            run_rewind(&paths, &format!("last:{}", target.id), false).unwrap(),
+            0
+        );
+        assert_eq!(
+            std::fs::read_to_string(cwd.join("a.txt")).unwrap(),
+            "before\n"
+        );
+        let reopened = Session::open(&Session::latest_path(&paths).unwrap().unwrap()).unwrap();
+        assert_eq!(
+            reopened.active_leaf_id().as_deref(),
+            Some(reopened.tree.last().unwrap().id.as_str())
+        );
+        assert!(reopened.latest_custom_on_path("rewind").is_some());
     }
 }

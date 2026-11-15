@@ -10,7 +10,7 @@ impl App {
             Some(position) => (&body[..position], body[position..].trim()),
             None => (body, ""),
         };
-        let always = matches!(name, "help" | "quit" | "debug" | "trust");
+        let always = matches!(name, "help" | "quit" | "debug" | "trust" | "approve");
         if self.turn_active && !always {
             self.set_notice(
                 "cancel the running turn first (Esc) before using this command",
@@ -35,6 +35,7 @@ impl App {
             "profile" => self.command_profile(rest).await,
             "theme" => self.command_theme(rest),
             "tree" => self.command_tree(),
+            "rewind" => self.command_rewind(rest),
             "fork" => self.command_fork(),
             "new" => self.command_new().await,
             "resume" => self.command_resume(rest).await,
@@ -42,11 +43,13 @@ impl App {
             "compact" => self.command_compact(),
             "commit" => self.command_commit(rest).await,
             "pr" => self.command_pr(rest).await,
+            "plan" => self.command_plan(rest).await,
             "tools" => self.command_tools(),
             "mcp" => self.command_mcp(),
             "skill" => self.command_skill(rest),
             "workflow" => self.command_workflow(rest).await,
             "sec" => self.command_sec(rest),
+            "approve" => self.command_approve(),
             "trust" => self.command_trust(rest).await,
             "export" => self.command_export(rest),
             "clear" => self.command_clear(),
@@ -388,6 +391,91 @@ impl App {
         self.spawn_rebuild(Switch::Profile(name.to_string()), config);
     }
 
+    /// `/plan`: enter plan mode, or show the plan; `/plan approve` restores
+    /// the previous mode and tool set; `/plan exit` discards the plan.
+    pub(super) async fn command_plan(&mut self, rest: &str) {
+        let Some(core) = self.core().cloned() else {
+            return;
+        };
+        let permissions = core.permissions.clone();
+        let in_plan = permissions.mode() == crate::policy::PermissionMode::Plan;
+        let (status, notice) = match rest.trim() {
+            "" if in_plan => {
+                let plan = core
+                    .session
+                    .lock()
+                    .ok()
+                    .and_then(|session| crate::tools::todo::latest_plan(&session));
+                let text = match plan {
+                    Some((status, tasks)) if !tasks.is_empty() => {
+                        let mut text = format!("{status}:");
+                        for (index, task) in tasks.iter().enumerate() {
+                            text.push_str(&format!("\n{}. {task}", index + 1));
+                        }
+                        text.push_str("\n\n/plan approve applies it · /plan exit discards it");
+                        text
+                    }
+                    _ => "plan mode is active; no plan yet. Describe the task; the model must answer with a todo plan.".into(),
+                };
+                self.transcript.push_note("plan", text, false);
+                return;
+            }
+            "" => {
+                permissions.enter_plan();
+                (
+                    None,
+                    "plan mode: read-only tools; the next turn must produce a todo plan",
+                )
+            }
+            "approve" | "exit" if !in_plan => {
+                self.set_notice("plan mode is not active; /plan enters it", Role::Muted);
+                return;
+            }
+            "approve" => {
+                permissions.leave_plan();
+                (
+                    Some("approved"),
+                    "plan approved: the previous mode and tools are back",
+                )
+            }
+            "exit" => {
+                permissions.leave_plan();
+                (
+                    Some("discarded"),
+                    "plan discarded: the previous mode and tools are back",
+                )
+            }
+            _ => {
+                self.set_notice(command_usage("plan"), Role::Error);
+                return;
+            }
+        };
+        let mut config = self.config.clone();
+        config.permissions.mode = permissions.mode();
+        if let Err(error) = self.rebuild_core_with(config).await {
+            // Keep the mode and tool set consistent: undo the switch.
+            if status.is_some() {
+                permissions.enter_plan();
+            } else {
+                permissions.leave_plan();
+            }
+            self.set_notice(format!("/plan failed: {error}"), Role::Error);
+            return;
+        }
+        if let Ok(mut session) = core.session.lock() {
+            let entry = match status {
+                Some(status) => crate::tools::todo::plan_entry(&session, status),
+                None => crate::session::CustomData::new("permission-mode")
+                    .with("mode", "plan")
+                    .with("source", "/plan"),
+            };
+            if let Err(error) = session.append(EntryKind::Custom(entry)) {
+                tracing::warn!(%error, "cannot record the plan-mode change");
+            }
+        }
+        self.set_notice(notice, Role::Success);
+    }
+
     pub(super) async fn rebuild_core_with(&mut self, config: Config) -> Result<()> {
         let Some(old) = self.core().cloned() else {
             bail!("no runtime");
@@ -502,6 +590,83 @@ impl App {
             return;
         }
         self.modal = Some(ModalData::Tree(view));
+    }
+
+    pub(super) fn command_rewind(&mut self, argument: &str) {
+        let Some(runtime) = &self.runtime else {
+            return;
+        };
+        let core = runtime.core.clone();
+        let session_handle = runtime.session.clone();
+        let mut turns = 1usize;
+        let mut force = false;
+        for word in argument.split_whitespace() {
+            if word.eq_ignore_ascii_case("force") || word == "--force" {
+                force = true;
+            } else if let Ok(turns_parsed) = word.parse::<usize>() {
+                turns = turns_parsed;
+            } else {
+                self.set_notice(
+                    format!("usage: /rewind [turns] [force] (got {word:?})"),
+                    Role::Error,
+                );
+                return;
+            }
+        }
+        let mut session = match session_handle.lock() {
+            Ok(session) => session,
+            Err(poison) => poison.into_inner(),
+        };
+        let target = match crate::session::rewind::target_before_turn(&session, turns) {
+            Ok(target) => target,
+            Err(message) => {
+                drop(session);
+                self.set_notice(message.clone(), Role::Warning);
+                self.transcript.push_note("rewind", message, true);
+                return;
+            }
+        };
+        let plan = match crate::session::rewind::plan(&session, &target) {
+            Ok(plan) => plan,
+            Err(error) => {
+                drop(session);
+                let message = format!("{error:#}");
+                self.set_notice(message.clone(), Role::Error);
+                self.transcript.push_note("rewind", message, true);
+                return;
+            }
+        };
+        let paths: Vec<_> = plan
+            .files
+            .iter()
+            .filter(|file| file.content.is_some())
+            .map(|file| file.path.clone())
+            .collect();
+        let report = match crate::session::rewind::apply(&mut session, &plan, force) {
+            Ok(report) => report,
+            Err(error) => {
+                drop(session);
+                let message = format!("{error:#}");
+                self.set_notice(
+                    message.lines().next().unwrap_or(&message).to_string(),
+                    Role::Error,
+                );
+                self.transcript.push_note("rewind", message, true);
+                return;
+            }
+        };
+        let _ = session.fsync();
+        drop(session);
+        // Restored bytes are what the harness itself wrote now; the model does
+        // not have to re-read them before the next edit.
+        let ctx = core.tool_context();
+        for path in &paths {
+            crate::tools::write::record_own_write(&ctx, path);
+        }
+        self.refresh_session_blocks();
+        let message = format!("rewound to {}: {}", report.target, report.summary());
+        self.transcript.push_note("rewind", message.clone(), false);
+        self.set_notice(message, Role::Success);
     }
 
     pub(super) fn command_fork(&mut self) {
@@ -672,6 +837,35 @@ impl App {
             selected: 0,
             scroll: 0,
         }));
+    }
+
+    /// Approve exactly the next sensitive action after a provenance warning.
+    pub(super) fn command_approve(&mut self) {
+        let Some(runtime) = &self.runtime else {
+            return;
+        };
+        let pending = {
+            let mut state = runtime
+                .core
+                .provenance
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            state.approve()
+        };
+        match pending {
+            Some(pending) => self.set_notice(
+                format!(
+                    "approved the next sensitive action; warning from {} ({})",
+                    pending.origin,
+                    pending.patterns.join(", ")
+                ),
+                Role::Success,
+            ),
+            None => self.set_notice(
+                "no provenance warning is pending; nothing to approve",
+                Role::Muted,
+            ),
+        }
     }
 
     pub(super) fn command_mcp(&mut self) {

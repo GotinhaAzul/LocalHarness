@@ -163,7 +163,7 @@ fn run(ctx: &ToolContext, args: &Value) -> Result<ToolResult, ToolResult> {
 
     let (diff, added, removed) = diff_report(&before, &after, MAX_DIFF_LINES);
     let change = crate::tools::undo::record_change(ctx, Ok(Some(&before)), &after);
-    atomic_write(&path, after.as_bytes(), file_mode(&path))
+    crate::tools::hunk::mutation_write(&path, Some(&before), &after, file_mode(&path))
         .map_err(|err| ToolResult::err("PATCH_FAILED", format!("cannot write {display}: {err}")))?;
     record_own_write(ctx, &path);
 

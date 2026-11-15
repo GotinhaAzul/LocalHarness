@@ -198,6 +198,50 @@ pub fn plan_snapshot(session: &Session) -> Vec<(String, PlanStatus)> {
         .collect()
 }
 
+/// Session entry kind for a plan-mode proposal and its outcome.
+pub const PLAN_ENTRY: &str = "plan";
+
+/// A `plan` session entry: the current todo plan's task titles with `status`
+/// (`proposed` when a plan-mode turn settles, then `approved` or `discarded`
+/// from `/plan approve` and `/plan exit`). The user reads it with `/plan`.
+pub fn plan_entry(session: &Session, status: &str) -> crate::session::CustomData {
+    let tasks: Vec<String> = read_state(session)
+        .tasks
+        .into_iter()
+        .map(|task| task.content)
+        .collect();
+    crate::session::CustomData::new(PLAN_ENTRY)
+        .with("status", status)
+        .with("tasks", tasks)
+}
+
+/// The latest `plan` entry on the active branch: its status and tasks.
+pub fn latest_plan(session: &Session) -> Option<(String, Vec<String>)> {
+    let entry = session.latest_custom_on_path(PLAN_ENTRY)?;
+    let EntryKind::Custom(custom) = &entry.kind else {
+        return None;
+    };
+    let status = custom
+        .payload
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("proposed")
+        .to_string();
+    let tasks = custom
+        .payload
+        .get("tasks")
+        .and_then(Value::as_array)
+        .map(|tasks| {
+            tasks
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    Some((status, tasks))
+}
+
 fn state_details(state: &TodoState) -> Value {
     let mut entry = state.payload();
     entry.insert("kind".into(), json!("todo-state"));
@@ -553,6 +597,7 @@ mod tests {
             app: "test".into(),
             redact: true,
             context: None,
+            permissions: None,
         };
         let session = Session::create(&paths, header, true).expect("session");
         let ctx = ToolContext {
