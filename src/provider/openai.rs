@@ -125,6 +125,41 @@ impl OpenAiCompatProvider {
             ));
         }
 
+        // Some servers and gateways ignore `stream: true` and answer with one
+        // completion body. Normalize it into the same events a stream yields,
+        // so both shapes reach one accumulator.
+        if is_json_response(response.headers()) {
+            let text = tokio::select! {
+                _ = cancel.cancelled() => {
+                    let _ = tx.send(Err(ProviderError::new(
+                        ErrorClass::Cancelled,
+                        "generation cancelled",
+                    )));
+                    return Attempt::Finished;
+                }
+                result = tokio::time::timeout(self.timeouts.total, response.text()) => result,
+            };
+            return match text {
+                Ok(Ok(text)) => match self.handle_full_body(&text, req, tx, yielded) {
+                    Ok(()) => Attempt::Finished,
+                    Err(err) => Attempt::Failed(err),
+                },
+                Ok(Err(err)) => Attempt::Failed(ProviderError::new(
+                    ErrorClass::Connection,
+                    self.scrub(format!(
+                        "reading the response failed: {err}. Retry; if it persists check the engine."
+                    )),
+                )),
+                Err(_) => Attempt::Failed(ProviderError::new(
+                    ErrorClass::Connection,
+                    format!(
+                        "request exceeded {} s; raise model.request_timeout_secs or reduce context.",
+                        self.timeouts.total.as_secs()
+                    ),
+                )),
+            };
+        }
+
         let mut parser = SseParser::new();
         let mut tool_index = ToolCallIndexer::default();
         let mut stream = response.bytes_stream();
@@ -244,13 +279,7 @@ impl OpenAiCompatProvider {
         })?;
 
         if let Some(err) = chunk.error {
-            let message = err.into_message();
-            let class = if is_context_error(&message) {
-                ErrorClass::ContextTooSmall
-            } else {
-                ErrorClass::BadRequest
-            };
-            return Err(ProviderError::new(class, self.scrub(message)));
+            return Err(self.api_error(err));
         }
 
         let truncated = chunk.truncated;
@@ -276,7 +305,7 @@ impl OpenAiCompatProvider {
             for call in delta.tool_calls.unwrap_or_default() {
                 let index = tool_index.assign(&call);
                 let (name, arguments) = match call.function {
-                    Some(function) => (function.name, function.arguments),
+                    Some(function) => (function.name, function.arguments.map(arguments_text)),
                     None => (None, None),
                 };
                 if call.id.is_some() || name.is_some() || arguments.is_some() {
@@ -294,6 +323,98 @@ impl OpenAiCompatProvider {
             }
         }
         Ok(())
+    }
+
+    fn api_error(&self, err: ApiError) -> ProviderError {
+        let message = err.into_message();
+        let class = if is_context_error(&message) {
+            ErrorClass::ContextTooSmall
+        } else {
+            ErrorClass::BadRequest
+        };
+        ProviderError::new(class, self.scrub(message))
+    }
+
+    /// A non-streamed completion body, emitted as the events a stream of the
+    /// same completion would produce: reasoning, content, one whole delta per
+    /// tool call, finish reason, then usage.
+    fn handle_full_body(
+        &self,
+        text: &str,
+        req: &ChatRequest,
+        tx: &UnboundedSender<StreamItem>,
+        yielded: &mut bool,
+    ) -> Result<(), ProviderError> {
+        let body: FullResponse = serde_json::from_str(text.trim()).map_err(|err| {
+            ProviderError::new(
+                ErrorClass::Parse,
+                format!(
+                    "could not parse the completion body ({err}); provider is not speaking the OpenAI chat API. Body: {}",
+                    truncate_body(text)
+                ),
+            )
+        })?;
+        if let Some(err) = body.error {
+            return Err(self.api_error(err));
+        }
+        for choice in body.choices {
+            let message = choice.message;
+            if let Some(reasoning) = reasoning_text(&message, req.reasoning_field.as_deref())
+                && !reasoning.is_empty()
+            {
+                *yielded = true;
+                let _ = tx.send(Ok(StreamEvent::ReasoningDelta(reasoning)));
+            }
+            if let Some(content) = message.content
+                && !content.is_empty()
+            {
+                *yielded = true;
+                let _ = tx.send(Ok(StreamEvent::Delta(content)));
+            }
+            for (index, call) in message
+                .tool_calls
+                .unwrap_or_default()
+                .into_iter()
+                .enumerate()
+            {
+                let Some(function) = call.function else {
+                    continue;
+                };
+                *yielded = true;
+                let _ = tx.send(Ok(StreamEvent::ToolCallDelta {
+                    index: call.index.unwrap_or(index),
+                    id: call.id,
+                    name: function.name,
+                    arguments: function.arguments.map(arguments_text),
+                }));
+            }
+            if let Some(reason) = choice.finish_reason {
+                let _ = tx.send(Ok(StreamEvent::Finish(reason)));
+            }
+        }
+        if let Some(usage) =
+            usage_from(body.usage, body.timings, body.truncated, body.context_shift)
+        {
+            let _ = tx.send(Ok(StreamEvent::Usage(usage)));
+        }
+        Ok(())
+    }
+}
+
+fn is_json_response(headers: &reqwest::header::HeaderMap) -> bool {
+    headers
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.to_ascii_lowercase().starts_with("application/json"))
+}
+
+/// Tool-call arguments as text. The OpenAI shape is a JSON string; some
+/// gateways (and Ollama's native format) send the object itself.
+fn arguments_text(arguments: Value) -> String {
+    match arguments {
+        Value::String(text) => text,
+        Value::Null => String::new(),
+        other => other.to_string(),
     }
 }
 
@@ -462,7 +583,86 @@ fn merge_leading_system(messages: &[ChatMessage]) -> Vec<ChatMessage> {
     merged
 }
 
+/// How the session's internal call ids are written for the active model.
+///
+/// The session stores harness-owned ids (`call_0001`, ...), plus whatever
+/// older sessions recorded. Most templates accept any string, but Mistral's
+/// tokenizer (`mistral_common`, used by vLLM and Mistral-format templates)
+/// rejects any `tool_call_id` that is not exactly nine ASCII alphanumerics.
+/// The mapping is deterministic and injective per session, so a call and its
+/// result always carry the same wire id and the prompt prefix stays stable
+/// for the server's KV cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WireIds {
+    AsIs,
+    Mistral,
+}
+
+impl WireIds {
+    fn for_model(model: &str) -> Self {
+        let model = model.to_ascii_lowercase();
+        const MISTRAL: [&str; 7] = [
+            "mistral",
+            "mixtral",
+            "devstral",
+            "magistral",
+            "codestral",
+            "ministral",
+            "pixtral",
+        ];
+        if MISTRAL.iter().any(|family| model.contains(family)) {
+            WireIds::Mistral
+        } else {
+            WireIds::AsIs
+        }
+    }
+
+    fn render(self, id: &str) -> String {
+        match self {
+            WireIds::AsIs => id.to_string(),
+            WireIds::Mistral => mistral_call_id(id),
+        }
+    }
+}
+
+/// Nine alphanumerics. Internal ids keep their order as zero-padded digits
+/// (`call_0007` → `000000007`), so engines that sort tool messages by id
+/// still see call order. Any other id (an engine id an older session stored)
+/// is hashed behind a leading letter, which cannot collide with the digit
+/// form.
+fn mistral_call_id(id: &str) -> String {
+    if let Some(digits) = id.strip_prefix("call_")
+        && digits.len() >= 4
+        && digits.bytes().all(|byte| byte.is_ascii_digit())
+        && let Ok(number) = digits.parse::<u64>()
+        && number < 1_000_000_000
+    {
+        return format!("{number:09}");
+    }
+    if id.len() == 9
+        && id.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        && !id.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return id.to_string();
+    }
+    // FNV-1a: stable across builds, unlike the std hasher.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in id.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    const ALPHABET: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut out = String::with_capacity(9);
+    out.push('z');
+    for _ in 0..8 {
+        out.push(ALPHABET[(hash % 36) as usize] as char);
+        hash /= 36;
+    }
+    out
+}
+
 fn build_body(req: &ChatRequest, include_usage: bool) -> Result<Value, ProviderError> {
+    let wire_ids = WireIds::for_model(&req.model);
     let normalized = merge_leading_system(&req.messages);
     debug_assert!(
         normalized
@@ -504,7 +704,7 @@ fn build_body(req: &ChatRequest, include_usage: bool) -> Result<Value, ProviderE
                         .iter()
                         .map(|call| {
                             json!({
-                                "id": call.id,
+                                "id": wire_ids.render(&call.id),
                                 "type": "function",
                                 "function": {
                                     "name": call.name,
@@ -518,7 +718,7 @@ fn build_body(req: &ChatRequest, include_usage: bool) -> Result<Value, ProviderE
                 Value::Object(object)
             }
             ChatMessage::Tool { call_id, content } => {
-                json!({"role":"tool","tool_call_id":call_id,"content":content})
+                json!({"role":"tool","tool_call_id":wire_ids.render(call_id),"content":content})
             }
         })
         .collect();
@@ -687,8 +887,35 @@ struct ToolCallDelta {
 struct FunctionDelta {
     #[serde(default)]
     name: Option<String>,
+    /// A string on the OpenAI wire, an object from some gateways.
     #[serde(default)]
-    arguments: Option<String>,
+    arguments: Option<Value>,
+}
+
+/// A non-streamed chat completion (`stream: false`, or a server that ignores
+/// `stream: true`). Usage and timing fields match the streamed chunk.
+#[derive(Debug, Deserialize)]
+struct FullResponse {
+    #[serde(default)]
+    choices: Vec<FullChoice>,
+    #[serde(default)]
+    usage: Option<WireUsage>,
+    #[serde(default)]
+    timings: Option<Timings>,
+    #[serde(default)]
+    truncated: Option<bool>,
+    #[serde(default)]
+    context_shift: Option<u32>,
+    #[serde(default)]
+    error: Option<ApiError>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FullChoice {
+    #[serde(default)]
+    message: Delta,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 /// Stateful assignment of stream-local tool-call indices.
@@ -1109,6 +1336,25 @@ mod tests {
             body["messages"][1]["tool_calls"][0]["function"]["arguments"],
             "{\"path\":\"a.rs\"}"
         );
+    }
+
+    #[test]
+    fn mistral_models_get_nine_character_call_ids() {
+        assert_eq!(WireIds::for_model("Devstral-Small-2507"), WireIds::Mistral);
+        assert_eq!(WireIds::for_model("qwen3-coder"), WireIds::AsIs);
+        assert_eq!(mistral_call_id("call_0007"), "000000007");
+        assert_eq!(mistral_call_id("call_12345"), "000012345");
+        assert_eq!(mistral_call_id("aB3dE6gH9"), "aB3dE6gH9");
+        for legacy in ["call_1", "chatcmpl-tool-abc", "", "000000007"] {
+            let wire = mistral_call_id(legacy);
+            assert_eq!(wire.len(), 9, "{legacy:?} -> {wire}");
+            assert!(wire.bytes().all(|b| b.is_ascii_alphanumeric()), "{wire}");
+            assert!(wire.starts_with('z'), "{wire}");
+            assert_eq!(wire, mistral_call_id(legacy), "deterministic");
+        }
+        assert_ne!(mistral_call_id("call_1"), mistral_call_id("call_2"));
+        // Order is kept for engines that sort tool messages by id.
+        assert!(mistral_call_id("call_0009") < mistral_call_id("call_0010"));
     }
 
     #[test]

@@ -186,6 +186,26 @@ fn harness_with_extra(
     config: Config,
     extra: Vec<Arc<dyn localharness::Tool>>,
 ) -> Harness {
+    let provider = Arc::new(ScriptedProvider {
+        scripts: Mutex::new(scripts.into()),
+        requests: Mutex::new(Vec::new()),
+        strict_system: AtomicBool::new(false),
+    });
+    let (core, session) = build_core(dir, config, extra, provider.clone());
+    Harness {
+        core,
+        session,
+        provider,
+    }
+}
+
+/// A core over any provider, for example the real HTTP client.
+fn build_core(
+    dir: &std::path::Path,
+    config: Config,
+    extra: Vec<Arc<dyn localharness::Tool>>,
+    provider: Arc<dyn Provider>,
+) -> (Arc<Core>, SessionHandle) {
     let mut paths = Paths::discover(dir).unwrap();
     paths.data_dir = dir.join("data");
     paths.config_dir = dir.join("config");
@@ -211,11 +231,6 @@ fn harness_with_extra(
     selected.extend(extra);
     let (_, model_profile) = config.model_profile();
     let tool_specs = ToolRegistry::specs_with(&selected, model_profile.short_tool_schemas());
-    let provider = Arc::new(ScriptedProvider {
-        scripts: Mutex::new(scripts.into()),
-        requests: Mutex::new(Vec::new()),
-        strict_system: AtomicBool::new(false),
-    });
     let budget = TokenBudget::new(config.context_window(), config.model.max_output_tokens);
     let tool_specs_json = localharness::provider::tools_json(&tool_specs);
     let tool_specs_cost = localharness::context::ToolSpecCost::from_json(&tool_specs_json, &budget);
@@ -227,7 +242,7 @@ fn harness_with_extra(
         limits: localharness::agent::RunLimits::from(&config.budgets),
         config,
         paths: paths.clone(),
-        provider: provider.clone(),
+        provider,
         registry,
         tool_specs,
         tool_specs_json,
@@ -257,11 +272,7 @@ fn harness_with_extra(
         mcp: Default::default(),
         approver: None,
     };
-    Harness {
-        core: Arc::new(core),
-        session,
-        provider,
-    }
+    (Arc::new(core), session)
 }
 
 async fn run(
@@ -345,7 +356,7 @@ async fn bash_records_evidence_and_findings_link_to_it() {
 }
 
 #[tokio::test]
-async fn bash_secrets_are_redacted_in_session_and_evidence() {
+async fn bash_secrets_are_redacted_in_evidence_but_not_in_what_the_model_reads() {
     const KEY: &str = "AKIAIOSFODNN7EXAMPLE";
     let dir = tempfile::tempdir().unwrap();
     let harness = harness(
@@ -372,9 +383,13 @@ async fn bash_secrets_are_redacted_in_session_and_evidence() {
             .into_iter()
             .find(|entry| entry.is_tool_result())
             .expect("tool result");
+        // The in-memory tree is what the model reads, so it keeps the raw
+        // output (this session is not persisted). Redaction applies to the
+        // evidence written to disk below, and to session files (see
+        // tests/redaction.rs).
         let content = &entry.tool_result().expect("tool result data").content;
-        assert!(!content.contains(KEY), "{content}");
-        assert!(content.contains("[REDACTED:aws:AKIA..."), "{content}");
+        assert!(content.contains(KEY), "{content}");
+        assert!(!content.contains("[REDACTED"), "{content}");
     }
 
     let state = harness.core.security.lock().unwrap();
@@ -612,6 +627,46 @@ async fn duplicate_engine_ids_get_distinct_internal_ids_and_results() {
         .map(|call| call.id)
         .collect();
     assert_eq!(call_ids, ["call_0001", "call_0002"]);
+    assert_eq!(tool_results(&harness.session).len(), 2);
+}
+
+#[tokio::test]
+async fn whole_calls_on_a_reused_index_and_engine_id_stay_separate() {
+    // Some engines emit every call whole on index 0 with the same id. The
+    // accumulator must close the first call instead of splicing the second
+    // call's arguments onto it.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.rs"), "a\n").unwrap();
+    std::fs::write(dir.path().join("b.rs"), "b\n").unwrap();
+    let whole = |path: &str| StreamEvent::ToolCallDelta {
+        index: 0,
+        id: Some("call_1".into()),
+        name: Some("read".into()),
+        arguments: Some(json!({ "path": path }).to_string()),
+    };
+    let harness = harness(
+        dir.path(),
+        vec![
+            Script::Events(vec![
+                whole("a.rs"),
+                whole("b.rs"),
+                StreamEvent::Finish("tool_calls".into()),
+            ]),
+            text_script("done"),
+        ],
+        &["read"],
+    );
+    let (outcome, _) = run(&harness, "read both").await;
+    assert_eq!(outcome.status, TurnStatus::Done);
+    let calls: Vec<_> = assistants(&harness.session)
+        .into_iter()
+        .flat_map(|assistant| assistant.tool_calls.unwrap_or_default())
+        .collect();
+    assert_eq!(calls.len(), 2, "{calls:?}");
+    assert_eq!(calls[0].id, "call_0001");
+    assert_eq!(calls[1].id, "call_0002");
+    assert_eq!(calls[0].arguments, json!({"path": "a.rs"}));
+    assert_eq!(calls[1].arguments, json!({"path": "b.rs"}));
     assert_eq!(tool_results(&harness.session).len(), 2);
 }
 
@@ -2241,4 +2296,258 @@ async fn an_8k_window_compacts_once_between_a_tool_call_and_the_answer() {
     );
     drop(session);
     assert_eq!(last_assistant(&harness.session), "it computes values");
+}
+
+// ---------------------------------------------------------------------------
+// Multi-turn tool loops through the real HTTP client against scripted engine
+// fixtures. Each engine reports ids differently; the session must only ever
+// see the ledger's ids, and every request must pair each call with exactly
+// one result.
+// ---------------------------------------------------------------------------
+
+mod engines {
+    use super::*;
+    use axum::Router;
+    use axum::body::Body;
+    use axum::extract::State as AxumState;
+    use axum::http::header;
+    use axum::response::Response;
+    use axum::routing::post;
+    use localharness::provider::OpenAiCompatProvider;
+
+    #[derive(Clone, Default)]
+    struct Fake {
+        requests: Arc<Mutex<Vec<serde_json::Value>>>,
+        bodies: Arc<Mutex<VecDeque<String>>>,
+    }
+
+    async fn chat(AxumState(fake): AxumState<Fake>, body: String) -> Response {
+        fake.requests
+            .lock()
+            .unwrap()
+            .push(serde_json::from_str(&body).unwrap_or_default());
+        let body = fake.bodies.lock().unwrap().pop_front().unwrap_or_default();
+        let content_type = if body.trim_start().starts_with('{') {
+            "application/json"
+        } else {
+            "text/event-stream"
+        };
+        Response::builder()
+            .header(header::CONTENT_TYPE, content_type)
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    async fn serve(bodies: Vec<String>) -> (String, Fake) {
+        let fake = Fake {
+            bodies: Arc::new(Mutex::new(bodies.into())),
+            ..Fake::default()
+        };
+        let app = Router::new()
+            .route("/v1/chat/completions", post(chat))
+            .with_state(fake.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{address}"), fake)
+    }
+
+    fn sse(chunks: Vec<serde_json::Value>) -> String {
+        let mut out = String::new();
+        for chunk in chunks {
+            out.push_str(&format!("data: {chunk}\n\n"));
+        }
+        out.push_str("data: [DONE]\n\n");
+        out
+    }
+
+    fn delta(delta: serde_json::Value) -> serde_json::Value {
+        json!({"choices": [{"index": 0, "delta": delta}]})
+    }
+
+    fn done(reason: &str) -> serde_json::Value {
+        json!({"choices": [{"index": 0, "delta": {}, "finish_reason": reason}],
+               "usage": {"prompt_tokens": 50, "completion_tokens": 5, "total_tokens": 55}})
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Engine {
+        /// Fragmented arguments, explicit index, a fresh id per call that
+        /// restarts at the same value every request.
+        LlamaCpp,
+        /// vLLM with a Mistral model: whole calls, nine-character ids.
+        VllmMistral,
+        /// Ollama compatibility route: no id, no index.
+        Ollama,
+    }
+
+    impl Engine {
+        fn model(self) -> &'static str {
+            match self {
+                Engine::VllmMistral => "mistral-small-3.2",
+                _ => "test-model",
+            }
+        }
+
+        fn call(self, path: &str) -> String {
+            let args = json!({ "path": path }).to_string();
+            match self {
+                Engine::LlamaCpp => {
+                    let (head, tail) = args.split_at(args.len() / 2);
+                    sse(vec![
+                        delta(
+                            json!({"tool_calls": [{"index": 0, "id": "call_0", "type": "function",
+                            "function": {"name": "read", "arguments": ""}}]}),
+                        ),
+                        delta(
+                            json!({"tool_calls": [{"index": 0, "function": {"arguments": head}}]}),
+                        ),
+                        delta(
+                            json!({"tool_calls": [{"index": 0, "function": {"arguments": tail}}]}),
+                        ),
+                        done("tool_calls"),
+                    ])
+                }
+                Engine::VllmMistral => sse(vec![
+                    delta(
+                        json!({"tool_calls": [{"index": 0, "id": "aB3dE6gH9", "type": "function",
+                        "function": {"name": "read", "arguments": args}}]}),
+                    ),
+                    done("tool_calls"),
+                ]),
+                Engine::Ollama => sse(vec![
+                    delta(
+                        json!({"tool_calls": [{"function": {"name": "read", "arguments": args}}]}),
+                    ),
+                    done("tool_calls"),
+                ]),
+            }
+        }
+
+        fn text(self, text: &str) -> String {
+            sse(vec![delta(json!({ "content": text })), done("stop")])
+        }
+    }
+
+    /// Every assistant call in the request body has exactly one tool message,
+    /// and every tool message answers exactly one call.
+    fn assert_paired(body: &serde_json::Value, engine: Engine) {
+        let messages = body["messages"].as_array().expect("messages");
+        let mut calls = Vec::new();
+        let mut results = Vec::new();
+        for message in messages {
+            for call in message["tool_calls"].as_array().into_iter().flatten() {
+                calls.push(call["id"].as_str().unwrap().to_string());
+            }
+            if message["role"] == "tool" {
+                results.push(message["tool_call_id"].as_str().unwrap().to_string());
+            }
+        }
+        assert_eq!(
+            calls, results,
+            "{engine:?}: calls and results must pair 1:1 in order"
+        );
+        let mut unique = calls.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            calls.len(),
+            "{engine:?}: duplicate wire ids {calls:?}"
+        );
+        if matches!(engine, Engine::VllmMistral) {
+            for id in &calls {
+                assert!(
+                    id.len() == 9 && id.bytes().all(|b| b.is_ascii_alphanumeric()),
+                    "Mistral needs nine alphanumerics, got {id:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_multi_turn_tool_loop_survives_every_engine() {
+        for engine in [Engine::LlamaCpp, Engine::VllmMistral, Engine::Ollama] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("a.rs"), "a\n").unwrap();
+            std::fs::write(dir.path().join("b.rs"), "b\n").unwrap();
+            let (base, fake) = serve(vec![
+                engine.call("a.rs"),
+                engine.call("b.rs"),
+                engine.text("first done"),
+                engine.call("a.rs"),
+                engine.text("second done"),
+            ])
+            .await;
+            let mut config = base_config();
+            config.model.endpoint = base.clone();
+            config.model.model = engine.model().into();
+            config.profiles.get_mut("test").unwrap().tools = vec!["read".into()];
+            let provider =
+                Arc::new(OpenAiCompatProvider::new(&config.model, engine.model()).unwrap());
+            let (core, session) = build_core(dir.path(), config, Vec::new(), provider);
+            let harness = Harness {
+                core,
+                session,
+                provider: Arc::new(ScriptedProvider {
+                    scripts: Mutex::new(VecDeque::new()),
+                    requests: Mutex::new(Vec::new()),
+                    strict_system: AtomicBool::new(false),
+                }),
+            };
+            let (first, _) = run(&harness, "read a then b").await;
+            assert_eq!(
+                first.status,
+                TurnStatus::Done,
+                "{engine:?}: {:?}",
+                first.error
+            );
+            let (second, _) = run(&harness, "read a again").await;
+            assert_eq!(
+                second.status,
+                TurnStatus::Done,
+                "{engine:?}: {:?}",
+                second.error
+            );
+
+            let ids: Vec<String> = assistants(&harness.session)
+                .into_iter()
+                .flat_map(|assistant| assistant.tool_calls.unwrap_or_default())
+                .map(|call| call.id)
+                .collect();
+            assert_eq!(ids, ["call_0001", "call_0002", "call_0003"], "{engine:?}");
+            let results: Vec<String> = harness
+                .session
+                .lock()
+                .unwrap()
+                .branch_entries()
+                .into_iter()
+                .filter_map(|entry| match &entry.kind {
+                    EntryKind::ToolResult(result) => Some(result.call_id.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                results, ids,
+                "{engine:?}: one result per call, by internal id"
+            );
+
+            let requests = fake.requests.lock().unwrap().clone();
+            assert_eq!(requests.len(), 5, "{engine:?}");
+            for body in &requests {
+                assert_paired(body, engine);
+            }
+            // The last request replays all three calls.
+            let last = &requests[4];
+            let replayed = last["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|message| message["role"] == "tool")
+                .count();
+            assert_eq!(replayed, 3, "{engine:?}");
+        }
+    }
 }
