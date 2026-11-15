@@ -1201,14 +1201,26 @@ input characters. Missing input and unreadable files return prescriptive errors.
 - No telemetry, no analytics, no phone-home.
 - Endpoint defaults to `http://127.0.0.1:8080`. A non-local endpoint is allowed
   only when explicitly configured, with a warning.
-- Session entries, archived tool artifacts, evidence, and exported reports pass
-  through `security::redact` before they reach disk. Provider tokens, private
-  key blocks, bearer and high-entropy `Authorization` values, secret-like
-  `.env` assignments, and the exact values of `*TOKEN*`, `*SECRET*`, `*KEY*`,
-  and `*PASSWORD*` environment variables become
+- Session entries, archived tool artifacts, evidence, finding text, and
+  exported reports pass through `security::redact` before they reach disk.
+  Provider tokens, private key blocks, bearer and high-entropy `Authorization`
+  values, secret-like `.env` assignments (upper-case names; unquoted code
+  expressions are skipped), and the exact values of `*TOKEN*`, `*SECRET*`,
+  `*KEY*`, and `*PASSWORD*` environment variables become
   `[REDACTED:<kind>:<first4>...<hash8>]`. Evidence keeps `sha256` over the raw
   output and `stored_sha256` over the redacted artifact. `--no-redact` is the
-  explicit opt-out and is recorded in the session header. `--no-session`
+  explicit opt-out and is recorded in the session header.
+- Redaction is a persistence transform only. `Session::append` writes a
+  redacted copy to disk and keeps the raw entry in the in-memory tree that
+  prompts are built from. `ArtifactStore` writes the redacted file and keeps a
+  bounded in-memory copy of the raw text, so `recall` and `undo` read the
+  original in the live process. A placeholder in model-visible text gets
+  written back into files, so it must never come from the live path. After a
+  resume, replayed results that contain placeholders get a note, and
+  `tools::write::atomic_write` (shared by `write`, `edit`, `patch`, and
+  `undo`) refuses content that adds a placeholder the file does not already
+  hold. `Session::export_markdown` redacts a clone of each entry before
+  rendering, since the tree it reads is raw. `--no-session`
   disables session and artifact writes for sensitive engagements. It does not
   delete or disable an engagement file the user explicitly created; findings
   are separate, user-owned data.
@@ -1899,7 +1911,8 @@ These do not block implementation; defaults are specified.
   acceptable after Linux is stable.
 - **Multiple live sessions.** One active session per process in v1. Tabs or
   multiple windows are later.
-- **Redaction coverage.** Secret redaction is shape-based. Unknown credential
-  formats, secrets split across stream chunks, and live `bg` log files before
-  they are read as tool output are not guaranteed. `--no-redact` is explicit
+- **Redaction coverage.** Secret redaction is shape-based and applies to
+  disk only. Unknown credential formats, secrets split across stream chunks,
+  and live `bg` log files are not guaranteed. The endpoint sees raw tool
+  output by design. `--no-redact` is explicit
   and recorded; it is not a default.

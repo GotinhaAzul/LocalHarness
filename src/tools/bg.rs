@@ -336,8 +336,9 @@ impl BgTool {
         };
         // Dev servers and watchers color their output and redraw spinners;
         // resolve that before counting lines.
+        // Not redacted: this is model-facing. The session entry for this
+        // result is redacted when it is written to disk.
         let raw = crate::sanitize::terminal_output(&raw).into_owned();
-        let raw = ctx.artifacts.redact_owned(&raw);
         let body = tail_chars(&last_lines(&raw, lines), MAX_LOG_CHARS);
         let body = if body.is_empty() {
             "(log is empty; the process may not have written output yet)".to_string()
