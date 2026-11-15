@@ -78,6 +78,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("skill", "pick a skill and append its instructions"),
     ("workflow", "pick a workflow to start on a new branch"),
     ("sec", "engagement summary, scope, or report"),
+    ("approve", "approve the next sensitive action after a provenance warning"),
     ("trust", "show the trust state"),
     ("export", "write the branch as Markdown"),
     ("clear", "clear the transcript view"),
@@ -98,6 +99,7 @@ fn command_usage(name: &str) -> &'static str {
         "sec" => {
             "/sec [summary|report|scope add|remove <target>|scope clear]   (no argument: pick)"
         }
+        "approve" => "/approve   (after a provenance warning; one action)",
         "trust" => "/trust [confirm]",
         "commit" => "/commit [confirm|cancel|edit <message>]   (no argument: show or draft)",
         "pr" => "/pr [confirm|cancel]   (no argument: show the pending action)",
@@ -110,7 +112,7 @@ const HELP: &str = "\
 Commands: /help [command] /quit /login [endpoint] [model] [api-key] /model [name]
 /profile [name] /theme [name|save] /tree /fork /new /resume [id|last] /sessions
 /compact /tools /mcp /commit [confirm|cancel|edit <message>] /pr [confirm|cancel]
-/skill [name] /workflow [name] /sec [...] /trust [confirm] /export [path]
+/skill [name] /workflow [name] /sec [...] /approve /trust [confirm] /export [path]
 /clear /debug
 A command that chooses from a list opens a picker when run without an
 argument: type to filter, arrows to move, Enter to pick.
@@ -1466,6 +1468,24 @@ impl App {
             AgentEvent::Notice(message) => {
                 self.transcript.turn_note("notice", &message, false);
                 self.set_notice(message, Role::Muted);
+            }
+            AgentEvent::Provenance {
+                origin,
+                warning,
+                approval_required,
+                ..
+            } => {
+                if let Some(warning) = warning {
+                    self.transcript.turn_note("provenance", &warning, true);
+                    self.set_notice(
+                        if approval_required {
+                            format!("{origin}: injection warning; approve the next sensitive action with /approve")
+                        } else {
+                            format!("{origin}: injection warning")
+                        },
+                        Role::Warning,
+                    );
+                }
             }
             AgentEvent::Guard { code, message } => {
                 self.transcript.turn_note(&code, &message, true);

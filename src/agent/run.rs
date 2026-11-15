@@ -113,6 +113,27 @@ pub async fn run_turn(
         tool_mode: core.tool_mode_label().unwrap_or_default(),
     });
 
+    // Lifecycle hook: session_start runs once per session and may add context
+    // or block. A failed hook is visible; it never silently approves.
+    let session_hooks = crate::hooks::session_start(&hook_env(&core)).await;
+    hook_notices(&tx, &session_hooks);
+    if let Some(block) = session_hooks.blocked {
+        let message = format!(
+            "hook {:?} blocked session start: {}. Nothing ran.",
+            block.hook, block.reason
+        );
+        append_error(&core.session, "hook_block", &message, false);
+        let _ = tx.send(AgentEvent::Error {
+            code: "hook_block".into(),
+            message: message.clone(),
+            recoverable: false,
+        });
+        let outcome = TurnOutcome::ok(TurnStatus::Blocked);
+        let _ = tx.send(AgentEvent::State(AgentState::Error));
+        let _ = tx.send(AgentEvent::TurnDone(outcome.clone()));
+        return outcome;
+    }
+
     // Resolve the window and tokenizer after bring-up. A deferred startup
     // probe runs before the server exists, so the build-time values can be
     // fallbacks; this refresh is what keeps the first turn from budgeting
@@ -184,6 +205,28 @@ pub async fn run_turn(
     }
 
     let turn_start = core.session.lock().expect("session lock").active_leaf_id();
+
+    // Lifecycle hook: user_prompt may add context or block before the model
+    // sees the prompt.
+    let prompt_hooks = crate::hooks::user_prompt(&hook_env(&core), &user_text).await;
+    hook_notices(&tx, &prompt_hooks);
+    if let Some(block) = prompt_hooks.blocked {
+        let message = format!(
+            "hook {:?} blocked this prompt: {}. The model was not called.",
+            block.hook, block.reason
+        );
+        append_error(&core.session, "hook_block", &message, false);
+        let _ = tx.send(AgentEvent::Error {
+            code: "hook_block".into(),
+            message: message.clone(),
+            recoverable: false,
+        });
+        let outcome = TurnOutcome::ok(TurnStatus::Blocked);
+        let _ = tx.send(AgentEvent::State(AgentState::Error));
+        let _ = tx.send(AgentEvent::TurnDone(outcome.clone()));
+        return outcome;
+    }
+
     let outcome = run_loop(&core, &tx, &cancel, turn_start, turn).await;
     if let Ok(mut session) = core.session.lock()
         && let Err(err) = session.fsync()
@@ -198,6 +241,40 @@ pub async fn run_turn(
     }));
     let _ = tx.send(AgentEvent::TurnDone(outcome.clone()));
     outcome
+}
+
+/// A hook environment bound to this core's config, session, and artifacts.
+fn hook_env(core: &Core) -> crate::hooks::HookEnv<'_> {
+    let identity = crate::hooks::HookIdentity {
+        session_id: core
+            .session
+            .lock()
+            .map(|session| session.id.clone())
+            .unwrap_or_default(),
+        model: core.provider.model().to_string(),
+        profile: core.config.profile_name().to_string(),
+    };
+    crate::hooks::HookEnv {
+        config: &core.config.hooks,
+        cwd: &core.paths.cwd,
+        session: Some(&core.session),
+        artifacts: Some(core.artifacts.as_ref()),
+        identity,
+    }
+}
+
+/// Make hook failures and added context visible in the transcript.
+fn hook_notices(tx: &UnboundedSender<AgentEvent>, hooks: &crate::hooks::Outcome) {
+    for warning in &hooks.warnings {
+        let _ = tx.send(AgentEvent::Notice(format!("[hook] {warning}")));
+    }
+    for context in &hooks.contexts {
+        let _ = tx.send(AgentEvent::Notice(format!(
+            "[hook] {} added context ({} chars)",
+            context.hook,
+            context.text.chars().count()
+        )));
+    }
 }
 
 /// The configured window, if the model profile or `[model]` pins one.
@@ -401,6 +478,28 @@ async fn run_loop(
             } else {
                 "auto"
             };
+            // Lifecycle hook: pre_compact may add context or veto the
+            // compaction. It cannot change the budget.
+            let compact_hooks = crate::hooks::pre_compact(
+                &hook_env(core),
+                reason,
+                assembled.estimated_tokens,
+            )
+            .await;
+            hook_notices(tx, &compact_hooks);
+            if let Some(block) = compact_hooks.blocked {
+                let message = format!(
+                    "hook {:?} blocked compaction: {}. The prompt was not compacted.",
+                    block.hook, block.reason
+                );
+                append_error(&core.session, "hook_block", &message, true);
+                let _ = tx.send(AgentEvent::Error {
+                    code: "hook_block".into(),
+                    message,
+                    recoverable: true,
+                });
+                return TurnOutcome::ok(TurnStatus::Blocked);
+            }
             let mut result = compact_session(
                 &core.session,
                 findings.as_ref(),
@@ -724,6 +823,10 @@ async fn run_loop(
             );
             match gates::settle(&facts, &mut progress, gate_tools) {
                 SettleDecision::Done => {
+                    // Lifecycle hook: stop is advisory and cannot undo a
+                    // finished turn, but its failures and context are visible.
+                    let stop_hooks = crate::hooks::stop(&hook_env(core), "done").await;
+                    hook_notices(tx, &stop_hooks);
                     if gate_tools.verify
                         && verify_configured
                         && facts.unverified_mutations
@@ -773,6 +876,7 @@ async fn run_loop(
                             "the turn stopped at a no-progress checkpoint; this call did not run",
                         ),
                         None,
+                        Some(crate::provenance::tool_tag(&call.name)),
                     );
                 }
                 let message = progress.checkpoint_message(reason);
@@ -1621,6 +1725,7 @@ async fn execute_batch(
 
     let ctx = core.tool_context_with(cancel.clone());
     let active: Vec<&str> = core.tools.iter().map(|tool| tool.name()).collect();
+    let hooks = hook_env(core);
     for (position, original) in calls.iter().enumerate() {
         if core.model_profile.one_call && position > 0 {
             invalid_calls += 1;
@@ -1636,6 +1741,7 @@ async fn execute_batch(
                     ),
                 ),
                 None,
+                Some(crate::provenance::tool_tag(&original.name)),
             );
             continue;
         }
@@ -1647,6 +1753,7 @@ async fn execute_batch(
                     remaining,
                     &ToolResult::err("cancelled", "cancelled; this call did not run"),
                     None,
+                    Some(crate::provenance::tool_tag(&remaining.name)),
                 );
             }
             break;
@@ -1699,6 +1806,8 @@ async fn execute_batch(
         let mut evidence_args: Option<Value> = None;
         let mut result;
         let mut repaired = None;
+        let mut pre_context: Vec<(String, String)> = Vec::new();
+        let mut executed = false;
 
         if tool.is_none() {
             let hint = unknown_suggestion
@@ -1809,6 +1918,41 @@ async fn execute_batch(
                         result = ToolResult::err("permission_denied", message);
                     }
 
+                    // Lifecycle hook: pre_tool. It sees the repaired arguments
+                    // only after every harness gate above; it can block but
+                    // cannot change tools, scope, policy, or the endpoint.
+                    if !result.is_error {
+                        let pre = crate::hooks::pre_tool(&hooks, &call.name, &args).await;
+                        for warning in &pre.warnings {
+                            let _ = tx.send(AgentEvent::Notice(format!(
+                                "[hook] {warning}"
+                            )));
+                        }
+                        pre_context = pre
+                            .contexts
+                            .into_iter()
+                            .map(|context| (context.hook, context.text))
+                            .collect();
+                        if let Some(block) = pre.blocked {
+                            let message = format!(
+                                "hook {:?} blocked this {} call: {}. The call did not run.",
+                                block.hook, call.name, block.reason
+                            );
+                            let _ = tx.send(AgentEvent::Notice(message.clone()));
+                            result = ToolResult::err("hook_block", message);
+                        }
+                    }
+
+                    // Instruction provenance: an untrusted warning gates the
+                    // next sensitive action. This can only deny, never widen.
+                    if !result.is_error
+                        && let crate::provenance::Gate::Deny { code, message } =
+                            crate::provenance::check(core, call, &args).await
+                    {
+                        let _ = tx.send(AgentEvent::Notice(message.clone()));
+                        result = ToolResult::err(&code, message);
+                    }
+
                     if result.is_error {
                         // Keep the failure and skip execution.
                     } else {
@@ -1820,6 +1964,7 @@ async fn execute_batch(
                                 guard_trip = Some(("loop_guard".into(), reason));
                             }
                             LoopDecision::Ok => {
+                                executed = true;
                                 let fut = tool.as_ref().unwrap().call(&ctx, args.clone());
                                 tokio::select! {
                                     biased;
@@ -1848,9 +1993,86 @@ async fn execute_batch(
         }
 
         let duration_ms = started.elapsed().as_millis() as u64;
+
+        // Lifecycle hook: post_tool sees the raw result. Its context is added
+        // to the result; a block turns the result into an error.
+        if executed {
+            let hook_args = evidence_args.as_ref().unwrap_or(&call.arguments);
+            let post = crate::hooks::post_tool(
+                &hooks,
+                &call.name,
+                hook_args,
+                &result.content,
+                result.is_error,
+                duration_ms,
+            )
+            .await;
+            for warning in &post.warnings {
+                let _ = tx.send(AgentEvent::Notice(format!("[hook] {warning}")));
+                result.content = format!("[hook warning] {warning}\n\n{}", result.content);
+            }
+            for context in post.contexts {
+                result.content.push_str(&format!(
+                    "\n\n[hook context from {}]\n{}",
+                    context.hook, context.text
+                ));
+            }
+            if let Some(block) = post.blocked {
+                let message = format!(
+                    "hook {:?} blocked the {} result: {}. The change was not undone.",
+                    block.hook, call.name, block.reason
+                );
+                let _ = tx.send(AgentEvent::Notice(message.clone()));
+                result = ToolResult::err("hook_block", message);
+            }
+        }
+
+        // Instruction provenance: tag the result's source and warn on an
+        // instruction-shaped phrase in untrusted output. The detector only
+        // adds visible text and a pending approval gate; it never rewrites the
+        // content and never changes the tool set, scope, or endpoint.
+        let origin = crate::provenance::origin_for(core, &call.name);
+        let mut provenance_warning = None;
+        if executed && !result.is_error && crate::provenance::scans(&call.name) {
+            if let Some(detection) = crate::provenance::detect(&result.content) {
+                let line = crate::provenance::warning_line(&origin.tag(), &detection);
+                result.content = format!("{line}\n\n{}", result.content);
+                if let Ok(mut state) = core.provenance.lock() {
+                    state.note(&origin.tag(), &detection);
+                }
+                if let Ok(mut session) = core.session.lock() {
+                    let data = CustomData::new("provenance-warning")
+                        .with("origin", origin.tag())
+                        .with("patterns", json!(detection.patterns))
+                        .with("excerpt", detection.excerpt.clone())
+                        .with("approval", "required");
+                    if let Err(error) = session.append(EntryKind::Custom(data)) {
+                        tracing::warn!(%error, "cannot record the provenance warning");
+                    }
+                }
+                provenance_warning = Some(line);
+            }
+        }
+        {
+            let pending = core
+                .provenance
+                .lock()
+                .map(|state| state.pending().is_some())
+                .unwrap_or(false);
+            let _ = tx.send(AgentEvent::Provenance {
+                call_id: call.id.clone(),
+                origin: origin.tag(),
+                warning: provenance_warning,
+                approval_required: pending,
+            });
+        }
+
         let evidence_output = result.content.clone();
         if let Some(note) = routed_note {
             result.content = format!("{note}\n{}", result.content);
+        }
+        for (hook, text) in pre_context {
+            result.content = format!("[hook context from {hook}]\n{text}\n\n{}", result.content);
         }
         result.content = format!(
             "[tool] {} - {}\n{}",
@@ -1906,7 +2128,13 @@ async fn execute_batch(
             details: result.details.clone(),
         };
         let entry_id =
-            append_tool_result(&core.session, call, &tool_result, capped.artifact.clone());
+            append_tool_result(
+                &core.session,
+                call,
+                &tool_result,
+                capped.artifact.clone(),
+                Some(origin.tag()),
+            );
         if let (Some(tool), Some(args), Some(entry_id)) =
             (tool.as_deref(), evidence_args.as_ref(), entry_id.as_deref())
             && tool.evidence_enabled()
@@ -2025,6 +2253,7 @@ async fn execute_batch(
                     remaining,
                     &ToolResult::err("loop_guard", "not executed: the loop guard ended this turn"),
                     None,
+                    Some(crate::provenance::tool_tag(&remaining.name)),
                 );
             }
             break;
@@ -2320,15 +2549,19 @@ fn append_tool_result(
     call: &ToolCall,
     result: &ToolResult,
     artifact: Option<String>,
+    provenance: Option<String>,
 ) -> Option<String> {
     if let Ok(mut session) = session.lock() {
-        match session.append(EntryKind::ToolResult(ToolResultData {
-            call_id: call.id.clone(),
-            content: result.content.clone(),
-            is_error: result.is_error,
-            details: result.details.clone(),
-            artifact,
-        })) {
+        match session.append_tagged(
+            EntryKind::ToolResult(ToolResultData {
+                call_id: call.id.clone(),
+                content: result.content.clone(),
+                is_error: result.is_error,
+                details: result.details.clone(),
+                artifact,
+            }),
+            provenance,
+        ) {
             Ok(entry) => return Some(entry.id),
             Err(error) => tracing::warn!(%error, "tool result entry was not written"),
         }
@@ -2621,6 +2854,7 @@ mod tests {
             reads: Arc::new(Mutex::new(ReadTracker::default())),
             bg: Arc::new(Mutex::new(BgRegistry::new())),
             security: Arc::new(Mutex::new(SecurityState::default())),
+            provenance: Default::default(),
             sandbox: None,
             budget,
             static_prompt,

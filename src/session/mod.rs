@@ -55,7 +55,7 @@ impl Session {
                 next_seq: 1,
                 redactor: Redactor::new(redact),
             };
-            let header = session.make_entry(0, "s0", None, EntryKind::Session(header));
+            let header = session.make_entry(0, "s0", None, EntryKind::Session(header), None);
             session.tree.push(header);
             return Ok(session);
         }
@@ -88,7 +88,7 @@ impl Session {
             next_seq: 1,
             redactor: Redactor::new(redact),
         };
-        let header_entry = session.make_entry(0, "s0", None, EntryKind::Session(header));
+        let header_entry = session.make_entry(0, "s0", None, EntryKind::Session(header), None);
         session.write_entry(&header_entry)?;
         session.tree.push(header_entry);
         Ok(session)
@@ -231,10 +231,23 @@ impl Session {
         self.redactor.enabled()
     }
 
-    pub fn append(&mut self, mut kind: EntryKind) -> Result<Entry> {
+    pub fn append(&mut self, kind: EntryKind) -> Result<Entry> {
+        self.append_tagged(kind, None)
+    }
+
+    /// Append an entry with an explicit provenance tag. User entries default
+    /// to `user`; tool results pass `tool:<name>` or `external`.
+    pub fn append_tagged(
+        &mut self,
+        mut kind: EntryKind,
+        provenance: Option<String>,
+    ) -> Result<Entry> {
         let seq = self.next_seq;
         self.next_seq += 1;
         Self::redact_entry(&self.redactor, &mut kind);
+        let provenance = provenance.or_else(|| {
+            matches!(kind, EntryKind::User(_)).then(|| crate::provenance::USER.to_string())
+        });
         let checkout = matches!(kind, EntryKind::Checkout(_));
         let parent = if checkout {
             None
@@ -245,7 +258,7 @@ impl Session {
             }
         };
         let id = format!("{}{seq}", if checkout { 'c' } else { 'e' });
-        let entry = self.make_entry(seq, &id, parent, kind);
+        let entry = self.make_entry(seq, &id, parent, kind, provenance);
         self.write_entry(&entry)?;
         self.tree.push(entry.clone());
         Ok(entry)
@@ -403,13 +416,21 @@ impl Session {
         }
     }
 
-    fn make_entry(&self, seq: u64, id: &str, parent: Option<String>, kind: EntryKind) -> Entry {
+    fn make_entry(
+        &self,
+        seq: u64,
+        id: &str,
+        parent: Option<String>,
+        kind: EntryKind,
+        provenance: Option<String>,
+    ) -> Entry {
         Entry {
             v: FORMAT_VERSION,
             seq,
             id: id.to_string(),
             parent,
             ts: Utc::now(),
+            provenance,
             kind,
         }
     }

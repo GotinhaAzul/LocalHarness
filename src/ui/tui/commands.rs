@@ -47,6 +47,7 @@ impl App {
             "skill" => self.command_skill(rest),
             "workflow" => self.command_workflow(rest).await,
             "sec" => self.command_sec(rest),
+            "approve" => self.command_approve(),
             "trust" => self.command_trust(rest).await,
             "export" => self.command_export(rest),
             "clear" => self.command_clear(),
@@ -672,6 +673,35 @@ impl App {
             selected: 0,
             scroll: 0,
         }));
+    }
+
+    /// Approve exactly the next sensitive action after a provenance warning.
+    pub(super) fn command_approve(&mut self) {
+        let Some(runtime) = &self.runtime else {
+            return;
+        };
+        let pending = {
+            let mut state = runtime
+                .core
+                .provenance
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            state.approve()
+        };
+        match pending {
+            Some(pending) => self.set_notice(
+                format!(
+                    "approved the next sensitive action; warning from {} ({})",
+                    pending.origin,
+                    pending.patterns.join(", ")
+                ),
+                Role::Success,
+            ),
+            None => self.set_notice(
+                "no provenance warning is pending; nothing to approve",
+                Role::Muted,
+            ),
+        }
     }
 
     pub(super) fn command_mcp(&mut self) {

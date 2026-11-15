@@ -212,6 +212,7 @@ mod tests {
             id: id.into(),
             parent: parent.map(str::to_string),
             ts: Utc::now(),
+            provenance: None,
             kind,
         }
     }

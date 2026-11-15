@@ -332,6 +332,7 @@ mod tests {
             id: format!("e{seq}"),
             parent: parent.map(str::to_string),
             ts: Utc::now(),
+            provenance: None,
             kind,
         }
     }
@@ -389,6 +390,7 @@ mod tests {
             id: format!("c{seq}"),
             parent: None,
             ts: Utc::now(),
+            provenance: None,
             kind: EntryKind::Checkout(CheckoutData {
                 target: target.into(),
                 reason: "fork".into(),
