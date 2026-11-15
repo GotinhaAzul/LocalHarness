@@ -2245,13 +2245,15 @@ fn record_prompt_prefix(core: &Core) -> context::PromptPrefix {
         })
         .unwrap_or(false);
     if !unchanged {
+        let stable = super::prompt::stable_prefix_chars(&core.system_prompt);
+        let stable_chars = core.system_prompt[..stable].chars().count();
         append_custom(
             &core.session,
             "prompt-prefix",
             json!({
                 "hash": prefix.hash,
                 "chars": prefix.chars,
-                "stable_chars": super::prompt::stable_prefix_chars(&core.system_prompt),
+                "stable_chars": stable_chars,
                 "tools_chars": core.tool_specs_json.chars().count(),
             }),
         );
