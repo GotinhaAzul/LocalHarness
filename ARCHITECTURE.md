@@ -1097,8 +1097,11 @@ Feature flags: `coding`, `security`, `lsp`. The binary is a thin wrapper.
 - Output is capped and archived as an artifact when large. Every invocation is
   recorded as a `hook-invocation` custom entry with duration, outcome, and
   reason.
-- Hooks run after the harness gates. They cannot enable a denied tool or change
-  scope, the tool list, the endpoint, or the permission mode. `stop` runs when
+- `pre_tool` runs inside `authorize::decide` (§8.14), after the permission
+  policy and before the harness gates: a call the policy denies never reaches
+  a hook, and a hook block denies even a rule-allowed call before anyone is
+  asked. Hooks cannot enable a denied tool or change scope, the tool list, the
+  endpoint, or the permission mode. `stop` runs when
   the turn loop ends and is advisory because the turn has already stopped.
 - `lh hooks list` and `lh hooks test <name>` exercise hooks without a model
   turn. See `docs/hooks.md`.
@@ -1357,7 +1360,13 @@ decision point. `authorize::decide` returns `Allow`, `Ask` (exact subject plus
 preview), or `Deny` (code and reason) before any other gate; a deny stops the
 call at once and `authorize::confirm` resolves an ask after the harness gates
 pass. Lifecycle hooks and provenance checks add their inputs inside `decide`
-so the loop keeps one decision point.
+so the loop keeps one decision point: policy first (a deny skips the hooks),
+then `pre_tool` hooks (block or add context), then provenance. A deny from any
+source wins; hooks and provenance never turn an ask into an allow. A
+provenance approval that something could still grant (`/approve` already
+given, or a frontend approver attached) is resolved by
+`authorize::confirm_provenance` after the gates, so a call that fails
+`READ_FIRST` or scope never spends the approval.
 
 - Policy comes from the global config and, only when trusted, the project
   config. Rules from both are kept, global first. Skills, workflows, and the

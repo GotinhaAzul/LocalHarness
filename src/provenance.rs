@@ -485,29 +485,54 @@ pub enum Gate {
     Deny { code: String, message: String },
 }
 
-/// Dispatch-time provenance gate. Allow unless an untrusted warning is pending
-/// and this call is sensitive. An explicit `/approve` (or a frontend approver)
-/// permits exactly the next sensitive action; nothing here can add a tool or
-/// widen a policy.
-pub async fn check(core: &Core, call: &ToolCall, args: &Value) -> Gate {
+/// A provenance approval one call needs before it may run: an untrusted
+/// warning is pending and the call is sensitive. Built by [`assess`] without
+/// changing any state, so a call that a later harness gate refuses never
+/// consumes the user's `/approve`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Requirement {
+    pub pending: PendingWarning,
+    pub sensitivity: Sensitivity,
+    /// `/approve` already covers the next sensitive action.
+    pub approved: bool,
+}
+
+impl Requirement {
+    /// Whether [`resolve`] can only deny: nothing was approved and no
+    /// frontend approver can be asked.
+    pub fn certain_denial(&self, core: &Core) -> bool {
+        !self.approved && core.approver.is_none()
+    }
+}
+
+/// Pure half of the provenance gate, read by `authorize::decide`: `None`
+/// unless an untrusted warning is pending and this call is sensitive.
+pub fn assess(core: &Core, call: &ToolCall, args: &Value) -> Option<Requirement> {
     let (pending, approved) = {
-        let Ok(state) = core.provenance.lock() else {
-            return Gate::Allow;
-        };
-        (state.pending().cloned(), state.is_approved())
+        let state = core.provenance.lock().ok()?;
+        (state.pending().cloned()?, state.is_approved())
     };
-    let Some(pending) = pending else {
-        return Gate::Allow;
-    };
-    let origin = origin_for(core, &call.name);
-    let sensitivity = if origin == Origin::External {
-        Some(Sensitivity::Network)
+    let sensitivity = if origin_for(core, &call.name) == Origin::External {
+        Sensitivity::Network
     } else {
-        sensitivity(call, args, &core.paths.cwd)
+        sensitivity(call, args, &core.paths.cwd)?
     };
-    let Some(sensitivity) = sensitivity else {
-        return Gate::Allow;
-    };
+    Some(Requirement {
+        pending,
+        sensitivity,
+        approved,
+    })
+}
+
+/// Resolving half of the provenance gate, run once the harness gates passed.
+/// An explicit `/approve` (or a frontend approver) permits exactly this one
+/// sensitive action; nothing here can add a tool or widen a policy.
+pub async fn resolve(core: &Core, call: &ToolCall, args: &Value, required: Requirement) -> Gate {
+    let Requirement {
+        pending,
+        sensitivity,
+        approved,
+    } = required;
     if approved {
         if let Ok(mut state) = core.provenance.lock() {
             state.take_approved();
@@ -558,6 +583,15 @@ pub async fn check(core: &Core, call: &ToolCall, args: &Value) -> Gate {
             pending.excerpt,
             sensitivity.label()
         ),
+    }
+}
+
+/// Dispatch-time provenance gate in one step: [`assess`] then [`resolve`].
+/// Allow unless an untrusted warning is pending and this call is sensitive.
+pub async fn check(core: &Core, call: &ToolCall, args: &Value) -> Gate {
+    match assess(core, call, args) {
+        None => Gate::Allow,
+        Some(required) => resolve(core, call, args, required).await,
     }
 }
 

@@ -130,7 +130,10 @@ dispatch:
 - Untrusted content can never enable a denied tool, add a tool, change the
   endpoint, widen `/sec` scope, or change the permission mode. Hooks and
   provenance can only deny or add visible text; the enforcement is in the
-  dispatcher, not in prompt wording.
+  dispatcher, not in prompt wording. Both feed the same pre-dispatch decision
+  as the permission rules (`authorize::decide`): a deny from any of them wins,
+  so an allow rule cannot override a hook block or a pending provenance
+  warning. An approval is spent only by a call that passed every other gate.
 
 The detector is a speed bump, not a proof of safety. Encoded or paraphrased
 instructions may pass, and a warning only gates the next sensitive action.

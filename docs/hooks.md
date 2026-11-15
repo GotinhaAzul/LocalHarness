@@ -39,7 +39,7 @@ set defaults and cannot be hook names.
 |---|---|---|
 | `session_start` | once per session, before the first model call | load environment facts, announce a policy |
 | `user_prompt` | after the user message is recorded, before the model sees it | classify the request, add a reminder |
-| `pre_tool` | after the harness gates and before a tool runs | policy check, block a dangerous command |
+| `pre_tool` | after the permission policy allows or asks, before the harness gates and before any approval prompt | policy check, block a dangerous command |
 | `post_tool` | after a tool ran, before its result is stored | format the edited file, add a note |
 | `pre_compact` | before a deterministic compaction | record why context is being rebuilt |
 | `stop` | once when a turn ends, for every status | notifications, cleanup |

@@ -267,7 +267,7 @@ pub async fn run_turn(
 }
 
 /// A hook environment bound to this core's config, session, and artifacts.
-fn hook_env(core: &Core) -> crate::hooks::HookEnv<'_> {
+pub(crate) fn hook_env(core: &Core) -> crate::hooks::HookEnv<'_> {
     let identity = crate::hooks::HookIdentity {
         session_id: core
             .session
@@ -1814,7 +1814,6 @@ async fn execute_batch(
 
     let ctx = core.tool_context_with(cancel.clone());
     let active: Vec<&str> = core.tools.iter().map(|tool| tool.name()).collect();
-    let hooks = hook_env(core);
     for (position, original) in calls.iter().enumerate() {
         if core.model_profile.one_call && position > 0 {
             invalid_calls += 1;
@@ -1944,11 +1943,19 @@ async fn execute_batch(
                     repaired = Some(args.clone());
                     result = ToolResult::ok("");
 
-                    // Permission policy first: a denial (rule, plan mode)
-                    // stops the call before any other gate. An ask waits
-                    // until the harness gates pass.
+                    // The single pre-dispatch decision: permission policy,
+                    // `pre_tool` hooks, and provenance. A deny from any of
+                    // them stops the call before the harness gates. An ask
+                    // or a provenance approval waits until the gates pass.
+                    let verdict =
+                        super::authorize::decide(core, tool.as_deref().unwrap(), call, &args).await;
+                    for notice in verdict.notices {
+                        let _ = tx.send(AgentEvent::Notice(notice));
+                    }
+                    pre_notes.extend(verdict.notes);
+                    let mut pending_provenance = verdict.provenance;
                     let mut pending_ask = None;
-                    match super::authorize::decide(core, tool.as_deref().unwrap(), &args) {
+                    match verdict.decision {
                         crate::policy::Decision::Allow => {}
                         crate::policy::Decision::Ask(request) => pending_ask = Some(request),
                         crate::policy::Decision::Deny { code, message } => {
@@ -2039,39 +2046,15 @@ async fn execute_batch(
                         result = ToolResult::err("permission_denied", message);
                     }
 
-                    // Lifecycle hook: pre_tool. It sees the repaired arguments
-                    // only after every harness gate above; it can block but
-                    // cannot change tools, scope, policy, or the endpoint.
-                    if !result.is_error {
-                        let pre = crate::hooks::pre_tool(&hooks, &call.name, &args).await;
-                        for warning in &pre.warnings {
-                            let _ = tx.send(AgentEvent::Notice(format!("[hook] {warning}")));
-                            pre_notes.push(format!("[hook warning] {warning}"));
-                        }
-                        for context in pre.contexts {
-                            pre_notes.push(format!(
-                                "[hook context from {}]\n{}",
-                                context.hook, context.text
-                            ));
-                        }
-                        if let Some(block) = pre.blocked {
-                            let message = format!(
-                                "hook {:?} blocked this {} call: {}. The call did not run.",
-                                block.hook, call.name, block.reason
-                            );
-                            let _ = tx.send(AgentEvent::Notice(message.clone()));
-                            result = ToolResult::err("hook_block", message);
-                        }
-                    }
-
-                    // Instruction provenance: an untrusted warning gates the
-                    // next sensitive action. This can only deny, never widen.
+                    // Provenance approval decided above: spend `/approve` or
+                    // ask the frontend only now that the call can run.
                     if !result.is_error
-                        && let crate::provenance::Gate::Deny { code, message } =
-                            crate::provenance::check(core, call, &args).await
+                        && let Some(required) = pending_provenance.take()
+                        && let Err(denied) =
+                            super::authorize::confirm_provenance(core, call, &args, required).await
                     {
-                        let _ = tx.send(AgentEvent::Notice(message.clone()));
-                        result = ToolResult::err(&code, message);
+                        let _ = tx.send(AgentEvent::Notice(denied.content.clone()));
+                        result = denied;
                     }
 
                     if result.is_error {
@@ -2124,7 +2107,7 @@ async fn execute_batch(
         if executed {
             let hook_args = evidence_args.as_ref().unwrap_or(&call.arguments);
             let post = crate::hooks::post_tool(
-                &hooks,
+                &hook_env(core),
                 &call.name,
                 hook_args,
                 &result.content,

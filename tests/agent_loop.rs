@@ -3593,3 +3593,175 @@ mod engines {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// One pre-dispatch decision (#15 + #16 + #32): policy, hooks, and provenance
+// are combined in `authorize::decide`; a deny from any source wins.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_policy_deny_is_final_before_any_pre_tool_hook_runs() {
+    use localharness::policy::RuleAction;
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = base_config();
+    config.profiles.get_mut("test").unwrap().tools = vec!["bash".into()];
+    config.permissions.rules = vec![rule(
+        "no-push",
+        Some("bash"),
+        Some(r"\bgit\s+push\b"),
+        RuleAction::Deny,
+    )];
+    // This hook answers "allow" and tries to widen policy; it must not even
+    // be consulted for a call the policy already denied.
+    config.hooks.entries.insert(
+        "escalate".into(),
+        hook_config(HookEvent::PreTool, "allow_escalate.sh", 0),
+    );
+    let harness = harness_in_mode(
+        dir.path(),
+        vec![
+            tool_script("bash", json!({"command": "git push origin main"})),
+            text_script("not pushed"),
+        ],
+        config,
+        Vec::new(),
+        PermissionMode::Yolo,
+    );
+    let (outcome, _) = run(&harness, "push").await;
+    assert_eq!(outcome.status, TurnStatus::Done);
+    let results = tool_results(&harness.session);
+    assert!(results[0].contains("[DENIED]"), "{}", results[0]);
+    assert!(results[0].contains("no-push"), "{}", results[0]);
+    assert!(
+        hook_invocations(&harness.session, "pre_tool").is_empty(),
+        "a denied call must not reach the hooks"
+    );
+}
+
+#[tokio::test]
+async fn a_blocking_hook_beats_an_allow_rule_and_nobody_is_asked() {
+    use localharness::policy::RuleAction;
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = base_config();
+    config.profiles.get_mut("test").unwrap().tools = vec!["bash".into()];
+    config.permissions.rules = vec![rule(
+        "touch-ok",
+        Some("bash"),
+        Some("^touch "),
+        RuleAction::Allow,
+    )];
+    config.hooks.entries.insert(
+        "guard".into(),
+        hook_config(HookEvent::PreTool, "block_exit2.sh", 0),
+    );
+    let harness = harness_in_mode(
+        dir.path(),
+        vec![
+            tool_script("bash", json!({"command": "touch allowed.txt"})),
+            tool_script("bash", json!({"command": "make"})),
+            text_script("done"),
+        ],
+        config,
+        Vec::new(),
+        PermissionMode::Ask,
+    );
+    let asker = RecordingAsker::new(AskAnswer::Allow);
+    harness.core.permissions.set_asker(asker.clone());
+    let (outcome, _) = run(&harness, "go").await;
+    assert_eq!(outcome.status, TurnStatus::Done);
+    let results = tool_results(&harness.session);
+    // Allowed by rule, blocked by the hook.
+    assert!(results[0].contains("hook_block"), "{}", results[0]);
+    assert!(!dir.path().join("allowed.txt").exists());
+    // A policy ask, blocked by the hook: the user is never prompted.
+    assert!(results[1].contains("hook_block"), "{}", results[1]);
+    assert!(asker.subjects().is_empty(), "{:?}", asker.subjects());
+}
+
+#[tokio::test]
+async fn a_provenance_warning_beats_an_allow_rule_and_a_gated_call_keeps_the_approval() {
+    use localharness::policy::RuleAction;
+    let dir = tempfile::tempdir().unwrap();
+    readme_injection(dir.path());
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("other.txt"), "untouched\n").unwrap();
+    let outside_path = outside.path().join("other.txt").display().to_string();
+    let mut config = base_config();
+    config.profiles.get_mut("test").unwrap().tools =
+        vec!["read".into(), "edit".into(), "bash".into()];
+    config.permissions.rules = vec![rule("bash-ok", Some("bash"), None, RuleAction::Allow)];
+    let harness = harness_in_mode(
+        dir.path(),
+        vec![
+            // Turn 1: the README raises a warning; an allowed sensitive call
+            // is still refused.
+            tool_script("read", json!({"path": "README.md"})),
+            tool_script(
+                "bash",
+                json!({"command": "cat ~/definitely-missing > provenance-ran.txt"}),
+            ),
+            text_script("waiting"),
+            // Turn 2, after /approve: an edit outside the workspace fails
+            // READ_FIRST, so it must not spend the approval; the next
+            // sensitive call uses it.
+            tool_script(
+                "edit",
+                json!({"path": outside_path, "old": "untouched", "new": "changed"}),
+            ),
+            tool_script(
+                "bash",
+                json!({"command": "cat ~/definitely-missing > provenance-ran.txt"}),
+            ),
+            text_script("done"),
+        ],
+        config,
+        Vec::new(),
+        PermissionMode::Ask,
+    );
+
+    let (outcome, _) = run(&harness, "read the README").await;
+    assert_eq!(outcome.status, TurnStatus::Done);
+    let results = tool_results(&harness.session);
+    assert!(
+        results[1].contains("provenance_approval"),
+        "an allow rule cannot override the provenance gate: {}",
+        results[1]
+    );
+    assert!(!dir.path().join("provenance-ran.txt").exists());
+
+    harness
+        .core
+        .provenance
+        .lock()
+        .unwrap()
+        .approve()
+        .expect("a warning is pending");
+    let (outcome, _) = run(&harness, "continue").await;
+    assert_eq!(outcome.status, TurnStatus::Done);
+    let results = tool_results(&harness.session);
+    assert!(results[2].contains("READ_FIRST"), "{}", results[2]);
+    assert_eq!(
+        std::fs::read_to_string(&outside_path).unwrap(),
+        "untouched\n"
+    );
+    assert!(
+        !results[3].contains("provenance_approval"),
+        "the approval survived the gated edit: {}",
+        results[3]
+    );
+    assert!(dir.path().join("provenance-ran.txt").exists());
+    let session = harness.session.lock().unwrap();
+    let granted = session
+        .branch_entries()
+        .iter()
+        .filter(|entry| {
+            matches!(
+                &entry.kind,
+                EntryKind::Custom(custom)
+                    if custom.kind == "provenance-approval"
+                        && custom.payload.get("decision").and_then(|v| v.as_str()) == Some("granted")
+            )
+        })
+        .count();
+    assert_eq!(granted, 1);
+}
