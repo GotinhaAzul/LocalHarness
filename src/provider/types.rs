@@ -209,6 +209,11 @@ pub struct Usage {
     /// Engine-native count of context-shift events for this request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_shift: Option<u32>,
+    /// Completion tokens spent on reasoning: the server's
+    /// `completion_tokens_details.reasoning_tokens`, else estimated by the
+    /// harness from the reasoning text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u32>,
 }
 
 impl Usage {
@@ -239,6 +244,7 @@ impl Usage {
         self.tokens_per_sec = other.tokens_per_sec.or(self.tokens_per_sec);
         self.truncated = other.truncated.or(self.truncated);
         self.context_shift = other.context_shift.or(self.context_shift);
+        self.reasoning_tokens = other.reasoning_tokens.or(self.reasoning_tokens);
     }
 
     /// Share of the prompt reused from the server cache, 0-100.

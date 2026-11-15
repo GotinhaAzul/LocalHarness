@@ -9,6 +9,18 @@ use crate::paths::Paths;
 use crate::skills::SkillIndex;
 use crate::tools::{Tool, ToolPack, ToolRegistry};
 
+/// Heading that starts the volatile tail of the system prompt. Everything
+/// before it is byte-stable for a profile and tool list, so a local engine can
+/// reuse its prefix cache; the working directory and profile name live after
+/// it and cannot invalidate the stable head.
+pub const SESSION_FACTS_HEADING: &str = "## Session\n\n";
+
+/// Byte offset where the volatile session facts start. The whole prompt is
+/// stable when the heading is missing.
+pub fn stable_prefix_chars(prompt: &str) -> usize {
+    prompt.rfind(SESSION_FACTS_HEADING).unwrap_or(prompt.len())
+}
+
 pub fn build_system_prompt(
     config: &Config,
     paths: &Paths,
@@ -38,12 +50,6 @@ pub(crate) fn build_system_prompt_with_agents(
         out.push_str(identity);
         out.push_str("\n\n");
     }
-    out.push_str(&format!(
-        "Working directory: {}\nProfile: {}\n\n",
-        paths.cwd.display(),
-        config.profile_name()
-    ));
-
     if let Some(brief) = repo_brief
         && !brief.trim().is_empty()
     {
@@ -138,7 +144,16 @@ pub(crate) fn build_system_prompt_with_agents(
         out.push_str("\n\n");
     }
 
-    out.push_str("Work directly. Report what changed, what was verified, and what remains uncertain. Keep final answers concise.\n");
+    out.push_str("Work directly. Report what changed, what was verified, and what remains uncertain. Keep final answers concise.\n\n");
+
+    // Volatile facts go last: a timestamp, a cwd, or a branch name before the
+    // conversation would invalidate the engine's prefix cache on every turn.
+    out.push_str(SESSION_FACTS_HEADING);
+    out.push_str(&format!(
+        "Working directory: {}\nProfile: {}\n",
+        paths.cwd.display(),
+        config.profile_name()
+    ));
     out
 }
 
@@ -179,7 +194,7 @@ mod tests {
     use crate::tools::ToolRegistry;
 
     #[test]
-    fn prompt_contains_rules_and_ends_with_work_directly() {
+    fn prompt_contains_rules_and_ends_with_session_facts() {
         let dir = tempfile::tempdir().unwrap();
         let mut paths = Paths::discover(dir.path()).unwrap();
         paths.data_dir = dir.path().join("data");
@@ -203,6 +218,36 @@ mod tests {
         assert!(prompt.contains("Available tools (names only"));
         assert!(prompt.contains("read"));
         assert!(prompt.contains("Work directly"));
+        let facts = &prompt[stable_prefix_chars(&prompt)..];
+        assert!(facts.starts_with(SESSION_FACTS_HEADING));
+        assert!(facts.contains("Working directory:"));
+        assert!(facts.ends_with(&format!("Profile: {}\n", config.profile_name())));
+    }
+
+    #[test]
+    fn volatile_session_facts_sit_after_the_stable_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut paths = Paths::discover(dir.path()).unwrap();
+        paths.data_dir = dir.path().join("data");
+        paths.config_dir = dir.path().join("config");
+        let mut config = Config::builtin();
+        config.profile_name = "full".into();
+        let registry = ToolRegistry::builtin();
+        let tools = registry.select(config.profile(), &[]).unwrap();
+
+        let first = build_system_prompt(&config, &paths, &SkillIndex::bundled(), &tools, None);
+        paths.cwd = dir.path().join("another checkout");
+        let second = build_system_prompt(&config, &paths, &SkillIndex::bundled(), &tools, None);
+
+        let head = |prompt: &str| prompt[..stable_prefix_chars(prompt)].to_string();
+        assert_eq!(
+            head(&first),
+            head(&second),
+            "the stable head must not depend on the working directory"
+        );
+        assert_ne!(first, second, "the volatile tail must carry the cwd");
+        assert!(!head(&first).contains(&dir.path().display().to_string()));
+        assert!(first[stable_prefix_chars(&first)..].contains(&dir.path().display().to_string()));
     }
 
     #[test]
