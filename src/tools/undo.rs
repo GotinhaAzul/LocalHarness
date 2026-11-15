@@ -325,6 +325,62 @@ mod tests {
         std::fs::read_to_string(dir.path().join(name)).ok()
     }
 
+    /// Snapshots go to a persisted artifact store, where they are redacted.
+    /// Undo in the same process must still restore the exact bytes, and after
+    /// a restart (only the redacted file left) it must refuse.
+    #[tokio::test]
+    async fn undo_restores_redacted_snapshots_exactly_and_refuses_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let password = format!("pw-{:x}", std::process::id() as u64 * 7919 + 104_729);
+        let original = format!("DB_PASSWORD={password}\nname = Column(Text)\n");
+        std::fs::write(dir.path().join("settings.py"), &original).unwrap();
+        let mut ctx = test_context(dir.path());
+        let root = dir.path().join(".lh-artifacts");
+        ctx.artifacts = std::sync::Arc::new(
+            crate::session::ArtifactStore::new("s", Some(root.clone())).unwrap(),
+        );
+        ReadTool.call(&ctx, json!({"path": "settings.py"})).await;
+        let edited = mutate(
+            &ctx,
+            &EditTool,
+            json!({"path": "settings.py", "old": "Column(Text)", "new": "Column(String)"}),
+        )
+        .await;
+        assert!(!edited.is_error, "{}", edited.content);
+        let stored: String = std::fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .map(|entry| std::fs::read_to_string(entry.path()).unwrap_or_default())
+            .collect();
+        assert!(!stored.contains(&password), "snapshot kept the secret");
+
+        // Same process: exact restore.
+        let undone = mutate(&ctx, &UndoTool, json!({"path": "settings.py"})).await;
+        assert!(!undone.is_error, "{}", undone.content);
+        assert_eq!(on_disk(&dir, "settings.py").unwrap(), original);
+
+        // A later process only has the redacted snapshot: undo refuses
+        // rather than writing a placeholder into the file.
+        let redo = mutate(
+            &ctx,
+            &EditTool,
+            json!({"path": "settings.py", "old": "Column(Text)", "new": "Column(String)"}),
+        )
+        .await;
+        assert!(!redo.is_error, "{}", redo.content);
+        let before_undo = on_disk(&dir, "settings.py").unwrap();
+        ctx.artifacts =
+            std::sync::Arc::new(crate::session::ArtifactStore::new("s", Some(root)).unwrap());
+        let refused = mutate(&ctx, &UndoTool, json!({"path": "settings.py"})).await;
+        assert!(refused.is_error, "{}", refused.content);
+        assert!(
+            refused.content.contains("redaction placeholder"),
+            "{}",
+            refused.content
+        );
+        assert_eq!(on_disk(&dir, "settings.py").unwrap(), before_undo);
+    }
+
     #[tokio::test]
     async fn undo_steps_back_through_edits_one_at_a_time() {
         let dir = tempfile::tempdir().unwrap();

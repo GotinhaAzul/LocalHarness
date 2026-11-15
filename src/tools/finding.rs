@@ -104,14 +104,19 @@ impl FindingTool {
             }
         }
 
+        // `findings.jsonl` is written to disk. The model reads raw tool output
+        // and the auto-attached evidence comes from the raw session tree, so
+        // redact free text here. `target` is matched against scope and
+        // `poc_steps` are replayed, so both stay as given.
+        let redact = |text: String| ctx.artifacts.redact_owned(&text);
         let new = NewFinding {
-            title,
+            title: redact(title),
             severity,
             target,
-            evidence,
+            evidence: evidence.map(redact),
             evidence_ref,
-            impact: non_empty(args, "impact"),
-            remediation: non_empty(args, "remediation"),
+            impact: non_empty(args, "impact").map(redact),
+            remediation: non_empty(args, "remediation").map(redact),
             session_id,
             entry_id,
             poc_steps: parse_steps(args)?.unwrap_or_default(),
@@ -145,8 +150,10 @@ impl FindingTool {
         let mut patch = FindingPatch::default();
         let mut changed: Vec<&str> = Vec::new();
 
+        // Free text is redacted before it reaches `findings.jsonl`; see `add`.
+        let redact = |text: String| ctx.artifacts.redact_owned(&text);
         if let Some(title) = non_empty(args, "title") {
-            patch.title = Some(title);
+            patch.title = Some(redact(title));
             changed.push("title");
         }
         if let Some(severity) = non_empty(args, "severity") {
@@ -162,15 +169,15 @@ impl FindingTool {
             changed.push("target");
         }
         if let Some(evidence) = non_empty(args, "evidence") {
-            patch.evidence = Some(evidence);
+            patch.evidence = Some(redact(evidence));
             changed.push("evidence");
         }
         if let Some(impact) = non_empty(args, "impact") {
-            patch.impact = Some(impact);
+            patch.impact = Some(redact(impact));
             changed.push("impact");
         }
         if let Some(remediation) = non_empty(args, "remediation") {
-            patch.remediation = Some(remediation);
+            patch.remediation = Some(redact(remediation));
             changed.push("remediation");
         }
         if let Some(steps) = parse_steps(args)? {
@@ -1034,6 +1041,40 @@ mod tests {
         assert_eq!(reference.session.as_deref(), Some("ephemeral"));
         assert_eq!(reference.entry.as_deref(), Some("e1"));
         assert_eq!(reference.artifact.as_deref(), Some("art-7"));
+    }
+
+    #[tokio::test]
+    async fn finding_text_is_redacted_before_it_is_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(dir.path());
+        let key = format!("AKIA{}", "R".repeat(16));
+        let added = FindingTool
+            .call(
+                &ctx,
+                json!({
+                    "action": "add",
+                    "title": format!("Leaked key {key}"),
+                    "severity": "high",
+                    "target": "https://app.test/config",
+                    "evidence": format!("aws_access_key_id = {key}"),
+                    "impact": format!("anyone can use {key}"),
+                    "remediation": format!("rotate {key}"),
+                }),
+            )
+            .await;
+        assert!(!added.is_error, "{}", added.content);
+        let updated = FindingTool
+            .call(
+                &ctx,
+                json!({"action": "update", "id": "f1", "evidence": format!("again {key}")}),
+            )
+            .await;
+        assert!(!updated.is_error, "{}", updated.content);
+        let state = ctx.security.lock().unwrap();
+        let engagement = state.engagement.as_ref().unwrap();
+        let stored = std::fs::read_to_string(engagement.findings_path()).unwrap();
+        assert!(!stored.contains(&key), "{stored}");
+        assert!(stored.contains("[REDACTED:aws:AKIA..."), "{stored}");
     }
 
     #[tokio::test]

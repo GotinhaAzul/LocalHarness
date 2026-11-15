@@ -34,6 +34,7 @@ fn header(model: &str, session: &str) -> HeaderData {
         used: 12400,
         window: 64000,
         completion: 0,
+        reasoning: 0,
         tok_s: 24.0,
         cache: Some((940, 1000)),
         session: session.into(),

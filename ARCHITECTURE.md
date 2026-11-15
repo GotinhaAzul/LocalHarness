@@ -100,13 +100,48 @@ Streaming:
 
 - SSE frames: `data: {...}`, `data: [DONE]`, comments, CRLF, multi-line data,
   frames split across chunks, multiple frames per chunk.
-- Accumulate tool calls by `index`: `id`, `function.name`, and
-  `function.arguments` fragments. Handle providers that emit a complete call in
-  one frame.
-- Parse `usage` from the final chunk when present.
-- Parse `reasoning_content` and `reasoning` fields. A model profile decides
+- Accumulate tool calls in one state machine (`provider/accum.rs`): each call
+  is a slot that is `Open` while fragments for its stream index arrive and
+  `Closed` when the stream ends or a new whole call takes over the index (a
+  name plus arguments while the open arguments are already a complete JSON
+  object, or a different engine id). Handles SGLang fragments, vLLM whole
+  calls, Ollama calls without `id` or `index`, and object-valued `arguments`.
+- JSON is validated at close. When `finish_reason` is `length` (or
+  `max_tokens`) and a call's arguments are empty or incomplete, the turn fails
+  with `tool_call_truncated` and the call is never executed.
+- An in-stream `error` object (`{"error":{...}}` or `{"error":"..."}`) aborts
+  the turn with the server's message, even after an HTTP 200.
+- A server that ignores `stream: true` and answers `application/json` is
+  emitted as the same events, so streamed and non-streamed completions fold
+  into one normalized `Completion` (`fold_stream`).
+- Parse `usage` and llama.cpp `timings` from any chunk; reports are merged and
+  surfaced once per completion.
+- Parse reasoning from the configured `reasoning_field`, then
+  `reasoning_content`, `reasoning`, and `thinking`. Inline `<think>` blocks and gpt-oss
+  `<|channel|>analysis` messages join the same stream, and reasoning markup is
+  stripped from assistant content at context assembly. `usage` may carry
+  `reasoning_tokens` (reported, else estimated). A per-profile
+  `thinking = auto|on|off` policy merges `thinking_control` into `extra_body`
+  when thinking is off. A model profile decides
   whether reasoning is shown, kept in context, or stripped after the turn.
 - `finish_reason`: `stop`, `length`, `tool_calls`, `content_filter`.
+
+Tool-call ids:
+
+- The session never stores an engine id. `agent/calls.rs` (`CallLedger`)
+  assigns `call_0001`, `call_0002`, ... in arrival order, continuing after the
+  highest internal id anywhere in the session tree, so ids are unique and
+  sortable across turns, branches and compaction. The engine id is mapped to
+  the internal id for the current request only.
+- Before each request the replayed history must have exactly one result per
+  call and one call per result; otherwise the turn fails with a typed error
+  (`tool_result_missing`, `tool_result_duplicate`, `tool_result_orphan`,
+  `tool_call_duplicate`) and nothing is sent.
+- Ids are rendered per model at the wire: Mistral-family models
+  (`mistral_common` tokenizers) get nine alphanumerics (`call_0007` →
+  `000000007`; ids an older session stored are hashed to `z` + 8 characters).
+  Other models receive the internal id unchanged. Older session files replay
+  unchanged.
 
 ### 2.2 Optional probes
 
@@ -626,7 +661,7 @@ deletes entries.
 - `session-id` is `YYYYMMDD-HHMMSS-<pid>` or a short random suffix.
 - One advisory lock per session file. A second process refuses to write and
   names the lock holder.
-- Flush each entry to the file. `fsync` at turn end and after compaction.
+- Flush each entry to the file. `fsync` once at turn end; compactions inside a turn are covered by that fsync.
 - On load, ignore a malformed final line, drop orphan entries with a warning,
   and validate that every `parent` exists.
 - Export: `/export [path]` writes Markdown for the active branch. Findings have
@@ -1184,14 +1219,26 @@ input characters. Missing input and unreadable files return prescriptive errors.
 - No telemetry, no analytics, no phone-home.
 - Endpoint defaults to `http://127.0.0.1:8080`. A non-local endpoint is allowed
   only when explicitly configured, with a warning.
-- Session entries, archived tool artifacts, evidence, and exported reports pass
-  through `security::redact` before they reach disk. Provider tokens, private
-  key blocks, bearer and high-entropy `Authorization` values, secret-like
-  `.env` assignments, and the exact values of `*TOKEN*`, `*SECRET*`, `*KEY*`,
-  and `*PASSWORD*` environment variables become
+- Session entries, archived tool artifacts, evidence, finding text, and
+  exported reports pass through `security::redact` before they reach disk.
+  Provider tokens, private key blocks, bearer and high-entropy `Authorization`
+  values, secret-like `.env` assignments (upper-case names; unquoted code
+  expressions are skipped), and the exact values of `*TOKEN*`, `*SECRET*`,
+  `*KEY*`, and `*PASSWORD*` environment variables become
   `[REDACTED:<kind>:<first4>...<hash8>]`. Evidence keeps `sha256` over the raw
   output and `stored_sha256` over the redacted artifact. `--no-redact` is the
-  explicit opt-out and is recorded in the session header. `--no-session`
+  explicit opt-out and is recorded in the session header.
+- Redaction is a persistence transform only. `Session::append` writes a
+  redacted copy to disk and keeps the raw entry in the in-memory tree that
+  prompts are built from. `ArtifactStore` writes the redacted file and keeps a
+  bounded in-memory copy of the raw text, so `recall` and `undo` read the
+  original in the live process. A placeholder in model-visible text gets
+  written back into files, so it must never come from the live path. After a
+  resume, replayed results that contain placeholders get a note, and
+  `tools::write::atomic_write` (shared by `write`, `edit`, `patch`, and
+  `undo`) refuses content that adds a placeholder the file does not already
+  hold. `Session::export_markdown` redacts a clone of each entry before
+  rendering, since the tree it reads is raw. `--no-session`
   disables session and artifact writes for sensitive engagements. It does not
   delete or disable an engagement file the user explicitly created; findings
   are separate, user-owned data.
@@ -1601,6 +1648,7 @@ src/
   text.rs                 shared clipping, one-line, slug, byte excerpts
   provider/
     mod.rs                Provider trait and error types
+    accum.rs              tool-call accumulator and normalized completion
     openai.rs             OpenAI-compatible client
     sse.rs                SSE framing and parsing
     types.rs              request/response/stream types
@@ -1883,7 +1931,8 @@ These do not block implementation; defaults are specified.
   acceptable after Linux is stable.
 - **Multiple live sessions.** One active session per process in v1. Tabs or
   multiple windows are later.
-- **Redaction coverage.** Secret redaction is shape-based. Unknown credential
-  formats, secrets split across stream chunks, and live `bg` log files before
-  they are read as tool output are not guaranteed. `--no-redact` is explicit
+- **Redaction coverage.** Secret redaction is shape-based and applies to
+  disk only. Unknown credential formats, secrets split across stream chunks,
+  and live `bg` log files are not guaranteed. The endpoint sees raw tool
+  output by design. `--no-redact` is explicit
   and recorded; it is not a default.

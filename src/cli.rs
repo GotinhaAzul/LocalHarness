@@ -925,6 +925,7 @@ fn render_event(event: AgentEvent, json: bool) -> Result<Option<TurnStatus>> {
                     "completion_tokens":usage.completion_tokens,
                     "cached_tokens":usage.cached_tokens,
                     "cache_percent":usage.cache_percent(),
+                    "reasoning_tokens":usage.reasoning_tokens,
                 })
             }
             AgentEvent::Context { used, window } => {

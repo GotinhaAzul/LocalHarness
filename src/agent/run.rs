@@ -1,6 +1,6 @@
 //! One turn: stream the model, run tool batches, enforce guards, settle.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 use std::time::Instant;
 
@@ -13,7 +13,9 @@ use crate::context::compact::{
     FindingSummary, build_summary_keeping, recent_tail_start, summary_budget, tail_budget,
 };
 use crate::context::{self, BATCH_CAP_CHARS, StaticPrompt, TokenBudget, ToolSpecCost};
-use crate::provider::{ChatMessage, ChatRequest, ErrorClass, ProviderError, StreamEvent, Usage};
+use crate::provider::{
+    CallAccumulator, ChatMessage, ChatRequest, ErrorClass, ProviderError, StreamEvent, Usage,
+};
 use crate::session::{
     AssistantData, CompactionData, CustomData, EntryKind, ToolCall, ToolResultData, UserData,
 };
@@ -530,6 +532,21 @@ async fn run_loop(
         }
         let request_prefix =
             context::prompt_prefix(leading_system(&assembled), &core.tool_specs_json);
+        let extra_body = match core
+            .model_profile
+            .request_extra_body(!core.tool_specs.is_empty())
+        {
+            Ok(body) => body,
+            Err(message) => {
+                append_error(&core.session, "thinking_policy", &message, false);
+                let _ = tx.send(AgentEvent::Error {
+                    code: "thinking_policy".into(),
+                    message: message.clone(),
+                    recoverable: false,
+                });
+                return TurnOutcome::error("thinking_policy", message);
+            }
+        };
         let request = ChatRequest {
             model: core.provider.model().to_string(),
             messages,
@@ -546,11 +563,7 @@ async fn run_loop(
             // than the window holds makes some servers reject the request.
             max_tokens: budget.max_output_tokens,
             stop: core.model_profile.stop.clone(),
-            extra_body: core
-                .model_profile
-                .extra_body
-                .as_ref()
-                .and_then(|value| serde_json::to_value(value).ok()),
+            extra_body,
             include_usage: true,
             reasoning_field: core.model_profile.reasoning_field.clone(),
         };
@@ -1248,7 +1261,7 @@ fn recover_output(
             ));
         }
     } else if calls.is_empty() && content_empty {
-        out.nudge = Some("[localharness] empty response: you returned no text and no tool call. Make the next tool call, or give your final answer.".into());
+        out.nudge = Some("[localharness] empty response: you returned no text and no tool call (reasoning alone is not an answer). Make the next tool call, or give your final answer outside the reasoning block.".into());
     }
     out
 }
@@ -1256,7 +1269,7 @@ fn recover_output(
 struct StreamAccum {
     content: String,
     reasoning: String,
-    calls: BTreeMap<usize, PartialCall>,
+    calls: CallAccumulator,
     usage: Option<Usage>,
     finish: Option<String>,
     think: super::output::ThinkSplitter,
@@ -1264,24 +1277,21 @@ struct StreamAccum {
     reasoning_loop: super::output::RepetitionGuard,
     /// Set when the repetition guard stopped the stream.
     degenerate: bool,
+    /// The model profile's `strip_reasoning`: reasoning is shown live but
+    /// never persisted in the session entry.
+    strip_reasoning: bool,
     /// When the request was sent, and when tokens first and last arrived.
     sent: Instant,
     first_token: Option<Instant>,
     last_token: Option<Instant>,
 }
 
-#[derive(Default)]
-struct PartialCall {
-    id: String,
-    name: String,
-    arguments: String,
-}
-
 impl StreamAccum {
     /// Content streamed so far, without tool calls, for a cancelled or failed
     /// generation. Keeps the branch useful after an interruption.
     fn partial(&self) -> Option<AssistantData> {
-        if self.content.trim().is_empty() && self.reasoning.trim().is_empty() {
+        let keep_reasoning = !self.strip_reasoning && !self.reasoning.is_empty();
+        if self.content.trim().is_empty() && !keep_reasoning {
             return None;
         }
         Some(AssistantData {
@@ -1290,11 +1300,7 @@ impl StreamAccum {
             } else {
                 Some(self.content.clone())
             },
-            reasoning: if self.reasoning.is_empty() {
-                None
-            } else {
-                Some(self.reasoning.clone())
-            },
+            reasoning: keep_reasoning.then(|| self.reasoning.clone()),
             tool_calls: None,
             usage: self.usage.clone(),
             stop_reason: Some("cancelled".into()),
@@ -1305,13 +1311,14 @@ impl StreamAccum {
         Self {
             content: String::new(),
             reasoning: String::new(),
-            calls: BTreeMap::new(),
+            calls: CallAccumulator::new(),
             usage: None,
             finish: None,
             think: super::output::ThinkSplitter::default(),
             content_loop: super::output::RepetitionGuard::default(),
             reasoning_loop: super::output::RepetitionGuard::default(),
             degenerate: false,
+            strip_reasoning: false,
             sent: Instant::now(),
             first_token: None,
             last_token: None,
@@ -1345,6 +1352,35 @@ impl StreamAccum {
             if secs >= 0.2 {
                 usage.tokens_per_sec = Some((f64::from(usage.completion_tokens - 1) / secs) as f32);
             }
+        }
+    }
+
+    /// A reply that only reasoned (no text, no tool call) is a parser or
+    /// thinking-policy problem, not an answer: say so visibly. The loop's
+    /// empty-response nudge then retries instead of completing the turn.
+    fn warn_reasoning_only(&self, tx: &UnboundedSender<AgentEvent>) {
+        let cut_short = matches!(self.finish.as_deref(), Some("length") | Some("max_tokens"));
+        if self.content.trim().is_empty()
+            && !self.calls.has_named_call()
+            && !self.reasoning.trim().is_empty()
+            && !cut_short
+            && !self.degenerate
+        {
+            let _ = tx.send(AgentEvent::Guard {
+                code: "reasoning_only".into(),
+                message: "the model replied with reasoning only: no answer text and no tool call. Retrying with a nudge. If this repeats, the server's reasoning parser may be swallowing the answer or tool call (check reasoning_field and the engine's reasoning parser), or set thinking = \"off\" with a thinking_control in the model profile.".into(),
+            });
+        }
+    }
+
+    /// Count reasoning tokens from the text when the server reported usage
+    /// without them, so the token meter shows them for every engine.
+    fn estimate_reasoning_tokens(&mut self, budget: &TokenBudget) {
+        if let Some(usage) = self.usage.as_mut()
+            && usage.reasoning_tokens.is_none()
+            && !self.reasoning.trim().is_empty()
+        {
+            usage.reasoning_tokens = Some(budget.estimate_text(&self.reasoning));
         }
     }
 
@@ -1388,30 +1424,10 @@ impl StreamAccum {
     /// Other invalid JSON is left for the repair layer, which can fix common
     /// model mistakes.
     fn validate_calls(&self) -> Result<(), ProviderError> {
-        let cut_short = matches!(self.finish.as_deref(), Some("length") | Some("max_tokens"));
-        if self.degenerate || !cut_short {
+        if self.degenerate {
             return Ok(());
         }
-        for call in self.calls.values() {
-            if call.name.trim().is_empty() {
-                continue;
-            }
-            // A call cut off right after its name has no argument text at
-            // all. Finalization would turn that into `{}`, which can run a
-            // no-required-keys tool from a reply the output limit cut off.
-            if call.arguments.trim().is_empty()
-                || serde_json::from_str::<Value>(&call.arguments).is_err()
-            {
-                return Err(ProviderError::new(
-                    ErrorClass::ToolCallTruncated,
-                    format!(
-                        "the model hit the output token limit while writing the {:?} tool call; its arguments are incomplete and nothing was executed. Raise [model] max_output_tokens or split the call into smaller steps.",
-                        call.name
-                    ),
-                ));
-            }
-        }
-        Ok(())
+        self.calls.check_truncation(self.finish.as_deref())
     }
 
     /// Emit anything the think splitter held back, and move reasoning that a
@@ -1437,24 +1453,17 @@ impl StreamAccum {
 
     fn finalize(self, ledger: &mut CallLedger) -> AssistantData {
         let mut calls = Vec::new();
-        for call in self.calls.into_values() {
-            if call.name.trim().is_empty() {
-                continue;
-            }
+        // The engine id stops here: the session only ever sees the ledger's
+        // internal id, assigned in arrival order.
+        for call in self.calls.into_calls() {
             let internal_id = ledger.next_id();
-            if !call.id.trim().is_empty() {
-                ledger.map_engine_id(call.id.trim(), &internal_id);
+            if let Some(engine_id) = &call.engine_id {
+                ledger.map_engine_id(engine_id, &internal_id);
             }
-            let arguments = if call.arguments.trim().is_empty() {
-                json!({})
-            } else {
-                serde_json::from_str(&call.arguments)
-                    .unwrap_or_else(|_| Value::String(call.arguments.clone()))
-            };
             calls.push(ToolCall {
                 id: internal_id,
+                arguments: call.parsed_arguments(),
                 name: call.name,
-                arguments,
             });
         }
         AssistantData {
@@ -1463,7 +1472,7 @@ impl StreamAccum {
             } else {
                 Some(self.content)
             },
-            reasoning: if self.reasoning.is_empty() {
+            reasoning: if self.reasoning.is_empty() || self.strip_reasoning {
                 None
             } else {
                 Some(self.reasoning)
@@ -1504,6 +1513,7 @@ async fn stream_assistant(
         provider.chat_stream(request, etx, child).await;
     });
     let mut accum = StreamAccum::new();
+    accum.strip_reasoning = core.model_profile.strip_reasoning();
     let mut failure: Option<ProviderError> = None;
     while let Some(item) = erx.recv().await {
         if let Some(err) = handle_stream_item(
@@ -1527,6 +1537,8 @@ async fn stream_assistant(
     let _ = task.await;
     accum.settle_reasoning(tx);
     accum.measure();
+    accum.estimate_reasoning_tokens(budget);
+    accum.warn_reasoning_only(tx);
     if let Some(usage) = &accum.usage {
         let _ = tx.send(AgentEvent::Usage(usage.clone()));
     }
@@ -1583,16 +1595,9 @@ fn handle_stream_item(
             arguments,
         }) => {
             accum.token_arrived();
-            let call = accum.calls.entry(index).or_default();
-            if let Some(id) = id {
-                merge_fragment(&mut call.id, &id);
-            }
-            if let Some(name) = name {
-                merge_fragment(&mut call.name, &name);
-            }
-            if let Some(arguments) = arguments {
-                call.arguments.push_str(&arguments);
-            }
+            accum
+                .calls
+                .push(index, id.as_deref(), name.as_deref(), arguments.as_deref());
             None
         }
         Ok(StreamEvent::Usage(usage)) => {
@@ -1617,15 +1622,6 @@ fn handle_stream_item(
             accum.finish = Some(reason);
             None
         }
-    }
-}
-
-fn merge_fragment(buffer: &mut String, fragment: &str) {
-    if fragment.is_empty() {
-        return;
-    }
-    if buffer.is_empty() || !buffer.ends_with(fragment) {
-        buffer.push_str(fragment);
     }
 }
 
@@ -2633,7 +2629,8 @@ fn compact_session(
         thread_id,
         keep_from: keep_from.clone(),
     }))?;
-    session.fsync()?;
+    // No fsync here: compaction runs inside a turn and the turn end fsyncs
+    // once, so a turn that compacts costs one fsync, not one per compaction.
     Ok(Compacted {
         summary: summary.summary,
         tokens_before: summary.tokens_before,
@@ -2905,21 +2902,9 @@ mod tests {
     }
 
     #[test]
-    fn merge_fragment_handles_repeats() {
-        let mut buffer = String::new();
-        merge_fragment(&mut buffer, "read");
-        merge_fragment(&mut buffer, "read");
-        assert_eq!(buffer, "read");
-        merge_fragment(&mut buffer, "_file");
-        assert_eq!(buffer, "read_file");
-    }
-
-    #[test]
     fn partial_call_finalizes_with_synthetic_id_and_bad_json() {
         let mut accum = StreamAccum::new();
-        let call = accum.calls.entry(0).or_default();
-        call.name = "read".into();
-        call.arguments = "{not json".into();
+        accum.calls.push(0, None, Some("read"), Some("{not json"));
         let mut ledger = CallLedger::default();
         let assistant = accum.finalize(&mut ledger);
         let calls = assistant.tool_calls.unwrap();
@@ -2928,7 +2913,7 @@ mod tests {
         // Ids must not repeat across messages, or replayed history pairs a
         // call with another call's result.
         let mut again = StreamAccum::new();
-        again.calls.entry(0).or_default().name = "read".into();
+        again.calls.push(0, None, Some("read"), None);
         let second = again.finalize(&mut ledger).tool_calls.unwrap();
         assert_eq!(second[0].id, "call_0002");
         assert_ne!(calls[0].id, second[0].id);
@@ -2938,9 +2923,12 @@ mod tests {
     fn a_length_cut_invalid_call_is_rejected_before_dispatch() {
         let mut accum = StreamAccum::new();
         accum.finish = Some("length".into());
-        let call = accum.calls.entry(0).or_default();
-        call.name = "write".into();
-        call.arguments = "{\"path\":\"big.rs\",\"content\":\"fn a".into();
+        accum.calls.push(
+            0,
+            None,
+            Some("write"),
+            Some("{\"path\":\"big.rs\",\"content\":\"fn a"),
+        );
         let err = accum.validate_calls().expect_err("truncated call");
         assert_eq!(err.class, ErrorClass::ToolCallTruncated);
         assert!(err.message.contains("incomplete"), "{}", err.message);
@@ -2951,10 +2939,8 @@ mod tests {
     fn a_length_cut_call_without_arguments_is_rejected() {
         let mut accum = StreamAccum::new();
         accum.finish = Some("max_tokens".into());
-        let call = accum.calls.entry(0).or_default();
         // The stream stopped after the name, before any argument text.
-        call.name = "todo".into();
-        assert!(call.arguments.is_empty());
+        accum.calls.push(0, None, Some("todo"), None);
         let err = accum.validate_calls().expect_err("truncated call");
         assert_eq!(err.class, ErrorClass::ToolCallTruncated);
         assert!(err.message.contains("incomplete"), "{}", err.message);
@@ -2964,9 +2950,9 @@ mod tests {
     fn a_complete_call_is_not_rejected_at_the_output_limit() {
         let mut accum = StreamAccum::new();
         accum.finish = Some("length".into());
-        let call = accum.calls.entry(0).or_default();
-        call.name = "read".into();
-        call.arguments = "{\"path\":\"a.rs\"}".into();
+        accum
+            .calls
+            .push(0, None, Some("read"), Some("{\"path\":\"a.rs\"}"));
         assert!(accum.validate_calls().is_ok());
     }
 

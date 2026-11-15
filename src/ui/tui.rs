@@ -443,6 +443,7 @@ impl App {
             used,
             window,
             completion: 0,
+            reasoning: 0,
             tok_s: 0.0,
             cache: None,
             session: short_session_id(&session_id),
@@ -1271,6 +1272,7 @@ impl App {
         self.stream_phase = StreamPhase::Waiting;
         self.running_tools.clear();
         self.completion_tokens = 0;
+        self.header.reasoning = 0;
         self.tok_s = 0.0;
         self.token_events.clear();
         self.notice = None;
@@ -1428,6 +1430,7 @@ impl App {
                 }
                 self.completion_tokens = usage.completion_tokens;
                 self.header.completion = usage.completion_tokens;
+                self.header.reasoning = usage.reasoning_tokens.unwrap_or(0);
                 self.last_usage = Some(usage);
             }
             AgentEvent::Context { used, window } => {

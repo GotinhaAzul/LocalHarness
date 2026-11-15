@@ -15,8 +15,10 @@ use bytes::Bytes;
 use futures_util::stream;
 use localharness::config::ModelConfig;
 use localharness::provider::{
-    ChatMessage, ChatRequest, ErrorClass, OpenAiCompatProvider, StreamEvent, collect_stream,
+    ChatMessage, ChatRequest, Completion, ErrorClass, OpenAiCompatProvider, StreamEvent, ToolCall,
+    Usage, collect_stream, fold_stream,
 };
+use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone)]
@@ -46,10 +48,13 @@ async fn chat(AxumState(state): AxumState<FakeState>, body: String) -> Response 
             .unwrap();
     };
     let mut builder = Response::builder().status(script.status);
-    builder = builder.header(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("text/event-stream"),
-    );
+    // A body that is one JSON object is a non-streamed completion.
+    let content_type = if script.body.trim_start().starts_with('{') {
+        "application/json"
+    } else {
+        "text/event-stream"
+    };
+    builder = builder.header(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
     if script.chunked {
         let bytes = script.body.into_bytes();
         let chunks: Vec<Result<Bytes, Infallible>> = bytes
@@ -564,4 +569,349 @@ async fn cancellation_mid_stream_returns_cancelled() {
         .find_map(|event| event.err())
         .expect("cancellation should surface as an error");
     assert_eq!(error.class, ErrorClass::Cancelled);
+}
+
+#[tokio::test]
+async fn a_thinking_only_chunk_becomes_reasoning() {
+    let (base, state) = spawn().await;
+    state.script.lock().unwrap().push_back(Script {
+        status: 200,
+        body: concat!(
+            "data: {\"choices\":[{\"delta\":{\"thinking\":\"ponder\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        )
+        .into(),
+        chunked: false,
+    });
+    let events = collect_stream(&provider(&base), request(), CancellationToken::new()).await;
+    let reasoning: Vec<String> = events
+        .into_iter()
+        .filter_map(|event| match event.expect("stream item") {
+            StreamEvent::ReasoningDelta(text) => Some(text),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(reasoning, vec!["ponder".to_string()]);
+}
+
+// ---------------------------------------------------------------------------
+// Engine fixtures. One logical completion (reasoning, text, two tool calls,
+// usage) rendered the way each engine streams it. Every fixture must fold into
+// the same normalized `Completion`, and so must the non-streamed body.
+// ---------------------------------------------------------------------------
+
+const READ_ARGS: &str = r#"{"path":"src/main.rs"}"#;
+const WRITE_ARGS: &str =
+    r#"{"path":"notes.md","content":"line one\nline \"two\" with unicode: café ✓\n"}"#;
+
+fn sse(chunks: &[serde_json::Value]) -> String {
+    let mut body = String::new();
+    for chunk in chunks {
+        body.push_str("data: ");
+        body.push_str(&chunk.to_string());
+        body.push_str("\n\n");
+    }
+    body.push_str("data: [DONE]\n\n");
+    body
+}
+
+/// Split `text` into `parts` pieces on char boundaries.
+fn pieces(text: &str, parts: usize) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    assert!(chars.len() >= parts);
+    (0..parts)
+        .map(|part| {
+            let start = part * chars.len() / parts;
+            let end = (part + 1) * chars.len() / parts;
+            chars[start..end].iter().collect()
+        })
+        .collect()
+}
+
+fn usage_json(completion: u32) -> serde_json::Value {
+    json!({"prompt_tokens": 120, "completion_tokens": completion, "total_tokens": 120 + completion})
+}
+
+fn delta(delta: serde_json::Value) -> serde_json::Value {
+    json!({"choices": [{"index": 0, "delta": delta}]})
+}
+
+fn finish(reason: &str) -> serde_json::Value {
+    json!({"choices": [{"index": 0, "delta": {}, "finish_reason": reason}]})
+}
+
+/// SGLang / llama.cpp style: explicit indices, id and name on the first
+/// fragment, arguments in 20 pieces each.
+fn fragmented_fixture(id_prefix: &str, repeat_usage: bool) -> String {
+    let mut chunks = vec![
+        delta(json!({"role": "assistant", "reasoning_content": "pl"})),
+        delta(json!({"reasoning_content": "an"})),
+    ];
+    for piece in pieces("Reading both.", 5) {
+        chunks.push(delta(json!({ "content": piece })));
+    }
+    for (index, (name, args)) in [("read", READ_ARGS), ("write", WRITE_ARGS)]
+        .into_iter()
+        .enumerate()
+    {
+        for (position, piece) in pieces(args, 20).into_iter().enumerate() {
+            let call = if position == 0 {
+                json!({"index": index, "id": format!("{id_prefix}{index}"), "type": "function",
+                       "function": {"name": name, "arguments": piece}})
+            } else {
+                json!({"index": index, "function": {"arguments": piece}})
+            };
+            chunks.push(delta(json!({ "tool_calls": [call] })));
+        }
+    }
+    chunks.push(finish("tool_calls"));
+    if repeat_usage {
+        // llama.cpp-style: a cumulative usage report on many chunks.
+        let count = chunks.len() as u32;
+        for (position, chunk) in chunks.iter_mut().enumerate() {
+            let so_far = (40 * (position as u32 + 1)) / count;
+            chunk["usage"] = usage_json(so_far.max(1));
+        }
+    } else {
+        chunks.push(json!({"choices": [], "usage": usage_json(40)}));
+    }
+    sse(&chunks)
+}
+
+/// vLLM style: each call arrives whole once its region parses.
+fn whole_call_fixture() -> String {
+    sse(&[
+        delta(json!({"role": "assistant", "reasoning_content": "plan"})),
+        delta(json!({"content": "Reading both."})),
+        delta(
+            json!({"tool_calls": [{"index": 0, "id": "chatcmpl-tool-9f1e", "type": "function",
+            "function": {"name": "read", "arguments": READ_ARGS}}]}),
+        ),
+        delta(
+            json!({"tool_calls": [{"index": 1, "id": "chatcmpl-tool-77ab", "type": "function",
+            "function": {"name": "write", "arguments": WRITE_ARGS}}]}),
+        ),
+        finish("tool_calls"),
+        json!({"choices": [], "usage": usage_json(40)}),
+    ])
+}
+
+/// Ollama compatibility route: no ids, no indices, reasoning in `reasoning`,
+/// thinking, content and calls gathered across chunks.
+fn ollama_fixture() -> String {
+    sse(&[
+        delta(json!({"role": "assistant", "reasoning": "pl"})),
+        delta(json!({"reasoning": "an"})),
+        delta(json!({"content": "Reading "})),
+        delta(json!({"content": "both."})),
+        delta(json!({"tool_calls": [{"function": {"name": "read", "arguments": READ_ARGS}}]})),
+        delta(json!({"tool_calls": [{"function": {"name": "write", "arguments": WRITE_ARGS}}]})),
+        finish("tool_calls"),
+        json!({"choices": [], "usage": usage_json(40)}),
+    ])
+}
+
+/// The same completion as one non-streamed body (`stream` ignored).
+fn non_streamed_fixture() -> String {
+    json!({
+        "id": "chatcmpl-1",
+        "object": "chat.completion",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "reasoning_content": "plan",
+                "content": "Reading both.",
+                "tool_calls": [
+                    {"id": "call_x", "type": "function", "function": {"name": "read", "arguments": READ_ARGS}},
+                    {"id": "call_y", "type": "function", "function": {"name": "write", "arguments": WRITE_ARGS}}
+                ]
+            },
+            "finish_reason": "tool_calls"
+        }],
+        "usage": usage_json(40)
+    })
+    .to_string()
+}
+
+async fn fold(
+    body: &str,
+    chunked: bool,
+) -> Result<Completion, localharness::provider::ProviderError> {
+    let (base, state) = spawn().await;
+    state.script.lock().unwrap().push_back(Script {
+        status: 200,
+        body: body.into(),
+        chunked,
+    });
+    let events = collect_stream(&provider(&base), request(), CancellationToken::new()).await;
+    fold_stream(events)
+}
+
+/// Engine ids are per-engine noise; the ledger replaces them.
+fn without_engine_ids(mut completion: Completion) -> Completion {
+    for call in &mut completion.calls {
+        call.engine_id = None;
+    }
+    completion
+}
+
+#[tokio::test]
+async fn every_engine_fixture_folds_into_the_same_completion() {
+    let expected = Completion {
+        content: "Reading both.".into(),
+        reasoning: "plan".into(),
+        calls: vec![
+            localharness::provider::AssembledCall {
+                engine_id: None,
+                name: "read".into(),
+                arguments: READ_ARGS.into(),
+            },
+            localharness::provider::AssembledCall {
+                engine_id: None,
+                name: "write".into(),
+                arguments: WRITE_ARGS.into(),
+            },
+        ],
+        usage: Some(Usage::new(120, 40)),
+        finish: Some("tool_calls".into()),
+    };
+    let fixtures = [
+        ("sglang", fragmented_fixture("call_", false)),
+        ("llama.cpp", fragmented_fixture("", true)),
+        ("vllm", whole_call_fixture()),
+        ("ollama", ollama_fixture()),
+    ];
+    for (engine, body) in &fixtures {
+        // Byte-chunked transport on top of the engine's own fragmentation.
+        for chunked in [false, true] {
+            let completion = fold(body, chunked)
+                .await
+                .unwrap_or_else(|err| panic!("{engine}: {err}"));
+            assert_eq!(
+                without_engine_ids(completion),
+                expected,
+                "{engine} chunked={chunked}"
+            );
+        }
+    }
+    let full = fold(&non_streamed_fixture(), false)
+        .await
+        .expect("non-streamed");
+    assert_eq!(full.calls[0].engine_id.as_deref(), Some("call_x"));
+    assert_eq!(without_engine_ids(full), expected, "non-streamed body");
+}
+
+#[tokio::test]
+async fn fragmented_fixtures_split_each_call_into_twenty_chunks() {
+    let body = fragmented_fixture("call_", false);
+    let (base, state) = spawn().await;
+    state.script.lock().unwrap().push_back(Script {
+        status: 200,
+        body,
+        chunked: true,
+    });
+    let events = collect_stream(&provider(&base), request(), CancellationToken::new()).await;
+    let calls = tool_deltas(events);
+    assert_eq!(calls.iter().filter(|call| call.0 == 0).count(), 20);
+    assert_eq!(calls.iter().filter(|call| call.0 == 1).count(), 20);
+}
+
+#[tokio::test]
+async fn repeated_usage_reports_fold_into_one() {
+    let (base, state) = spawn().await;
+    state.script.lock().unwrap().push_back(Script {
+        status: 200,
+        body: fragmented_fixture("", true),
+        chunked: false,
+    });
+    let events = collect_stream(&provider(&base), request(), CancellationToken::new()).await;
+    let reports = events
+        .iter()
+        .filter(|event| matches!(event, Ok(StreamEvent::Usage(_))))
+        .count();
+    assert!(reports > 1, "the fixture repeats usage");
+    let completion = fold_stream(events).unwrap();
+    assert_eq!(completion.usage, Some(Usage::new(120, 40)));
+}
+
+#[tokio::test]
+async fn a_call_cut_by_the_output_limit_is_truncated_on_every_shape() {
+    let cut = &WRITE_ARGS[..WRITE_ARGS.len() / 2];
+    let streamed = sse(&[
+        delta(
+            json!({"tool_calls": [{"index": 0, "id": "c0", "function": {"name": "write", "arguments": cut}}]}),
+        ),
+        finish("length"),
+    ]);
+    let full = json!({"choices": [{"message": {"role": "assistant", "tool_calls": [
+        {"id": "c0", "type": "function", "function": {"name": "write", "arguments": cut}}
+    ]}, "finish_reason": "length"}]})
+    .to_string();
+    for body in [streamed, full] {
+        let err = fold(&body, true).await.expect_err("truncated");
+        assert_eq!(err.class, ErrorClass::ToolCallTruncated);
+        assert_eq!(err.class.code(), "tool_call_truncated");
+    }
+}
+
+#[tokio::test]
+async fn an_error_object_after_tool_fragments_aborts_the_completion() {
+    let body = sse(&[
+        delta(
+            json!({"tool_calls": [{"index": 0, "id": "c0", "function": {"name": "read", "arguments": "{\"pa"}}]}),
+        ),
+        json!({"error": "model crashed while generating"}),
+    ]);
+    let err = fold(&body, true).await.expect_err("in-stream error");
+    assert_eq!(err.message, "model crashed while generating");
+    let full = json!({"error": {"message": "out of memory", "type": "server_error"}}).to_string();
+    let err = fold(&full, false).await.expect_err("error body");
+    assert_eq!(err.message, "out of memory");
+}
+
+#[tokio::test]
+async fn object_arguments_from_a_gateway_are_accepted() {
+    let body = sse(&[
+        delta(
+            json!({"tool_calls": [{"function": {"name": "read", "arguments": {"path": "src/main.rs"}}}]}),
+        ),
+        finish("tool_calls"),
+    ]);
+    let completion = fold(&body, false).await.unwrap();
+    assert_eq!(completion.calls[0].arguments, READ_ARGS);
+}
+
+#[tokio::test]
+async fn mistral_models_receive_nine_character_call_ids() {
+    let (base, state) = spawn().await;
+    state.script.lock().unwrap().push_back(Script {
+        status: 200,
+        body: SSE_OK.into(),
+        chunked: false,
+    });
+    let config = ModelConfig {
+        endpoint: base.clone(),
+        ..ModelConfig::default()
+    };
+    let provider = OpenAiCompatProvider::new(&config, "mistral-small-3.2").unwrap();
+    let mut req = request();
+    req.model = "mistral-small-3.2".into();
+    req.messages.push(ChatMessage::Assistant {
+        content: None,
+        tool_calls: vec![ToolCall {
+            id: "call_0001".into(),
+            name: "read".into(),
+            arguments: json!({"path": "a.rs"}),
+        }],
+    });
+    req.messages.push(ChatMessage::Tool {
+        call_id: "call_0001".into(),
+        content: "ok".into(),
+    });
+    collect_stream(&provider, req, CancellationToken::new()).await;
+    let sent = state.requests.lock().unwrap()[0].clone();
+    assert_eq!(sent["messages"][1]["tool_calls"][0]["id"], "000000001");
+    assert_eq!(sent["messages"][2]["tool_call_id"], "000000001");
 }
