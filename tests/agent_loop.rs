@@ -12,6 +12,7 @@ use localharness::config::{
 };
 use localharness::context::TokenBudget;
 use localharness::paths::Paths;
+use localharness::policy::{AskAnswer, AskRequest, Asker, PermissionMode, Permissions, Policy};
 use localharness::provider::{
     ChatMessage, ChatRequest, ErrorClass, Provider, ProviderError, StreamEvent, StreamItem, Usage,
 };
@@ -190,6 +191,49 @@ fn harness_with_extra(
     config: Config,
     extra: Vec<Arc<dyn localharness::Tool>>,
 ) -> Harness {
+    harness_in_mode(dir, scripts, config, extra, PermissionMode::Yolo)
+}
+
+/// A harness whose permissions start in `mode`, with the tool set filtered
+/// for that mode exactly as `app::create_runtime` does.
+fn harness_in_mode(
+    dir: &std::path::Path,
+    scripts: Vec<Script>,
+    config: Config,
+    extra: Vec<Arc<dyn localharness::Tool>>,
+    mode: PermissionMode,
+) -> Harness {
+    let provider = Arc::new(ScriptedProvider {
+        scripts: Mutex::new(scripts.into()),
+        requests: Mutex::new(Vec::new()),
+        strict_system: AtomicBool::new(false),
+    });
+    let (core, session) = build_core_in_mode(dir, config, extra, provider.clone(), mode);
+    Harness {
+        core,
+        session,
+        provider,
+    }
+}
+
+/// A core over any provider, for example the real HTTP client. Permissions
+/// start in yolo, as for `harness_with_extra`.
+fn build_core(
+    dir: &std::path::Path,
+    config: Config,
+    extra: Vec<Arc<dyn localharness::Tool>>,
+    provider: Arc<dyn Provider>,
+) -> (Arc<Core>, SessionHandle) {
+    build_core_in_mode(dir, config, extra, provider, PermissionMode::Yolo)
+}
+
+fn build_core_in_mode(
+    dir: &std::path::Path,
+    config: Config,
+    extra: Vec<Arc<dyn localharness::Tool>>,
+    provider: Arc<dyn Provider>,
+    mode: PermissionMode,
+) -> (Arc<Core>, SessionHandle) {
     let mut paths = Paths::discover(dir).unwrap();
     paths.data_dir = dir.join("data");
     paths.config_dir = dir.join("config");
@@ -204,6 +248,7 @@ fn harness_with_extra(
             app: "test".into(),
             redact: true,
             context: None,
+            permissions: None,
         },
         true,
     )
@@ -211,15 +256,17 @@ fn harness_with_extra(
     let session: SessionHandle = Arc::new(Mutex::new(session));
     let artifacts = session.lock().unwrap().artifacts.clone();
     let registry = ToolRegistry::builtin();
+    // The config's rules apply; callers that predate permissions use yolo
+    // (no asking) and a test switches modes with `set_mode`.
+    let permissions = Arc::new(Permissions::new(
+        Policy::compile(&config.permissions.rules).unwrap(),
+        mode,
+    ));
     let mut selected = registry.select(config.profile(), &[]).unwrap();
     selected.extend(extra);
+    let selected = permissions.filter_tools(selected, &registry);
     let (_, model_profile) = config.model_profile();
     let tool_specs = ToolRegistry::specs_with(&selected, model_profile.short_tool_schemas());
-    let provider = Arc::new(ScriptedProvider {
-        scripts: Mutex::new(scripts.into()),
-        requests: Mutex::new(Vec::new()),
-        strict_system: AtomicBool::new(false),
-    });
     let budget = TokenBudget::new(config.context_window(), config.model.max_output_tokens);
     let tool_specs_json = localharness::provider::tools_json(&tool_specs);
     let tool_specs_cost = localharness::context::ToolSpecCost::from_json(&tool_specs_json, &budget);
@@ -231,7 +278,7 @@ fn harness_with_extra(
         limits: localharness::agent::RunLimits::from(&config.budgets),
         config,
         paths: paths.clone(),
-        provider: provider.clone(),
+        provider,
         registry,
         tool_specs,
         tool_specs_json,
@@ -261,12 +308,9 @@ fn harness_with_extra(
         startup: None,
         mcp: Default::default(),
         approver: None,
+        permissions,
     };
-    Harness {
-        core: Arc::new(core),
-        session,
-        provider,
-    }
+    (Arc::new(core), session)
 }
 
 async fn run(
@@ -350,7 +394,7 @@ async fn bash_records_evidence_and_findings_link_to_it() {
 }
 
 #[tokio::test]
-async fn bash_secrets_are_redacted_in_session_and_evidence() {
+async fn bash_secrets_are_redacted_in_evidence_but_not_in_what_the_model_reads() {
     const KEY: &str = "AKIAIOSFODNN7EXAMPLE";
     let dir = tempfile::tempdir().unwrap();
     let harness = harness(
@@ -377,9 +421,13 @@ async fn bash_secrets_are_redacted_in_session_and_evidence() {
             .into_iter()
             .find(|entry| entry.is_tool_result())
             .expect("tool result");
+        // The in-memory tree is what the model reads, so it keeps the raw
+        // output (this session is not persisted). Redaction applies to the
+        // evidence written to disk below, and to session files (see
+        // tests/redaction.rs).
         let content = &entry.tool_result().expect("tool result data").content;
-        assert!(!content.contains(KEY), "{content}");
-        assert!(content.contains("[REDACTED:aws:AKIA..."), "{content}");
+        assert!(content.contains(KEY), "{content}");
+        assert!(!content.contains("[REDACTED"), "{content}");
     }
 
     let state = harness.core.security.lock().unwrap();
@@ -621,6 +669,46 @@ async fn duplicate_engine_ids_get_distinct_internal_ids_and_results() {
 }
 
 #[tokio::test]
+async fn whole_calls_on_a_reused_index_and_engine_id_stay_separate() {
+    // Some engines emit every call whole on index 0 with the same id. The
+    // accumulator must close the first call instead of splicing the second
+    // call's arguments onto it.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.rs"), "a\n").unwrap();
+    std::fs::write(dir.path().join("b.rs"), "b\n").unwrap();
+    let whole = |path: &str| StreamEvent::ToolCallDelta {
+        index: 0,
+        id: Some("call_1".into()),
+        name: Some("read".into()),
+        arguments: Some(json!({ "path": path }).to_string()),
+    };
+    let harness = harness(
+        dir.path(),
+        vec![
+            Script::Events(vec![
+                whole("a.rs"),
+                whole("b.rs"),
+                StreamEvent::Finish("tool_calls".into()),
+            ]),
+            text_script("done"),
+        ],
+        &["read"],
+    );
+    let (outcome, _) = run(&harness, "read both").await;
+    assert_eq!(outcome.status, TurnStatus::Done);
+    let calls: Vec<_> = assistants(&harness.session)
+        .into_iter()
+        .flat_map(|assistant| assistant.tool_calls.unwrap_or_default())
+        .collect();
+    assert_eq!(calls.len(), 2, "{calls:?}");
+    assert_eq!(calls[0].id, "call_0001");
+    assert_eq!(calls[1].id, "call_0002");
+    assert_eq!(calls[0].arguments, json!({"path": "a.rs"}));
+    assert_eq!(calls[1].arguments, json!({"path": "b.rs"}));
+    assert_eq!(tool_results(&harness.session).len(), 2);
+}
+
+#[tokio::test]
 async fn internal_call_ids_increase_across_turns() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("a.rs"), "a\n").unwrap();
@@ -701,10 +789,8 @@ async fn tool_calls_written_as_text_are_executed() {
     assert!(results[0].contains("fn main() {}"), "{}", results[0]);
     let first = &assistants(&harness.session)[0];
     assert_eq!(first.content.as_deref(), Some("Reading it."));
-    assert_eq!(
-        first.reasoning.as_deref(),
-        Some("I should look at the file.")
-    );
+    // The default profile strips reasoning from the persisted entry.
+    assert_eq!(first.reasoning, None);
     assert_eq!(first.tool_calls.as_ref().unwrap()[0].name, "read");
     assert!(
         events
@@ -712,9 +798,9 @@ async fn tool_calls_written_as_text_are_executed() {
             .any(|e| matches!(e, AgentEvent::Notice(n) if n.contains("--jinja")))
     );
     assert!(
-        events
-            .iter()
-            .any(|e| matches!(e, AgentEvent::ReasoningDelta(_)))
+        events.iter().any(
+            |e| matches!(e, AgentEvent::ReasoningDelta(text) if text.contains("I should look"))
+        )
     );
 }
 
@@ -990,6 +1076,138 @@ async fn cache_and_timing_reports_are_stored_with_the_reply() {
         1,
         "usage must be reported once, not per chunk and once at the end"
     );
+}
+
+#[tokio::test]
+async fn two_cold_model_calls_raise_a_cache_alarm() {
+    let cold = |completion: u32| Usage {
+        prompt_tokens: 100,
+        completion_tokens: completion,
+        total_tokens: 100 + completion,
+        cached_tokens: Some(10),
+        ..Usage::default()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness(
+        dir.path(),
+        vec![
+            Script::Events(vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call_1".into()),
+                    name: Some("read".into()),
+                    arguments: Some(json!({"path": "missing.rs"}).to_string()),
+                },
+                StreamEvent::Finish("tool_calls".into()),
+                StreamEvent::Usage(cold(5)),
+            ]),
+            Script::Events(vec![
+                StreamEvent::Delta("done".into()),
+                StreamEvent::Finish("stop".into()),
+                StreamEvent::Usage(cold(2)),
+            ]),
+        ],
+        &["read"],
+    );
+    let (outcome, events) = run(&harness, "read it").await;
+    assert_eq!(outcome.status, TurnStatus::Done, "{outcome:?}");
+    let alarm = events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::Notice(message)
+                if message.contains("prompt cache hit 10%")
+                    && message.contains("two consecutive requests") =>
+            {
+                Some(message.clone())
+            }
+            _ => None,
+        })
+        .expect("cache alarm after two cold calls");
+    assert!(
+        alarm.contains("server evicted") || alarm.contains("another slot"),
+        "{alarm}"
+    );
+    let session = harness.session.lock().unwrap();
+    let entry = session
+        .latest_custom_on_path("cache-cold")
+        .expect("cold cache sample is recorded");
+    let EntryKind::Custom(data) = &entry.kind else {
+        panic!("cache-cold must be a custom entry");
+    };
+    assert_eq!(data.payload["cache_percent"], 10);
+    assert_eq!(data.payload["prompt_tokens"], 100);
+    assert_eq!(data.payload["cached_tokens"], 10);
+}
+
+#[tokio::test]
+async fn compaction_logs_a_cache_boundary_and_reuses_the_base_prefix() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut harness = harness(dir.path(), vec![text_script("after compaction")], &["read"]);
+    let mut core = Arc::try_unwrap(harness.core).unwrap_or_else(|_| panic!("sole owner"));
+    core.budget = TokenBudget::new(4096, 1024);
+    let base = core.system_prompt.clone();
+    harness.core = Arc::new(core);
+    let (outcome, _) = run(&harness, &"x".repeat(8000)).await;
+    assert_eq!(outcome.status, TurnStatus::Done, "{outcome:?}");
+
+    let session = harness.session.lock().unwrap();
+    let entry = session
+        .latest_custom_on_path("cache-boundary")
+        .expect("compaction logs a cache boundary");
+    let EntryKind::Custom(data) = &entry.kind else {
+        panic!("cache-boundary must be a custom entry");
+    };
+    assert_eq!(data.payload["reason"], "auto");
+    assert_eq!(
+        data.payload["reuse_prefix_chars"].as_u64().unwrap(),
+        base.chars().count() as u64,
+        "the whole pre-compaction system block is reused"
+    );
+    assert!(
+        data.payload["reprefill_chars"].as_u64().unwrap() > 0,
+        "only the new summary and state re-prefill"
+    );
+    drop(session);
+
+    let requests = harness.provider.requests.lock().unwrap();
+    let request = requests.last().expect("post-compaction request");
+    match &request.messages[0] {
+        ChatMessage::System { content } => {
+            assert!(
+                content.starts_with(&base),
+                "the base prefix must stay byte-identical through compaction"
+            );
+        }
+        other => panic!("leading message is {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn prompt_prefix_is_logged_once_and_reused_across_turns() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness(
+        dir.path(),
+        vec![text_script("first"), text_script("second")],
+        &["read"],
+    );
+    run(&harness, "one").await;
+    run(&harness, "two").await;
+    let session = harness.session.lock().unwrap();
+    let prefixes = session.customs_on_path("prompt-prefix");
+    assert_eq!(
+        prefixes.len(),
+        1,
+        "an unchanged prefix is logged once, not every turn"
+    );
+    let EntryKind::Custom(data) = &prefixes[0].kind else {
+        panic!("prompt-prefix must be a custom entry");
+    };
+    assert_eq!(
+        data.payload["hash"].as_str().unwrap().len(),
+        64,
+        "SHA-256 hex hash"
+    );
+    assert!(data.payload["chars"].as_u64().unwrap() > 0);
 }
 
 #[tokio::test]
@@ -2498,4 +2716,880 @@ async fn malformed_hook_output_fails_closed_on_pre_tool() {
     assert!(content.contains("malformed output"), "{content}");
     let invocations = hook_invocations(&harness.session, "pre_tool");
     assert_eq!(invocations[0].payload["outcome"], "error");
+}
+
+// ---------------------------------------------------------------------------
+// Permission policy (#15) and plan mode (#14)
+// ---------------------------------------------------------------------------
+
+/// Records every question and answers with a fixed verdict.
+struct RecordingAsker {
+    answer: AskAnswer,
+    asked: Mutex<Vec<AskRequest>>,
+}
+
+impl RecordingAsker {
+    fn new(answer: AskAnswer) -> Arc<Self> {
+        Arc::new(Self {
+            answer,
+            asked: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn subjects(&self) -> Vec<String> {
+        self.asked
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|request| request.subject.clone())
+            .collect()
+    }
+}
+
+#[async_trait]
+impl Asker for RecordingAsker {
+    async fn ask(&self, request: AskRequest) -> AskAnswer {
+        self.asked.lock().unwrap().push(request);
+        self.answer
+    }
+}
+
+fn rule(
+    id: &str,
+    tool: Option<&str>,
+    command: Option<&str>,
+    action: localharness::policy::RuleAction,
+) -> localharness::policy::RuleConfig {
+    localharness::policy::RuleConfig {
+        id: Some(id.into()),
+        tool: tool.map(str::to_string),
+        path: None,
+        command: command.map(str::to_string),
+        network: None,
+        action,
+    }
+}
+
+fn workflow_config(tools: &[&str]) -> Config {
+    let mut config = base_config();
+    let workflow = localharness::workflows::WorkflowSpec {
+        name: "lists-tools".into(),
+        description: None,
+        profile: None,
+        prompt: "do the work".into(),
+        skills: vec![],
+        tools: tools.iter().map(|tool| tool.to_string()).collect(),
+        steps: vec![],
+        artifacts: vec![],
+    };
+    workflow.apply_to_config(&mut config).unwrap();
+    config
+}
+
+fn plan_entries(session: &SessionHandle) -> Vec<serde_json::Map<String, serde_json::Value>> {
+    let session = session.lock().unwrap();
+    session
+        .branch_entries()
+        .into_iter()
+        .filter_map(|entry| match &entry.kind {
+            EntryKind::Custom(custom) if custom.kind == "plan" => Some(custom.payload.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_deny_rule_blocks_git_push_even_when_a_workflow_lists_bash() {
+    use localharness::policy::RuleAction;
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = workflow_config(&["bash"]);
+    config.permissions.rules = vec![rule(
+        "no-push",
+        Some("bash"),
+        Some(r"\bgit\s+push\b"),
+        RuleAction::Deny,
+    )];
+    let harness = harness_in_mode(
+        dir.path(),
+        vec![
+            tool_script("bash", json!({"command": "git push origin main"})),
+            tool_script("bash", json!({"command": "touch fallback.txt"})),
+            text_script("pushed nothing; wrote fallback.txt instead"),
+        ],
+        config,
+        Vec::new(),
+        PermissionMode::Ask,
+    );
+    assert!(harness.core.tools.iter().any(|tool| tool.name() == "bash"));
+    let asker = RecordingAsker::new(AskAnswer::Allow);
+    harness.core.permissions.set_asker(asker.clone());
+
+    let (outcome, _) = run(&harness, "push it").await;
+
+    // The denial does not kill the turn: the model tried another approach.
+    assert_eq!(outcome.status, TurnStatus::Done);
+    let results = tool_results(&harness.session);
+    assert!(results[0].contains("[DENIED]"), "{}", results[0]);
+    assert!(results[0].contains("no-push"), "{}", results[0]);
+    assert!(dir.path().join("fallback.txt").exists());
+    // A deny is decided before anyone is asked.
+    assert_eq!(asker.subjects(), vec!["touch fallback.txt".to_string()]);
+}
+
+#[tokio::test]
+async fn ask_prompts_once_per_exact_command_not_per_prefix() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness_in_mode(
+        dir.path(),
+        vec![
+            tool_script("bash", json!({"command": "touch a.txt"})),
+            tool_script("bash", json!({"command": "touch a.txt"})),
+            tool_script("bash", json!({"command": "touch a.txt b.txt"})),
+            text_script("done"),
+        ],
+        workflow_config(&["bash"]),
+        Vec::new(),
+        PermissionMode::Ask,
+    );
+    let asker = RecordingAsker::new(AskAnswer::Allow);
+    harness.core.permissions.set_asker(asker.clone());
+
+    let (outcome, _) = run(&harness, "touch files").await;
+
+    assert_eq!(outcome.status, TurnStatus::Done);
+    assert_eq!(
+        asker.subjects(),
+        vec!["touch a.txt".to_string(), "touch a.txt b.txt".to_string()]
+    );
+    assert!(dir.path().join("b.txt").exists());
+}
+
+#[tokio::test]
+async fn a_later_specific_allow_beats_an_earlier_broad_ask() {
+    use localharness::policy::RuleAction;
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = workflow_config(&["bash"]);
+    config.permissions.rules = vec![
+        rule("bash-asks", Some("bash"), None, RuleAction::Ask),
+        rule("touch-ok", Some("bash"), Some("^touch "), RuleAction::Allow),
+    ];
+    let harness = harness_in_mode(
+        dir.path(),
+        vec![
+            tool_script("bash", json!({"command": "touch allowed.txt"})),
+            tool_script("bash", json!({"command": "mkdir asked"})),
+            text_script("done"),
+        ],
+        config,
+        Vec::new(),
+        PermissionMode::Ask,
+    );
+    let asker = RecordingAsker::new(AskAnswer::Deny);
+    harness.core.permissions.set_asker(asker.clone());
+
+    let (outcome, _) = run(&harness, "go").await;
+
+    assert_eq!(outcome.status, TurnStatus::Done);
+    assert!(dir.path().join("allowed.txt").exists());
+    assert!(!dir.path().join("asked").exists());
+    assert_eq!(asker.subjects(), vec!["mkdir asked".to_string()]);
+    let asked = asker.asked.lock().unwrap()[0].clone();
+    assert_eq!(asked.rule.as_deref(), Some("bash-asks"));
+    let results = tool_results(&harness.session);
+    assert!(results[1].contains("[DENIED]"), "{}", results[1]);
+    assert!(results[1].contains("declined"), "{}", results[1]);
+}
+
+#[tokio::test]
+async fn an_ask_with_no_frontend_is_denied_and_the_turn_continues() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness_in_mode(
+        dir.path(),
+        vec![
+            tool_script("write", json!({"path": "new.txt", "content": "x"})),
+            text_script("could not write; here is the content instead"),
+        ],
+        workflow_config(&["write"]),
+        Vec::new(),
+        PermissionMode::Ask,
+    );
+
+    let (outcome, _) = run(&harness, "write it").await;
+
+    assert_eq!(outcome.status, TurnStatus::Done);
+    assert!(!dir.path().join("new.txt").exists());
+    let result = last_tool_result(&harness.session);
+    assert!(result.contains("[DENIED]"), "{result}");
+    assert!(result.contains("cannot ask"), "{result}");
+    assert!(result.contains("--yolo"), "{result}");
+}
+
+#[tokio::test]
+async fn plan_mode_refuses_every_mutation_at_dispatch() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+    let harness = harness_in_mode(
+        dir.path(),
+        vec![
+            tool_script("read", json!({"path": "a.txt"})),
+            parallel_tool_script(&[
+                ("write", json!({"path": "a.txt", "content": "two\n"})),
+                ("edit", json!({"path": "a.txt", "old": "one", "new": "two"})),
+                (
+                    "patch",
+                    json!({"path": "a.txt", "anchor": "one", "replacement": "two"}),
+                ),
+                ("undo", json!({"path": "a.txt"})),
+                ("bash", json!({"command": "git commit -am wip"})),
+                ("bash", json!({"command": "git push origin main"})),
+                ("git", json!({"action": "commit", "message": "wip"})),
+            ]),
+            tool_script(
+                "todo",
+                json!({"action": "plan", "tasks": ["change a.txt", "verify"]}),
+            ),
+            text_script("Proposed plan above."),
+        ],
+        workflow_config(&[
+            "read", "write", "edit", "patch", "undo", "bash", "git", "todo",
+        ]),
+        Vec::new(),
+        PermissionMode::Plan,
+    );
+    let names: Vec<&str> = harness.core.tools.iter().map(|tool| tool.name()).collect();
+    for removed in ["write", "edit", "patch", "undo"] {
+        assert!(!names.contains(&removed), "{removed} in {names:?}");
+    }
+
+    let (outcome, _) = run(&harness, "plan the change").await;
+
+    assert_eq!(outcome.status, TurnStatus::Done);
+    let results = tool_results(&harness.session);
+    assert_eq!(results.len(), 9, "{results:#?}");
+    for refused in &results[1..8] {
+        assert!(refused.contains("[plan_mode]"), "{refused}");
+        assert!(refused.contains("/plan approve"), "{refused}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+        "one\n"
+    );
+    let plans = plan_entries(&harness.session);
+    assert_eq!(plans.len(), 1);
+    assert_eq!(plans[0]["status"], "proposed");
+    assert_eq!(plans[0]["tasks"], json!(["change a.txt", "verify"]));
+    // The tools offered to the model are the plan-mode set.
+    let requests = harness.provider.requests.lock().unwrap();
+    let offered: Vec<String> = requests[0]
+        .tools
+        .iter()
+        .map(|spec| spec.name.clone())
+        .collect();
+    assert!(!offered.iter().any(|name| name == "write"), "{offered:?}");
+}
+
+#[tokio::test]
+async fn plan_mode_allows_read_only_bash() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "hello\n").unwrap();
+    let harness = harness_in_mode(
+        dir.path(),
+        vec![
+            tool_script("bash", json!({"command": "cat a.txt | wc -l"})),
+            tool_script("todo", json!({"action": "plan", "tasks": ["edit a.txt"]})),
+            text_script("plan ready"),
+        ],
+        workflow_config(&["bash", "todo"]),
+        Vec::new(),
+        PermissionMode::Plan,
+    );
+    let (outcome, _) = run(&harness, "look").await;
+    assert_eq!(outcome.status, TurnStatus::Done);
+    let results = tool_results(&harness.session);
+    assert!(!results[0].contains("plan_mode"), "{}", results[0]);
+    assert!(results[0].contains('1'), "{}", results[0]);
+}
+
+#[tokio::test]
+async fn a_workflow_listing_write_cannot_reenable_it_in_plan_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness_in_mode(
+        dir.path(),
+        vec![
+            tool_script("write", json!({"path": "x.txt", "content": "x"})),
+            tool_script("todo", json!({"action": "plan", "tasks": ["write x.txt"]})),
+            text_script("plan ready"),
+        ],
+        workflow_config(&["write", "read"]),
+        Vec::new(),
+        PermissionMode::Plan,
+    );
+    let names: Vec<&str> = harness.core.tools.iter().map(|tool| tool.name()).collect();
+    assert!(!names.contains(&"write"), "{names:?}");
+    // Plan mode brings `todo` so the plan can be written.
+    assert!(names.contains(&"todo"), "{names:?}");
+
+    let (outcome, _) = run(&harness, "write x").await;
+
+    assert_eq!(outcome.status, TurnStatus::Done);
+    let results = tool_results(&harness.session);
+    assert!(results[0].contains("[plan_mode]"), "{}", results[0]);
+    assert!(results[0].contains("/plan approve"), "{}", results[0]);
+    assert!(!dir.path().join("x.txt").exists());
+}
+
+#[tokio::test]
+async fn a_plan_mode_turn_cannot_settle_without_a_todo_plan() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness_in_mode(
+        dir.path(),
+        vec![
+            text_script("I would change a few files."),
+            tool_script("todo", json!({"action": "plan", "tasks": ["change files"]})),
+            text_script("plan recorded"),
+        ],
+        workflow_config(&["read", "todo"]),
+        Vec::new(),
+        PermissionMode::Plan,
+    );
+    let (outcome, events) = run(&harness, "propose").await;
+    assert_eq!(outcome.status, TurnStatus::Done);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::Notice(message) if message.contains("plan mode")
+    )));
+    assert_eq!(harness.provider.requests.lock().unwrap().len(), 3);
+    assert_eq!(plan_entries(&harness.session).len(), 1);
+}
+
+fn reasoning_script() -> Script {
+    Script::Events(vec![
+        StreamEvent::ReasoningDelta("secret chain of thought".into()),
+        StreamEvent::Delta("answer".into()),
+        StreamEvent::Finish("stop".into()),
+    ])
+}
+
+fn harness_strip(dir: &std::path::Path, scripts: Vec<Script>, strip: bool) -> Harness {
+    let mut config = base_config();
+    config
+        .model_profiles
+        .get_mut("default")
+        .expect("default model profile")
+        .strip_reasoning = Some(strip);
+    harness_config(dir, scripts, config)
+}
+
+#[tokio::test]
+async fn strip_reasoning_true_persists_no_reasoning() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness_strip(dir.path(), vec![reasoning_script()], true);
+    let (outcome, events) = run(&harness, "think").await;
+    assert_eq!(outcome.status, TurnStatus::Done);
+    // Still streamed live for the reasoning pane.
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::ReasoningDelta(_)))
+    );
+    let replies = assistants(&harness.session);
+    assert_eq!(replies.len(), 1);
+    assert_eq!(replies[0].reasoning, None);
+    let session = harness.session.lock().unwrap();
+    let persisted = serde_json::to_string(&session.branch_entries()).unwrap();
+    assert!(
+        !persisted.contains("secret chain of thought"),
+        "{persisted}"
+    );
+}
+
+#[tokio::test]
+async fn strip_reasoning_false_persists_and_replays_reasoning() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness_strip(dir.path(), vec![reasoning_script()], false);
+    let (outcome, _) = run(&harness, "think").await;
+    assert_eq!(outcome.status, TurnStatus::Done);
+    let replies = assistants(&harness.session);
+    assert_eq!(
+        replies[0].reasoning.as_deref(),
+        Some("secret chain of thought")
+    );
+    // Ctrl+R replays reasoning from the session blocks.
+    let session = harness.session.lock().unwrap();
+    let blocks = localharness::ui::render::blocks_from_session(&session);
+    assert!(blocks.iter().any(|block| matches!(
+        &block.kind,
+        localharness::ui::render::BlockKind::Assistant { reasoning: Some(text), .. }
+            if text == "secret chain of thought"
+    )));
+}
+
+fn harness_profile_edit(
+    dir: &std::path::Path,
+    scripts: Vec<Script>,
+    tools: &[&str],
+    edit: impl FnOnce(&mut localharness::config::ModelProfile),
+) -> Harness {
+    let mut config = base_config();
+    config.profiles.get_mut("test").expect("test profile").tools =
+        tools.iter().map(|s| s.to_string()).collect();
+    edit(
+        config
+            .model_profiles
+            .get_mut("default")
+            .expect("default model profile"),
+    );
+    harness_config(dir, scripts, config)
+}
+
+#[tokio::test]
+async fn thinking_off_without_a_control_refuses_before_the_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness_profile_edit(dir.path(), vec![text_script("no")], &["read"], |p| {
+        p.thinking = localharness::config::ThinkingPolicy::Off;
+    });
+    let (outcome, _) = run(&harness, "hi").await;
+    assert_eq!(outcome.status, TurnStatus::Error);
+    let (code, message) = outcome.error.expect("error");
+    assert_eq!(code, "thinking_policy");
+    assert!(message.contains("thinking_control"), "{message}");
+    assert_eq!(harness.provider.requests.lock().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn thinking_auto_sends_the_control_only_with_tools_active() {
+    let control: toml::Value =
+        toml::from_str("chat_template_kwargs = { enable_thinking = false }").unwrap();
+    for (tools, expect_off) in [(&["read"][..], true), (&[][..], false)] {
+        let dir = tempfile::tempdir().unwrap();
+        let control = control.clone();
+        let harness = harness_profile_edit(dir.path(), vec![text_script("ok")], tools, |p| {
+            p.thinking_breaks_tools = true;
+            p.thinking_control = Some(control);
+        });
+        let (outcome, _) = run(&harness, "hi").await;
+        assert_eq!(outcome.status, TurnStatus::Done);
+        let requests = harness.provider.requests.lock().unwrap();
+        let sent = requests[0]
+            .extra_body
+            .as_ref()
+            .and_then(|body| body.pointer("/chat_template_kwargs/enable_thinking"))
+            .cloned();
+        assert_eq!(sent, expect_off.then_some(json!(false)), "tools {tools:?}");
+    }
+}
+
+#[tokio::test]
+async fn reasoning_only_reply_warns_and_retries() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness(
+        dir.path(),
+        vec![
+            Script::Events(vec![
+                StreamEvent::ReasoningDelta("I should answer 4".into()),
+                StreamEvent::Finish("stop".into()),
+            ]),
+            text_script("4"),
+        ],
+        &["read"],
+    );
+    let (outcome, events) = run(&harness, "2+2?").await;
+    assert_eq!(outcome.status, TurnStatus::Done);
+    assert!(
+        events.iter().any(
+            |event| matches!(event, AgentEvent::Guard { code, .. } if code == "reasoning_only")
+        ),
+        "missing reasoning_only warning"
+    );
+    let requests = harness.provider.requests.lock().unwrap();
+    assert_eq!(
+        requests.len(),
+        2,
+        "the reasoning-only reply is not the answer"
+    );
+    assert!(requests[1].messages.iter().any(|message| matches!(
+        message,
+        ChatMessage::User { content, .. } if content.contains("empty response")
+    )));
+    drop(requests);
+    assert_eq!(last_assistant(&harness.session), "4");
+}
+
+#[tokio::test]
+async fn old_inline_reasoning_never_reaches_the_next_prompt() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness(dir.path(), vec![text_script("ok")], &["read"]);
+    {
+        let mut session = harness.session.lock().unwrap();
+        for (question, answer) in [
+            ("q1", "<think>private plan</think>\n\nfirst answer"),
+            (
+                "q2",
+                "<|channel|>analysis<|message|>harmony plan<|end|><|start|>assistant<|channel|>final<|message|>second answer",
+            ),
+            ("q3", "dangling plan</think>third answer"),
+        ] {
+            session
+                .append(EntryKind::User(localharness::session::UserData {
+                    content: question.into(),
+                    attachments: Vec::new(),
+                }))
+                .unwrap();
+            session
+                .append(EntryKind::Assistant(localharness::session::AssistantData {
+                    content: Some(answer.into()),
+                    reasoning: None,
+                    tool_calls: None,
+                    usage: None,
+                    stop_reason: Some("stop".into()),
+                }))
+                .unwrap();
+        }
+    }
+    let (outcome, _) = run(&harness, "next").await;
+    assert_eq!(outcome.status, TurnStatus::Done);
+    let requests = harness.provider.requests.lock().unwrap();
+    let assistant_text: Vec<String> = requests[0]
+        .messages
+        .iter()
+        .filter_map(|message| match message {
+            ChatMessage::Assistant { content, .. } => content.clone(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        assistant_text,
+        vec!["first answer", "second answer", "third answer"]
+    );
+    let prompt = format!("{:?}", requests[0].messages);
+    for leaked in ["plan", "<think>", "</think>", "<|channel|>"] {
+        assert!(!prompt.contains(leaked), "{leaked} leaked: {prompt}");
+    }
+}
+
+#[tokio::test]
+async fn reasoning_tokens_are_estimated_when_the_server_omits_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness(
+        dir.path(),
+        vec![Script::Events(vec![
+            StreamEvent::ReasoningDelta("x".repeat(400)),
+            StreamEvent::Delta("answer".into()),
+            StreamEvent::Finish("stop".into()),
+            StreamEvent::Usage(Usage::new(20, 120)),
+        ])],
+        &["read"],
+    );
+    let (outcome, events) = run(&harness, "think").await;
+    assert_eq!(outcome.status, TurnStatus::Done);
+    let reported = events.iter().find_map(|event| match event {
+        AgentEvent::Usage(usage) => usage.reasoning_tokens,
+        _ => None,
+    });
+    assert!(
+        reported.is_some_and(|tokens| tokens > 50),
+        "reasoning tokens: {reported:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_8k_window_compacts_once_between_a_tool_call_and_the_answer() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("big.rs"),
+        "let value = compute_something(1, 2, 3);\n".repeat(500),
+    )
+    .unwrap();
+    let mut harness = harness(
+        dir.path(),
+        vec![
+            tool_script("read", json!({"path": "big.rs", "limit": 400})),
+            bare_text_script("it computes values"),
+        ],
+        &["read"],
+    );
+    let mut core = Arc::try_unwrap(harness.core).unwrap_or_else(|_| panic!("sole owner"));
+    core.budget = TokenBudget::new(8192, 1024);
+    harness.core = Arc::new(core);
+
+    // The question carries enough context to sit under the 80% threshold
+    // before the tool call; the read result pushes it over once.
+    let prompt = format!("what does big.rs do? {}", "context ".repeat(2100));
+    let (outcome, events) = run(&harness, &prompt).await;
+    assert_eq!(outcome.status, TurnStatus::Done, "outcome: {outcome:?}");
+    assert_eq!(
+        harness.provider.requests.lock().unwrap().len(),
+        2,
+        "one call for the tool, one for the answer"
+    );
+    let session = harness.session.lock().unwrap();
+    let compactions = session
+        .branch_entries()
+        .iter()
+        .filter(|entry| entry.is_compaction())
+        .count();
+    assert_eq!(compactions, 1, "exactly one compaction per turn");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::Compacted { .. }))
+            .count(),
+        1
+    );
+    drop(session);
+    assert_eq!(last_assistant(&harness.session), "it computes values");
+}
+
+// ---------------------------------------------------------------------------
+// Multi-turn tool loops through the real HTTP client against scripted engine
+// fixtures. Each engine reports ids differently; the session must only ever
+// see the ledger's ids, and every request must pair each call with exactly
+// one result.
+// ---------------------------------------------------------------------------
+
+mod engines {
+    use super::*;
+    use axum::Router;
+    use axum::body::Body;
+    use axum::extract::State as AxumState;
+    use axum::http::header;
+    use axum::response::Response;
+    use axum::routing::post;
+    use localharness::provider::OpenAiCompatProvider;
+
+    #[derive(Clone, Default)]
+    struct Fake {
+        requests: Arc<Mutex<Vec<serde_json::Value>>>,
+        bodies: Arc<Mutex<VecDeque<String>>>,
+    }
+
+    async fn chat(AxumState(fake): AxumState<Fake>, body: String) -> Response {
+        fake.requests
+            .lock()
+            .unwrap()
+            .push(serde_json::from_str(&body).unwrap_or_default());
+        let body = fake.bodies.lock().unwrap().pop_front().unwrap_or_default();
+        let content_type = if body.trim_start().starts_with('{') {
+            "application/json"
+        } else {
+            "text/event-stream"
+        };
+        Response::builder()
+            .header(header::CONTENT_TYPE, content_type)
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    async fn serve(bodies: Vec<String>) -> (String, Fake) {
+        let fake = Fake {
+            bodies: Arc::new(Mutex::new(bodies.into())),
+            ..Fake::default()
+        };
+        let app = Router::new()
+            .route("/v1/chat/completions", post(chat))
+            .with_state(fake.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{address}"), fake)
+    }
+
+    fn sse(chunks: Vec<serde_json::Value>) -> String {
+        let mut out = String::new();
+        for chunk in chunks {
+            out.push_str(&format!("data: {chunk}\n\n"));
+        }
+        out.push_str("data: [DONE]\n\n");
+        out
+    }
+
+    fn delta(delta: serde_json::Value) -> serde_json::Value {
+        json!({"choices": [{"index": 0, "delta": delta}]})
+    }
+
+    fn done(reason: &str) -> serde_json::Value {
+        json!({"choices": [{"index": 0, "delta": {}, "finish_reason": reason}],
+               "usage": {"prompt_tokens": 50, "completion_tokens": 5, "total_tokens": 55}})
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Engine {
+        /// Fragmented arguments, explicit index, a fresh id per call that
+        /// restarts at the same value every request.
+        LlamaCpp,
+        /// vLLM with a Mistral model: whole calls, nine-character ids.
+        VllmMistral,
+        /// Ollama compatibility route: no id, no index.
+        Ollama,
+    }
+
+    impl Engine {
+        fn model(self) -> &'static str {
+            match self {
+                Engine::VllmMistral => "mistral-small-3.2",
+                _ => "test-model",
+            }
+        }
+
+        fn call(self, path: &str) -> String {
+            let args = json!({ "path": path }).to_string();
+            match self {
+                Engine::LlamaCpp => {
+                    let (head, tail) = args.split_at(args.len() / 2);
+                    sse(vec![
+                        delta(
+                            json!({"tool_calls": [{"index": 0, "id": "call_0", "type": "function",
+                            "function": {"name": "read", "arguments": ""}}]}),
+                        ),
+                        delta(
+                            json!({"tool_calls": [{"index": 0, "function": {"arguments": head}}]}),
+                        ),
+                        delta(
+                            json!({"tool_calls": [{"index": 0, "function": {"arguments": tail}}]}),
+                        ),
+                        done("tool_calls"),
+                    ])
+                }
+                Engine::VllmMistral => sse(vec![
+                    delta(
+                        json!({"tool_calls": [{"index": 0, "id": "aB3dE6gH9", "type": "function",
+                        "function": {"name": "read", "arguments": args}}]}),
+                    ),
+                    done("tool_calls"),
+                ]),
+                Engine::Ollama => sse(vec![
+                    delta(
+                        json!({"tool_calls": [{"function": {"name": "read", "arguments": args}}]}),
+                    ),
+                    done("tool_calls"),
+                ]),
+            }
+        }
+
+        fn text(self, text: &str) -> String {
+            sse(vec![delta(json!({ "content": text })), done("stop")])
+        }
+    }
+
+    /// Every assistant call in the request body has exactly one tool message,
+    /// and every tool message answers exactly one call.
+    fn assert_paired(body: &serde_json::Value, engine: Engine) {
+        let messages = body["messages"].as_array().expect("messages");
+        let mut calls = Vec::new();
+        let mut results = Vec::new();
+        for message in messages {
+            for call in message["tool_calls"].as_array().into_iter().flatten() {
+                calls.push(call["id"].as_str().unwrap().to_string());
+            }
+            if message["role"] == "tool" {
+                results.push(message["tool_call_id"].as_str().unwrap().to_string());
+            }
+        }
+        assert_eq!(
+            calls, results,
+            "{engine:?}: calls and results must pair 1:1 in order"
+        );
+        let mut unique = calls.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            calls.len(),
+            "{engine:?}: duplicate wire ids {calls:?}"
+        );
+        if matches!(engine, Engine::VllmMistral) {
+            for id in &calls {
+                assert!(
+                    id.len() == 9 && id.bytes().all(|b| b.is_ascii_alphanumeric()),
+                    "Mistral needs nine alphanumerics, got {id:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_multi_turn_tool_loop_survives_every_engine() {
+        for engine in [Engine::LlamaCpp, Engine::VllmMistral, Engine::Ollama] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("a.rs"), "a\n").unwrap();
+            std::fs::write(dir.path().join("b.rs"), "b\n").unwrap();
+            let (base, fake) = serve(vec![
+                engine.call("a.rs"),
+                engine.call("b.rs"),
+                engine.text("first done"),
+                engine.call("a.rs"),
+                engine.text("second done"),
+            ])
+            .await;
+            let mut config = base_config();
+            config.model.endpoint = base.clone();
+            config.model.model = engine.model().into();
+            config.profiles.get_mut("test").unwrap().tools = vec!["read".into()];
+            let provider =
+                Arc::new(OpenAiCompatProvider::new(&config.model, engine.model()).unwrap());
+            let (core, session) = build_core(dir.path(), config, Vec::new(), provider);
+            let harness = Harness {
+                core,
+                session,
+                provider: Arc::new(ScriptedProvider {
+                    scripts: Mutex::new(VecDeque::new()),
+                    requests: Mutex::new(Vec::new()),
+                    strict_system: AtomicBool::new(false),
+                }),
+            };
+            let (first, _) = run(&harness, "read a then b").await;
+            assert_eq!(
+                first.status,
+                TurnStatus::Done,
+                "{engine:?}: {:?}",
+                first.error
+            );
+            let (second, _) = run(&harness, "read a again").await;
+            assert_eq!(
+                second.status,
+                TurnStatus::Done,
+                "{engine:?}: {:?}",
+                second.error
+            );
+
+            let ids: Vec<String> = assistants(&harness.session)
+                .into_iter()
+                .flat_map(|assistant| assistant.tool_calls.unwrap_or_default())
+                .map(|call| call.id)
+                .collect();
+            assert_eq!(ids, ["call_0001", "call_0002", "call_0003"], "{engine:?}");
+            let results: Vec<String> = harness
+                .session
+                .lock()
+                .unwrap()
+                .branch_entries()
+                .into_iter()
+                .filter_map(|entry| match &entry.kind {
+                    EntryKind::ToolResult(result) => Some(result.call_id.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                results, ids,
+                "{engine:?}: one result per call, by internal id"
+            );
+
+            let requests = fake.requests.lock().unwrap().clone();
+            assert_eq!(requests.len(), 5, "{engine:?}");
+            for body in &requests {
+                assert_paired(body, engine);
+            }
+            // The last request replays all three calls.
+            let last = &requests[4];
+            let replayed = last["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|message| message["role"] == "tool")
+                .count();
+            assert_eq!(replayed, 3, "{engine:?}");
+        }
+    }
 }

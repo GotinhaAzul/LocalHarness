@@ -129,6 +129,21 @@ pub struct SessionData {
     /// session files written before this field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<SessionContextWindow>,
+    /// Permission mode and rule hash at session start. Absent in session
+    /// files written before permissions existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permissions: Option<SessionPermissions>,
+}
+
+/// The permission policy a session started under.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionPermissions {
+    /// `ask`, `accept-edits`, `plan`, `dont-ask`, or `yolo`.
+    pub mode: String,
+    /// First 16 hex digits of SHA-256 over the rules as JSON.
+    pub rules_hash: String,
+    /// Number of rules in force.
+    pub rules: usize,
 }
 
 fn default_redact() -> bool {
@@ -145,6 +160,7 @@ impl Default for SessionData {
             app: String::new(),
             redact: true,
             context: None,
+            permissions: None,
         }
     }
 }
@@ -421,6 +437,7 @@ mod tests {
                 app: "test".into(),
                 redact: true,
                 context,
+                permissions: None,
             }),
         }
     }

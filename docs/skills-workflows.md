@@ -197,6 +197,12 @@ workflow-level fields are the only policy, and the engine has no code
 evaluator. An approval step takes a `message` only; `prompt`, `require`, and
 `retry` are configuration errors on a gate.
 
+A workflow's `tools` list narrows the tool set; it never widens the
+permission policy. `[permissions]` deny rules and plan mode still apply to
+every listed tool, and `lh workflow run` cannot answer a permission prompt, so
+calls that would ask are denied unless the run passes `--mode accept-edits`,
+has matching allow rules, or uses `--yolo`.
+
 `lh workflow run` loads and validates the workflow's `skills` and prepends
 their instructions to the first prompt step. The TUI does the same by adding
 labeled user entries when it starts the workflow.

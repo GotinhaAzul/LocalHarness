@@ -1,6 +1,6 @@
 //! One turn: stream the model, run tool batches, enforce guards, settle.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 use std::time::Instant;
 
@@ -13,7 +13,9 @@ use crate::context::compact::{
     FindingSummary, build_summary_keeping, recent_tail_start, summary_budget, tail_budget,
 };
 use crate::context::{self, BATCH_CAP_CHARS, StaticPrompt, TokenBudget, ToolSpecCost};
-use crate::provider::{ChatMessage, ChatRequest, ErrorClass, ProviderError, StreamEvent, Usage};
+use crate::provider::{
+    CallAccumulator, ChatMessage, ChatRequest, ErrorClass, ProviderError, StreamEvent, Usage,
+};
 use crate::session::{
     AssistantData, CompactionData, CustomData, EntryKind, ToolCall, ToolResultData, UserData,
 };
@@ -430,11 +432,13 @@ async fn run_loop(
         });
         return TurnOutcome::budget(&code, message);
     }
+    record_prompt_prefix(core);
     let mut loop_guard = LoopGuard::new();
     let verify_configured = !core.config.verify.steps.is_empty();
     let gate_tools = gates::GateTools::from_names(core.tools.iter().map(|tool| tool.name()));
     let read_available = core.tools.iter().any(|tool| tool.name() == "read");
     let mut pending_compaction = false;
+    let mut cache_watch = CacheWatch::default();
     let mut call_ledger = CallLedger::from_session(&core.session.lock().expect("session lock"));
     let mut compacted_since_model_call = false;
     let mut invalid_tool_calls = 0u32;
@@ -518,6 +522,7 @@ async fn run_loop(
                 });
                 return TurnOutcome::ok(TurnStatus::Blocked);
             }
+            let system_before_compaction = leading_system(&assembled).to_string();
             let mut result = compact_session(
                 &core.session,
                 findings.as_ref(),
@@ -543,6 +548,26 @@ async fn run_loop(
             match result {
                 Ok(compacted) => {
                     compacted_since_model_call = true;
+                    let system_after_compaction = leading_system(&assembled);
+                    let reuse = context::common_prefix_chars(
+                        &system_before_compaction,
+                        system_after_compaction,
+                    );
+                    let reprefill = system_after_compaction
+                        .chars()
+                        .count()
+                        .saturating_sub(reuse);
+                    append_custom(
+                        &core.session,
+                        "cache-boundary",
+                        json!({
+                            "reason": reason,
+                            "reuse_prefix_chars": reuse,
+                            "reprefill_chars": reprefill,
+                            "chars_before": system_before_compaction.chars().count(),
+                            "chars_after": system_after_compaction.chars().count(),
+                        }),
+                    );
                     let _ = tx.send(AgentEvent::Compacted {
                         summary: compacted.summary,
                         tokens_before: compacted.tokens_before,
@@ -622,6 +647,23 @@ async fn run_loop(
         } else if let Some(reason) = &core.vision.blocked {
             ChatMessage::strip_images(&mut messages, reason);
         }
+        let request_prefix =
+            context::prompt_prefix(leading_system(&assembled), &core.tool_specs_json);
+        let extra_body = match core
+            .model_profile
+            .request_extra_body(!core.tool_specs.is_empty())
+        {
+            Ok(body) => body,
+            Err(message) => {
+                append_error(&core.session, "thinking_policy", &message, false);
+                let _ = tx.send(AgentEvent::Error {
+                    code: "thinking_policy".into(),
+                    message: message.clone(),
+                    recoverable: false,
+                });
+                return TurnOutcome::error("thinking_policy", message);
+            }
+        };
         let request = ChatRequest {
             model: core.provider.model().to_string(),
             messages,
@@ -638,11 +680,7 @@ async fn run_loop(
             // than the window holds makes some servers reject the request.
             max_tokens: budget.max_output_tokens,
             stop: core.model_profile.stop.clone(),
-            extra_body: core
-                .model_profile
-                .extra_body
-                .as_ref()
-                .and_then(|value| serde_json::to_value(value).ok()),
+            extra_body,
             include_usage: true,
             reasoning_field: core.model_profile.reasoning_field.clone(),
         };
@@ -782,6 +820,27 @@ async fn run_loop(
             ));
             return TurnOutcome::ok(TurnStatus::ContextTruncated);
         }
+        if let Some(cold) = cache_watch.observe(
+            assistant.usage.as_ref(),
+            &request_prefix,
+            compacted_since_model_call.then_some("system block rewritten"),
+        ) {
+            let message = format!(
+                "prompt cache hit {}% on two consecutive requests; likely invalidator: {}. Keep one session on one server slot and avoid changing the profile or tool list mid-session.",
+                cold.percent, cold.invalidator
+            );
+            append_custom(
+                &core.session,
+                "cache-cold",
+                json!({
+                    "cache_percent": cold.percent,
+                    "likely_invalidator": cold.invalidator,
+                    "prompt_tokens": assistant.usage.as_ref().map(|usage| usage.prompt_tokens),
+                    "cached_tokens": assistant.usage.as_ref().and_then(|usage| usage.cached_tokens),
+                }),
+            );
+            let _ = tx.send(AgentEvent::Notice(message));
+        }
         let mut assistant = assistant;
         // A successful reply means the current context fits. A later fill can
         // compact or retry on its own allowance instead of a per-turn budget.
@@ -839,6 +898,39 @@ async fn run_loop(
                 verify_configured,
                 turn_start.as_deref(),
             );
+            // Plan mode: the turn settles only once a todo plan exists, and
+            // the plan is stored as a session entry the user can read.
+            if core.permissions.mode() == crate::policy::PermissionMode::Plan {
+                if !facts.todo_plan_present && gate_tools.todo {
+                    if progress.can_continue_settle() {
+                        progress.settle_continuations += 1;
+                        let message = "[localharness] plan mode: record your proposal now with the todo tool, action \"plan\", one task per step you propose. Nothing may change until the user runs /plan approve.";
+                        if let Err(err) = append_user(&core.session, message) {
+                            return TurnOutcome::error("session_write", err.to_string());
+                        }
+                        let _ = tx.send(AgentEvent::Notice(message.into()));
+                        continue;
+                    }
+                    let message = "plan mode: the turn ended without a todo plan after reminders. Ask again for a plan; nothing was changed.".to_string();
+                    append_error(&core.session, "gate_block", &message, true);
+                    let _ = tx.send(AgentEvent::Error {
+                        code: "gate_block".into(),
+                        message,
+                        recoverable: true,
+                    });
+                    return TurnOutcome::ok(TurnStatus::Blocked);
+                }
+                let entry = {
+                    let session = core.session.lock().expect("session lock");
+                    crate::tools::todo::plan_entry(&session, "proposed")
+                };
+                if let Ok(mut session) = core.session.lock()
+                    && let Err(err) = session.append(EntryKind::Custom(entry))
+                {
+                    tracing::warn!(%err, "cannot record the plan in the session");
+                }
+                return TurnOutcome::ok(TurnStatus::Done);
+            }
             match gates::settle(&facts, &mut progress, gate_tools) {
                 SettleDecision::Done => {
                     if gate_tools.verify
@@ -1320,7 +1412,7 @@ fn recover_output(
             ));
         }
     } else if calls.is_empty() && content_empty {
-        out.nudge = Some("[localharness] empty response: you returned no text and no tool call. Make the next tool call, or give your final answer.".into());
+        out.nudge = Some("[localharness] empty response: you returned no text and no tool call (reasoning alone is not an answer). Make the next tool call, or give your final answer outside the reasoning block.".into());
     }
     out
 }
@@ -1328,7 +1420,7 @@ fn recover_output(
 struct StreamAccum {
     content: String,
     reasoning: String,
-    calls: BTreeMap<usize, PartialCall>,
+    calls: CallAccumulator,
     usage: Option<Usage>,
     finish: Option<String>,
     think: super::output::ThinkSplitter,
@@ -1336,24 +1428,21 @@ struct StreamAccum {
     reasoning_loop: super::output::RepetitionGuard,
     /// Set when the repetition guard stopped the stream.
     degenerate: bool,
+    /// The model profile's `strip_reasoning`: reasoning is shown live but
+    /// never persisted in the session entry.
+    strip_reasoning: bool,
     /// When the request was sent, and when tokens first and last arrived.
     sent: Instant,
     first_token: Option<Instant>,
     last_token: Option<Instant>,
 }
 
-#[derive(Default)]
-struct PartialCall {
-    id: String,
-    name: String,
-    arguments: String,
-}
-
 impl StreamAccum {
     /// Content streamed so far, without tool calls, for a cancelled or failed
     /// generation. Keeps the branch useful after an interruption.
     fn partial(&self) -> Option<AssistantData> {
-        if self.content.trim().is_empty() && self.reasoning.trim().is_empty() {
+        let keep_reasoning = !self.strip_reasoning && !self.reasoning.is_empty();
+        if self.content.trim().is_empty() && !keep_reasoning {
             return None;
         }
         Some(AssistantData {
@@ -1362,11 +1451,7 @@ impl StreamAccum {
             } else {
                 Some(self.content.clone())
             },
-            reasoning: if self.reasoning.is_empty() {
-                None
-            } else {
-                Some(self.reasoning.clone())
-            },
+            reasoning: keep_reasoning.then(|| self.reasoning.clone()),
             tool_calls: None,
             usage: self.usage.clone(),
             stop_reason: Some("cancelled".into()),
@@ -1377,13 +1462,14 @@ impl StreamAccum {
         Self {
             content: String::new(),
             reasoning: String::new(),
-            calls: BTreeMap::new(),
+            calls: CallAccumulator::new(),
             usage: None,
             finish: None,
             think: super::output::ThinkSplitter::default(),
             content_loop: super::output::RepetitionGuard::default(),
             reasoning_loop: super::output::RepetitionGuard::default(),
             degenerate: false,
+            strip_reasoning: false,
             sent: Instant::now(),
             first_token: None,
             last_token: None,
@@ -1417,6 +1503,35 @@ impl StreamAccum {
             if secs >= 0.2 {
                 usage.tokens_per_sec = Some((f64::from(usage.completion_tokens - 1) / secs) as f32);
             }
+        }
+    }
+
+    /// A reply that only reasoned (no text, no tool call) is a parser or
+    /// thinking-policy problem, not an answer: say so visibly. The loop's
+    /// empty-response nudge then retries instead of completing the turn.
+    fn warn_reasoning_only(&self, tx: &UnboundedSender<AgentEvent>) {
+        let cut_short = matches!(self.finish.as_deref(), Some("length") | Some("max_tokens"));
+        if self.content.trim().is_empty()
+            && !self.calls.has_named_call()
+            && !self.reasoning.trim().is_empty()
+            && !cut_short
+            && !self.degenerate
+        {
+            let _ = tx.send(AgentEvent::Guard {
+                code: "reasoning_only".into(),
+                message: "the model replied with reasoning only: no answer text and no tool call. Retrying with a nudge. If this repeats, the server's reasoning parser may be swallowing the answer or tool call (check reasoning_field and the engine's reasoning parser), or set thinking = \"off\" with a thinking_control in the model profile.".into(),
+            });
+        }
+    }
+
+    /// Count reasoning tokens from the text when the server reported usage
+    /// without them, so the token meter shows them for every engine.
+    fn estimate_reasoning_tokens(&mut self, budget: &TokenBudget) {
+        if let Some(usage) = self.usage.as_mut()
+            && usage.reasoning_tokens.is_none()
+            && !self.reasoning.trim().is_empty()
+        {
+            usage.reasoning_tokens = Some(budget.estimate_text(&self.reasoning));
         }
     }
 
@@ -1460,30 +1575,10 @@ impl StreamAccum {
     /// Other invalid JSON is left for the repair layer, which can fix common
     /// model mistakes.
     fn validate_calls(&self) -> Result<(), ProviderError> {
-        let cut_short = matches!(self.finish.as_deref(), Some("length") | Some("max_tokens"));
-        if self.degenerate || !cut_short {
+        if self.degenerate {
             return Ok(());
         }
-        for call in self.calls.values() {
-            if call.name.trim().is_empty() {
-                continue;
-            }
-            // A call cut off right after its name has no argument text at
-            // all. Finalization would turn that into `{}`, which can run a
-            // no-required-keys tool from a reply the output limit cut off.
-            if call.arguments.trim().is_empty()
-                || serde_json::from_str::<Value>(&call.arguments).is_err()
-            {
-                return Err(ProviderError::new(
-                    ErrorClass::ToolCallTruncated,
-                    format!(
-                        "the model hit the output token limit while writing the {:?} tool call; its arguments are incomplete and nothing was executed. Raise [model] max_output_tokens or split the call into smaller steps.",
-                        call.name
-                    ),
-                ));
-            }
-        }
-        Ok(())
+        self.calls.check_truncation(self.finish.as_deref())
     }
 
     /// Emit anything the think splitter held back, and move reasoning that a
@@ -1509,24 +1604,17 @@ impl StreamAccum {
 
     fn finalize(self, ledger: &mut CallLedger) -> AssistantData {
         let mut calls = Vec::new();
-        for call in self.calls.into_values() {
-            if call.name.trim().is_empty() {
-                continue;
-            }
+        // The engine id stops here: the session only ever sees the ledger's
+        // internal id, assigned in arrival order.
+        for call in self.calls.into_calls() {
             let internal_id = ledger.next_id();
-            if !call.id.trim().is_empty() {
-                ledger.map_engine_id(call.id.trim(), &internal_id);
+            if let Some(engine_id) = &call.engine_id {
+                ledger.map_engine_id(engine_id, &internal_id);
             }
-            let arguments = if call.arguments.trim().is_empty() {
-                json!({})
-            } else {
-                serde_json::from_str(&call.arguments)
-                    .unwrap_or_else(|_| Value::String(call.arguments.clone()))
-            };
             calls.push(ToolCall {
                 id: internal_id,
+                arguments: call.parsed_arguments(),
                 name: call.name,
-                arguments,
             });
         }
         AssistantData {
@@ -1535,7 +1623,7 @@ impl StreamAccum {
             } else {
                 Some(self.content)
             },
-            reasoning: if self.reasoning.is_empty() {
+            reasoning: if self.reasoning.is_empty() || self.strip_reasoning {
                 None
             } else {
                 Some(self.reasoning)
@@ -1576,6 +1664,7 @@ async fn stream_assistant(
         provider.chat_stream(request, etx, child).await;
     });
     let mut accum = StreamAccum::new();
+    accum.strip_reasoning = core.model_profile.strip_reasoning();
     let mut failure: Option<ProviderError> = None;
     while let Some(item) = erx.recv().await {
         if let Some(err) = handle_stream_item(
@@ -1599,6 +1688,8 @@ async fn stream_assistant(
     let _ = task.await;
     accum.settle_reasoning(tx);
     accum.measure();
+    accum.estimate_reasoning_tokens(budget);
+    accum.warn_reasoning_only(tx);
     if let Some(usage) = &accum.usage {
         let _ = tx.send(AgentEvent::Usage(usage.clone()));
     }
@@ -1655,16 +1746,9 @@ fn handle_stream_item(
             arguments,
         }) => {
             accum.token_arrived();
-            let call = accum.calls.entry(index).or_default();
-            if let Some(id) = id {
-                merge_fragment(&mut call.id, &id);
-            }
-            if let Some(name) = name {
-                merge_fragment(&mut call.name, &name);
-            }
-            if let Some(arguments) = arguments {
-                call.arguments.push_str(&arguments);
-            }
+            accum
+                .calls
+                .push(index, id.as_deref(), name.as_deref(), arguments.as_deref());
             None
         }
         Ok(StreamEvent::Usage(usage)) => {
@@ -1689,15 +1773,6 @@ fn handle_stream_item(
             accum.finish = Some(reason);
             None
         }
-    }
-}
-
-fn merge_fragment(buffer: &mut String, fragment: &str) {
-    if fragment.is_empty() {
-        return;
-    }
-    if buffer.is_empty() || !buffer.ends_with(fragment) {
-        buffer.push_str(fragment);
     }
 }
 
@@ -1823,7 +1898,19 @@ async fn execute_batch(
         let mut pre_notes: Vec<String> = Vec::new();
         let mut executed = false;
 
-        if tool.is_none() {
+        if tool.is_none()
+            && core.permissions.mode() == crate::policy::PermissionMode::Plan
+            && core.registry.get(&call.name).is_some()
+        {
+            // Plan mode removed this tool; name the reason, not a typo.
+            result = ToolResult::err(
+                "plan_mode",
+                format!(
+                    "plan mode is active: {} is removed until the user runs /plan approve. Investigate with read-only tools and write the plan with todo action \"plan\".",
+                    call.name
+                ),
+            );
+        } else if tool.is_none() {
             let hint = unknown_suggestion
                 .map(|name| format!("did you mean {name}? "))
                 .unwrap_or_default();
@@ -1857,7 +1944,20 @@ async fn execute_batch(
                     repaired = Some(args.clone());
                     result = ToolResult::ok("");
 
-                    if read_available
+                    // Permission policy first: a denial (rule, plan mode)
+                    // stops the call before any other gate. An ask waits
+                    // until the harness gates pass.
+                    let mut pending_ask = None;
+                    match super::authorize::decide(core, tool.as_deref().unwrap(), &args) {
+                        crate::policy::Decision::Allow => {}
+                        crate::policy::Decision::Ask(request) => pending_ask = Some(request),
+                        crate::policy::Decision::Deny { code, message } => {
+                            result = ToolResult::err(&code, message);
+                        }
+                    }
+
+                    if !result.is_error
+                        && read_available
                         && matches!(call.name.as_str(), "edit" | "write" | "patch")
                         && let Some(path) = &args_path
                     {
@@ -1914,6 +2014,13 @@ async fn execute_batch(
                         if let Err(message) = gate {
                             result = ToolResult::err("SEC_SCOPE", message);
                         }
+                    }
+
+                    if !result.is_error
+                        && let Some(request) = pending_ask.take()
+                        && let Err(denied) = super::authorize::confirm(core, request, cancel).await
+                    {
+                        result = denied;
                     }
 
                     // The frontend (ACP) may add its own approval gate. It
@@ -2423,6 +2530,108 @@ fn append_custom(session: &crate::tools::SessionHandle, kind: &str, payload: Val
     }
 }
 
+/// Fingerprint the request prefix and record it on the session branch when it
+/// changes. The base system prompt and the serialized tools array are the
+/// bytes every request starts with; the volatile session facts sit at the tail
+/// of the system block, and compaction reports its own cache boundary.
+fn record_prompt_prefix(core: &Core) -> context::PromptPrefix {
+    let prefix = context::prompt_prefix(&core.system_prompt, &core.tool_specs_json);
+    let unchanged = core
+        .session
+        .lock()
+        .ok()
+        .and_then(|session| {
+            session
+                .latest_custom_on_path("prompt-prefix")
+                .and_then(|entry| match &entry.kind {
+                    EntryKind::Custom(data) => data
+                        .payload
+                        .get("hash")
+                        .and_then(Value::as_str)
+                        .map(|hash| hash == prefix.hash),
+                    _ => None,
+                })
+        })
+        .unwrap_or(false);
+    if !unchanged {
+        let stable = super::prompt::stable_prefix_chars(&core.system_prompt);
+        let stable_chars = core.system_prompt[..stable].chars().count();
+        append_custom(
+            &core.session,
+            "prompt-prefix",
+            json!({
+                "hash": prefix.hash,
+                "chars": prefix.chars,
+                "stable_chars": stable_chars,
+                "tools_chars": core.tool_specs_json.chars().count(),
+            }),
+        );
+        tracing::info!(hash = %prefix.hash, "prompt prefix");
+    }
+    prefix
+}
+
+/// The leading system message, which is the prefix the conversation follows.
+fn leading_system(assembled: &crate::context::AssembledContext) -> &str {
+    match assembled.messages.first() {
+        Some(ChatMessage::System { content }) => content,
+        _ => "",
+    }
+}
+
+/// A cold prefix-cache streak worth reporting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CacheCold {
+    percent: u32,
+    invalidator: &'static str,
+}
+
+/// Tracks prefix-cache hits across consecutive model calls in a turn. Engines
+/// that do not report `cached_tokens` are ignored rather than guessed at.
+#[derive(Debug, Default)]
+struct CacheWatch {
+    last_prefix: Option<String>,
+    cold_calls: u32,
+    warned: bool,
+}
+
+impl CacheWatch {
+    /// Observe one model call. Returns a report on the second consecutive call
+    /// below 70% so a single noisy sample does not raise an alarm.
+    fn observe(
+        &mut self,
+        usage: Option<&Usage>,
+        prefix: &context::PromptPrefix,
+        compaction_reason: Option<&str>,
+    ) -> Option<CacheCold> {
+        let previous = self.last_prefix.replace(prefix.hash.clone());
+        let usage = usage?;
+        let percent = usage.cache_percent()?;
+        if percent >= 70 {
+            self.cold_calls = 0;
+            self.warned = false;
+            return None;
+        }
+        self.cold_calls += 1;
+        if self.cold_calls < 2 || self.warned {
+            return None;
+        }
+        self.warned = true;
+        let prefix_changed = previous.is_some_and(|hash| hash != prefix.hash);
+        let invalidator = if compaction_reason.is_some() {
+            "the compaction rewrote the system block"
+        } else if prefix_changed {
+            "the prompt prefix (system prompt or tool list) changed"
+        } else {
+            "the server evicted the prefix or moved the request to another slot"
+        };
+        Some(CacheCold {
+            percent,
+            invalidator,
+        })
+    }
+}
+
 /// Exact rendered-prompt count when `/tokenize` answers.
 async fn exact_prompt_tokens(
     core: &Core,
@@ -2737,7 +2946,8 @@ fn compact_session(
         thread_id,
         keep_from: keep_from.clone(),
     }))?;
-    session.fsync()?;
+    // No fsync here: compaction runs inside a turn and the turn end fsyncs
+    // once, so a turn that compacts costs one fsync, not one per compaction.
     Ok(Compacted {
         summary: summary.summary,
         tokens_before: summary.tokens_before,
@@ -2834,6 +3044,7 @@ mod tests {
                 app: "test".into(),
                 redact: true,
                 context: None,
+                permissions: None,
             },
             true,
         )
@@ -2857,6 +3068,9 @@ mod tests {
             crate::app::measure_static_prompt(&budget, &system_prompt, tool_specs_cost, Some(""));
         Core {
             approver: None,
+            permissions: std::sync::Arc::new(crate::policy::Permissions::with_mode(
+                crate::policy::PermissionMode::Yolo,
+            )),
             config,
             paths: paths.clone(),
             provider: Arc::new(ProbeProvider {
@@ -2954,21 +3168,65 @@ mod tests {
     }
 
     #[test]
-    fn merge_fragment_handles_repeats() {
-        let mut buffer = String::new();
-        merge_fragment(&mut buffer, "read");
-        merge_fragment(&mut buffer, "read");
-        assert_eq!(buffer, "read");
-        merge_fragment(&mut buffer, "_file");
-        assert_eq!(buffer, "read_file");
+    fn cold_cache_alarm_needs_two_consecutive_calls() {
+        let prefix = crate::context::prompt_prefix("system", "[]");
+        let cold = Usage {
+            prompt_tokens: 100,
+            cached_tokens: Some(10),
+            ..Usage::default()
+        };
+        let warm = Usage {
+            prompt_tokens: 100,
+            cached_tokens: Some(90),
+            ..Usage::default()
+        };
+        let mut watch = CacheWatch::default();
+        assert!(watch.observe(Some(&cold), &prefix, None).is_none());
+        let report = watch
+            .observe(Some(&cold), &prefix, None)
+            .expect("second cold call alarms");
+        assert_eq!(report.percent, 10);
+        assert!(report.invalidator.contains("server evicted"));
+        assert!(
+            watch.observe(Some(&cold), &prefix, None).is_none(),
+            "one alarm per cold streak"
+        );
+        watch.observe(Some(&warm), &prefix, None);
+        assert!(watch.observe(Some(&cold), &prefix, None).is_none());
+    }
+
+    #[test]
+    fn cold_cache_alarm_names_a_changed_prefix_or_compaction() {
+        let first = crate::context::prompt_prefix("system", "[]");
+        let second = crate::context::prompt_prefix("system changed", "[]");
+        let cold = Usage {
+            prompt_tokens: 100,
+            cached_tokens: Some(0),
+            ..Usage::default()
+        };
+        let mut watch = CacheWatch::default();
+        watch.observe(Some(&cold), &first, None);
+        let report = watch
+            .observe(Some(&cold), &second, None)
+            .expect("changed prefix alarm");
+        assert!(report.invalidator.contains("prefix"));
+        let mut watch = CacheWatch::default();
+        watch.observe(Some(&cold), &first, None);
+        let report = watch
+            .observe(Some(&cold), &first, Some("auto"))
+            .expect("compaction alarm");
+        assert!(report.invalidator.contains("compaction"));
+        // An engine that does not report cached tokens never guesses.
+        let mut watch = CacheWatch::default();
+        let unknown = Usage::new(100, 1);
+        watch.observe(Some(&unknown), &first, None);
+        assert!(watch.observe(Some(&unknown), &first, None).is_none());
     }
 
     #[test]
     fn partial_call_finalizes_with_synthetic_id_and_bad_json() {
         let mut accum = StreamAccum::new();
-        let call = accum.calls.entry(0).or_default();
-        call.name = "read".into();
-        call.arguments = "{not json".into();
+        accum.calls.push(0, None, Some("read"), Some("{not json"));
         let mut ledger = CallLedger::default();
         let assistant = accum.finalize(&mut ledger);
         let calls = assistant.tool_calls.unwrap();
@@ -2977,7 +3235,7 @@ mod tests {
         // Ids must not repeat across messages, or replayed history pairs a
         // call with another call's result.
         let mut again = StreamAccum::new();
-        again.calls.entry(0).or_default().name = "read".into();
+        again.calls.push(0, None, Some("read"), None);
         let second = again.finalize(&mut ledger).tool_calls.unwrap();
         assert_eq!(second[0].id, "call_0002");
         assert_ne!(calls[0].id, second[0].id);
@@ -2987,9 +3245,12 @@ mod tests {
     fn a_length_cut_invalid_call_is_rejected_before_dispatch() {
         let mut accum = StreamAccum::new();
         accum.finish = Some("length".into());
-        let call = accum.calls.entry(0).or_default();
-        call.name = "write".into();
-        call.arguments = "{\"path\":\"big.rs\",\"content\":\"fn a".into();
+        accum.calls.push(
+            0,
+            None,
+            Some("write"),
+            Some("{\"path\":\"big.rs\",\"content\":\"fn a"),
+        );
         let err = accum.validate_calls().expect_err("truncated call");
         assert_eq!(err.class, ErrorClass::ToolCallTruncated);
         assert!(err.message.contains("incomplete"), "{}", err.message);
@@ -3000,10 +3261,8 @@ mod tests {
     fn a_length_cut_call_without_arguments_is_rejected() {
         let mut accum = StreamAccum::new();
         accum.finish = Some("max_tokens".into());
-        let call = accum.calls.entry(0).or_default();
         // The stream stopped after the name, before any argument text.
-        call.name = "todo".into();
-        assert!(call.arguments.is_empty());
+        accum.calls.push(0, None, Some("todo"), None);
         let err = accum.validate_calls().expect_err("truncated call");
         assert_eq!(err.class, ErrorClass::ToolCallTruncated);
         assert!(err.message.contains("incomplete"), "{}", err.message);
@@ -3013,9 +3272,9 @@ mod tests {
     fn a_complete_call_is_not_rejected_at_the_output_limit() {
         let mut accum = StreamAccum::new();
         accum.finish = Some("length".into());
-        let call = accum.calls.entry(0).or_default();
-        call.name = "read".into();
-        call.arguments = "{\"path\":\"a.rs\"}".into();
+        accum
+            .calls
+            .push(0, None, Some("read"), Some("{\"path\":\"a.rs\"}"));
         assert!(accum.validate_calls().is_ok());
     }
 

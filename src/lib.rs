@@ -16,6 +16,7 @@ pub mod hooks;
 pub mod mcp;
 pub mod media;
 pub mod paths;
+pub mod policy;
 pub mod provenance;
 pub mod provider;
 pub mod sandbox;
