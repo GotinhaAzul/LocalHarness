@@ -332,6 +332,7 @@ async fn run_loop(
         });
         return TurnOutcome::budget(&code, message);
     }
+    record_prompt_prefix(core);
     let mut loop_guard = LoopGuard::new();
     let verify_configured = !core.config.verify.steps.is_empty();
     let gate_tools = gates::GateTools::from_names(core.tools.iter().map(|tool| tool.name()));
@@ -2173,6 +2174,45 @@ fn append_custom(session: &crate::tools::SessionHandle, kind: &str, payload: Val
         }
         let _ = session.append(EntryKind::Custom(data));
     }
+}
+
+/// Fingerprint the request prefix and record it on the session branch when it
+/// changes. The base system prompt and the serialized tools array are the
+/// bytes every request starts with; the volatile session facts sit at the tail
+/// of the system block, and compaction reports its own cache boundary.
+fn record_prompt_prefix(core: &Core) -> context::PromptPrefix {
+    let prefix = context::prompt_prefix(&core.system_prompt, &core.tool_specs_json);
+    let unchanged = core
+        .session
+        .lock()
+        .ok()
+        .and_then(|session| {
+            session
+                .latest_custom_on_path("prompt-prefix")
+                .and_then(|entry| match &entry.kind {
+                    EntryKind::Custom(data) => data
+                        .payload
+                        .get("hash")
+                        .and_then(Value::as_str)
+                        .map(|hash| hash == prefix.hash),
+                    _ => None,
+                })
+        })
+        .unwrap_or(false);
+    if !unchanged {
+        append_custom(
+            &core.session,
+            "prompt-prefix",
+            json!({
+                "hash": prefix.hash,
+                "chars": prefix.chars,
+                "stable_chars": super::prompt::stable_prefix_chars(&core.system_prompt),
+                "tools_chars": core.tool_specs_json.chars().count(),
+            }),
+        );
+        tracing::info!(hash = %prefix.hash, "prompt prefix");
+    }
+    prefix
 }
 
 /// Exact rendered-prompt count when `/tokenize` answers.
