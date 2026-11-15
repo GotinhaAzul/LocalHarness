@@ -205,8 +205,9 @@ content hash before every line:
 2  954620a7  beta
 ```
 
-`patch` takes the path with that tag and an `ops` array. Line numbers are
-1-based coordinates from the read, not coordinates after earlier operations.
+`patch` takes the path with that tag (`PATH#SNAPSHOT` or the bracketed header
+`[PATH#SNAPSHOT]` both work) and an `ops` array. Line numbers are 1-based
+coordinates from the read, not coordinates after earlier operations.
 
 ```json
 {

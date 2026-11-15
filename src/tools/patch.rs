@@ -190,6 +190,12 @@ fn run(ctx: &ToolContext, args: &Value) -> Result<ToolResult, ToolResult> {
 /// Split `path#snapshot`, accepting only the 12-hex tag `read` emits. In text
 /// mode this is never consulted, so a filename containing `#` is unchanged.
 fn split_snapshot(raw: &str) -> Option<(&str, &str)> {
+    // Accept the header exactly as read printed it, `[path#snapshot]`, as
+    // well as the plain `path#snapshot` form.
+    let raw = raw
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or(raw);
     let (path, tag) = raw.rsplit_once('#')?;
     if path.is_empty() || tag.len() != 12 || !tag.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return None;
@@ -858,6 +864,7 @@ mod tests {
     fn snapshot_tags_are_stripped_only_in_hash_mode() {
         let tag = "0123456789ab";
         assert_eq!(gate_path(&format!("a.rs#{tag}"), EditMode::Hash), "a.rs");
+        assert_eq!(gate_path(&format!("[a.rs#{tag}]"), EditMode::Hash), "a.rs");
         assert_eq!(gate_path("dir/a#b.rs", EditMode::Hash), "dir/a#b.rs");
         assert_eq!(
             gate_path("a.rs#0123456789ab", EditMode::Text),
