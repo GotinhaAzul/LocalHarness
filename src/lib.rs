@@ -10,6 +10,7 @@ pub mod cli;
 pub mod config;
 pub mod context;
 pub mod doctor;
+pub mod events;
 pub mod external;
 pub mod git;
 pub mod mcp;
