@@ -134,6 +134,15 @@ tool_mode = "repair"        # native | repair | auto
 - `reasoning_field` names the streaming field (`reasoning_content` by default,
   falling back to `reasoning`).
 - `stop` adds stop sequences.
+- `temperature`, `top_p`, `min_p`, `repeat_penalty`, `dry_multiplier`,
+  `dry_base`, `xtc_probability`, and `seed` are per-model samplers. Each one
+  overrides the same global `[model]` value. The bundled presets are
+  `qwen-coding`, `gemma-chat`, and `glm-agent`; `model_profile = "auto"`
+  applies one from the model name, and `--model-profile <name>` selects one
+  explicitly. Only fields the engine accepts are sent: `min_p` is omitted for
+  Ollama, DRY/XTC only go to llama.cpp and KoboldCpp, and `lh doctor` warns
+  about each omitted field. Set `[model] engine` when a gateway hides the real
+  server.
 - `extra_body` merges server-specific fields into every request, for example
   `chat_template_kwargs`.
 - `parallel_tool_calls` is recorded for compatibility; tools run sequentially.
@@ -332,5 +341,6 @@ the server reported nothing; the harness falls back to the configured
   calls; cut prose is continued. Raise `[model] max_output_tokens` if it
   repeats.
 - **"repetition guard"**: the model fell into an exact loop and was stopped
-  early. Lower `temperature`, or add a repetition penalty through
-  `extra_body` (llama.cpp: `repeat_penalty`; vLLM: `repetition_penalty`).
+  early. Apply a sampler preset (`qwen-coding`, `gemma-chat`, `glm-agent`),
+  lower `temperature`, or set `min_p`/`repeat_penalty`/DRY values in the model
+  profile. `lh doctor` reports fields the engine omits.

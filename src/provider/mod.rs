@@ -1,7 +1,9 @@
 //! Provider abstraction. One implementation: OpenAI-compatible HTTP.
 
+pub mod engine;
 pub mod openai;
 pub mod probe;
+pub mod sampler;
 pub mod sse;
 pub mod types;
 
@@ -9,7 +11,9 @@ use async_trait::async_trait;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 
+pub use engine::{Engine, StructuredOutput};
 pub use openai::OpenAiCompatProvider;
+pub use sampler::{SamplerField, SamplerSettings};
 pub use types::{
     ChatMessage, ChatRequest, ErrorClass, ImageData, ProviderError, StreamEvent, StreamItem,
     ToolCall, ToolSpec, Usage, redact, tools_json, tools_payload,

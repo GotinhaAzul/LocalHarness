@@ -393,6 +393,12 @@ pub async fn create_runtime(
             }
         }
     }
+    let engine = crate::provider::Engine::resolve(provider.as_ref(), &config.model.engine).await;
+    let samplers = crate::provider::SamplerSettings::resolve(&config.model, &profile);
+    for warning in samplers.warnings(engine) {
+        tracing::warn!("{warning}");
+        session.warnings.push(warning);
+    }
     let skills =
         SkillIndex::load(&paths, config.trust).advertised_for(&crate::tools::active_packs(&tools));
     let repo_brief = registry
@@ -531,6 +537,7 @@ pub async fn create_runtime(
         model_profile: profile,
         vision,
         tool_probe,
+        engine,
         cancel: CancellationToken::new(),
         tool_timeout: Duration::from_secs(660),
         path_jail: options.path_jail,
@@ -689,6 +696,20 @@ pub async fn rebuild_core(old: &Arc<Core>, mut config: Config) -> Result<Arc<Cor
     if let Some(probe) = &tool_probe {
         apply_tool_probe(probe, &mut model_profile, &mut tool_specs);
     }
+    let engine = if same_target {
+        old.engine
+    } else {
+        crate::provider::Engine::resolve(provider.as_ref(), &config.model.engine).await
+    };
+    if !same_target {
+        let samplers = crate::provider::SamplerSettings::resolve(&config.model, &model_profile);
+        for warning in samplers.warnings(engine) {
+            tracing::warn!("{warning}");
+            if let Ok(mut session) = old.session.lock() {
+                session.warnings.push(warning);
+            }
+        }
+    }
     if let Some(text) = repair_protocol(tool_probe.as_ref(), &tools, !tool_specs.is_empty()) {
         system_prompt.push_str(&text);
     }
@@ -766,6 +787,7 @@ pub async fn rebuild_core(old: &Arc<Core>, mut config: Config) -> Result<Arc<Cor
         model_profile,
         vision,
         tool_probe,
+        engine,
         cancel: old.cancel.clone(),
         tool_timeout: old.tool_timeout,
         path_jail: old.path_jail,

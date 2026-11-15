@@ -11,7 +11,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::provider::probe::{self, LlamaProps, OllamaModel, ToolProbe, WindowTruth};
-use crate::provider::{Provider, endpoint_urls};
+use crate::provider::{Engine, Provider, SamplerSettings, endpoint_urls};
 
 /// Timeout for one metadata probe. Long enough for a local engine to answer,
 /// short enough that an unknown endpoint does not stall `lh doctor`.
@@ -74,7 +74,6 @@ impl DoctorManifest {
         let mut tool_dialect = "unknown".to_string();
         let mut tool_parser = None;
         let reasoning_field = None;
-        let structured_output = "unknown".to_string();
         let mut cache_mode = None;
         let mut tokenizer_route = None;
         let mut embeddings = false;
@@ -228,6 +227,36 @@ impl DoctorManifest {
             }
         }
 
+        // 8. MLX-LM only identifies itself through the models it serves.
+        if !detected {
+            match probe::get_json_with_timeout(
+                provider,
+                &format!("{}/models", urls.api),
+                PROBE_TIMEOUT,
+            )
+            .await
+            {
+                Ok(value)
+                    if value["data"].as_array().is_some_and(|items| {
+                        items.iter().any(|item| {
+                            item["id"]
+                                .as_str()
+                                .is_some_and(|id| id.to_ascii_lowercase().contains("mlx"))
+                                || item["owned_by"]
+                                    .as_str()
+                                    .is_some_and(|owner| owner.eq_ignore_ascii_case("mlx"))
+                        })
+                    }) =>
+                {
+                    probes_ok.push("mlx /v1/models".into());
+                    engine = "mlx".into();
+                    detected = true;
+                    engine_json = Some(value);
+                }
+                _ => probes_failed.push("mlx /v1/models".into()),
+            }
+        }
+
         // Fill engine-specific fields from what the engine actually reported.
         match engine.as_str() {
             "llama.cpp" => {
@@ -294,6 +323,11 @@ impl DoctorManifest {
             }
             _ => {}
         }
+        let structured_output = Engine::parse(&engine)
+            .unwrap_or(Engine::Generic)
+            .structured_output()
+            .label()
+            .to_string();
         if tool_parser.is_none()
             && let Some(value) = &engine_json
         {
@@ -352,6 +386,21 @@ impl DoctorManifest {
             probes_failed,
             warnings,
             fixes,
+        }
+    }
+
+    /// Warn when the active model profile asks for a sampler the engine does
+    /// not accept. The harness omits the field; the warning names the exact
+    /// field and the action.
+    pub fn warn_unsupported_samplers(
+        &mut self,
+        profile_name: &str,
+        engine: Engine,
+        settings: &SamplerSettings,
+    ) {
+        for warning in settings.warnings(engine) {
+            self.warnings
+                .push(format!("model profile {profile_name:?}: {warning}"));
         }
     }
 
@@ -736,6 +785,32 @@ mod tests {
     }
 
     #[test]
+    fn text_manifest_warns_about_samplers_the_engine_rejects() {
+        use crate::config::{ModelConfig, ModelProfile};
+
+        let mut manifest = sample_manifest();
+        manifest.engine = "ollama".into();
+        let profile = ModelProfile {
+            min_p: Some(0.05),
+            repeat_penalty: Some(1.05),
+            dry_multiplier: Some(0.8),
+            ..ModelProfile::default()
+        };
+        let settings = SamplerSettings::resolve(&ModelConfig::default(), &profile);
+        manifest.warn_unsupported_samplers("qwen-coding", Engine::Ollama, &settings);
+        let text = manifest.to_text();
+        assert!(text.contains("model profile \"qwen-coding\""), "{text}");
+        assert!(text.contains("min_p"), "{text}");
+        assert!(text.contains("dry_multiplier"), "{text}");
+        assert!(
+            !manifest
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("sets repeat_penalty"))
+        );
+    }
+
+    #[test]
     fn text_manifest_shows_the_effective_window_and_fixes() {
         let text = sample_manifest().to_text();
         assert!(text.contains("engine: llama.cpp"));
@@ -856,6 +931,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mlx_manifest_reports_no_grammar_backend() {
+        use axum::routing::get;
+
+        let app = axum::Router::new().route(
+            "/v1/models",
+            get(|| async {
+                axum::Json(serde_json::json!({
+                    "object": "list",
+                    "data": [{
+                        "id": "mlx-community/Qwen3-8B-4bit",
+                        "object": "model",
+                        "owned_by": "mlx"
+                    }]
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let config = crate::config::ModelConfig {
+            endpoint: format!("http://{address}"),
+            ..Default::default()
+        };
+        let provider =
+            crate::provider::OpenAiCompatProvider::new(&config, "mlx-community/Qwen3-8B-4bit")
+                .unwrap();
+        let manifest = DoctorManifest::probe(&provider, 8192).await;
+        assert_eq!(manifest.engine, "mlx");
+        assert_eq!(manifest.structured_output, "none");
+    }
+
+    #[tokio::test]
     async fn ollama_manifest_reports_capabilities_and_mismatch() {
         use axum::routing::{get, post};
 
@@ -903,6 +1013,7 @@ mod tests {
 
         assert_eq!(manifest.engine, "ollama");
         assert_eq!(manifest.tool_dialect, "native");
+        assert_eq!(manifest.structured_output, "json_schema");
         assert_eq!(manifest.context.trained, Some(131_072));
         assert_eq!(manifest.context.allocated, Some(8192));
         assert_eq!(manifest.context.effective, 8192);

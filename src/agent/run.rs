@@ -515,8 +515,11 @@ async fn run_loop(
                 .clone()
                 .or(Some("auto".into())),
             parallel_tool_calls: core.model_profile.parallel_tool_calls,
-            temperature: core.config.model.temperature,
-            top_p: core.config.model.top_p,
+            samplers: crate::provider::SamplerSettings::resolve(
+                &core.config.model,
+                &core.model_profile,
+            ),
+            engine: core.engine,
             // The budget's reservation, capped to the window: asking for more
             // than the window holds makes some servers reject the request.
             max_tokens: budget.max_output_tokens,
@@ -2631,6 +2634,7 @@ mod tests {
             model_profile: ModelProfile::default(),
             vision: Default::default(),
             tool_probe: None,
+            engine: crate::provider::Engine::Generic,
             cancel: CancellationToken::new(),
             tool_timeout: std::time::Duration::from_secs(10),
             path_jail: false,

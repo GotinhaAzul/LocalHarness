@@ -110,8 +110,12 @@ fn request() -> ChatRequest {
         }],
         tool_choice: Some("auto".into()),
         parallel_tool_calls: None,
-        temperature: 0.2,
-        top_p: 0.95,
+        samplers: localharness::provider::SamplerSettings {
+            temperature: Some(0.2),
+            top_p: Some(0.95),
+            ..Default::default()
+        },
+        engine: localharness::provider::Engine::Generic,
         max_tokens: 128,
         stop: vec![],
         extra_body: None,
@@ -411,6 +415,68 @@ async fn malformed_sse_is_a_parse_error() {
         .find_map(|event| event.err())
         .expect("an error");
     assert_eq!(error.class, ErrorClass::Parse);
+}
+
+#[tokio::test]
+async fn sampler_fields_are_lowered_per_engine_and_unsupported_ones_are_omitted() {
+    use localharness::provider::{Engine, SamplerField, SamplerSettings};
+
+    async fn sent_body(engine: Engine) -> serde_json::Value {
+        let (base, state) = spawn().await;
+        state.script.lock().unwrap().push_back(Script {
+            status: 200,
+            body: SSE_OK.into(),
+            chunked: false,
+        });
+        let mut req = request();
+        req.engine = engine;
+        req.samplers = SamplerSettings {
+            temperature: Some(0.2),
+            top_p: Some(0.95),
+            min_p: Some(0.05),
+            repeat_penalty: Some(1.05),
+            dry_multiplier: Some(0.8),
+            xtc_probability: Some(0.0),
+            seed: Some(7),
+            ..Default::default()
+        };
+        let events = collect_stream(&provider(&base), req, CancellationToken::new()).await;
+        assert!(
+            events.iter().all(|event| event.is_ok()),
+            "stream should finish"
+        );
+        let requests = state.requests.lock().unwrap();
+        requests[0].clone()
+    }
+
+    // llama.cpp accepts min_p and spells the penalty repeat_penalty.
+    let llama = sent_body(Engine::LlamaCpp).await;
+    assert_eq!(llama["min_p"], 0.05);
+    assert_eq!(llama["repeat_penalty"], 1.05);
+    assert_eq!(llama["dry_multiplier"], 0.8);
+    assert!(llama.get("repetition_penalty").is_none());
+
+    // vLLM accepts min_p and spells the penalty repetition_penalty; DRY and
+    // XTC are llama.cpp-only and must not be sent.
+    let vllm = sent_body(Engine::Vllm).await;
+    assert_eq!(vllm["min_p"], 0.05);
+    assert_eq!(vllm["repetition_penalty"], 1.05);
+    assert!(vllm.get("dry_multiplier").is_none());
+    assert!(vllm.get("xtc_probability").is_none());
+
+    // Ollama's OpenAI-compatible API does not take min_p: the body omits it.
+    let ollama = sent_body(Engine::Ollama).await;
+    assert!(ollama.get("min_p").is_none());
+    assert_eq!(ollama["repeat_penalty"], 1.05);
+    let settings = SamplerSettings {
+        min_p: Some(0.05),
+        ..Default::default()
+    };
+    assert_eq!(
+        settings.unsupported(Engine::Ollama),
+        vec![SamplerField::MinP]
+    );
+    assert!(settings.warnings(Engine::Ollama)[0].contains("min_p"));
 }
 
 #[tokio::test]

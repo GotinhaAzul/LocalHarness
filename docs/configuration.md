@@ -34,8 +34,16 @@ model = ""                      # auto-select if /v1/models has one entry
 api_key = ""
 start_command = ""              # optional; run once if the endpoint is down
 context_window = 32768
+engine = "auto"                 # auto | llama.cpp | vllm | sglang | ollama | lmstudio | koboldcpp | tabbyapi | mlx | generic
 temperature = 0.2
 top_p = 0.95
+# Optional global sampler defaults; a model profile overrides each field.
+# min_p = 0.05
+# repeat_penalty = 1.05
+# dry_multiplier = 0.8
+# dry_base = 1.75
+# xtc_probability = 0.0
+# seed = 0
 max_output_tokens = 4096
 request_timeout_secs = 900
 connect_timeout_secs = 5
@@ -140,6 +148,43 @@ when the model profile does not set one.
 `[vision]` configures the size cap, EXIF handling, remote endpoints, and an
 optional model that describes images for text-only models. See
 [images.md](images.md).
+
+### Sampler profiles
+
+Sampling is per model. Every field below is optional and overrides the same
+global `[model]` value when set:
+
+```toml
+[model_profile.qwen-coding]
+match = ["qwen3-coder", "qwen3.5-coder", "qwen2.5-coder", "qwen3"]
+temperature = 0.2
+top_p = 0.95
+min_p = 0.05
+repeat_penalty = 1.05
+dry_multiplier = 0.8
+dry_base = 1.75
+xtc_probability = 0.0
+seed = 0
+```
+
+Bundled presets are `qwen-coding`, `gemma-chat`, and `glm-agent`. With
+`model_profile = "auto"` (the default), selecting a matching model from
+`/model` applies its preset; `--model-profile qwen-coding` or a profile's
+`model_profile = "qwen-coding"` selects one explicitly. A user-defined profile
+always beats a bundled preset for the same model.
+
+The harness sends only fields the detected engine accepts, under the name that
+engine uses: `repeat_penalty` for llama.cpp/Ollama/LM Studio/KoboldCpp and
+`repetition_penalty` for vLLM/SGLang/TabbyAPI. DRY and XTC go only to llama.cpp
+and KoboldCpp; `min_p` is omitted for Ollama and the generic profile. `lh doctor`
+warns about every omitted field and names it. Pin `[model] engine` when a
+gateway hides the real server, otherwise detection is best-effort.
+`extra_body` still merges last, so an engine-only sampler can be passed there.
+
+The streaming repetition guard remains the last line of defense, not the first.
+
+`--debug` records the exact request body in the diagnostic log
+(`localharness::provider::request`), with the configured bearer token redacted.
 
 ```toml
 [vision]

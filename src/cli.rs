@@ -394,13 +394,19 @@ async fn run_doctor(config: &Config, paths: &Paths, json: bool, fix: bool) -> Re
         }
     }
     let provider = crate::provider::OpenAiCompatProvider::new(&config.model, model)?;
-    let (_, profile) = config.model_profile();
+    let (profile_name, profile) = config.model_profile();
     let configured = profile
         .context_window
         .or(config.model.context_window)
         .unwrap_or(0);
-    let manifest = crate::doctor::DoctorManifest::probe(&provider, configured).await;
-    let mut manifest = manifest;
+    let samplers = crate::provider::SamplerSettings::resolve(&config.model, &profile);
+    let mut manifest = crate::doctor::DoctorManifest::probe(&provider, configured).await;
+    manifest.warn_unsupported_samplers(
+        &profile_name,
+        crate::provider::Engine::parse(&manifest.engine)
+            .unwrap_or(crate::provider::Engine::Generic),
+        &samplers,
+    );
     // `lh doctor` never sends a chat completion. Show the last conformance
     // result the runtime stored for this model/build, if any.
     let probe_path = paths.data_dir.join("tool-probe-cache.json");
