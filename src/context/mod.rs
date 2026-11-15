@@ -338,8 +338,14 @@ fn push_assistant(
                 .collect()
         })
         .unwrap_or_default();
+    // Reasoning is never replayed, even from entries written before the
+    // stream split it out of content.
+    let content = assistant
+        .content
+        .as_deref()
+        .map(crate::agent::output::strip_reasoning_markup);
     messages.push(ChatMessage::Assistant {
-        content: assistant.content.clone(),
+        content,
         tool_calls: tool_calls.clone(),
     });
     // Chat APIs carry images only in user messages, so images returned by

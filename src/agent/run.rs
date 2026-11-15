@@ -505,6 +505,21 @@ async fn run_loop(
         } else if let Some(reason) = &core.vision.blocked {
             ChatMessage::strip_images(&mut messages, reason);
         }
+        let extra_body = match core
+            .model_profile
+            .request_extra_body(!core.tool_specs.is_empty())
+        {
+            Ok(body) => body,
+            Err(message) => {
+                append_error(&core.session, "thinking_policy", &message, false);
+                let _ = tx.send(AgentEvent::Error {
+                    code: "thinking_policy".into(),
+                    message: message.clone(),
+                    recoverable: false,
+                });
+                return TurnOutcome::error("thinking_policy", message);
+            }
+        };
         let request = ChatRequest {
             model: core.provider.model().to_string(),
             messages,
@@ -521,11 +536,7 @@ async fn run_loop(
             // than the window holds makes some servers reject the request.
             max_tokens: budget.max_output_tokens,
             stop: core.model_profile.stop.clone(),
-            extra_body: core
-                .model_profile
-                .extra_body
-                .as_ref()
-                .and_then(|value| serde_json::to_value(value).ok()),
+            extra_body,
             include_usage: true,
             reasoning_field: core.model_profile.reasoning_field.clone(),
         };
@@ -1202,7 +1213,7 @@ fn recover_output(
             ));
         }
     } else if calls.is_empty() && content_empty {
-        out.nudge = Some("[localharness] empty response: you returned no text and no tool call. Make the next tool call, or give your final answer.".into());
+        out.nudge = Some("[localharness] empty response: you returned no text and no tool call (reasoning alone is not an answer). Make the next tool call, or give your final answer outside the reasoning block.".into());
     }
     out
 }
@@ -1300,6 +1311,35 @@ impl StreamAccum {
             if secs >= 0.2 {
                 usage.tokens_per_sec = Some((f64::from(usage.completion_tokens - 1) / secs) as f32);
             }
+        }
+    }
+
+    /// A reply that only reasoned (no text, no tool call) is a parser or
+    /// thinking-policy problem, not an answer: say so visibly. The loop's
+    /// empty-response nudge then retries instead of completing the turn.
+    fn warn_reasoning_only(&self, tx: &UnboundedSender<AgentEvent>) {
+        let cut_short = matches!(self.finish.as_deref(), Some("length") | Some("max_tokens"));
+        if self.content.trim().is_empty()
+            && self.calls.values().all(|call| call.name.trim().is_empty())
+            && !self.reasoning.trim().is_empty()
+            && !cut_short
+            && !self.degenerate
+        {
+            let _ = tx.send(AgentEvent::Guard {
+                code: "reasoning_only".into(),
+                message: "the model replied with reasoning only: no answer text and no tool call. Retrying with a nudge. If this repeats, the server's reasoning parser may be swallowing the answer or tool call (check reasoning_field and the engine's reasoning parser), or set thinking = \"off\" with a thinking_control in the model profile.".into(),
+            });
+        }
+    }
+
+    /// Count reasoning tokens from the text when the server reported usage
+    /// without them, so the token meter shows them for every engine.
+    fn estimate_reasoning_tokens(&mut self, budget: &TokenBudget) {
+        if let Some(usage) = self.usage.as_mut()
+            && usage.reasoning_tokens.is_none()
+            && !self.reasoning.trim().is_empty()
+        {
+            usage.reasoning_tokens = Some(budget.estimate_text(&self.reasoning));
         }
     }
 
@@ -1483,6 +1523,8 @@ async fn stream_assistant(
     let _ = task.await;
     accum.settle_reasoning(tx);
     accum.measure();
+    accum.estimate_reasoning_tokens(budget);
+    accum.warn_reasoning_only(tx);
     if let Some(usage) = &accum.usage {
         let _ = tx.send(AgentEvent::Usage(usage.clone()));
     }

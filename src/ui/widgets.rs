@@ -25,6 +25,8 @@ pub struct HeaderData {
     pub window: u32,
     /// Completion tokens streamed in the current turn, shown separately.
     pub completion: u32,
+    /// Reasoning tokens in the last reply (reported or estimated).
+    pub reasoning: u32,
     pub tok_s: f32,
     /// Share of the last prompt served from the server's prefix cache.
     pub cache: Option<u32>,
@@ -217,6 +219,10 @@ fn context_spans(data: &HeaderData, gauge: bool, theme: &Theme) -> Vec<Span<'sta
     if data.completion > 0 {
         text.push('+');
         text.push_str(&format_tokens(data.completion));
+    }
+    if data.reasoning > 0 {
+        text.push_str(" think ");
+        text.push_str(&format_tokens(data.reasoning));
     }
     spans.push(Span::styled(text, theme.style(Role::Muted)));
     if data.window_guess {
@@ -818,4 +824,34 @@ pub fn tools_lines(view: &ToolsModal, width: usize, theme: &Theme) -> Vec<Line<'
         lines.push(Line::styled("(no active tools)", theme.style(Role::Muted)));
     }
     lines
+}
+
+#[cfg(test)]
+mod reasoning_meter_tests {
+    use super::*;
+
+    #[test]
+    fn token_meter_shows_reasoning_tokens() {
+        let theme = Theme::bundled("default");
+        let mut data = HeaderData {
+            cwd: "/tmp/p".into(),
+            model: "m".into(),
+            logged_in: true,
+            used: 1200,
+            window: 8000,
+            completion: 900,
+            ..HeaderData::default()
+        };
+        let text = |data: &HeaderData| -> String {
+            header_line(data, 160, &theme)
+                .spans
+                .iter()
+                .map(|span| span.content.to_string())
+                .collect()
+        };
+        assert!(!text(&data).contains("think"));
+        data.reasoning = 640;
+        let line = text(&data);
+        assert!(line.contains("think 640"), "{line}");
+    }
 }

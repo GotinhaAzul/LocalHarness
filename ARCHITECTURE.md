@@ -105,7 +105,12 @@ Streaming:
   one frame.
 - Parse `usage` from the final chunk when present.
 - Parse reasoning from the configured `reasoning_field`, then
-  `reasoning_content`, `reasoning`, and `thinking`. A model profile decides
+  `reasoning_content`, `reasoning`, and `thinking`. Inline `<think>` blocks and gpt-oss
+  `<|channel|>analysis` messages join the same stream, and reasoning markup is
+  stripped from assistant content at context assembly. `usage` may carry
+  `reasoning_tokens` (reported, else estimated). A per-profile
+  `thinking = auto|on|off` policy merges `thinking_control` into `extra_body`
+  when thinking is off. A model profile decides
   whether reasoning is shown, kept in context, or stripped after the turn.
 - `finish_reason`: `stop`, `length`, `tool_calls`, `content_filter`.
 

@@ -583,6 +583,14 @@ struct WireUsage {
     total_tokens: u32,
     #[serde(default)]
     prompt_tokens_details: Option<PromptTokensDetails>,
+    #[serde(default)]
+    completion_tokens_details: Option<CompletionTokensDetails>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct CompletionTokensDetails {
+    #[serde(default)]
+    reasoning_tokens: Option<u32>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -635,6 +643,10 @@ fn usage_from(
             .map(|rate| rate as f32),
         truncated,
         context_shift: context_shift.or(timings.n_shift),
+        reasoning_tokens: wire
+            .completion_tokens_details
+            .and_then(|details| details.reasoning_tokens)
+            .filter(|tokens| *tokens > 0),
     })
 }
 
@@ -930,6 +942,12 @@ mod tests {
         .unwrap();
         assert_eq!(usage.cached_tokens, Some(900));
         assert_eq!(usage.cache_percent(), Some(90));
+        assert_eq!(usage.reasoning_tokens, None);
+        let usage = usage_of(
+            r#"{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":50,"total_tokens":60,"completion_tokens_details":{"reasoning_tokens":42}}}"#,
+        )
+        .unwrap();
+        assert_eq!(usage.reasoning_tokens, Some(42));
         // llama.cpp timings, possibly on a chunk without usage.
         let usage = usage_of(
             r#"{"choices":[],"timings":{"cache_n":236,"prompt_n":12,"prompt_ms":30.9,"predicted_n":35,"predicted_ms":661.0,"predicted_per_second":52.94}}"#,

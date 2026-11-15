@@ -2026,3 +2026,171 @@ async fn strip_reasoning_false_persists_and_replays_reasoning() {
             if text == "secret chain of thought"
     )));
 }
+
+fn harness_profile_edit(
+    dir: &std::path::Path,
+    scripts: Vec<Script>,
+    tools: &[&str],
+    edit: impl FnOnce(&mut localharness::config::ModelProfile),
+) -> Harness {
+    let mut config = base_config();
+    config.profiles.get_mut("test").expect("test profile").tools =
+        tools.iter().map(|s| s.to_string()).collect();
+    edit(
+        config
+            .model_profiles
+            .get_mut("default")
+            .expect("default model profile"),
+    );
+    harness_config(dir, scripts, config)
+}
+
+#[tokio::test]
+async fn thinking_off_without_a_control_refuses_before_the_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness_profile_edit(dir.path(), vec![text_script("no")], &["read"], |p| {
+        p.thinking = localharness::config::ThinkingPolicy::Off;
+    });
+    let (outcome, _) = run(&harness, "hi").await;
+    assert_eq!(outcome.status, TurnStatus::Error);
+    let (code, message) = outcome.error.expect("error");
+    assert_eq!(code, "thinking_policy");
+    assert!(message.contains("thinking_control"), "{message}");
+    assert_eq!(harness.provider.requests.lock().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn thinking_auto_sends_the_control_only_with_tools_active() {
+    let control: toml::Value =
+        toml::from_str("chat_template_kwargs = { enable_thinking = false }").unwrap();
+    for (tools, expect_off) in [(&["read"][..], true), (&[][..], false)] {
+        let dir = tempfile::tempdir().unwrap();
+        let control = control.clone();
+        let harness = harness_profile_edit(dir.path(), vec![text_script("ok")], tools, |p| {
+            p.thinking_breaks_tools = true;
+            p.thinking_control = Some(control);
+        });
+        let (outcome, _) = run(&harness, "hi").await;
+        assert_eq!(outcome.status, TurnStatus::Done);
+        let requests = harness.provider.requests.lock().unwrap();
+        let sent = requests[0]
+            .extra_body
+            .as_ref()
+            .and_then(|body| body.pointer("/chat_template_kwargs/enable_thinking"))
+            .cloned();
+        assert_eq!(sent, expect_off.then_some(json!(false)), "tools {tools:?}");
+    }
+}
+
+#[tokio::test]
+async fn reasoning_only_reply_warns_and_retries() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness(
+        dir.path(),
+        vec![
+            Script::Events(vec![
+                StreamEvent::ReasoningDelta("I should answer 4".into()),
+                StreamEvent::Finish("stop".into()),
+            ]),
+            text_script("4"),
+        ],
+        &["read"],
+    );
+    let (outcome, events) = run(&harness, "2+2?").await;
+    assert_eq!(outcome.status, TurnStatus::Done);
+    assert!(
+        events.iter().any(
+            |event| matches!(event, AgentEvent::Guard { code, .. } if code == "reasoning_only")
+        ),
+        "missing reasoning_only warning"
+    );
+    let requests = harness.provider.requests.lock().unwrap();
+    assert_eq!(
+        requests.len(),
+        2,
+        "the reasoning-only reply is not the answer"
+    );
+    assert!(requests[1].messages.iter().any(|message| matches!(
+        message,
+        ChatMessage::User { content, .. } if content.contains("empty response")
+    )));
+    drop(requests);
+    assert_eq!(last_assistant(&harness.session), "4");
+}
+
+#[tokio::test]
+async fn old_inline_reasoning_never_reaches_the_next_prompt() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness(dir.path(), vec![text_script("ok")], &["read"]);
+    {
+        let mut session = harness.session.lock().unwrap();
+        for (question, answer) in [
+            ("q1", "<think>private plan</think>\n\nfirst answer"),
+            (
+                "q2",
+                "<|channel|>analysis<|message|>harmony plan<|end|><|start|>assistant<|channel|>final<|message|>second answer",
+            ),
+            ("q3", "dangling plan</think>third answer"),
+        ] {
+            session
+                .append(EntryKind::User(localharness::session::UserData {
+                    content: question.into(),
+                    attachments: Vec::new(),
+                }))
+                .unwrap();
+            session
+                .append(EntryKind::Assistant(localharness::session::AssistantData {
+                    content: Some(answer.into()),
+                    reasoning: None,
+                    tool_calls: None,
+                    usage: None,
+                    stop_reason: Some("stop".into()),
+                }))
+                .unwrap();
+        }
+    }
+    let (outcome, _) = run(&harness, "next").await;
+    assert_eq!(outcome.status, TurnStatus::Done);
+    let requests = harness.provider.requests.lock().unwrap();
+    let assistant_text: Vec<String> = requests[0]
+        .messages
+        .iter()
+        .filter_map(|message| match message {
+            ChatMessage::Assistant { content, .. } => content.clone(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        assistant_text,
+        vec!["first answer", "second answer", "third answer"]
+    );
+    let prompt = format!("{:?}", requests[0].messages);
+    for leaked in ["plan", "<think>", "</think>", "<|channel|>"] {
+        assert!(!prompt.contains(leaked), "{leaked} leaked: {prompt}");
+    }
+}
+
+#[tokio::test]
+async fn reasoning_tokens_are_estimated_when_the_server_omits_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness(
+        dir.path(),
+        vec![Script::Events(vec![
+            StreamEvent::ReasoningDelta("x".repeat(400)),
+            StreamEvent::Delta("answer".into()),
+            StreamEvent::Finish("stop".into()),
+            StreamEvent::Usage(Usage::new(20, 120)),
+        ])],
+        &["read"],
+    );
+    let (outcome, events) = run(&harness, "think").await;
+    assert_eq!(outcome.status, TurnStatus::Done);
+    let reported = events.iter().find_map(|event| match event {
+        AgentEvent::Usage(usage) => usage.reasoning_tokens,
+        _ => None,
+    });
+    assert!(
+        reported.is_some_and(|tokens| tokens > 50),
+        "reasoning tokens: {reported:?}"
+    );
+}

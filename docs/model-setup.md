@@ -139,12 +139,45 @@ tool_mode = "repair"        # native | repair | auto
   falls back in this order: `reasoning_content`, `reasoning`, `thinking`
   (Ollama). Any other value prints a startup warning naming the accepted
   fields and the default order is used.
+- Inline reasoning is normalized into the same stream as the reasoning
+  fields: `<think>`/`<thinking>` blocks, text before a lone `</think>`, and
+  gpt-oss harmony `<|channel|>analysis<|message|>…<|end|>` messages (the
+  `<|channel|>final<|message|>` text becomes the answer). Assistant content is
+  stripped of these blocks again when the context is assembled, so a session
+  written by an older build cannot replay chain-of-thought into the prompt.
+- `thinking = "auto" | "on" | "off"` (default `auto`) decides whether the model
+  thinks. When the resolved policy is off, the table in `thinking_control` is
+  deep-merged into `extra_body`; the engine's own switch goes there:
+
+  ```toml
+  [model_profile.qwen3]
+  thinking = "auto"
+  thinking_breaks_tools = true
+  thinking_control = { chat_template_kwargs = { enable_thinking = false } }  # vLLM, SGLang, llama.cpp --jinja
+  # thinking_control = { think = false }                                     # Ollama
+  ```
+
+  `auto` turns thinking off only when tools are active and
+  `thinking_breaks_tools = true` (models documented to call tools only in
+  non-thinking mode). `thinking = "off"` with no `thinking_control` refuses
+  the turn with a `thinking_policy` error naming the key, instead of sending a
+  request that silently keeps thinking.
+- A reply with reasoning but no text and no tool call is not treated as an
+  answer: the TUI shows a `reasoning_only` warning and the loop retries once
+  with an empty-response nudge. Repeats usually mean the server's reasoning
+  parser swallowed the answer or the tool call.
 - `stop` adds stop sequences.
 - `extra_body` merges server-specific fields into every request, for example
   `chat_template_kwargs`.
 - `parallel_tool_calls` is recorded for compatibility; tools run sequentially.
 
 ## Context and token accounting
+
+Reasoning tokens are reported separately in the header meter (`think N`):
+the server's `usage.completion_tokens_details.reasoning_tokens` when present,
+otherwise an estimate from the reasoning text with the calibrated
+characters-per-token ratio. The headless `--json` `usage` event carries the
+same `reasoning_tokens` field.
 
 An engine can report three different context sizes, and they are not
 interchangeable:

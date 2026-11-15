@@ -876,6 +876,25 @@ pub struct ModelProfile {
     /// The model accepts images as content parts. `None` asks the server
     /// (llama.cpp `/props`), else assumes text only.
     pub vision: Option<bool>,
+    /// Whether the model should think: `auto`, `on`, or `off`.
+    pub thinking: ThinkingPolicy,
+    /// Request fields that turn thinking off on this engine, merged into
+    /// `extra_body` when the resolved policy is off. For example
+    /// `{ chat_template_kwargs = { enable_thinking = false } }`.
+    pub thinking_control: Option<toml::Value>,
+    /// The model cannot call tools reliably while thinking; `thinking =
+    /// "auto"` then turns thinking off whenever tools are active.
+    pub thinking_breaks_tools: bool,
+}
+
+/// `thinking` in a model profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ThinkingPolicy {
+    #[default]
+    Auto,
+    On,
+    Off,
 }
 
 impl Default for ModelProfile {
@@ -894,7 +913,23 @@ impl Default for ModelProfile {
             extra_body: None,
             native_tools: None,
             vision: None,
+            thinking: ThinkingPolicy::Auto,
+            thinking_control: None,
+            thinking_breaks_tools: false,
         }
+    }
+}
+
+/// Deep-merge `patch` into `base`; objects merge key by key, anything else
+/// replaces.
+fn merge_json(base: &mut serde_json::Value, patch: serde_json::Value) {
+    match (base, patch) {
+        (serde_json::Value::Object(base), serde_json::Value::Object(patch)) => {
+            for (key, value) in patch {
+                merge_json(base.entry(key).or_insert(serde_json::Value::Null), value);
+            }
+        }
+        (base, patch) => *base = patch,
     }
 }
 
@@ -905,6 +940,50 @@ pub const REASONING_FIELDS: [&str; 3] = ["reasoning_content", "reasoning", "thin
 impl ModelProfile {
     pub fn strip_reasoning(&self) -> bool {
         self.strip_reasoning.unwrap_or(true)
+    }
+
+    /// Whether thinking is off for a request: `off`, or `auto` with tools
+    /// active on a model marked `thinking_breaks_tools`.
+    pub fn thinking_off(&self, tools_active: bool) -> bool {
+        match self.thinking {
+            ThinkingPolicy::Off => true,
+            ThinkingPolicy::On => false,
+            ThinkingPolicy::Auto => self.thinking_breaks_tools && tools_active,
+        }
+    }
+
+    /// The request's `extra_body`: the profile's, with `thinking_control`
+    /// merged on top when thinking is off. Refuses when thinking must be off
+    /// but the profile names no control, since sending the request anyway
+    /// would silently ignore the policy.
+    pub fn request_extra_body(
+        &self,
+        tools_active: bool,
+    ) -> Result<Option<serde_json::Value>, String> {
+        let base = self
+            .extra_body
+            .as_ref()
+            .and_then(|value| serde_json::to_value(value).ok());
+        if !self.thinking_off(tools_active) {
+            return Ok(base);
+        }
+        let Some(control) = self
+            .thinking_control
+            .as_ref()
+            .and_then(|value| serde_json::to_value(value).ok())
+        else {
+            let why = if self.thinking == ThinkingPolicy::Off {
+                "thinking = \"off\"".to_string()
+            } else {
+                "thinking = \"auto\" with thinking_breaks_tools = true and tools active".to_string()
+            };
+            return Err(format!(
+                "{why} needs the engine's control to turn thinking off, and this model profile sets no thinking_control. Add it to the model profile, for example `thinking_control = {{ chat_template_kwargs = {{ enable_thinking = false }} }}` (vLLM/SGLang/llama.cpp Qwen3) or `thinking_control = {{ think = false }}` (Ollama), or set thinking = \"on\"."
+            ));
+        };
+        let mut merged = base.unwrap_or_else(|| serde_json::Value::Object(Default::default()));
+        merge_json(&mut merged, control);
+        Ok(Some(merged))
     }
 
     /// A startup warning when `reasoning_field` names a field the decoder
@@ -1117,6 +1196,52 @@ mod tests {
         let parsed: Config = toml::from_str("[lsp]\ngate = \"off\"\n").expect("off is valid");
         assert_eq!(parsed.lsp.gate, LspGate::Off);
         assert!(toml::from_str::<Config>("[lsp]\ngate = \"sometimes\"\n").is_err());
+    }
+
+    #[test]
+    fn thinking_policy_resolves_and_merges_the_control() {
+        let parsed: Config = toml::from_str(
+            r#"
+[model_profile.qwen]
+thinking = "off"
+extra_body = { top_k = 20, chat_template_kwargs = { other = 1 } }
+thinking_control = { chat_template_kwargs = { enable_thinking = false } }
+"#,
+        )
+        .expect("valid profile");
+        let profile = &parsed.model_profiles["qwen"];
+        assert_eq!(profile.thinking, ThinkingPolicy::Off);
+        let body = profile.request_extra_body(false).unwrap().unwrap();
+        assert_eq!(body["top_k"], 20);
+        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
+        assert_eq!(body["chat_template_kwargs"]["other"], 1);
+
+        // `on` and plain `auto` leave extra_body alone.
+        let mut on = profile.clone();
+        on.thinking = ThinkingPolicy::On;
+        let body = on.request_extra_body(true).unwrap().unwrap();
+        assert!(
+            body["chat_template_kwargs"]
+                .get("enable_thinking")
+                .is_none()
+        );
+        let mut auto = profile.clone();
+        auto.thinking = ThinkingPolicy::Auto;
+        assert!(!auto.thinking_off(true));
+        // `auto` turns it off only with tools active on a marked model.
+        auto.thinking_breaks_tools = true;
+        assert!(!auto.thinking_off(false));
+        let body = auto.request_extra_body(true).unwrap().unwrap();
+        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
+
+        // `off` without a control refuses and names the key.
+        let bare = ModelProfile {
+            thinking: ThinkingPolicy::Off,
+            ..ModelProfile::default()
+        };
+        let err = bare.request_extra_body(false).unwrap_err();
+        assert!(err.contains("thinking_control"), "{err}");
+        assert!(toml::from_str::<Config>("[model_profile.x]\nthinking = \"maybe\"\n").is_err());
     }
 
     #[test]
