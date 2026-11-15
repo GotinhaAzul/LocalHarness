@@ -20,5 +20,7 @@ FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=build /src/target/release/lh /usr/local/bin/lh
 USER nonroot:nonroot
 ENV HOME=/home/nonroot
-WORKDIR /home/nonroot
+# Match the documented bind mount so `lh` derives its project from the
+# workspace the user mounted, not from the image's home directory.
+WORKDIR /workspace
 ENTRYPOINT ["/usr/local/bin/lh"]
