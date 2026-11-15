@@ -1,6 +1,6 @@
 //! One turn: stream the model, run tool batches, enforce guards, settle.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 use std::time::Instant;
 
@@ -13,7 +13,9 @@ use crate::context::compact::{
     FindingSummary, build_summary_keeping, recent_tail_start, summary_budget, tail_budget,
 };
 use crate::context::{self, BATCH_CAP_CHARS, StaticPrompt, TokenBudget, ToolSpecCost};
-use crate::provider::{ChatMessage, ChatRequest, ErrorClass, ProviderError, StreamEvent, Usage};
+use crate::provider::{
+    CallAccumulator, ChatMessage, ChatRequest, ErrorClass, ProviderError, StreamEvent, Usage,
+};
 use crate::session::{
     AssistantData, CompactionData, CustomData, EntryKind, ToolCall, ToolResultData, UserData,
 };
@@ -1210,7 +1212,7 @@ fn recover_output(
 struct StreamAccum {
     content: String,
     reasoning: String,
-    calls: BTreeMap<usize, PartialCall>,
+    calls: CallAccumulator,
     usage: Option<Usage>,
     finish: Option<String>,
     think: super::output::ThinkSplitter,
@@ -1222,13 +1224,6 @@ struct StreamAccum {
     sent: Instant,
     first_token: Option<Instant>,
     last_token: Option<Instant>,
-}
-
-#[derive(Default)]
-struct PartialCall {
-    id: String,
-    name: String,
-    arguments: String,
 }
 
 impl StreamAccum {
@@ -1259,7 +1254,7 @@ impl StreamAccum {
         Self {
             content: String::new(),
             reasoning: String::new(),
-            calls: BTreeMap::new(),
+            calls: CallAccumulator::new(),
             usage: None,
             finish: None,
             think: super::output::ThinkSplitter::default(),
@@ -1342,30 +1337,10 @@ impl StreamAccum {
     /// Other invalid JSON is left for the repair layer, which can fix common
     /// model mistakes.
     fn validate_calls(&self) -> Result<(), ProviderError> {
-        let cut_short = matches!(self.finish.as_deref(), Some("length") | Some("max_tokens"));
-        if self.degenerate || !cut_short {
+        if self.degenerate {
             return Ok(());
         }
-        for call in self.calls.values() {
-            if call.name.trim().is_empty() {
-                continue;
-            }
-            // A call cut off right after its name has no argument text at
-            // all. Finalization would turn that into `{}`, which can run a
-            // no-required-keys tool from a reply the output limit cut off.
-            if call.arguments.trim().is_empty()
-                || serde_json::from_str::<Value>(&call.arguments).is_err()
-            {
-                return Err(ProviderError::new(
-                    ErrorClass::ToolCallTruncated,
-                    format!(
-                        "the model hit the output token limit while writing the {:?} tool call; its arguments are incomplete and nothing was executed. Raise [model] max_output_tokens or split the call into smaller steps.",
-                        call.name
-                    ),
-                ));
-            }
-        }
-        Ok(())
+        self.calls.check_truncation(self.finish.as_deref())
     }
 
     /// Emit anything the think splitter held back, and move reasoning that a
@@ -1391,24 +1366,17 @@ impl StreamAccum {
 
     fn finalize(self, ledger: &mut CallLedger) -> AssistantData {
         let mut calls = Vec::new();
-        for call in self.calls.into_values() {
-            if call.name.trim().is_empty() {
-                continue;
-            }
+        // The engine id stops here: the session only ever sees the ledger's
+        // internal id, assigned in arrival order.
+        for call in self.calls.into_calls() {
             let internal_id = ledger.next_id();
-            if !call.id.trim().is_empty() {
-                ledger.map_engine_id(call.id.trim(), &internal_id);
+            if let Some(engine_id) = &call.engine_id {
+                ledger.map_engine_id(engine_id, &internal_id);
             }
-            let arguments = if call.arguments.trim().is_empty() {
-                json!({})
-            } else {
-                serde_json::from_str(&call.arguments)
-                    .unwrap_or_else(|_| Value::String(call.arguments.clone()))
-            };
             calls.push(ToolCall {
                 id: internal_id,
+                arguments: call.parsed_arguments(),
                 name: call.name,
-                arguments,
             });
         }
         AssistantData {
@@ -1537,16 +1505,9 @@ fn handle_stream_item(
             arguments,
         }) => {
             accum.token_arrived();
-            let call = accum.calls.entry(index).or_default();
-            if let Some(id) = id {
-                merge_fragment(&mut call.id, &id);
-            }
-            if let Some(name) = name {
-                merge_fragment(&mut call.name, &name);
-            }
-            if let Some(arguments) = arguments {
-                call.arguments.push_str(&arguments);
-            }
+            accum
+                .calls
+                .push(index, id.as_deref(), name.as_deref(), arguments.as_deref());
             None
         }
         Ok(StreamEvent::Usage(usage)) => {
@@ -1571,15 +1532,6 @@ fn handle_stream_item(
             accum.finish = Some(reason);
             None
         }
-    }
-}
-
-fn merge_fragment(buffer: &mut String, fragment: &str) {
-    if fragment.is_empty() {
-        return;
-    }
-    if buffer.is_empty() || !buffer.ends_with(fragment) {
-        buffer.push_str(fragment);
     }
 }
 
@@ -2701,21 +2653,9 @@ mod tests {
     }
 
     #[test]
-    fn merge_fragment_handles_repeats() {
-        let mut buffer = String::new();
-        merge_fragment(&mut buffer, "read");
-        merge_fragment(&mut buffer, "read");
-        assert_eq!(buffer, "read");
-        merge_fragment(&mut buffer, "_file");
-        assert_eq!(buffer, "read_file");
-    }
-
-    #[test]
     fn partial_call_finalizes_with_synthetic_id_and_bad_json() {
         let mut accum = StreamAccum::new();
-        let call = accum.calls.entry(0).or_default();
-        call.name = "read".into();
-        call.arguments = "{not json".into();
+        accum.calls.push(0, None, Some("read"), Some("{not json"));
         let mut ledger = CallLedger::default();
         let assistant = accum.finalize(&mut ledger);
         let calls = assistant.tool_calls.unwrap();
@@ -2724,7 +2664,7 @@ mod tests {
         // Ids must not repeat across messages, or replayed history pairs a
         // call with another call's result.
         let mut again = StreamAccum::new();
-        again.calls.entry(0).or_default().name = "read".into();
+        again.calls.push(0, None, Some("read"), None);
         let second = again.finalize(&mut ledger).tool_calls.unwrap();
         assert_eq!(second[0].id, "call_0002");
         assert_ne!(calls[0].id, second[0].id);
@@ -2734,9 +2674,12 @@ mod tests {
     fn a_length_cut_invalid_call_is_rejected_before_dispatch() {
         let mut accum = StreamAccum::new();
         accum.finish = Some("length".into());
-        let call = accum.calls.entry(0).or_default();
-        call.name = "write".into();
-        call.arguments = "{\"path\":\"big.rs\",\"content\":\"fn a".into();
+        accum.calls.push(
+            0,
+            None,
+            Some("write"),
+            Some("{\"path\":\"big.rs\",\"content\":\"fn a"),
+        );
         let err = accum.validate_calls().expect_err("truncated call");
         assert_eq!(err.class, ErrorClass::ToolCallTruncated);
         assert!(err.message.contains("incomplete"), "{}", err.message);
@@ -2747,10 +2690,8 @@ mod tests {
     fn a_length_cut_call_without_arguments_is_rejected() {
         let mut accum = StreamAccum::new();
         accum.finish = Some("max_tokens".into());
-        let call = accum.calls.entry(0).or_default();
         // The stream stopped after the name, before any argument text.
-        call.name = "todo".into();
-        assert!(call.arguments.is_empty());
+        accum.calls.push(0, None, Some("todo"), None);
         let err = accum.validate_calls().expect_err("truncated call");
         assert_eq!(err.class, ErrorClass::ToolCallTruncated);
         assert!(err.message.contains("incomplete"), "{}", err.message);
@@ -2760,9 +2701,9 @@ mod tests {
     fn a_complete_call_is_not_rejected_at_the_output_limit() {
         let mut accum = StreamAccum::new();
         accum.finish = Some("length".into());
-        let call = accum.calls.entry(0).or_default();
-        call.name = "read".into();
-        call.arguments = "{\"path\":\"a.rs\"}".into();
+        accum
+            .calls
+            .push(0, None, Some("read"), Some("{\"path\":\"a.rs\"}"));
         assert!(accum.validate_calls().is_ok());
     }
 

@@ -616,6 +616,46 @@ async fn duplicate_engine_ids_get_distinct_internal_ids_and_results() {
 }
 
 #[tokio::test]
+async fn whole_calls_on_a_reused_index_and_engine_id_stay_separate() {
+    // Some engines emit every call whole on index 0 with the same id. The
+    // accumulator must close the first call instead of splicing the second
+    // call's arguments onto it.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.rs"), "a\n").unwrap();
+    std::fs::write(dir.path().join("b.rs"), "b\n").unwrap();
+    let whole = |path: &str| StreamEvent::ToolCallDelta {
+        index: 0,
+        id: Some("call_1".into()),
+        name: Some("read".into()),
+        arguments: Some(json!({ "path": path }).to_string()),
+    };
+    let harness = harness(
+        dir.path(),
+        vec![
+            Script::Events(vec![
+                whole("a.rs"),
+                whole("b.rs"),
+                StreamEvent::Finish("tool_calls".into()),
+            ]),
+            text_script("done"),
+        ],
+        &["read"],
+    );
+    let (outcome, _) = run(&harness, "read both").await;
+    assert_eq!(outcome.status, TurnStatus::Done);
+    let calls: Vec<_> = assistants(&harness.session)
+        .into_iter()
+        .flat_map(|assistant| assistant.tool_calls.unwrap_or_default())
+        .collect();
+    assert_eq!(calls.len(), 2, "{calls:?}");
+    assert_eq!(calls[0].id, "call_0001");
+    assert_eq!(calls[1].id, "call_0002");
+    assert_eq!(calls[0].arguments, json!({"path": "a.rs"}));
+    assert_eq!(calls[1].arguments, json!({"path": "b.rs"}));
+    assert_eq!(tool_results(&harness.session).len(), 2);
+}
+
+#[tokio::test]
 async fn internal_call_ids_increase_across_turns() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("a.rs"), "a\n").unwrap();
