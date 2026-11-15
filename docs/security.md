@@ -275,9 +275,15 @@ it. Project `.harness/` config, profiles, skills, workflows, tools, and verify
 steps are ignored unless `--trust` is passed or the TUI trust confirmation is
 accepted. Trust is per session and shown in the header/footer.
 
-`AGENTS.md` is always read as untrusted project instructions. It cannot change
-scope, tools, gates, or the endpoint. A trusted project still cannot grant
-security scope.
+`AGENTS.md` is read as untrusted project instructions from the chain of
+directories between the git repository root and the working directory, nearest
+last. Each file is shown under a source-path header. The chain is capped at
+32 KiB total and 12 KiB per file; truncation is deterministic and warns. A
+symlink that resolves outside the repository is refused. `lh context --show`
+prints the manifest with each path, byte count, SHA-256, and
+loaded/skipped/truncated state; `--no-agents-md` and `LH_AGENTS_MD=0` disable
+the chain. The files cannot change scope, tools, gates, or the endpoint. A
+trusted project still cannot grant security scope.
 
 Repository content and tool output are delimited and labeled as untrusted data
 in the system prompt. This reduces, but does not eliminate, prompt injection.

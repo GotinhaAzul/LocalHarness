@@ -70,6 +70,7 @@ verify_attempts = 2
 identity = ""                   # replaces the built-in one-line identity
 instructions = ""               # extra instructions appended to the prompt
 file = ""                       # or a Markdown file, relative to the config dir
+agents_md = true                # load the hierarchical AGENTS.md chain
 
 [lsp]
 gate = "warn"                   # off | warn | block (see below)
@@ -219,6 +220,15 @@ directory, then the path itself; an untrusted repository cannot shadow it.
 Per-profile `prompt` files still append after that. None of these can change
 the gates, tool selection, scope, or the endpoint; those remain in code.
 
+`[prompt] agents_md` (default `true`) loads the `AGENTS.md` chain from the git
+repository root to the working directory, nearest last, each under a
+source-path header. Each file is capped at 12 KiB and the chain at 32 KiB;
+truncation is deterministic and reported as a warning. A symlink that resolves
+outside the repository is refused. `lh context --show` prints the manifest
+(path, bytes, SHA-256, loaded/skipped/truncated) and `lh context --json` emits
+it as JSON. `--no-agents-md` or `LH_AGENTS_MD=0` disables loading for one run.
+The files remain untrusted, advisory instructions.
+
 The TUI does not require `[model]` to be resolved at startup. If the endpoint is
 down or `model` is empty, the harness opens with `not logged in`; `/login`
 validates `GET /v1/models`, applies the selection, and writes `endpoint`,
@@ -284,6 +294,7 @@ Steps run sequentially without a shell and stop at the first failure.
 | `LH_THEME` | Theme name |
 | `LH_NO_SESSION` | Disable persistence |
 | `LH_TRUST` | Trust project config |
+| `LH_AGENTS_MD` | Set to `0` to skip the AGENTS.md chain |
 | `LH_CONFIG_DIR`, `LH_DATA_DIR` | Override roots |
 | `LH_SKIP_TOOL_PROBE` | Skip the one-shot tool-call conformance probe |
 | `NO_COLOR` | Disable color |
@@ -293,10 +304,16 @@ Steps run sequentially without a shell and stop at the first failure.
 ## Flags
 
 `--print`, `--json`, `--endpoint`, `--model`, `--model-profile`, `--profile`,
-`--theme`, `--api-key`, `--trust`, `--no-session`, `--no-redact`, `--continue`,
-`--resume`, `--path-jail`, `--sandbox [read-only|workspace-write]`,
-`--no-sandbox`, `--engagement`, `--no-color`, `--keep-artifacts`,
-`--clean-artifacts`, `--allow-remote-images`, `--keep-exif`, `--debug`.
+`--theme`, `--api-key`, `--trust`, `--no-session`, `--no-redact`,
+`--no-agents-md`, `--continue`, `--resume`, `--path-jail`,
+`--sandbox [read-only|workspace-write]`, `--no-sandbox`, `--engagement`,
+`--no-color`, `--keep-artifacts`, `--clean-artifacts`, `--allow-remote-images`,
+`--keep-exif`, `--debug`.
 
 `lh doctor [--json] [--fix]` prints the engine capability manifest without
 sending a chat completion. See [model-setup.md](model-setup.md).
+
+`lh context --show` prints the AGENTS.md chain and its manifest without
+opening a session or contacting a model; `--json` emits one stable object.
+With no AGENTS.md files in the chain, it reports an empty chain. With
+`--no-agents-md` or `LH_AGENTS_MD=0`, it reports that loading is disabled.
