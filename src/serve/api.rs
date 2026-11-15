@@ -151,7 +151,11 @@ impl EventLog {
     }
 
     fn publish(&self, name: &'static str, value: &Value) {
-        let mut inner = self.lock();
+        Self::push(&mut self.lock(), name, value);
+    }
+
+    /// Append under a lock the caller already holds.
+    fn push(inner: &mut LogInner, name: &'static str, value: &Value) {
         let frame = Arc::new(Frame {
             seq: inner.next,
             name,
@@ -215,7 +219,10 @@ pub struct State {
     host: Host,
     token: String,
     allow_yolo: bool,
+    /// Cancelled after running turns have stopped; ends SSE streams.
     shutdown: CancellationToken,
+    /// Set when shutdown starts; refuses new sessions and turns.
+    stopping: std::sync::atomic::AtomicBool,
     sessions: Mutex<HashMap<String, Arc<Live>>>,
     ephemeral: AtomicU64,
 }
@@ -227,6 +234,7 @@ impl State {
             token,
             allow_yolo,
             shutdown,
+            stopping: std::sync::atomic::AtomicBool::new(false),
             sessions: Mutex::new(HashMap::new()),
             ephemeral: AtomicU64::new(1),
         }
@@ -245,6 +253,7 @@ impl State {
     /// Cancel every running turn and wait (bounded) until each has written
     /// its cancellation to the session file, then stop MCP servers.
     pub async fn shutdown(&self, wait: Duration) {
+        self.stopping.store(true, Ordering::SeqCst);
         let lives: Vec<Arc<Live>> = self.sessions().drain().map(|(_, live)| live).collect();
         for live in &lives {
             live.session.cancel();
@@ -463,7 +472,7 @@ fn bad_request(message: impl Into<String>) -> Response<Body> {
 }
 
 async fn create_session(state: &Arc<State>, body: Value) -> Response<Body> {
-    if state.shutdown.is_cancelled() {
+    if state.stopping.load(Ordering::SeqCst) {
         return error(
             StatusCode::SERVICE_UNAVAILABLE,
             "shutting_down",
@@ -553,6 +562,14 @@ async fn create_session(state: &Arc<State>, body: Value) -> Response<Body> {
             );
         }
     };
+    if state.stopping.load(Ordering::SeqCst) {
+        opened.core.mcp.shutdown().await;
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "shutting_down",
+            "the server is stopping",
+        );
+    }
     if !opened.core.logged_in() {
         opened.core.mcp.shutdown().await;
         return error(
@@ -581,7 +598,7 @@ async fn create_session(state: &Arc<State>, body: Value) -> Response<Body> {
 }
 
 fn start(state: &Arc<State>, live: Arc<Live>, body: Value) -> Response<Body> {
-    if state.shutdown.is_cancelled() {
+    if state.stopping.load(Ordering::SeqCst) {
         return error(
             StatusCode::SERVICE_UNAVAILABLE,
             "shutting_down",
@@ -593,7 +610,12 @@ fn start(state: &Arc<State>, live: Arc<Live>, body: Value) -> Response<Body> {
         Some(Value::String(_)) => return bad_request("the prompt is empty"),
         _ => return bad_request("POST /turns requires {\"prompt\": \"<text>\"}"),
     };
+    // Claim the session and read the cursor under the event-log lock, which
+    // `drive` also holds while it releases the session and publishes `done`.
+    // So `after` is always at or past the previous turn's `done`.
+    let log = live.events.lock();
     let Ok(cancel) = live.session.begin() else {
+        drop(log);
         return error_with(
             StatusCode::CONFLICT,
             "session_busy",
@@ -601,7 +623,8 @@ fn start(state: &Arc<State>, live: Arc<Live>, body: Value) -> Response<Body> {
             json!({"session_id": live.session.id}),
         );
     };
-    let after = live.events.last_seq();
+    let after = log.next - 1;
+    drop(log);
     let turn = live.turns.fetch_add(1, Ordering::SeqCst) + 1;
     let id = live.session.id.clone();
     tokio::spawn(drive(live, text, cancel));
@@ -633,8 +656,10 @@ async fn drive(live: Arc<Live>, text: String, cancel: CancellationToken) {
         .last_status
         .lock()
         .unwrap_or_else(|poison| poison.into_inner()) = Some(format!("{:?}", outcome.status));
+    let done = AgentEvent::TurnDone(outcome);
+    let mut log = live.events.lock();
     live.session.finish();
-    live.events.publish_event(&AgentEvent::TurnDone(outcome));
+    EventLog::push(&mut log, event_name(&done), &event_json(&done));
 }
 
 /// The replay cursor: `?after=N`, else `Last-Event-ID`, else live only.
@@ -686,8 +711,10 @@ fn events(state: &Arc<State>, live: &Arc<Live>, after: Option<u64>) -> Response<
             return Some((Ok(BodyFrame::data(frame.bytes())), sse));
         }
         loop {
+            // Biased toward frames, so a `done` already published before
+            // shutdown is delivered before the stream closes.
             tokio::select! {
-                _ = sse.shutdown.cancelled() => return None,
+                biased;
                 received = sse.rx.recv() => match received {
                     Ok(frame) if frame.seq <= sse.last => continue,
                     Ok(frame) => {
@@ -698,6 +725,7 @@ fn events(state: &Arc<State>, live: &Arc<Live>, after: Option<u64>) -> Response<
                     // client reconnects with Last-Event-ID and replays.
                     Err(_) => return None,
                 },
+                _ = sse.shutdown.cancelled() => return None,
                 _ = tokio::time::sleep(KEEPALIVE) => {
                     return Some((Ok(BodyFrame::data(Bytes::from_static(b": keepalive\n\n"))), sse));
                 }

@@ -229,9 +229,11 @@ pub async fn run(config: Config, paths: Paths, options: ServeOptions) -> Result<
 
     eprintln!("lh serve stopping: cancelling running turns");
     drop(listener);
-    // Ends SSE streams and asks every connection to close.
-    shutdown.cancel();
+    // Refuse new work, cancel running turns, and wait until each has written
+    // its cancellation (and published `done`); then end SSE streams and ask
+    // every connection to close.
     state.shutdown(SHUTDOWN_TURN_WAIT).await;
+    shutdown.cancel();
     let _ = tokio::time::timeout(Duration::from_secs(3), async {
         while connections.join_next().await.is_some() {}
     })

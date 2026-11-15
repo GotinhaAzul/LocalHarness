@@ -793,6 +793,9 @@ async fn stopping_the_server_leaves_sessions_resumable() {
     }
     let status = server.terminate().await;
     assert!(status.success(), "stderr: {}", server.stderr());
+    // The open stream saw the cancelled turn settle before it closed.
+    let rest = events.until_done().await;
+    assert_eq!(done_status(&rest), "Cancelled");
 
     // The normal session store resumes it.
     let output = tokio::time::timeout(

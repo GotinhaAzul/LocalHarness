@@ -197,10 +197,12 @@ It runs at the same `ToolApprover` seam ACP uses.
 
 ## Stopping
 
-SIGINT (Ctrl+C) or SIGTERM stops the server. It refuses new work, cancels
-running turns, and waits up to 10 seconds for each turn to write its
-cancellation to the session file. It then ends open event streams, stops MCP
-servers, and removes the token file. Sessions stay in the normal session store:
+SIGINT (Ctrl+C) or SIGTERM stops the server. It refuses new sessions and turns
+(`503 shutting_down`), cancels running turns, and waits up to 10 seconds for
+each one to write its cancellation to the session file. An open event stream
+receives that turn's `done` (`"status":"Cancelled"`) before it closes. The
+server then closes the remaining connections, stops MCP servers, and removes
+the token file. Sessions stay in the normal session store:
 
 ```sh
 lh --resume <id>                       # TUI
