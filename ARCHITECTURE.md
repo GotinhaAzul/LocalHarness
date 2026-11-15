@@ -1516,7 +1516,8 @@ Model resolution is layered:
   config; a trusted project config still overrides them on the next start.
 
 Environment variables: `LH_ENDPOINT`, `LH_MODEL`, `LH_API_KEY`, `LH_PROFILE`,
-`LH_MODEL_PROFILE`, `LH_THEME`, `LH_NO_SESSION`, `LH_TRUST`.
+`LH_MODEL_PROFILE`, `LH_THEME`, `LH_NO_SESSION`, `LH_TRUST`, `LH_HOME`
+(the home used for standard skill roots).
 
 ### 10.3 Example config
 
