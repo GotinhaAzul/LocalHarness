@@ -132,8 +132,7 @@ async fn rewinding_two_turns_restores_conversation_and_files() {
         .lock()
         .branch_entries()
         .into_iter()
-        .filter(|entry| entry.is_assistant())
-        .next_back()
+        .rfind(|entry| entry.is_assistant())
         .map(|entry| entry.id.clone())
         .expect("first turn assistant");
     let first_leaf = fixture.lock().active_leaf_id().unwrap();

@@ -25,6 +25,7 @@ defaults. Environment variables fill the gaps.
 
 ```toml
 default_profile = "coding"      # coding | full | security | minimal | strict | shell | custom
+review = "multi_file"           # always | multi_file | off (see below)
 
 [model]
 endpoint = "http://127.0.0.1:8080"
@@ -140,6 +141,29 @@ when the model profile does not set one.
 `[vision]` configures the size cap, EXIF handling, remote endpoints, and an
 optional model that describes images for text-only models. See
 [images.md](images.md).
+
+## Hunk review
+
+`review` decides whether `edit`, `patch`, and `write` land immediately or wait
+for the TUI's hunk list:
+
+- `multi_file` (default) opens the review when a turn is about to touch a
+  second file. The first file still lands immediately.
+- `always` reviews every mutation, including a single-file edit.
+- `off` writes immediately, exactly as before the feature existed.
+
+In the review modal, `a` accepts the selected hunk, `r` rejects it, `e` opens
+its replacement text in the prompt (Enter saves, Esc cancels), `A`/`R` accept
+or reject all, Enter applies, and Esc rejects the whole batch. Accepted hunks
+are written atomically: a failed write rolls back every file in the batch. A
+rejected hunk is reported to the model with its file and line range, so it can
+explain or try a different change instead of silently retrying. The decision
+is recorded as a `hunk-review` session entry; `undo` still steps back over an
+applied hunk.
+
+Headless (`--print`), ACP, and workflow sessions have no interactive reviewer,
+so review auto-accepts: the mutation lands immediately and no review entry is
+recorded. That keeps scripts and CI non-blocking.
 
 ```toml
 [vision]

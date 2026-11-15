@@ -544,6 +544,7 @@ pub async fn create_runtime(
         startup,
         mcp,
         approver: options.approver.clone(),
+        reviewer: Default::default(),
     };
 
     Ok(Runtime {
@@ -778,6 +779,7 @@ pub async fn rebuild_core(old: &Arc<Core>, mut config: Config) -> Result<Arc<Cor
         window_cache: old.window_cache.clone(),
         mcp: old.mcp.clone(),
         approver: old.approver.clone(),
+        reviewer: std::sync::RwLock::new(old.reviewer()),
         // Endpoint bring-up is not retried on `/model` or `/login`; only a
         // still-running bring-up for the same target carries over.
         startup: if same_target {

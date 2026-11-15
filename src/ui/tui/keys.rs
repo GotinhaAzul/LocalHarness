@@ -68,6 +68,32 @@ impl App {
             return;
         }
 
+        // The review modal is parked while a hunk is open in the prompt
+        // editor: typing edits the hunk, Enter saves, Esc reverts.
+        if let Some(mut edit) = self.hunk_edit.take() {
+            match key.code {
+                KeyCode::Esc => {
+                    self.input.set_text("");
+                    self.modal = Some(ModalData::HunkReview(edit.modal));
+                }
+                KeyCode::Enter if !shift => {
+                    let text = self.input.text();
+                    self.input.set_text("");
+                    if let Some(hunk) = edit.modal.hunks.get_mut(edit.hunk) {
+                        hunk.text = text.clone();
+                    }
+                    edit.modal
+                        .set_choice(edit.hunk, crate::tools::hunk::HunkChoice::Edit(text));
+                    self.modal = Some(ModalData::HunkReview(edit.modal));
+                }
+                _ => {
+                    self.input.handle_key(key);
+                    self.hunk_edit = Some(edit);
+                }
+            }
+            return;
+        }
+
         if ctrl && matches!(key.code, KeyCode::Char('r') | KeyCode::Char('R')) {
             self.config.ui.show_reasoning = !self.config.ui.show_reasoning;
             self.transcript
@@ -266,6 +292,8 @@ impl App {
         let mut switch: Option<PathBuf> = None;
         let mut picked: Option<PickAction> = None;
         let mut preview_theme: Option<String> = None;
+        let mut review_submit: Option<(u64, crate::tools::hunk::HunkDecision)> = None;
+        let mut review_edit: Option<(u64, usize)> = None;
 
         match &mut modal {
             ModalData::Tree(view) => match key.code {
@@ -330,6 +358,25 @@ impl App {
             },
             // Letters feed the filter, so navigation is arrows, Tab, and
             // PgUp/PgDn; Ctrl+P/N and Ctrl+K/J also move.
+            ModalData::HunkReview(view) => match key.code {
+                // Esc rejects the whole batch: the tree is untouched and the
+                // model gets the rejection instead of a silent turn cancel.
+                KeyCode::Esc => {
+                    view.reject_all();
+                    review_submit = Some((view.id, view.decision()));
+                }
+                KeyCode::Up | KeyCode::Char('k') => view.move_by(-1),
+                KeyCode::Down | KeyCode::Char('j') => view.move_by(1),
+                KeyCode::PageUp => view.move_by(-15),
+                KeyCode::PageDown => view.move_by(15),
+                KeyCode::Char('a') => view.set_selected(crate::tools::hunk::HunkChoice::Accept),
+                KeyCode::Char('r') => view.set_selected(crate::tools::hunk::HunkChoice::Reject),
+                KeyCode::Char('A') => view.accept_all(),
+                KeyCode::Char('R') => view.reject_all(),
+                KeyCode::Char('e') => review_edit = Some((view.id, view.selected)),
+                KeyCode::Enter => review_submit = Some((view.id, view.decision())),
+                _ => {}
+            },
             ModalData::Picker(view) => {
                 let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
                 match key.code {
@@ -366,6 +413,35 @@ impl App {
                         .map(|item| item.label.clone());
                 }
             }
+        }
+
+        if let Some((id, decision)) = review_submit {
+            self.reviewer.submit(id, decision);
+            self.modal = None;
+            self.set_notice("hunk review submitted", Role::Success);
+            return;
+        }
+
+        if let Some((id, index)) = review_edit
+            && let ModalData::HunkReview(view) = &modal
+            && view.id == id
+        {
+            let text = view
+                .hunks
+                .get(index)
+                .map(|hunk| hunk.text.clone())
+                .unwrap_or_default();
+            let mut view = view.clone();
+            if let Some(hunk) = view.hunks.get_mut(index) {
+                hunk.text = text.clone();
+            }
+            self.input.set_text(&text);
+            self.hunk_edit = Some(HunkEdit {
+                modal: view,
+                hunk: index,
+            });
+            self.modal = None;
+            return;
         }
 
         if let Some(target) = target {

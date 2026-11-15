@@ -151,6 +151,14 @@ fn run(ctx: &ToolContext, args: &Value) -> Result<ToolResult, ToolResult> {
 
     let mode = if existed { file_mode(&path) } else { 0o600 };
     let previous = crate::tools::undo::previous_text(&path);
+    // A read failure (not UTF-8, or over 4 MB) cannot be diffed for review;
+    // keep the lossy text so `mutation_write` knows the file exists.
+    let before_text = match &previous {
+        Ok(text) => text.clone(),
+        Err(_) => std::fs::read(&path)
+            .ok()
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned()),
+    };
     let change = crate::tools::undo::record_change(
         ctx,
         previous
@@ -159,7 +167,7 @@ fn run(ctx: &ToolContext, args: &Value) -> Result<ToolResult, ToolResult> {
             .map_err(Clone::clone),
         content,
     );
-    atomic_write(&path, content.as_bytes(), mode)
+    crate::tools::hunk::mutation_write(&path, before_text.as_deref(), content, mode)
         .map_err(|err| ToolResult::err("WRITE_FAILED", format!("cannot write {display}: {err}")))?;
 
     record_own_write(ctx, &path);

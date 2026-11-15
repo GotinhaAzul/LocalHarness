@@ -33,6 +33,7 @@ use crate::git::{self, GitStatus};
 use crate::provider::{OpenAiCompatProvider, probe};
 use crate::session::{CompactionData, Entry, EntryKind, UserData};
 use crate::skills::SkillIndex;
+use crate::tools::hunk::HunkReviewer as _;
 use crate::tools::todo::{PlanStatus, plan_snapshot};
 use crate::ui::UiOptions;
 use crate::ui::complete::{self, Completion};
@@ -41,8 +42,8 @@ use crate::ui::render::{self, ActivityData, Transcript};
 use crate::ui::theme::{Role, Theme};
 use crate::ui::tree::TreeView;
 use crate::ui::widgets::{
-    FooterData, HeaderData, ModalData, PickAction, PickItem, PickerModal, SessionItem,
-    SessionsModal, ToolItem, ToolsModal, clip_end,
+    FooterData, HeaderData, HunkReviewModal, ModalData, PickAction, PickItem, PickerModal,
+    SessionItem, SessionsModal, ToolItem, ToolsModal, clip_end,
 };
 use crate::workflows::{self, WorkflowSpec};
 
@@ -50,6 +51,7 @@ use crate::workflows::{self, WorkflowSpec};
 mod commands;
 mod git_commands;
 mod keys;
+mod review;
 mod support;
 mod terminal;
 #[cfg(test)]
@@ -184,6 +186,13 @@ struct RunningTool {
     name: String,
     summary: String,
     started: Instant,
+}
+
+/// A hunk opened in the prompt editor with `e`; the review modal is parked
+/// here until Enter saves the edited hunk or Esc restores it unchanged.
+struct HunkEdit {
+    modal: HunkReviewModal,
+    hunk: usize,
 }
 
 const LOGIN_HINT: &str = "\
@@ -409,6 +418,10 @@ struct App {
     /// The theme to restore when a `/theme` picker previewing others is
     /// dismissed.
     theme_before_preview: Option<String>,
+    /// Hunk review: the frontend seam the agent loop calls before a reviewed
+    /// batch writes, and the hunk currently open in the prompt editor.
+    reviewer: Arc<review::TuiReviewer>,
+    hunk_edit: Option<HunkEdit>,
     /// Clear the screen and repaint every cell on the next frame.
     repaint: bool,
     /// The last frame as drawn, for tests that check the screen.
@@ -419,6 +432,8 @@ struct App {
 impl App {
     fn new(runtime: Runtime, options: UiOptions) -> Result<Self> {
         let config = runtime.core.config.clone();
+        let reviewer = Arc::new(review::TuiReviewer::default());
+        runtime.core.set_reviewer(reviewer.clone());
         let paths = runtime.core.paths.clone();
         let theme = Theme::load(
             &config.ui.theme,
@@ -496,6 +511,8 @@ impl App {
             bg_rx: Some(bg_rx),
             switching: None,
             theme_before_preview: None,
+            reviewer,
+            hunk_edit: None,
             repaint: false,
             #[cfg(test)]
             last_frame: None,
@@ -929,7 +946,9 @@ impl App {
         let activity = self.activity();
         let plan = self.visible_plan();
         let busy = self.turn_active;
-        self.input.set_placeholder(if busy {
+        self.input.set_placeholder(if self.hunk_edit.is_some() {
+            "editing hunk · Enter saves · Esc cancels"
+        } else if busy {
             "the agent is working · esc to interrupt"
         } else if self.switching.is_some() {
             "switching · type ahead, Enter sends when ready"
@@ -1280,6 +1299,7 @@ impl App {
         self.token_events.clear();
         self.notice = None;
         let (tx, rx) = mpsc::unbounded_channel();
+        self.reviewer.attach(tx.clone());
         self.agent_rx = Some(rx);
         let token = core.cancel.child_token();
         self.turn_cancel = token.clone();
@@ -1300,6 +1320,8 @@ impl App {
         self.turn_state = None;
         self.turn_started = None;
         self.running_tools.clear();
+        self.reviewer.detach();
+        self.hunk_edit = None;
         self.agent_rx = None;
         self.agent_task = None;
         self.transcript.finish_turn();
@@ -1471,6 +1493,14 @@ impl App {
             AgentEvent::Notice(message) => {
                 self.transcript.turn_note("notice", &message, false);
                 self.set_notice(message, Role::Muted);
+            }
+            AgentEvent::HunkReview { id, hunks } => {
+                self.hunk_edit = None;
+                self.modal = Some(ModalData::HunkReview(HunkReviewModal::new(id, hunks)));
+                self.set_notice(
+                    "review the proposed hunks · a accept · r reject · e edit · Enter apply",
+                    Role::Accent,
+                );
             }
             AgentEvent::Guard { code, message } => {
                 self.transcript.turn_note(&code, &message, true);

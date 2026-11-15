@@ -32,6 +32,8 @@ pub struct Config {
     #[serde(rename = "model_profile")]
     pub model_profiles: BTreeMap<String, ModelProfile>,
     pub verify: VerifyConfig,
+    /// When file mutations pause for interactive hunk review.
+    pub review: ReviewMode,
     /// Model Context Protocol servers, keyed by server name (`[mcp.<name>]`).
     pub mcp: BTreeMap<String, McpServerConfig>,
     /// Image attachments and the optional describing model (`[vision]`).
@@ -646,6 +648,39 @@ impl Default for SessionConfig {
             artifact_retention_days: 30,
             keep_artifacts: false,
             clean_artifacts: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewMode {
+    /// Review every mutation before it is written.
+    Always,
+    /// Review once a turn is about to touch a second file.
+    #[default]
+    MultiFile,
+    /// Write immediately, exactly as before the review feature.
+    Off,
+}
+
+impl ReviewMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            ReviewMode::Always => "always",
+            ReviewMode::MultiFile => "multi_file",
+            ReviewMode::Off => "off",
+        }
+    }
+
+    /// Parse a config or CLI value; unknown values return `None` so callers
+    /// can name the accepted ones.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "always" => Some(ReviewMode::Always),
+            "multi_file" | "multi-file" | "multi" => Some(ReviewMode::MultiFile),
+            "off" | "never" | "none" => Some(ReviewMode::Off),
+            _ => None,
         }
     }
 }

@@ -996,6 +996,9 @@ fn render_event(event: AgentEvent, json: bool) -> Result<Option<TurnStatus>> {
                 tokens_before,
             } => json!({"type":"compacted","summary":summary,"tokens_before":tokens_before}),
             AgentEvent::Notice(message) => json!({"type":"notice","message":message}),
+            AgentEvent::HunkReview { id, hunks } => {
+                json!({"type":"hunk_review","id":id,"hunks":hunks.len()})
+            }
             AgentEvent::Guard { code, message } => {
                 json!({"type":"guard","code":code,"message":message})
             }

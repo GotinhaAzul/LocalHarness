@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use localharness::Tool;
 use localharness::agent::{AgentEvent, Core, TurnStatus, run_turn};
 use localharness::config::{Config, ProfileConfig, VerifyConfig, VerifyStep};
 use localharness::context::TokenBudget;
@@ -120,6 +121,75 @@ fn tool_script(name: &str, args: serde_json::Value) -> Script {
         },
         StreamEvent::Finish("tool_calls".into()),
     ])
+}
+
+/// A single call with an explicit id, so a multi-step script does not reuse
+/// `call_1` and trip the duplicate-call check.
+fn call_script(id: &str, name: &str, args: serde_json::Value) -> Script {
+    Script::Events(vec![
+        StreamEvent::ToolCallDelta {
+            index: 0,
+            id: Some(id.into()),
+            name: Some(name.into()),
+            arguments: Some(args.to_string()),
+        },
+        StreamEvent::Finish("tool_calls".into()),
+    ])
+}
+
+struct ScriptedReviewer {
+    decisions: Mutex<VecDeque<localharness::tools::hunk::HunkDecision>>,
+    requests: Mutex<Vec<localharness::tools::hunk::HunkRequest>>,
+}
+
+#[async_trait]
+impl localharness::tools::hunk::HunkReviewer for ScriptedReviewer {
+    async fn review(
+        &self,
+        request: localharness::tools::hunk::HunkRequest,
+    ) -> localharness::tools::hunk::HunkDecision {
+        let count = request.hunks.len();
+        self.requests.lock().unwrap().push(request);
+        self.decisions
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or_else(|| localharness::tools::hunk::HunkDecision::accept_all(count))
+    }
+}
+
+fn scripted_reviewer(
+    decisions: Vec<localharness::tools::hunk::HunkDecision>,
+) -> Arc<ScriptedReviewer> {
+    Arc::new(ScriptedReviewer {
+        decisions: Mutex::new(decisions.into()),
+        requests: Mutex::new(Vec::new()),
+    })
+}
+
+/// Read two files and then propose an edit to each in one assistant message.
+fn two_file_edit_scripts() -> Vec<Script> {
+    vec![
+        call_script("read_a", "read", json!({"path": "a.txt"})),
+        call_script("read_b", "read", json!({"path": "b.txt"})),
+        parallel_tool_script(&[
+            ("edit", json!({"path": "a.txt", "old": "one", "new": "two"})),
+            ("edit", json!({"path": "b.txt", "old": "one", "new": "two"})),
+        ]),
+        text_script("done"),
+    ]
+}
+
+fn file_contents(path: &std::path::Path) -> (String, String) {
+    (
+        std::fs::read_to_string(path.join("a.txt")).unwrap(),
+        std::fs::read_to_string(path.join("b.txt")).unwrap(),
+    )
+}
+
+fn seed_files(dir: &std::path::Path) {
+    std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+    std::fs::write(dir.join("b.txt"), "one\n").unwrap();
 }
 
 fn parallel_tool_script(calls: &[(&str, serde_json::Value)]) -> Script {
@@ -256,6 +326,7 @@ fn harness_with_extra(
         startup: None,
         mcp: Default::default(),
         approver: None,
+        reviewer: Default::default(),
     };
     Harness {
         core: Arc::new(core),
@@ -1965,4 +2036,185 @@ async fn shell_profile_reads_edits_and_tests_with_bash_only() {
             .all(|request| request.tools.iter().all(|tool| tool.name == "bash")),
         "shell must never expose a non-bash tool"
     );
+}
+
+#[tokio::test]
+async fn two_file_edit_buffers_for_review_and_rejecting_one_hunk_keeps_that_file() {
+    use localharness::tools::hunk::{HunkChoice, HunkDecision};
+
+    let dir = tempfile::tempdir().unwrap();
+    seed_files(dir.path());
+    let reviewer = scripted_reviewer(vec![HunkDecision {
+        choices: vec![HunkChoice::Accept, HunkChoice::Reject],
+    }]);
+    let harness = harness(dir.path(), two_file_edit_scripts(), &["read", "edit"]);
+    harness.core.set_reviewer(reviewer.clone());
+
+    let (outcome, _) = run(&harness, "edit both files").await;
+    assert_eq!(outcome.status, TurnStatus::Done, "{:?}", outcome.error);
+    assert_eq!(
+        file_contents(dir.path()),
+        ("two\n".into(), "one\n".into()),
+        "only the accepted hunk lands"
+    );
+
+    {
+        let requests = reviewer.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1, "one review for the batch");
+        assert_eq!(requests[0].hunks.len(), 2);
+        assert_eq!(requests[0].hunks[0].file, "a.txt");
+        assert_eq!(requests[0].hunks[1].file, "b.txt");
+    }
+
+    // The model sees the rejected range, not a silent success.
+    let rejected = {
+        let session = harness.session.lock().unwrap();
+        let results: Vec<String> = session
+            .branch_entries()
+            .iter()
+            .filter_map(|entry| entry.tool_result().map(|result| result.content.clone()))
+            .collect();
+        results
+            .iter()
+            .rev()
+            .find(|content| content.contains("HUNK_REJECTED"))
+            .cloned()
+            .unwrap_or_else(|| panic!("no rejected tool result in {results:#?}"))
+    };
+    assert!(rejected.contains("b.txt"), "{rejected}");
+    assert!(rejected.contains("line 1"), "{rejected}");
+
+    // The decision is recorded on the branch.
+    let review = {
+        let session = harness.session.lock().unwrap();
+        session
+            .latest_custom_on_path("hunk-review")
+            .expect("hunk-review entry")
+            .clone()
+    };
+    match review.kind {
+        EntryKind::Custom(custom) => {
+            assert_eq!(custom.payload["hunks"], 2);
+            assert_eq!(custom.payload["applied"], 1);
+            assert_eq!(custom.payload["rejected"], 1);
+        }
+        _ => panic!("wrong entry type"),
+    }
+
+    // Undo still works over the accepted hunk.
+    let undo = localharness::tools::undo::UndoTool
+        .call(&harness.core.tool_context(), json!({"path": "a.txt"}))
+        .await;
+    assert!(!undo.is_error, "{}", undo.content);
+    assert_eq!(file_contents(dir.path()).0, "one\n");
+}
+
+#[tokio::test]
+async fn rejecting_every_hunk_leaves_every_file_byte_identical() {
+    use localharness::tools::hunk::HunkDecision;
+
+    let dir = tempfile::tempdir().unwrap();
+    seed_files(dir.path());
+    let reviewer = scripted_reviewer(vec![HunkDecision::reject_all(2)]);
+    let harness = harness(dir.path(), two_file_edit_scripts(), &["read", "edit"]);
+    harness.core.set_reviewer(reviewer.clone());
+
+    let (outcome, _) = run(&harness, "edit both files").await;
+    assert_eq!(outcome.status, TurnStatus::Done, "{:?}", outcome.error);
+    assert_eq!(file_contents(dir.path()), ("one\n".into(), "one\n".into()));
+    let session = harness.session.lock().unwrap();
+    let results: Vec<&ToolResultData> = session
+        .branch_entries()
+        .iter()
+        .filter_map(|entry| entry.tool_result())
+        .collect();
+    assert!(
+        results
+            .iter()
+            .filter(|result| result.content.contains("HUNK_REJECTED"))
+            .count()
+            >= 2,
+        "both calls report the rejection: {results:?}"
+    );
+}
+
+#[tokio::test]
+async fn review_off_writes_immediately_like_before_the_feature() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_files(dir.path());
+    let reviewer = scripted_reviewer(Vec::new());
+    let mut config = base_config();
+    config.review = localharness::config::ReviewMode::Off;
+    config.profiles.get_mut("test").expect("test profile").tools =
+        ["read", "edit"].map(str::to_string).to_vec();
+    let harness = harness_config(dir.path(), two_file_edit_scripts(), config);
+    harness.core.set_reviewer(reviewer.clone());
+
+    let (outcome, _) = run(&harness, "edit both files").await;
+    assert_eq!(outcome.status, TurnStatus::Done, "{:?}", outcome.error);
+    assert_eq!(
+        file_contents(dir.path()),
+        ("two\n".into(), "two\n".into()),
+        "review = off applies both writes without asking"
+    );
+    assert!(
+        reviewer.requests.lock().unwrap().is_empty(),
+        "no review requests in off mode"
+    );
+}
+
+#[tokio::test]
+async fn headless_review_without_a_reviewer_auto_accepts() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_files(dir.path());
+    let harness = harness(dir.path(), two_file_edit_scripts(), &["read", "edit"]);
+
+    let (outcome, _) = run(&harness, "edit both files").await;
+    assert_eq!(outcome.status, TurnStatus::Done, "{:?}", outcome.error);
+    assert_eq!(
+        file_contents(dir.path()),
+        ("two\n".into(), "two\n".into()),
+        "a session without an interactive reviewer keeps the old behavior"
+    );
+    let session = harness.session.lock().unwrap();
+    assert!(
+        session.latest_custom_on_path("hunk-review").is_none(),
+        "no review happened, so no decision is recorded"
+    );
+}
+
+#[tokio::test]
+async fn review_always_buffers_even_a_single_file_edit() {
+    use localharness::tools::hunk::HunkDecision;
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+    let reviewer = scripted_reviewer(vec![HunkDecision::reject_all(1)]);
+    let mut config = base_config();
+    config.review = localharness::config::ReviewMode::Always;
+    config.profiles.get_mut("test").expect("test profile").tools =
+        ["read", "edit"].map(str::to_string).to_vec();
+    let harness = harness_config(
+        dir.path(),
+        vec![
+            call_script("read_a", "read", json!({"path": "a.txt"})),
+            call_script(
+                "edit_a",
+                "edit",
+                json!({"path": "a.txt", "old": "one", "new": "two"}),
+            ),
+            text_script("ok"),
+        ],
+        config,
+    );
+    harness.core.set_reviewer(reviewer.clone());
+
+    let (outcome, _) = run(&harness, "edit one file").await;
+    assert_eq!(outcome.status, TurnStatus::Done, "{:?}", outcome.error);
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+        "one\n",
+        "always reviews the first mutation too"
+    );
+    assert_eq!(reviewer.requests.lock().unwrap().len(), 1);
 }

@@ -1592,6 +1592,21 @@ struct BatchOutcome {
     invalid_calls: u32,
 }
 
+/// A reviewed mutation that ran against a capture buffer: the file has not
+/// been touched yet, and its result text is provisional until the review
+/// decision is applied.
+struct BufferedCall {
+    call: ToolCall,
+    result: ToolResult,
+    writes: Vec<crate::tools::hunk::PendingWrite>,
+    started: Instant,
+    summary_args: String,
+}
+
+fn is_file_mutation(name: &str) -> bool {
+    matches!(name, "edit" | "patch" | "write")
+}
+
 struct ThreadSplit {
     kickoff: Option<String>,
 }
@@ -1621,6 +1636,53 @@ async fn execute_batch(
 
     let ctx = core.tool_context_with(cancel.clone());
     let active: Vec<&str> = core.tools.iter().map(|tool| tool.name()).collect();
+
+    // Hunk review: from a turn's second file mutation (or every mutation in
+    // `always`), run the mutating tools against a capture buffer, ask the
+    // frontend which hunks to keep, and write the accepted ones atomically.
+    // Without a reviewer (headless, ACP) the buffer is not used at all: the
+    // turn behaves exactly as before, which is the documented auto-accept.
+    let review_mode = core.config.review;
+    let reviewer = if review_mode == crate::config::ReviewMode::Off {
+        None
+    } else {
+        core.reviewer()
+    };
+    let mutation_calls: Vec<usize> = calls
+        .iter()
+        .enumerate()
+        .filter(|(_, call)| is_file_mutation(&call.name))
+        .map(|(index, _)| index)
+        .collect();
+    let mut review_active = false;
+    if reviewer.is_some() {
+        let mut files: HashSet<String> = gates::analyze_turn_since(
+            &core.session.lock().expect("session lock"),
+            false,
+            turn_start,
+        )
+        .files
+        .into_iter()
+        .collect();
+        for index in &mutation_calls {
+            if let Some(raw) = calls[*index].arguments.get("path").and_then(Value::as_str)
+                && let Ok(path) = ctx.resolve(raw)
+            {
+                files.insert(display_path(&ctx.cwd, &path));
+            }
+        }
+        review_active = match review_mode {
+            crate::config::ReviewMode::Always => !mutation_calls.is_empty(),
+            crate::config::ReviewMode::MultiFile => files.len() >= 2,
+            crate::config::ReviewMode::Off => false,
+        };
+    }
+    let capture: Option<crate::tools::hunk::Capture> =
+        review_active.then(|| std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+    let last_reviewed = mutation_calls.last().copied();
+    let mut buffered: Vec<BufferedCall> = Vec::new();
+    let mut review_done = false;
+
     for (position, original) in calls.iter().enumerate() {
         if core.model_profile.one_call && position > 0 {
             invalid_calls += 1;
@@ -1699,6 +1761,7 @@ async fn execute_batch(
         let mut evidence_args: Option<Value> = None;
         let mut result;
         let mut repaired = None;
+        let mut capture_start: Option<usize> = None;
 
         if tool.is_none() {
             let hint = unknown_suggestion
@@ -1812,38 +1875,119 @@ async fn execute_batch(
                     if result.is_error {
                         // Keep the failure and skip execution.
                     } else {
-                        let signature =
-                            format!("{}:{}", call.name, super::repair::canonical_json(&args));
-                        match loop_guard.check_and_record(signature) {
-                            LoopDecision::Tripped { reason } => {
-                                result = ToolResult::err("loop_guard", reason.clone());
-                                guard_trip = Some(("loop_guard".into(), reason));
+                        if let Some(capture) = &capture
+                            && is_file_mutation(&call.name)
+                            && let Some(path) =
+                                args_path.as_ref().and_then(|raw| ctx.resolve(raw).ok())
+                        {
+                            let duplicate = capture
+                                .lock()
+                                .map(|writes| writes.iter().any(|write| write.path == path))
+                                .unwrap_or(true);
+                            if duplicate {
+                                result = ToolResult::err(
+                                    "REVIEW_DUPLICATE",
+                                    format!(
+                                        "this batch already has a pending change to {}. Only one \
+                                         mutation per file can be reviewed at a time; this call did \
+                                         not run. Retry it in the next message after the review.",
+                                        display_path(&ctx.cwd, &path)
+                                    ),
+                                );
+                            } else {
+                                capture_start = capture.lock().ok().map(|writes| writes.len());
                             }
-                            LoopDecision::Ok => {
-                                let fut = tool.as_ref().unwrap().call(&ctx, args.clone());
-                                tokio::select! {
-                                    biased;
-                                    _ = cancel.cancelled() => {
-                                        result = ToolResult::err("cancelled", "cancelled during execution");
-                                    }
-                                    outcome = tokio::time::timeout(core.tool_timeout, fut) => {
-                                        result = match outcome {
-                                            Ok(result) => result,
-                                            Err(_) => ToolResult::err(
-                                                "timeout",
-                                                format!(
-                                                    "{} exceeded {} s; narrow the call or use bg for long work",
-                                                    call.name,
-                                                    core.tool_timeout.as_secs()
+                        }
+                        if result.is_error {
+                            // A review guard rejected the call; skip execution.
+                        } else {
+                            let signature =
+                                format!("{}:{}", call.name, super::repair::canonical_json(&args));
+                            match loop_guard.check_and_record(signature) {
+                                LoopDecision::Tripped { reason } => {
+                                    result = ToolResult::err("loop_guard", reason.clone());
+                                    guard_trip = Some(("loop_guard".into(), reason));
+                                }
+                                LoopDecision::Ok => {
+                                    let fut = async {
+                                        match (&capture, capture_start) {
+                                            (Some(capture), Some(_)) => {
+                                                crate::tools::hunk::with_capture(
+                                                    capture.clone(),
+                                                    tool.as_ref().unwrap().call(&ctx, args.clone()),
+                                                )
+                                                .await
+                                            }
+                                            _ => {
+                                                tool.as_ref()
+                                                    .unwrap()
+                                                    .call(&ctx, args.clone())
+                                                    .await
+                                            }
+                                        }
+                                    };
+                                    tokio::select! {
+                                        biased;
+                                        _ = cancel.cancelled() => {
+                                            result = ToolResult::err("cancelled", "cancelled during execution");
+                                        }
+                                        outcome = tokio::time::timeout(core.tool_timeout, fut) => {
+                                            result = match outcome {
+                                                Ok(result) => result,
+                                                Err(_) => ToolResult::err(
+                                                    "timeout",
+                                                    format!(
+                                                        "{} exceeded {} s; narrow the call or use bg for long work",
+                                                        call.name,
+                                                        core.tool_timeout.as_secs()
+                                                    ),
                                                 ),
-                                            ),
-                                        };
+                                            };
+                                        }
                                     }
                                 }
                             }
                         }
                     }
                 }
+            }
+        }
+
+        // A captured write did not touch the disk. Hold its result until the
+        // review applies the accepted hunks, then report the real outcome.
+        if let (Some(capture), Some(start)) = (&capture, capture_start) {
+            let writes = capture
+                .lock()
+                .map(|writes| writes[start..].to_vec())
+                .unwrap_or_default();
+            if !writes.is_empty() {
+                buffered.push(BufferedCall {
+                    call: call.clone(),
+                    result,
+                    writes,
+                    started,
+                    summary_args: summary_args.clone(),
+                });
+                if !review_done && last_reviewed == Some(position) {
+                    review_done = true;
+                    finish_review(
+                        core,
+                        tx,
+                        &ctx,
+                        cancel,
+                        &mut buffered,
+                        reviewer.as_ref().expect("review_active implies a reviewer"),
+                        review_mode,
+                        &mut deferred,
+                        &mut batch_chars,
+                        &mut *progress,
+                        loop_guard,
+                        &mut inferred_mutations,
+                        &mut inferred_files,
+                    )
+                    .await;
+                }
+                continue;
             }
         }
 
@@ -2031,6 +2175,30 @@ async fn execute_batch(
         }
     }
 
+    // A cancel, guard trip, or an early break can leave captured mutations
+    // unreviewed. Review them now; a cancelled turn rejects every hunk, so the
+    // tree is untouched and the model sees why.
+    if !buffered.is_empty()
+        && let Some(reviewer) = &reviewer
+    {
+        finish_review(
+            core,
+            tx,
+            &ctx,
+            cancel,
+            &mut buffered,
+            reviewer,
+            review_mode,
+            &mut deferred,
+            &mut batch_chars,
+            &mut *progress,
+            loop_guard,
+            &mut inferred_mutations,
+            &mut inferred_files,
+        )
+        .await;
+    }
+
     if let Ok(mut session) = core.session.lock() {
         for custom in deferred {
             if let Err(err) = session.append(EntryKind::Custom(custom)) {
@@ -2052,6 +2220,288 @@ async fn execute_batch(
         thread_split,
         invalid_calls,
     }
+}
+
+/// Apply a batch of captured mutations after the frontend's hunk review.
+/// Appends the final tool results and events, records the decisions in the
+/// session, and reports rejected ranges in the tool result the model sees.
+#[allow(clippy::too_many_arguments)]
+async fn finish_review(
+    core: &std::sync::Arc<Core>,
+    tx: &UnboundedSender<AgentEvent>,
+    ctx: &crate::tools::ToolContext,
+    cancel: &CancellationToken,
+    buffered: &mut Vec<BufferedCall>,
+    reviewer: &std::sync::Arc<dyn crate::tools::hunk::HunkReviewer>,
+    mode: crate::config::ReviewMode,
+    deferred: &mut Vec<CustomData>,
+    batch_chars: &mut usize,
+    progress: &mut RunProgress,
+    loop_guard: &mut LoopGuard,
+    inferred_mutations: &mut usize,
+    inferred_files: &mut HashSet<String>,
+) {
+    if buffered.is_empty() {
+        return;
+    }
+    let calls = std::mem::take(buffered);
+    let mut writes = Vec::new();
+    let mut owners = Vec::new();
+    for (index, call) in calls.iter().enumerate() {
+        for write in &call.writes {
+            writes.push(write.clone());
+            owners.push(index);
+        }
+    }
+    let set = crate::tools::hunk::HunkSet::new(writes, &ctx.cwd);
+    let total_hunks = set.views().len();
+    let decision = if total_hunks == 0 {
+        crate::tools::hunk::HunkDecision::accept_all(0)
+    } else {
+        reviewer
+            .review(crate::tools::hunk::HunkRequest {
+                hunks: set.views().to_vec(),
+                cancel: cancel.clone(),
+            })
+            .await
+    };
+    let committed = set.commit(&decision);
+
+    let mut applied = 0usize;
+    let mut rejected = 0usize;
+    let mut rejected_ranges = Vec::new();
+    let mut files = set.files();
+    if files.is_empty() {
+        files = calls
+            .iter()
+            .filter_map(|call| call.writes.first())
+            .map(|write| {
+                write
+                    .path
+                    .strip_prefix(&ctx.cwd)
+                    .unwrap_or(&write.path)
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .collect();
+    }
+
+    // Per-call outcomes. Today each tool produces one write; keep the mapping
+    // explicit so a future multi-file tool cannot silently mismatch.
+    let mut per_call: Vec<Vec<crate::tools::hunk::ProposalOutcome>> = vec![Vec::new(); calls.len()];
+    if let Ok(outcomes) = &committed {
+        for (index, outcome) in outcomes.iter().enumerate() {
+            per_call[owners[index]].push(outcome.clone());
+        }
+    }
+
+    for (index, call) in calls.iter().enumerate() {
+        let mut result = call.result.clone();
+        let mut changed = false;
+        let mut final_hashes: Vec<String> = Vec::new();
+        match &committed {
+            Err(error) => {
+                result = ToolResult::err(
+                    "REVIEW_FAILED",
+                    format!(
+                        "{error}\nThe change was not applied; nothing in this review was written."
+                    ),
+                );
+            }
+            Ok(_) => {
+                let call_writes: Vec<&crate::tools::hunk::PendingWrite> =
+                    call.writes.iter().collect();
+                if per_call[index].len() != call_writes.len() {
+                    result = ToolResult::err(
+                        "REVIEW_FAILED",
+                        "the review returned fewer outcomes than proposed writes; nothing was written",
+                    );
+                } else {
+                    let mut texts = Vec::new();
+                    let mut call_rejected_ranges = Vec::new();
+                    let mut call_applied = 0usize;
+                    for (write, outcome) in call_writes.iter().zip(&per_call[index]) {
+                        let display = write
+                            .path
+                            .strip_prefix(&ctx.cwd)
+                            .unwrap_or(&write.path)
+                            .to_string_lossy()
+                            .to_string();
+                        call_applied += outcome.accepted;
+                        if !outcome.rejected.is_empty() {
+                            for (start, end) in &outcome.rejected {
+                                rejected += 1;
+                                let label = if end < start {
+                                    format!("{display} after line {}", start.saturating_sub(1))
+                                } else if start == end {
+                                    format!("{display} line {start}")
+                                } else {
+                                    format!("{display} lines {start}-{end}")
+                                };
+                                call_rejected_ranges.push(label.clone());
+                                rejected_ranges.push(label);
+                            }
+                        }
+                        if outcome.changed {
+                            changed = true;
+                            applied += outcome.accepted;
+                        }
+                        if let Some(final_content) = &outcome.final_content {
+                            final_hashes
+                                .push(crate::tools::undo::content_hash(final_content.as_bytes()));
+                        }
+                    }
+                    if changed {
+                        if call_rejected_ranges.is_empty() {
+                            texts.push(result.content.clone());
+                        } else {
+                            let write = call_writes[0];
+                            let before = write.before.as_deref().unwrap_or("");
+                            let after = per_call[index][0]
+                                .final_content
+                                .as_deref()
+                                .unwrap_or(&write.after);
+                            let (diff, added, removed) =
+                                crate::tools::edit::diff_report(before, after, 200);
+                            texts.push(format!(
+                                "[review] applied {call_applied} hunk(s); rejected {}. The file \
+                                 differs from your proposal in the rejected ranges; read it before \
+                                 retrying.\n{diff}",
+                                call_rejected_ranges.join(", ")
+                            ));
+                            let mut details = result.details.clone().unwrap_or_else(|| json!({}));
+                            if let Some(object) = details.as_object_mut() {
+                                object.insert(
+                                    "path".into(),
+                                    json!(display_path(&ctx.cwd, &write.path)),
+                                );
+                                object.insert("added".into(), json!(added));
+                                object.insert("removed".into(), json!(removed));
+                                object.insert("review".into(), json!("partial"));
+                                object.insert("accepted".into(), json!(call_applied));
+                                object.insert("rejected".into(), json!(call_rejected_ranges));
+                            }
+                            result.details = Some(details);
+                        }
+                    } else if !call_rejected_ranges.is_empty() {
+                        let where_ = if call_rejected_ranges.is_empty() {
+                            "the reviewed hunks".to_string()
+                        } else {
+                            call_rejected_ranges.join(", ")
+                        };
+                        result = ToolResult::err(
+                            "HUNK_REJECTED",
+                            format!(
+                                "the user rejected the proposed change to {where_}. The file is \
+                                 unchanged. Do not retry the same change; ask what to change or \
+                                 explain the trade-off."
+                            ),
+                        );
+                        result.details = Some(json!({
+                            "review": "rejected",
+                            "rejected": call_rejected_ranges,
+                        }));
+                    } else {
+                        texts.push(result.content.clone());
+                    }
+                    if !texts.is_empty() {
+                        result.content = texts.join("\n");
+                    }
+                }
+            }
+        }
+
+        let text = format!(
+            "[tool] {} - {}\n{}",
+            call.call.name, call.summary_args, result.content
+        );
+        let mut capped = context::cap_result_with(&ctx.artifacts, &text, context::Preview::Head);
+        if *batch_chars + capped.content.chars().count() > BATCH_CAP_CHARS {
+            match ctx.artifacts.write(&text) {
+                Ok(artifact) => {
+                    capped.content = format!(
+                        "(batch cap; full result archived as {} · {} bytes · recall {} 1-120)",
+                        artifact.id, artifact.bytes, artifact.id
+                    );
+                    capped.artifact = Some(artifact.id);
+                }
+                Err(_) => {
+                    capped.content = capped.content.chars().take(200).collect::<String>();
+                }
+            }
+            capped.truncated = true;
+        }
+        *batch_chars += capped.content.chars().count();
+        let tool_result = ToolResult {
+            content: capped.content.clone(),
+            is_error: result.is_error,
+            details: result.details.clone(),
+        };
+        let _ = append_tool_result(
+            &core.session,
+            &call.call,
+            &tool_result,
+            capped.artifact.clone(),
+        );
+
+        let write_path = call
+            .writes
+            .first()
+            .map(|write| write.path.as_path())
+            .unwrap_or(ctx.cwd.as_path());
+        let display = display_path(&ctx.cwd, write_path);
+        if changed {
+            *inferred_mutations += 1;
+            inferred_files.insert(display.clone());
+            let mut details = result.details.clone().unwrap_or_else(|| json!({}));
+            if let Some(object) = details.as_object_mut() {
+                if let Some(hash) = final_hashes.first() {
+                    object.insert("after_sha256".into(), json!(hash));
+                }
+                object.insert("path".into(), json!(display));
+            }
+            deferred.push(crate::tools::undo::fs_change_entry(
+                display.clone(),
+                Some(&details),
+            ));
+            if let Some(write) = call.writes.first() {
+                crate::tools::write::record_own_write(ctx, &write.path);
+            }
+        }
+        let raw = arguments_raw(&call.call.arguments);
+        progress.record_tool_result(
+            &fingerprint(&call.call.name, &raw, &tool_result.content),
+            &tool_result.content,
+            tool_result.is_error,
+            changed,
+            false,
+        );
+        if changed {
+            loop_guard.record_progress();
+        }
+        let _ = tx.send(AgentEvent::ToolFinished {
+            call_id: call.call.id.clone(),
+            name: call.call.name.clone(),
+            is_error: tool_result.is_error,
+            duration_ms: call.started.elapsed().as_millis() as u64,
+            preview: preview(tool_body(&tool_result.content), 300),
+            artifact: capped.artifact,
+        });
+    }
+
+    let mut entry = CustomData::new("hunk-review")
+        .with("mode", mode.label())
+        .with("hunks", total_hunks)
+        .with("applied", applied)
+        .with("rejected", rejected)
+        .with("files", files.clone());
+    if !rejected_ranges.is_empty() {
+        entry = entry.with("rejected_ranges", rejected_ranges);
+    }
+    if let Err(error) = &committed {
+        entry = entry.with("error", error.to_string());
+    }
+    deferred.push(entry);
 }
 
 fn unique_file_count(existing: &[String], extra: &HashSet<String>) -> usize {
@@ -2605,6 +3055,7 @@ mod tests {
             crate::app::measure_static_prompt(&budget, &system_prompt, tool_specs_cost, Some(""));
         Core {
             approver: None,
+            reviewer: Default::default(),
             config,
             paths: paths.clone(),
             provider: Arc::new(ProbeProvider {

@@ -132,6 +132,7 @@ Twenty-four built-ins in three packs. `coding` (core + coding) is the default; `
 - **`test`** detects vitest, jest, go, cargo, pytest, or an npm test script and returns only the first failure.
 - **`review`** reads the working tree and checks the diff before the session settles.
 - **`undo`** reverts the last `edit`, `patch`, or `write` from session snapshots, and refuses when the file changed after the harness wrote it. Changes made through `bash` are not tracked.
+- **Hunk review.** `review = "multi_file"` (the default) pauses before a turn's second file mutation, shows the proposed hunks in the TUI, and writes only what you accept. Rejected hunks are reported back to the model with their ranges, accepted hunks land atomically, and `undo` still steps back over them. `always` reviews every mutation; `off` restores immediate writes. Headless `--print` has no reviewer, so it auto-accepts and never blocks.
 - **`read`/`grep`/`glob`** respect ignore files and keep results small; oversized output is archived and available through `recall`.
 
 Tool results are capped, archived, and retrievable. The model never has to guess where an excerpt came from.
@@ -182,6 +183,7 @@ The terminal interface is the default. Tool calls render as cards, diffs and str
 | `Ctrl+L` | redraw the whole screen |
 | `/` | slash-command completion |
 | `Tab` / `Shift+Tab` | complete commands, arguments, and paths; move back through choices |
+| Review: `a` / `r` / `e` | accept, reject, or edit the selected hunk (`A`/`R` all, `Enter` apply, `Esc` reject all) |
 
 Tab completes the token at the cursor: commands, arguments (themes, profiles, skills, workflows, session ids, models, `/login` endpoints, `/help` topics, `/sec` subcommands), and file paths. Ambiguous matches first extend to their shared prefix, then open a picker. Every command that chooses from a list — `/model`, `/profile`, `/theme` (with live preview), `/skill`, `/workflow`, `/sec`, `/resume` — opens a filterable menu when run without an argument: type to filter, arrows to move, Enter to pick. Model and profile switches load in the background, so the TUI stays responsive while the server swaps models.
 

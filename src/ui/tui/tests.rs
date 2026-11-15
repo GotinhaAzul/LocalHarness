@@ -737,6 +737,62 @@ async fn screen_never_drifts_from_what_ratatui_drew() {
 }
 
 #[tokio::test]
+async fn hunk_review_modal_accepts_rejects_edits_and_submits() {
+    use crate::tools::hunk::{HunkChoice, HunkDecision, HunkView};
+
+    fn hunk(file: &str, line: usize) -> HunkView {
+        HunkView {
+            file: file.into(),
+            start_line: line,
+            end_line: line,
+            added: 1,
+            removed: 1,
+            rationale: format!("change line {line}"),
+            text: format!("new {line}\n"),
+        }
+    }
+
+    let (_dir, mut app) = test_app().await;
+    app.handle_agent_event(AgentEvent::HunkReview {
+        id: 9,
+        hunks: vec![hunk("a.rs", 1), hunk("b.rs", 2)],
+    });
+    assert!(matches!(&app.modal, Some(ModalData::HunkReview(_))));
+
+    // Reject the first hunk, then edit the second.
+    app.handle_modal_key(key(KeyCode::Char('r'))).await;
+    app.handle_modal_key(key(KeyCode::Down)).await;
+    app.handle_modal_key(key(KeyCode::Char('e'))).await;
+    assert!(app.hunk_edit.is_some(), "e opens the prompt editor");
+    assert_eq!(app.input.text(), "new 2\n");
+    app.input.set_text("edited\n");
+    app.handle_key(key(KeyCode::Enter)).await;
+    match &app.modal {
+        Some(ModalData::HunkReview(view)) => {
+            assert_eq!(view.choices[0], HunkChoice::Reject);
+            assert_eq!(view.choices[1], HunkChoice::Edit("edited\n".into()));
+        }
+        other => panic!("expected the review modal, got {other:?}"),
+    }
+
+    app.handle_modal_key(key(KeyCode::Enter)).await;
+    assert!(app.modal.is_none());
+    let decision = app.reviewer.submitted().expect("a submitted decision");
+    assert_eq!(decision.choices[0], HunkChoice::Reject);
+    assert_eq!(decision.choices[1], HunkChoice::Edit("edited\n".into()));
+
+    // Esc is reject-all: nothing lands and the model is told.
+    app.handle_agent_event(AgentEvent::HunkReview {
+        id: 10,
+        hunks: vec![hunk("a.rs", 1), hunk("b.rs", 2)],
+    });
+    app.handle_modal_key(key(KeyCode::Esc)).await;
+    assert!(app.modal.is_none());
+    let decision = app.reviewer.submitted().expect("a submitted decision");
+    assert_eq!(decision, HunkDecision::reject_all(2));
+}
+
+#[tokio::test]
 async fn rewind_restores_files_moves_the_leaf_and_keeps_the_old_branch() {
     let (_dir, mut app) = test_app().await;
     let cwd = app.cwd_path();

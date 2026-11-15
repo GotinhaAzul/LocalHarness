@@ -514,7 +514,7 @@ Entry fields:
 | `tool_result` | call_id, content, is_error, details?, artifact? |
 | `compaction` | summary, tokens_before, reason, thread_id? |
 | `checkout` | target, reason (`tree`, `fork`, `resume`) |
-| `custom` | kind plus payload (`fs-change`, `rewind`, `verify-config`, `verify-result`, `todo-state`, `finding`, `thread-state`, `guard-trip`, `profile-change`, `model-change`) |
+| `custom` | kind plus payload (`fs-change`, `hunk-review`, `rewind`, `verify-config`, `verify-result`, `todo-state`, `finding`, `thread-state`, `guard-trip`, `profile-change`, `model-change`) |
 | `error` | code, message, recoverable |
 
 An assistant entry with `tool_calls` is a batch. The tool results that answer it
@@ -847,6 +847,45 @@ code and, where useful, the exact call shape.
 - In `bash` and `bg`, `git reset --hard`, `git clean -f`, `git push --force`
   (and `+ref`, `:ref`, `--delete`), `git rebase`, `filter-branch` and
   `git tag -d` are refused with `GIT_DESTRUCTIVE`.
+
+### 6.2b Hunk review
+
+`review = "always" | "multi_file" | "off"` (default `multi_file`) decides
+whether file mutations wait for the user. The agent loop decides per assistant
+batch: `always` activates on a batch with any mutation, `multi_file` when the
+turn's files (already changed plus this batch) reach two, `off` never.
+
+With an interactive frontend installed (`Core::reviewer`), active batches run
+`edit`, `patch`, and `write` inside a capture scope. The tools compute their
+before/after text exactly as usual and call the shared `mutation_write` seam,
+which records a `PendingWrite` instead of touching the disk. Post-mutation LSP
+diagnostics are skipped for a captured batch because the file has not changed
+yet; the read tracker is re-stamped after the accepted hunks land.
+
+At the batch's last mutation the loop:
+
+1. Splits each proposal with `TextDiff::from_lines` into hunks: file, old line
+   range, added/removed counts, and a one-line rationale. This is the same diff
+   engine the tool results use, not a second one; applying a hunk walks those
+   ops.
+2. Asks the `HunkReviewer` trait for one `Accept`/`Reject`/`Edit(text)` per
+   hunk. The TUI implements it with a modal (`a`, `r`, `e`, `A`, `R`, Enter,
+   Esc = reject all). A test can implement the trait with a script.
+3. Validates every proposal's current bytes against the before-text. A file
+   that changed while the review was open aborts the whole set before any
+   write.
+4. Applies accepted hunks atomically: every file is written, and a failed
+   write restores the ones already written and removes files it created. No
+   hunk accepted leaves the tree byte-identical.
+5. Appends the tool results (partial applications name the rejected file and
+   line ranges; a fully rejected call returns `HUNK_REJECTED`), the `fs-change`
+   entries with the final hash, and a `hunk-review` custom entry recording the
+   mode, hunk/applied/rejected counts, files, and rejected ranges. Undo uses
+   the same snapshot the tool captured before the review, so it still works.
+
+Without a reviewer (`--print`, ACP, workflows), no capture is installed: the
+turn writes immediately, exactly as before the feature, and no review entry is
+recorded. This is the documented non-blocking auto-accept.
 
 ### 6.3 Hard limits
 
