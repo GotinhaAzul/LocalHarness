@@ -381,6 +381,7 @@ pub(crate) fn test_context(dir: &Path) -> ToolContext {
         trust: false,
         verify: VerifyConfig { steps: Vec::new() },
         profile: "test".into(),
+        edit_mode: crate::config::EditMode::Text,
         packs: Vec::new(),
         reads: Arc::new(Mutex::new(ReadTracker::default())),
         bg: Arc::new(Mutex::new(BgRegistry::default())),

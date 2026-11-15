@@ -627,22 +627,32 @@ fn reject_noops(tool: &str, value: &Value) -> Result<(), RepairError> {
             }
         }
         "patch" => {
-            let anchor = value.get("anchor").and_then(|v| v.as_str()).unwrap_or("");
-            let replacement = value
-                .get("replacement")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            if anchor.is_empty() {
-                return Err(RepairError::new(
-                    "empty_anchor",
-                    "patch needs the exact anchor text; use write for new files",
-                ));
-            }
-            if anchor == replacement {
-                return Err(RepairError::new(
-                    "noop_patch",
-                    "patch anchor and replacement are identical; change the replacement",
-                ));
+            // Hash mode carries the edit in line anchors instead of text.
+            if let Some(ops) = value.get("ops") {
+                if ops.as_array().is_none_or(|ops| ops.is_empty()) {
+                    return Err(RepairError::new(
+                        "empty_ops",
+                        "patch ops is empty; pass at least one PUT, CUT, REM, or MV operation",
+                    ));
+                }
+            } else {
+                let anchor = value.get("anchor").and_then(|v| v.as_str()).unwrap_or("");
+                let replacement = value
+                    .get("replacement")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if anchor.is_empty() {
+                    return Err(RepairError::new(
+                        "empty_anchor",
+                        "patch needs the exact anchor text; use write for new files",
+                    ));
+                }
+                if anchor == replacement {
+                    return Err(RepairError::new(
+                        "noop_patch",
+                        "patch anchor and replacement are identical; change the replacement",
+                    ));
+                }
             }
         }
         "write" => {
@@ -1036,6 +1046,20 @@ mod tests {
         let err = repair("edit", r#"{"path":"a.rs"}"#, &schema).unwrap_err();
         assert_eq!(err.code, "missing_argument");
         assert!(err.message.contains("\"old\""));
+    }
+
+    #[test]
+    fn hash_patch_ops_skip_text_anchor_validation() {
+        let schema = schema_for("patch");
+        let value = repair(
+            "patch",
+            r#"{"path":"a.rs#0123456789ab","ops":[{"op":"REM","line":1,"hash":"deadbeef"}]}"#,
+            &schema,
+        )
+        .unwrap();
+        assert_eq!(value["ops"][0]["op"], "REM");
+        let err = repair("patch", r#"{"path":"a.rs#0123456789ab","ops":[]}"#, &schema).unwrap_err();
+        assert_eq!(err.code, "empty_ops");
     }
 
     #[test]

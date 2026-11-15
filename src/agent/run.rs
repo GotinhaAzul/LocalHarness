@@ -2002,10 +2002,9 @@ async fn execute_batch(
                         });
                     }
                     let args = repaired_args.args;
-                    args_path = args
-                        .get("path")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_string);
+                    args_path = args.get("path").and_then(|v| v.as_str()).map(|raw| {
+                        super::authorize::target_path(core, &call.name, raw).to_string()
+                    });
                     evidence_args = Some(args.clone());
                     repaired = Some(args.clone());
                     result = ToolResult::ok("");

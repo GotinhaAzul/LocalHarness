@@ -197,6 +197,19 @@ impl Config {
                 ..ModelProfile::default()
             },
         );
+        // Opt-in content-hash anchors: `read` annotates lines and `patch`
+        // accepts `path#snapshot` plus PUT/CUT/REM/MV operations. Exact-text
+        // editing remains the default.
+        cfg.model_profiles.insert(
+            "hash".into(),
+            ModelProfile {
+                tool_mode: ToolMode::Repair,
+                strip_reasoning: Some(true),
+                edit_mode: EditMode::Hash,
+                short_tool_schemas: Some(true),
+                ..ModelProfile::default()
+            },
+        );
         cfg.model_profiles.insert(
             "strict".into(),
             ModelProfile {
@@ -1088,6 +1101,8 @@ pub struct ModelProfile {
     pub tool_choice: Option<String>,
     /// Reject a second tool call in the same assistant message at dispatch.
     pub one_call: bool,
+    /// How file edits are anchored: exact text (default) or content hashes.
+    pub edit_mode: EditMode,
     /// Strip property descriptions and shorten tool descriptions in requests.
     pub short_tool_schemas: Option<bool>,
     pub stop: Vec<String>,
@@ -1129,6 +1144,7 @@ impl Default for ModelProfile {
             parallel_tool_calls: None,
             tool_choice: None,
             one_call: false,
+            edit_mode: EditMode::Text,
             short_tool_schemas: None,
             stop: vec![],
             extra_body: None,
@@ -1254,6 +1270,27 @@ impl Default for VisionConfig {
             allow_remote: false,
             max_bytes: crate::media::image::DEFAULT_MAX_BYTES,
             keep_exif: false,
+        }
+    }
+}
+
+/// How `read` and `patch` anchor an edit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum EditMode {
+    /// Exact search text; unchanged default.
+    #[default]
+    Text,
+    /// `read` annotates lines with content hashes and `patch` takes
+    /// `path#snapshot` with PUT/CUT/REM/MV operations.
+    Hash,
+}
+
+impl EditMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            EditMode::Text => "text",
+            EditMode::Hash => "hash",
         }
     }
 }
@@ -1407,6 +1444,24 @@ mod tests {
                 .unwrap_or_else(|error| panic!("{name}: {error}"));
             assert!(!selected.is_empty(), "{name} selects no tools");
         }
+    }
+
+    #[test]
+    fn edit_mode_defaults_to_text_and_parses_hash() {
+        let cfg = Config::builtin();
+        assert_eq!(cfg.model_profiles["default"].edit_mode, EditMode::Text);
+        assert_eq!(cfg.model_profiles["strict"].edit_mode, EditMode::Text);
+        assert_eq!(cfg.model_profiles["hash"].edit_mode, EditMode::Hash);
+
+        let parsed: Config = toml::from_str("[model_profile.custom]\nedit_mode = \"hash\"\n")
+            .expect("hash is valid");
+        assert_eq!(parsed.model_profiles["custom"].edit_mode, EditMode::Hash);
+        let parsed: Config = toml::from_str("[model_profile.custom]\nedit_mode = \"text\"\n")
+            .expect("text is valid");
+        assert_eq!(parsed.model_profiles["custom"].edit_mode, EditMode::Text);
+        assert!(
+            toml::from_str::<Config>("[model_profile.custom]\nedit_mode = \"fuzzy\"\n").is_err()
+        );
     }
 
     #[test]

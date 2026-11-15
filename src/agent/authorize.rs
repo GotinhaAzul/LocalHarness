@@ -55,8 +55,30 @@ impl Verdict {
     }
 }
 
+/// The file a call targets, as path rules and hunk review must see it: a
+/// hash-mode `patch` names `path#snapshot`, and the tag is not part of the
+/// filename (a deny rule on `.env` must match `.env#<snapshot>`).
+pub fn target_path<'a>(core: &Core, tool: &str, raw: &'a str) -> &'a str {
+    if tool == "patch" {
+        crate::tools::patch::gate_path(raw, core.model_profile.edit_mode)
+    } else {
+        raw
+    }
+}
+
 /// The permission policy alone, for one call in the current mode.
 pub fn policy_decision(core: &Core, tool: &dyn Tool, args: &Value) -> Decision {
+    let normalized = args
+        .get("path")
+        .and_then(Value::as_str)
+        .map(|raw| (raw, target_path(core, tool.name(), raw)))
+        .filter(|(raw, target)| raw != target)
+        .map(|(_, target)| {
+            let mut args = args.clone();
+            args["path"] = Value::String(target.to_string());
+            args
+        });
+    let args = normalized.as_ref().unwrap_or(args);
     let facts = CallFacts::new(tool.name(), tool.read_only(), args, &core.paths.cwd);
     match core.permissions.decide(&facts) {
         Decision::Ask(mut request) => {

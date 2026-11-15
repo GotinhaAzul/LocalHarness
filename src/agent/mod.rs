@@ -283,6 +283,7 @@ impl Core {
             trust: self.config.trust,
             verify: self.config.verify.clone(),
             profile: self.config.profile_name().to_string(),
+            edit_mode: self.model_profile.edit_mode,
             packs: crate::tools::active_packs(&self.tools),
             reads: self.reads.clone(),
             bg: self.bg.clone(),

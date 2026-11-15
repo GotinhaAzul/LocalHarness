@@ -140,6 +140,11 @@ strip_reasoning = true
 parallel_tool_calls = false
 short_tool_schemas = true
 
+[model_profile.hash]
+edit_mode = "hash"            # text (default) | hash; see below
+tool_mode = "repair"
+short_tool_schemas = true
+
 [model_profile.qwen3]
 match = ["qwen3"]
 context_window = 65536
@@ -222,6 +227,64 @@ more reliably with commands than with JSON calls. The output contract is:
 `short_tool_schemas = true` removes property descriptions from the request and
 shortens each tool description. It changes only what the model sees; argument
 validation still uses the full schema.
+
+## Hash-anchored edits
+
+`edit_mode = "hash"` is opt-in and defaults to `"text"`. It changes `read` and
+`patch` only: the exact-text `edit` tool and text-mode `patch` are unchanged.
+The bundled `hash` model profile sets it, or add it to your own:
+
+```toml
+[model_profile.mine]
+edit_mode = "hash"
+```
+
+Select it with `--model-profile mine`, or name it in a profile's
+`model_profile`. In hash mode, `read` prints a snapshot tag and an 8-hex
+content hash before every line:
+
+```
+[a.txt#0123456789ab]
+1  85ed202b  alpha
+2  954620a7  beta
+```
+
+`patch` takes the path with that tag (`PATH#SNAPSHOT` or the bracketed header
+`[PATH#SNAPSHOT]` both work) and an `ops` array. Line numbers are 1-based
+coordinates from the read, not coordinates after earlier operations.
+
+```json
+{
+  "path": "a.txt#0123456789ab",
+  "ops": [
+    {"op": "PUT", "line": 2, "hash": "954620a7", "text": "BETA"},
+    {"op": "CUT", "line": 4, "hash": "8a2f0c11", "count": 2},
+    {"op": "REM", "line": 7, "hash": "c30a9d42"},
+    {"op": "MV", "line": 9, "hash": "7e55b801", "to": 3, "to_hash": "4dc1e6aa"}
+  ]
+}
+```
+
+| Op | Meaning |
+|---|---|
+| `PUT` | Replace `count` lines (default 1) starting at `line` with `text`. An empty `text` deletes the range. |
+| `CUT` | Delete `count` lines (default 1) starting at `line`. |
+| `REM` | Delete exactly the one anchored line. |
+| `MV` | Move the anchored block (`count`, default 1) to immediately after the `to` line, whose hash is `to_hash`. |
+
+The snapshot covers the exact bytes, so a changed line ending is stale. Every
+operation is checked against the snapshot and every referenced line hash before
+anything is written. A stale snapshot, stale line hash, missing line, or
+overlapping operation writes nothing: the result is `STALE_ANCHOR` (or
+`invalid_args` for malformed operations) with fresh `[path#snapshot]` anchors
+for the targeted lines. A successful patch returns fresh anchors for the
+changed lines, so a follow-up patch can chain without a full re-read.
+
+Line hashes are content hashes, not security hashes: duplicate lines share a
+hash and are targeted by line number plus hash; whitespace-only lines hash
+their spaces; CRLF files hash the text without `\r` and are rewritten with
+their original endings. The same `read`-before-`write` requirement applies, and
+hash patches pass through the LSP gate below.
 
 ## Git approval
 

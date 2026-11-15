@@ -2262,6 +2262,68 @@ async fn shell_profile_reads_edits_and_tests_with_bash_only() {
 }
 
 #[tokio::test]
+async fn hash_edit_mode_wires_read_anchors_into_patch() {
+    use localharness::config::{EditMode, ModelProfile};
+    use localharness::tools::read::{line_hash, snapshot_hash};
+
+    let dir = tempfile::tempdir().unwrap();
+    let body = "alpha\nbeta\n";
+    std::fs::write(dir.path().join("a.txt"), body).unwrap();
+
+    let mut config = base_config();
+    config.model_profiles.insert(
+        "hash".into(),
+        ModelProfile {
+            edit_mode: EditMode::Hash,
+            ..ModelProfile::default()
+        },
+    );
+    let profile = config.profiles.get_mut("test").expect("test profile");
+    profile.model_profile = Some("hash".into());
+    profile.tools = vec!["read".into(), "patch".into()];
+    let snapshot = snapshot_hash(body.as_bytes());
+
+    let harness = harness_config(
+        dir.path(),
+        vec![
+            tool_script("read", json!({"path": "a.txt"})),
+            tool_script(
+                "patch",
+                json!({
+                    "path": format!("a.txt#{snapshot}"),
+                    "ops": [{"op": "PUT", "line": 2, "hash": line_hash("beta"), "text": "BETA"}],
+                }),
+            ),
+            text_script("done"),
+        ],
+        config,
+    );
+    let (outcome, _) = run(&harness, "patch beta with hash anchors").await;
+    assert_eq!(outcome.status, TurnStatus::Done, "{:?}", outcome.error);
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+        "alpha\nBETA\n"
+    );
+    let results = tool_results(&harness.session);
+    assert_eq!(results.len(), 2, "{results:?}");
+    assert!(
+        results[0].contains(&format!("[a.txt#{snapshot}]")),
+        "read must expose the snapshot: {}",
+        results[0]
+    );
+    assert!(
+        results[0].contains(&format!("2  {}  beta", line_hash("beta"))),
+        "read must annotate each line: {}",
+        results[0]
+    );
+    assert!(
+        results[1].contains(&format!("[a.txt#{}]", snapshot_hash(b"alpha\nBETA\n"))),
+        "patch must return fresh anchors: {}",
+        results[1]
+    );
+}
+
+#[tokio::test]
 async fn two_file_edit_buffers_for_review_and_rejecting_one_hunk_keeps_that_file() {
     use localharness::tools::hunk::{HunkChoice, HunkDecision};
 
@@ -4109,4 +4171,154 @@ async fn a_reviewed_edit_still_runs_post_tool_hooks() {
     let results = tool_results(&harness.session);
     let edit_result = results.last().expect("edit result");
     assert!(edit_result.contains("pre-hook note"), "{edit_result}");
+}
+
+// ---------------------------------------------------------------------------
+// Hash-anchored patches (#10) go through the same write seam as every other
+// mutation: hunk review (#56) and the redaction-placeholder guard (#112).
+// ---------------------------------------------------------------------------
+
+fn hash_patch_harness(
+    dir: &std::path::Path,
+    body: &str,
+    text: &str,
+    review: localharness::config::ReviewMode,
+) -> Harness {
+    use localharness::config::{EditMode, ModelProfile};
+    use localharness::tools::read::{line_hash, snapshot_hash};
+    std::fs::write(dir.join("a.txt"), body).unwrap();
+    let mut config = base_config();
+    config.review = review;
+    config.model_profiles.insert(
+        "hash".into(),
+        ModelProfile {
+            edit_mode: EditMode::Hash,
+            ..ModelProfile::default()
+        },
+    );
+    let profile = config.profiles.get_mut("test").expect("test profile");
+    profile.model_profile = Some("hash".into());
+    profile.tools = vec!["read".into(), "patch".into()];
+    let snapshot = snapshot_hash(body.as_bytes());
+    harness_config(
+        dir,
+        vec![
+            tool_script("read", json!({"path": "a.txt"})),
+            tool_script(
+                "patch",
+                json!({
+                    "path": format!("a.txt#{snapshot}"),
+                    "ops": [{"op": "PUT", "line": 2, "hash": line_hash("beta"), "text": text}],
+                }),
+            ),
+            text_script("done"),
+        ],
+        config,
+    )
+}
+
+#[tokio::test]
+async fn a_hash_patch_is_held_for_hunk_review() {
+    use localharness::tools::hunk::HunkDecision;
+    let dir = tempfile::tempdir().unwrap();
+    let harness = hash_patch_harness(
+        dir.path(),
+        "alpha\nbeta\n",
+        "BETA",
+        localharness::config::ReviewMode::Always,
+    );
+    let reviewer = scripted_reviewer(vec![HunkDecision::reject_all(1)]);
+    harness.core.set_reviewer(reviewer.clone());
+    let (outcome, _) = run(&harness, "patch beta").await;
+    assert_eq!(outcome.status, TurnStatus::Done, "{:?}", outcome.error);
+    assert_eq!(reviewer.requests.lock().unwrap().len(), 1);
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+        "alpha\nbeta\n",
+        "the rejected hash patch never reached the file"
+    );
+    let results = tool_results(&harness.session);
+    assert!(results[1].contains("HUNK_REJECTED"), "{}", results[1]);
+}
+
+#[tokio::test]
+async fn a_hash_patch_cannot_write_a_redaction_placeholder() {
+    let placeholder = localharness::security::redact::Redactor::new(true)
+        .redact_owned(&format!("aws_key = AKIA{}", "Q".repeat(16)))
+        .trim_start_matches("aws_key = ")
+        .to_string();
+    assert!(placeholder.starts_with("[REDACTED:"), "{placeholder}");
+    for review in [
+        localharness::config::ReviewMode::Off,
+        localharness::config::ReviewMode::Always,
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let harness = hash_patch_harness(
+            dir.path(),
+            "alpha\nbeta\n",
+            &format!("key = {placeholder}"),
+            review,
+        );
+        let reviewer = scripted_reviewer(Vec::new());
+        harness.core.set_reviewer(reviewer.clone());
+        let (outcome, _) = run(&harness, "patch beta").await;
+        assert_eq!(outcome.status, TurnStatus::Done, "{:?}", outcome.error);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "alpha\nbeta\n",
+            "review {review:?}"
+        );
+        let results = tool_results(&harness.session);
+        assert!(
+            results[1].contains("redaction placeholder"),
+            "review {review:?}: {}",
+            results[1]
+        );
+        assert!(
+            reviewer.requests.lock().unwrap().is_empty(),
+            "a refused write is never shown for review"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_path_deny_rule_matches_a_hash_patch_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = {
+        let mut harness = hash_patch_harness(
+            dir.path(),
+            "alpha\nbeta\n",
+            "BETA",
+            localharness::config::ReviewMode::Off,
+        );
+        // Rebuild the permissions with a deny rule on the plain file name.
+        let mut core = Arc::try_unwrap(harness.core).unwrap_or_else(|_| panic!("sole owner"));
+        core.permissions = Arc::new(Permissions::new(
+            Policy::compile(&[localharness::policy::RuleConfig {
+                id: Some("keep-a".into()),
+                tool: Some("patch".into()),
+                path: Some("a.txt".into()),
+                command: None,
+                network: None,
+                action: localharness::policy::RuleAction::Deny,
+            }])
+            .unwrap(),
+            PermissionMode::Yolo,
+        ));
+        harness.core = Arc::new(core);
+        harness
+    };
+    let (outcome, _) = run(&harness, "patch beta").await;
+    assert_eq!(outcome.status, TurnStatus::Done, "{:?}", outcome.error);
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+        "alpha\nbeta\n",
+        "a.txt#<snapshot> is a.txt to the policy"
+    );
+    let results = tool_results(&harness.session);
+    assert!(
+        results[1].contains("[DENIED]") && results[1].contains("keep-a"),
+        "{}",
+        results[1]
+    );
 }

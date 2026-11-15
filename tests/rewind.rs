@@ -63,6 +63,7 @@ impl Fixture {
             lsp: Arc::new(localharness::tools::lsp::LspService::new()),
             sandbox: None,
             vision: Default::default(),
+            edit_mode: localharness::config::EditMode::Text,
         };
         Fixture {
             _dir: dir,
