@@ -7,96 +7,26 @@ use std::sync::{Arc, Mutex, Weak};
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
-use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
-use crate::agent::{AgentEvent, Core, TurnOutcome, TurnStatus, run_turn};
-use crate::app::{RuntimeOptions, create_runtime};
-use crate::paths::Paths;
+use crate::agent::{AgentEvent, Core, TurnOutcome, TurnStatus};
+use crate::host::{HostedSession as AcpSession, needs_permission, start_turn};
 use crate::sanitize;
 use crate::session::{EntryKind, ToolCall};
 use crate::tools::{ToolApproval, ToolApprover};
 
 use super::{RpcError, Server, check_additional_directories, declared_root, valid_session_id};
 
-pub(crate) struct AcpSession {
-    pub id: String,
-    pub root: PathBuf,
-    pub core: Arc<Core>,
-    active: Mutex<Option<CancellationToken>>,
-}
-
-impl AcpSession {
-    pub(crate) fn cancel(&self) {
-        if let Some(token) = self
-            .active
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .as_ref()
-        {
-            token.cancel();
-        }
-    }
-
-    fn token(&self) -> CancellationToken {
-        self.active
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .clone()
-            .unwrap_or_default()
-    }
-
-    fn begin(&self) -> Result<CancellationToken, RpcError> {
-        let mut active = self
-            .active
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        if active.is_some() {
-            return Err(RpcError {
-                code: -32602,
-                message: "a prompt turn is already running in this session; cancel it or wait"
-                    .into(),
-                data: json!({"code": "session_busy", "sessionId": self.id}),
-            });
-        }
-        let token = CancellationToken::new();
-        *active = Some(token.clone());
-        Ok(token)
-    }
-
-    fn finish(&self) {
-        *self
-            .active
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner()) = None;
+fn busy(session: &AcpSession) -> RpcError {
+    RpcError {
+        code: -32602,
+        message: "a prompt turn is already running in this session; cancel it or wait".into(),
+        data: json!({"code": "session_busy", "sessionId": session.id}),
     }
 }
 
 impl Server {
-    /// Project trust and verify steps belong to the process working
-    /// directory. A session that declares another root gets neither, so a
-    /// client cannot extend the project's trust to an arbitrary directory.
-    fn session_config(&self, root: &std::path::Path) -> crate::config::Config {
-        let mut config = self.config.clone();
-        if root != self.process_paths.cwd {
-            config.trust = false;
-            config.verify = crate::config::VerifyConfig::default();
-        }
-        config
-    }
-
-    /// Paths for a session root, keeping the process's config/data roots and
-    /// `[session] dir` override so ACP and the CLI see the same sessions.
-    fn session_paths(&self, root: &std::path::Path) -> Result<Paths, RpcError> {
-        let mut paths = Paths::discover(root)
-            .map_err(|error| RpcError::internal(format!("cannot prepare {root:?}: {error}")))?;
-        paths.config_dir = self.process_paths.config_dir.clone();
-        paths.data_dir = self.process_paths.data_dir.clone();
-        paths.sessions_dir_override = self.process_paths.sessions_dir_override.clone();
-        Ok(paths)
-    }
-
     pub(crate) async fn new_session(self: &Arc<Self>, params: Value) -> Result<Value, RpcError> {
         check_additional_directories(&params)?;
         let cwd = params
@@ -104,7 +34,6 @@ impl Server {
             .and_then(Value::as_str)
             .ok_or_else(|| RpcError::invalid_params("session/new requires an absolute cwd"))?;
         let root = declared_root(cwd)?;
-        let root_paths = self.session_paths(&root)?;
         let ignored_mcp = params
             .get("mcpServers")
             .and_then(Value::as_array)
@@ -115,35 +44,21 @@ impl Server {
             server: Arc::downgrade(self),
             session_id: slot.clone(),
         });
-        let options = RuntimeOptions {
-            path_jail: true,
-            engagement: self.options.engagement.clone(),
-            no_session: self.options.no_session,
-            no_redact: self.options.no_redact,
-            resume: None,
-            continue_last: false,
-            approver: Some(approver),
-        };
-        let session_config = self.session_config(&root);
-        let trusted = session_config.trust;
-        let runtime = create_runtime(session_config, root_paths, options)
+        let opened = self
+            .host
+            .open(&root, None, Some(approver))
             .await
             .map_err(|error| RpcError::internal(format!("cannot create a session: {error:#}")))?;
-        let harness_id = lock_session(&runtime.core).id.clone();
+        let trusted = opened.trusted;
         // Ephemeral sessions all call themselves "ephemeral" in the harness;
         // give each ACP session a distinct id so the map cannot collide.
         let id = if self.options.no_session {
             format!("acp-{}", self.next_request.fetch_add(1, Ordering::SeqCst))
         } else {
-            harness_id
+            opened.harness_id
         };
         *slot.lock().unwrap_or_else(|poison| poison.into_inner()) = Some(id.clone());
-        let session = Arc::new(AcpSession {
-            id: id.clone(),
-            root,
-            core: runtime.core,
-            active: Mutex::new(None),
-        });
+        let session = Arc::new(AcpSession::new(id.clone(), root, opened.core));
         self.sessions
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
@@ -190,8 +105,11 @@ impl Server {
                 data: json!({"code": "session_already_loaded", "sessionId": id}),
             });
         }
-        let root_paths = self.session_paths(&root)?;
-        let file = root_paths.session_file(id);
+        let file = self
+            .host
+            .session_paths(&root)
+            .map_err(|error| RpcError::internal(format!("{error:#}")))?
+            .session_file(id);
         if !file.is_file() {
             return Err(RpcError::unknown_session(id));
         }
@@ -201,30 +119,17 @@ impl Server {
             server: Arc::downgrade(self),
             session_id: slot.clone(),
         });
-        let options = RuntimeOptions {
-            path_jail: true,
-            engagement: self.options.engagement.clone(),
-            no_session: false,
-            no_redact: self.options.no_redact,
-            resume: Some(file),
-            continue_last: false,
-            approver: Some(approver),
-        };
-        let session_config = self.session_config(&root);
-        let trusted = session_config.trust;
-        let runtime = create_runtime(session_config, root_paths, options)
+        let opened = self
+            .host
+            .open(&root, Some(file), Some(approver))
             .await
             .map_err(|error| {
                 RpcError::internal(format!("cannot load session {id:?}: {error:#}"))
             })?;
-        let loaded_id = lock_session(&runtime.core).id.clone();
+        let trusted = opened.trusted;
+        let loaded_id = opened.harness_id;
         *slot.lock().unwrap_or_else(|poison| poison.into_inner()) = Some(loaded_id.clone());
-        let session = Arc::new(AcpSession {
-            id: loaded_id.clone(),
-            root,
-            core: runtime.core,
-            active: Mutex::new(None),
-        });
+        let session = Arc::new(AcpSession::new(loaded_id.clone(), root, opened.core));
         self.sessions
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
@@ -344,7 +249,7 @@ impl Server {
             .session(id)
             .ok_or_else(|| RpcError::unknown_session(id))?;
         let text = prompt_text(&params)?;
-        let cancel = session.begin()?;
+        let cancel = session.begin().map_err(|_| busy(&session))?;
         let server = self.clone();
         let session_id = session.id.clone();
         let prompt_key = super::id_key(&request_id);
@@ -369,15 +274,12 @@ impl Server {
         text: String,
         cancel: CancellationToken,
     ) {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let core = session.core.clone();
-        let cancel_turn = cancel.clone();
-        let handle = tokio::spawn(async move { run_turn(core, text, tx, cancel_turn).await });
+        let mut turn = start_turn(session.core.clone(), text, cancel);
 
         let mut outcome: Option<TurnOutcome> = None;
         let mut text_stream = StreamText::default();
         let mut reasoning_stream = StreamText::default();
-        while let Some(event) = rx.recv().await {
+        while let Some(event) = turn.events.recv().await {
             match event {
                 AgentEvent::TextDelta(delta) => {
                     let text = text_stream.push(&delta);
@@ -403,14 +305,7 @@ impl Server {
         if !reasoning_tail.is_empty() {
             self.send_text(&session_id, "agent_thought_chunk", &reasoning_tail);
         }
-        let outcome = match (outcome, handle.await) {
-            (Some(outcome), _) => outcome,
-            (None, Ok(outcome)) => outcome,
-            (None, Err(error)) => TurnOutcome {
-                status: TurnStatus::Error,
-                error: Some(("turn_panicked".into(), error.to_string())),
-            },
-        };
+        let outcome = turn.outcome(outcome).await;
         session.finish();
         self.prompts
             .lock()
@@ -789,24 +684,6 @@ fn sanitize_value(value: &Value) -> Value {
     }
 }
 
-/// Built-in tools that cannot touch the filesystem or run a process. MCP and
-/// external tools always ask, even when their manifest claims read-only.
-fn needs_permission(name: &str) -> bool {
-    !matches!(
-        name,
-        "read"
-            | "grep"
-            | "glob"
-            | "repo_map"
-            | "recall"
-            | "review"
-            | "lsp"
-            | "skill"
-            | "todo"
-            | "thread"
-    )
-}
-
 fn permission_title(name: &str, args: &Value, summary: Option<&str>) -> String {
     let detail = summary.map(str::to_string).or_else(|| match name {
         "bash" | "bg" => args
@@ -868,23 +745,6 @@ mod tests {
         let out = stream.push("a\u{1b}]0;title\u{7}b\u{1b}[2Jc");
         assert_eq!(out, "abc");
         assert_eq!(stream.finish(), "");
-    }
-
-    #[test]
-    fn only_builtin_read_tools_skip_permission() {
-        for name in [
-            "read", "grep", "glob", "repo_map", "recall", "review", "lsp", "skill", "todo",
-            "thread",
-        ] {
-            assert!(!needs_permission(name), "{name} should be free");
-        }
-        for name in ["write", "edit", "patch", "bash", "bg", "verify", "test"] {
-            assert!(needs_permission(name), "{name} must ask");
-        }
-        // MCP/external names are not self-certifying.
-        for name in ["files__read_file", "mcp_read", "readOnlyThing"] {
-            assert!(needs_permission(name), "{name} must ask");
-        }
     }
 
     #[test]

@@ -15,7 +15,7 @@
   <img src="https://img.shields.io/badge/rust-1.88%2B-orange?style=flat-square" alt="Rust 1.88+">
   <img src="https://img.shields.io/badge/platform-linux%20x86__64%20%7C%20aarch64-lightgrey?style=flat-square" alt="Linux x86_64 and aarch64">
   <img src="https://img.shields.io/badge/telemetry-none-3FB950?style=flat-square" alt="No telemetry">
-  <img src="https://img.shields.io/badge/interface-TUI%20%7C%20headless%20%7C%20ACP-7AA2F7?style=flat-square" alt="TUI, headless, and ACP interfaces">
+  <img src="https://img.shields.io/badge/interface-TUI%20%7C%20headless%20%7C%20ACP%20%7C%20HTTP-7AA2F7?style=flat-square" alt="TUI, headless, ACP, and HTTP interfaces">
 </p>
 
 <p align="center">
@@ -240,6 +240,17 @@ lh --resume 20261107-201500-1234
 
 `--print` streams text to stdout, diagnostics to stderr, and exits with the turn status: `0` done, `1` error/blocked, `2` budget/stalled, `130` cancelled. `--json` emits newline-delimited events for scripts and CI. A headless run cannot answer a permission prompt, so calls that would ask are denied: pass `--mode accept-edits`, add allow rules, or use `--yolo` (explicit, recorded in the session).
 
+### Local HTTP API
+
+`lh serve` exposes sessions, turns, a Server-Sent Events stream, and cancel on loopback, for cron jobs, CI, dashboards, and scripts:
+
+```sh
+lh serve                       # prints {"listening":"http://127.0.0.1:PORT","token_file":"…"}
+curl -H "Authorization: Bearer $(cat <token_file>)" -X POST http://127.0.0.1:PORT/v1/sessions -d '{}'
+```
+
+The bearer token is written to a `0600` file. Only its path is printed. SSE event names are the `--json` event names. A session runs one turn at a time, and a second turn gets a typed `409`. A non-loopback bind needs `--allow-non-loopback`. HTTP sessions cannot answer a permission prompt, so commands and edits are denied unless the session is created with `"permission_mode": "accept-edits"`, or with `"yolo"` on a server started with `--allow-yolo`. Sessions stay resumable after the server stops. See [docs/serve.md](docs/serve.md).
+
 ### Editors
 
 `lh acp` speaks the Agent Client Protocol v1 over stdio, so Zed (and other ACP editors) can host a LocalHarness thread:
@@ -339,6 +350,7 @@ Global config: `~/.config/localharness/config.toml`. A trusted project `.harness
 | [External tools](docs/external-tools.md) | Manifest format, protocol, schemas, scope gating |
 | [MCP servers](docs/mcp.md) | stdio and HTTP servers, tool naming, profiles, `lh mcp` |
 | [Editor integration](docs/acp.md) | `lh acp`, Zed setup, permissions, roots, stop reasons, limitations |
+| [Local HTTP API](docs/serve.md) | `lh serve`, endpoints, SSE events, token, permission modes, shutdown |
 | [Images](docs/images.md) | `@image` attachments, vision models, the describer fallback, EXIF and remote rules |
 | [Themes](docs/themes.md) | Semantic tokens, color modes, user themes |
 | [Packaging and releases](docs/packaging.md) | Release artifacts, installer, AUR, Nix, Homebrew, Docker, completions |

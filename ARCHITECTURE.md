@@ -34,7 +34,7 @@ work.
 - [6. Tools and packs](#6-tools-and-packs)
 - [7. Extensibility](#7-extensibility)
 - [8. Security model](#8-security-model)
-- [9. Interfaces: TUI, headless, and ACP](#9-tui)
+- [9. Interfaces: TUI, headless, ACP, and HTTP](#9-tui)
 - [10. Configuration and storage](#10-configuration-and-storage)
 - [11. Module layout and dependencies](#11-module-layout-and-dependencies)
 - [12. Testing and verification](#12-testing-and-verification)
@@ -1527,7 +1527,7 @@ given, or a frontend approver attached) is resolved by
 
 ---
 
-## 9. Interfaces: TUI, headless, and ACP
+## 9. Interfaces: TUI, headless, ACP, and HTTP
 
 ### 9.1 Layout
 
@@ -1712,7 +1712,9 @@ scripting; `usage` events include `prompt_tokens`, `cached_tokens`, and
 implementation. Nobody can answer a permission `ask` headless, so it is denied
 with `DENIED`; pass `--mode accept-edits`, add allow rules, or `--yolo`.
 `--plan --print` runs one plan-mode turn, prints the stored plan (a `plan`
-event with `--json`), and exits 0 without touching the workspace.
+event with `--json`), and exits 0 without touching the workspace. The event
+schema (`type` names and fields) lives in `src/events.rs`, an exhaustive match
+on `AgentEvent` that `lh serve` shares.
 
 ### 9.8 Agent Client Protocol
 
@@ -1745,6 +1747,40 @@ non-read-only tool call.
 - `session/new` and `session/load` run in a task so the reader stays free for
   `session/cancel` and permission replies from other sessions.
 - `tests/acp.rs` drives the binary over stdio against a scripted endpoint.
+- Session hosting (runtime per root, root trust policy, one turn per session,
+  the turn driver) lives in `src/host.rs` and is shared with `lh serve`.
+
+### 9.9 Local HTTP API
+
+`lh serve` exposes hosted sessions over HTTP/1.1 on loopback (`docs/serve.md`):
+`POST /v1/sessions`, `POST /v1/sessions/{id}/turns`,
+`GET /v1/sessions/{id}/events` (SSE), `POST /v1/sessions/{id}/cancel`,
+`GET /v1/sessions`, and `GET /v1/health`.
+
+- Transport is `hyper` with `hyper-util` and `http-body-util`, already in the
+  lock graph through `reqwest`. There is no web framework.
+- A fresh 256-bit bearer token is written to a `0600` file whose path (never
+  the token) is printed. It is compared in constant time (`subtle`) before
+  routing, so a caller without it cannot probe for sessions. Requests with an
+  `Origin` header are refused, and there are no CORS headers.
+- Loopback only unless `--allow-non-loopback`, which warns. Host names are
+  refused in `--bind`.
+- Sessions come from `host::Host` with the path jail on, as in ACP. A second
+  turn on a busy session is a typed `409 session_busy`; nothing is queued.
+- SSE `event:` names and `data:` objects come from `src/events.rs`, so they
+  equal the `--json` names. Frames carry increasing ids, and a bounded
+  per-session buffer replays from `?after=` or `Last-Event-ID`. The `done`
+  frame is published after the session is released.
+- Permission: an HTTP turn cannot ask. Each session picks `permission_mode`
+  (`ask` default, `accept-edits`, `dont-ask`, `yolo` behind `--allow-yolo`)
+  and the mode is installed on the session's permission engine before the
+  runtime is built. `authorize::decide()` is the single pre-dispatch point:
+  config `[permissions]` allow/deny rules decide first, a deny wins, and an
+  unanswerable `ask` is denied. Harness gates still run afterward.
+- SIGINT/SIGTERM cancels running turns and waits (bounded) until their
+  cancellation is written, so every session stays resumable through the
+  normal session store.
+- `tests/serve.rs` drives the binary over loopback against a scripted endpoint.
 
 ---
 
@@ -1952,9 +1988,14 @@ src/
     tui/commands.rs       slash commands
     tui/support.rs        endpoint probing, themes, workflows, sessions
     tui/tests.rs          TUI tests, including the screen-drift check
+  events.rs               --json / SSE event schema (one exhaustive match)
+  host.rs                 session hosting shared by ACP and lh serve
   acp/
     mod.rs                JSON-RPC loop, capabilities, reverse requests
     session.rs            roots, turns, updates, permission callback
+  serve/
+    mod.rs                lh serve: bind policy, token file, accept loop, shutdown
+    api.rs                routes, auth, SSE event log, HTTP permission modes
   skills/                 bundled skills (embedded) plus discovery, validation,
                           install/lockfile, lint, and eval
   workflows/
@@ -1982,6 +2023,11 @@ Dependencies, with reasons:
 - `nix`, `fs2`: process groups and signals, and the advisory session lock.
 - `tracing`, `tracing-subscriber`: diagnostics, written to a log file, never
   telemetry.
+- `hyper`, `hyper-util`, `http-body-util`: the `lh serve` HTTP/1 server; all
+  three were already in the lock graph through `reqwest` (only hyper's
+  `server` feature is new).
+- `subtle`: constant-time token comparison; already in the graph through
+  `rustls`.
 - Dev: `tempfile`, `axum` (scripted SSE server), `insta` optional for snapshots.
 
 Later: `lsp-types` for the coding pack.

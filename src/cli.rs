@@ -187,6 +187,24 @@ pub enum Command {
     },
     /// Serve the Agent Client Protocol v1 on stdio for editor integrations.
     Acp,
+    /// Serve a local HTTP API (sessions, turns, SSE events, cancel) for
+    /// scripts and automation. See docs/serve.md.
+    Serve {
+        /// Address to listen on. Port 0 picks a free port.
+        #[arg(long, value_name = "IP:PORT", default_value = "127.0.0.1:0")]
+        bind: String,
+        /// Permit a non-loopback --bind address (prints a warning).
+        #[arg(long)]
+        allow_non_loopback: bool,
+        /// Where to write the bearer token (mode 0600). Defaults to
+        /// <data dir>/serve/token-<port>.
+        #[arg(long, value_name = "PATH")]
+        token_file: Option<PathBuf>,
+        /// Let a session request permission_mode "yolo" (every call the
+        /// harness gates allow runs without approval).
+        #[arg(long)]
+        allow_yolo: bool,
+    },
     /// Print shell completions to stdout.
     Completions {
         /// Shell to generate completions for.
@@ -460,6 +478,29 @@ pub async fn run(cli: Cli) -> Result<i32> {
             no_redact: !config.session.redact,
         };
         return crate::acp::run(config, paths, options).await;
+    }
+    if let Some(Command::Serve {
+        bind,
+        allow_non_loopback,
+        token_file,
+        allow_yolo,
+    }) = &cli.command
+    {
+        if cli.print.is_some() || cli.json || cli.continue_last || cli.resume.is_some() {
+            bail!(
+                "`lh serve` is a server; --print, --json, --continue, and --resume do not apply (resume over HTTP with {{\"resume\": \"<id>\"}})"
+            );
+        }
+        let options = crate::serve::ServeOptions {
+            bind: bind.clone(),
+            allow_non_loopback: *allow_non_loopback,
+            token_file: token_file.clone(),
+            allow_yolo: *allow_yolo,
+            engagement: cli.engagement.clone(),
+            no_session: config.session.no_session,
+            no_redact: !config.session.redact,
+        };
+        return crate::serve::run(config, paths, options).await;
     }
     if let Some(Command::Context { json, .. }) = &cli.command {
         return run_context(&config, &paths, *json);
@@ -1535,7 +1576,7 @@ async fn run_headless(runtime: crate::app::Runtime, prompt: String, json: bool) 
                 first_signal = true;
                 cancel.cancel();
                 if json {
-                    println!("{}", json!({"type":"cancelled"}));
+                    println!("{}", json!({"type": crate::events::CANCELLED}));
                 } else {
                     eprintln!("cancelling...");
                 }
@@ -1582,93 +1623,15 @@ async fn run_headless(runtime: crate::app::Runtime, prompt: String, json: bool) 
     })
 }
 
-/// One stable JSON object for a `--json` event.
-fn event_json(event: &AgentEvent) -> serde_json::Value {
-    match event {
-        AgentEvent::TurnStarted {
-            model,
-            profile,
-            tool_mode,
-        } => {
-            json!({"type":"started","model":model,"profile":profile,"tool_mode":tool_mode})
-        }
-        AgentEvent::State(state) => json!({"type":"state","state":format!("{state:?}")}),
-        AgentEvent::TextDelta(text) => json!({"type":"text","text":text}),
-        AgentEvent::ReasoningDelta(text) => json!({"type":"reasoning","text":text}),
-        AgentEvent::ToolStarted {
-            call_id,
-            name,
-            summary,
-        } => json!({"type":"tool_started","call_id":call_id,"name":name,"summary":summary}),
-        AgentEvent::ToolFinished {
-            call_id,
-            name,
-            is_error,
-            duration_ms,
-            preview,
-            artifact,
-        } => {
-            json!({"type":"tool_finished","call_id":call_id,"name":name,"is_error":is_error,"duration_ms":duration_ms,"preview":preview,"artifact":artifact})
-        }
-        AgentEvent::Usage(usage) => {
-            json!({
-                "type":"usage",
-                "prompt_tokens":usage.prompt_tokens,
-                "completion_tokens":usage.completion_tokens,
-                "cached_tokens":usage.cached_tokens,
-                "cache_percent":usage.cache_percent(),
-                "reasoning_tokens":usage.reasoning_tokens,
-            })
-        }
-        AgentEvent::Context { used, window } => {
-            json!({"type":"context","used":used,"window":window})
-        }
-        AgentEvent::WindowDetected { window, source } => {
-            json!({"type":"window_detected","window":window,"source":source})
-        }
-        AgentEvent::Compacted {
-            summary,
-            tokens_before,
-        } => json!({"type":"compacted","summary":summary,"tokens_before":tokens_before}),
-        AgentEvent::Notice(message) => json!({"type":"notice","message":message}),
-        AgentEvent::HunkReview { id, hunks } => {
-            json!({"type":"hunk_review","id":id,"hunks":hunks.len()})
-        }
-        AgentEvent::Provenance {
-            call_id,
-            origin,
-            warning,
-            approval_required,
-        } => json!({
-            "type": "provenance",
-            "call_id": call_id,
-            "origin": origin,
-            "warning": warning,
-            "approval_required": approval_required,
-        }),
-        AgentEvent::Guard { code, message } => {
-            json!({"type":"guard","code":code,"message":message})
-        }
-        AgentEvent::Error {
-            code,
-            message,
-            recoverable,
-        } => json!({"type":"error","code":code,"message":message,"recoverable":recoverable}),
-        AgentEvent::TurnDone(outcome) => {
-            json!({"type":"done","status":format!("{:?}", outcome.status)})
-        }
-    }
-}
-
 /// Render one event in plain or JSON mode. Returns the final status when done.
 fn render_event(event: AgentEvent, json: bool) -> Result<Option<TurnStatus>> {
     if json {
-        let done = match &event {
-            AgentEvent::TurnDone(outcome) => Some(outcome.status),
-            _ => None,
-        };
-        println!("{}", serde_json::to_string(&event_json(&event))?);
-        return Ok(done);
+        let value = crate::events::event_json(&event);
+        println!("{}", serde_json::to_string(&value)?);
+        if let AgentEvent::TurnDone(outcome) = event {
+            return Ok(Some(outcome.status));
+        }
+        return Ok(None);
     }
 
     match event {
@@ -1765,7 +1728,7 @@ mod tests {
             warning: Some("[provenance] untrusted content".into()),
             approval_required: true,
         };
-        let value = event_json(&event);
+        let value = crate::events::event_json(&event);
         assert_eq!(value["type"], "provenance");
         assert_eq!(value["call_id"], "call_0001");
         assert_eq!(value["origin"], "tool:read");
