@@ -4,7 +4,7 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use serde_json::json;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -187,6 +187,14 @@ pub enum Command {
     },
     /// Serve the Agent Client Protocol v1 on stdio for editor integrations.
     Acp,
+    /// Print shell completions to stdout.
+    Completions {
+        /// Shell to generate completions for.
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
+    /// Print the roff man page to stdout.
+    Man,
     /// Install, update, remove, list, lint, and evaluation-test skills.
     Skill {
         #[command(subcommand)]
@@ -321,6 +329,15 @@ pub enum McpCommand {
 }
 
 pub async fn run(cli: Cli) -> Result<i32> {
+    // Packaging commands only print generated text. Handle them before config
+    // discovery so a broken config or a missing working directory cannot stop
+    // a completion or man-page build.
+    match &cli.command {
+        Some(Command::Completions { shell }) => return run_completions(*shell),
+        Some(Command::Man) => return run_man_page(),
+        _ => {}
+    }
+
     let cwd = std::env::current_dir().context("cannot read the current directory")?;
     let mut paths = Paths::discover(&cwd)?;
 
@@ -544,6 +561,24 @@ pub async fn run(cli: Cli) -> Result<i32> {
     };
     mcp.shutdown().await;
     outcome
+}
+
+/// `lh completions <shell>`: write a completion script for packaging.
+fn run_completions(shell: clap_complete::Shell) -> Result<i32> {
+    let mut out = std::io::stdout();
+    clap_complete::generate(shell, &mut Cli::command(), "lh", &mut out);
+    out.flush().context("cannot write shell completions")?;
+    Ok(0)
+}
+
+/// `lh man`: write the roff man page used by release tarballs and packages.
+fn run_man_page() -> Result<i32> {
+    let command = Cli::command().name("lh");
+    let man = clap_mangen::Man::new(command);
+    let mut out = std::io::stdout();
+    man.render(&mut out).context("cannot write the man page")?;
+    out.flush().context("cannot write the man page")?;
+    Ok(0)
 }
 
 /// `lh context`: print the AGENTS.md chain and its manifest. This reads local

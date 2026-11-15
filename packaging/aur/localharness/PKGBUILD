@@ -1,0 +1,56 @@
+# Maintainer: LocalHarness contributors <https://github.com/GotinhaAzul/LocalHarness/issues>
+#
+# Source package: builds with the distribution Rust toolchain. Update pkgver
+# and sha256sums for each release; the release workflow attaches a rendered
+# copy with both filled in.
+pkgname=localharness
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Local-first agent harness for coding and security work'
+arch=('x86_64' 'aarch64')
+url='https://github.com/GotinhaAzul/LocalHarness'
+license=('MIT' 'Apache-2.0')
+depends=('gcc-libs')
+makedepends=('cargo' 'rust')
+provides=('lh')
+conflicts=('localharness-bin')
+options=('!lto')
+
+source=("localharness-${pkgver}.tar.gz::${url}/archive/refs/tags/v${pkgver}.tar.gz")
+sha256sums=('SKIP')
+_archive_dir="LocalHarness-${pkgver}"
+
+prepare() {
+    cd "${srcdir}/${_archive_dir}"
+    cargo fetch --locked
+}
+
+build() {
+    cd "${srcdir}/${_archive_dir}"
+    cargo build --release --locked --offline
+}
+
+check() {
+    cd "${srcdir}/${_archive_dir}"
+    cargo test --locked --offline
+}
+
+package() {
+    cd "${srcdir}/${_archive_dir}"
+
+    install -Dm755 target/release/lh "${pkgdir}/usr/bin/lh"
+
+    install -Dm644 LICENSE-MIT "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE-MIT"
+    install -Dm644 LICENSE-APACHE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE-APACHE"
+    install -Dm644 README.md "${pkgdir}/usr/share/doc/${pkgname}/README.md"
+    install -Dm644 THIRD_PARTY_NOTICES.md "${pkgdir}/usr/share/doc/${pkgname}/THIRD_PARTY_NOTICES.md"
+
+    target/release/lh completions bash > lh.bash
+    target/release/lh completions zsh > _lh
+    target/release/lh completions fish > lh.fish
+    target/release/lh man > lh.1
+    install -Dm644 lh.bash "${pkgdir}/usr/share/bash-completion/completions/lh"
+    install -Dm644 _lh "${pkgdir}/usr/share/zsh/site-functions/_lh"
+    install -Dm644 lh.fish "${pkgdir}/usr/share/fish/vendor_completions.d/lh.fish"
+    install -Dm644 lh.1 "${pkgdir}/usr/share/man/man1/lh.1"
+}

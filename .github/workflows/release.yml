@@ -1,0 +1,222 @@
+name: Release
+
+# Tag push publishes static musl binaries, checksums, completions, the man
+# page, packaging files, and the installer, then proves the installer works in
+# a clean container without a Rust toolchain.
+#
+# This workflow has never run against a real tag in this branch. The build,
+# packaging, and installer steps are exercised by hand and by tests/packaging.rs
+# locally; the tag-driven publish path is the part CI will exercise first.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  assets:
+    name: completions and man page
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Check the tag matches Cargo.toml
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$version" != "$tag" ]; then
+            echo "::error::tag v${tag} does not match Cargo.toml version ${version}"
+            exit 1
+          fi
+      - run: cargo build --release --locked
+      - name: Generate completions and the man page
+        run: |
+          set -eu
+          mkdir -p dist/completions dist/man
+          ./target/release/lh completions bash > dist/completions/lh.bash
+          ./target/release/lh completions zsh > dist/completions/lh.zsh
+          ./target/release/lh completions fish > dist/completions/lh.fish
+          ./target/release/lh man > dist/man/lh.1
+          test -s dist/completions/lh.bash
+          test -s dist/completions/lh.zsh
+          test -s dist/completions/lh.fish
+          test -s dist/man/lh.1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cli-assets
+          path: dist
+
+  build:
+    name: build ${{ matrix.target }}
+    needs: assets
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+      - uses: actions/download-artifact@v4
+        with:
+          name: cli-assets
+          path: dist
+      - name: Build the static binary
+        run: cross build --release --locked --target ${{ matrix.target }}
+      - name: Package the release tarball
+        run: |
+          set -eu
+          version="${GITHUB_REF_NAME#v}"
+          binary="target/${{ matrix.target }}/release/lh"
+          test -x "$binary"
+          install -Dm755 "$binary" dist/lh
+          cp README.md LICENSE-MIT LICENSE-APACHE THIRD_PARTY_NOTICES.md dist/
+          artifact="lh-v${version}-${{ matrix.target }}.tar.gz"
+          tar -czf "$artifact" -C dist .
+          sha256sum "$artifact" > "${artifact}.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: |
+            lh-v*.tar.gz
+            lh-v*.tar.gz.sha256
+
+  publish:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v4
+        with:
+          path: downloaded
+      - name: Assemble release assets
+        run: |
+          set -eu
+          version="${GITHUB_REF_NAME#v}"
+          mkdir -p release
+          find downloaded -name 'lh-v*.tar.gz' -exec cp {} release/ \;
+          (cd release && sha256sum -- *.tar.gz > SHA256SUMS)
+          cp install.sh release/install.sh
+
+          # Checksums for the mutable AUR and Homebrew files are filled here so
+          # a maintainer can copy the attached file into the tap/AUR verbatim.
+          source_url="https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/${GITHUB_REF_NAME}.tar.gz"
+          curl -fsSL "$source_url" -o source.tar.gz
+          source_sha="$(sha256sum source.tar.gz | awk '{print $1}')"
+          rm -f source.tar.gz
+
+          x86_64_sha="$(awk -v artifact="lh-v${version}-x86_64-unknown-linux-musl.tar.gz" '$2 == artifact { print $1 }' release/SHA256SUMS)"
+          aarch64_sha="$(awk -v artifact="lh-v${version}-aarch64-unknown-linux-musl.tar.gz" '$2 == artifact { print $1 }' release/SHA256SUMS)"
+          test -n "$x86_64_sha"
+          test -n "$aarch64_sha"
+
+          sed \
+            -e "s/^pkgver=.*/pkgver=${version}/" \
+            -e "s/^sha256sums_x86_64=('SKIP')/sha256sums_x86_64=('${x86_64_sha}')/" \
+            -e "s/^sha256sums_aarch64=('SKIP')/sha256sums_aarch64=('${aarch64_sha}')/" \
+            packaging/aur/localharness-bin/PKGBUILD > release/PKGBUILD-localharness-bin
+
+          sed \
+            -e "s/^pkgver=.*/pkgver=${version}/" \
+            -e "s/^sha256sums=('SKIP')/sha256sums=('${source_sha}')/" \
+            packaging/aur/localharness/PKGBUILD > release/PKGBUILD-localharness
+
+          sh packaging/homebrew/render.sh "$version" release/SHA256SUMS "$source_sha" > release/localharness.rb
+
+          test -s release/SHA256SUMS
+          test -s release/localharness.rb
+          test -s release/PKGBUILD-localharness-bin
+          test -s release/PKGBUILD-localharness
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true
+
+  verify-installer:
+    name: installer in a clean container
+    needs: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v4
+        with:
+          path: downloaded
+      - name: Assemble the local release directory
+        run: |
+          set -eu
+          mkdir -p dist
+          find downloaded -name 'lh-v*.tar.gz' -exec cp {} dist/ \;
+          (cd dist && sha256sum -- *.tar.gz > SHA256SUMS)
+      - name: Install in clean Debian without Rust or curl
+        run: |
+          set -eu
+          docker run --rm \
+            -v "$PWD/dist:/dist:ro" \
+            -v "$PWD/install.sh:/install.sh:ro" \
+            -e "LH_VERSION=${GITHUB_REF_NAME#v}" \
+            -e LH_INSTALL_SOURCE_DIR=/dist \
+            -e LH_INSTALL_DIR=/lh/bin \
+            -e XDG_DATA_HOME=/lh/share \
+            debian:bookworm-slim \
+            sh -c 'command -v cargo >/dev/null && exit 1 || true; sh /install.sh; /lh/bin/lh --version; /lh/bin/lh man | head -n 1; test -s /lh/share/man/man1/lh.1'
+      - name: Refuse a tampered artifact
+        run: |
+          set -eu
+          docker run --rm \
+            -v "$PWD/dist:/dist:ro" \
+            -v "$PWD/install.sh:/install.sh:ro" \
+            -e "LH_VERSION=${GITHUB_REF_NAME#v}" \
+            -e LH_INSTALL_SOURCE_DIR=/dist \
+            -e LH_INSTALL_DIR=/lh/bin \
+            debian:bookworm-slim \
+            sh -c '
+              set -eu
+              cp -r /dist /tmp/dist
+              printf tampered >> /tmp/dist/lh-v*-x86_64-unknown-linux-musl.tar.gz
+              if LH_INSTALL_SOURCE_DIR=/tmp/dist sh /install.sh 2>/tmp/install.err; then
+                echo "installer accepted a tampered artifact" >&2
+                exit 1
+              fi
+              grep -q "checksum mismatch" /tmp/install.err
+              test ! -e /lh/bin/lh
+            '
+
+  docker:
+    name: container image
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build the image
+        run: docker build -f packaging/docker/Dockerfile -t localharness:ci .
+      - name: Run as non-root in distroless
+        run: |
+          set -eu
+          user="$(docker image inspect --format '{{.Config.User}}' localharness:ci)"
+          test "$user" = "nonroot:nonroot"
+          docker run --rm localharness:ci --version
+          if docker run --rm --entrypoint sh localharness:ci -c true 2>/dev/null; then
+            echo "image unexpectedly contains a shell" >&2
+            exit 1
+          fi

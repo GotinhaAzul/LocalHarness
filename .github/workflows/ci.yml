@@ -49,6 +49,16 @@ jobs:
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
 
+  packaging:
+    name: packaging scripts
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - run: shellcheck install.sh packaging/homebrew/render.sh
+      - run: bash -n install.sh packaging/homebrew/render.sh packaging/aur/localharness-bin/PKGBUILD packaging/aur/localharness/PKGBUILD
+
   audit:
     name: advisories and licenses (advisory)
     runs-on: ubuntu-latest

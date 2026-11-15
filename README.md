@@ -47,6 +47,38 @@ Every tool error names the next action. Every guard is a code path, not a polite
 
 ## Install
 
+Prebuilt static binaries for Linux x86_64 and aarch64 are attached to every
+release with SHA-256 checksums. The installer needs no Rust toolchain, no sudo,
+and installs into `~/.local/bin`:
+
+```sh
+curl -fsSLO https://github.com/GotinhaAzul/LocalHarness/releases/latest/download/install.sh
+less install.sh          # read it before running
+sh install.sh
+lh --version
+```
+
+Download and read `install.sh` instead of piping it into a shell. It detects the
+architecture, downloads the matching static binary, verifies it against the
+release `SHA256SUMS`, and refuses to install anything on a checksum mismatch.
+Set `LH_VERSION=0.1.0` to pin a release and `LH_INSTALL_DIR` to change the
+prefix. Bash, zsh, and fish completions and the `lh.1` man page are installed
+under `$XDG_DATA_HOME` (default `~/.local/share`).
+
+| Channel | Install |
+|---|---|
+| AUR (binary) | `localharness-bin` recipe in `packaging/aur/` (publish pending) |
+| AUR (source) | `localharness` recipe in `packaging/aur/` (publish pending) |
+| Nix | `nix profile install github:GotinhaAzul/LocalHarness` |
+| Docker | `docker build -f packaging/docker/Dockerfile -t localharness .` then `docker run --rm -it -v "$PWD:/workspace" localharness` |
+| Homebrew | Best-effort formula in `packaging/homebrew/`; not in a tap yet |
+
+The Docker image is distroless, runs as a non-root user, and has no shell or
+package manager. See [docs/packaging.md](docs/packaging.md) for checksums,
+release assets, and package maintenance.
+
+From source (Rust 1.88 or newer, Linux x86_64 or aarch64):
+
 ```sh
 git clone https://github.com/GotinhaAzul/LocalHarness
 cd LocalHarness
@@ -61,7 +93,7 @@ cargo build --release
 ./target/release/lh --help
 ```
 
-Requires Rust 1.88 or newer and Linux x86_64 or aarch64. Dependencies are pinned in `Cargo.lock`.
+Dependencies are pinned in `Cargo.lock`.
 
 ## Quick start
 
@@ -309,6 +341,7 @@ Global config: `~/.config/localharness/config.toml`. A trusted project `.harness
 | [Editor integration](docs/acp.md) | `lh acp`, Zed setup, permissions, roots, stop reasons, limitations |
 | [Images](docs/images.md) | `@image` attachments, vision models, the describer fallback, EXIF and remote rules |
 | [Themes](docs/themes.md) | Semantic tokens, color modes, user themes |
+| [Packaging and releases](docs/packaging.md) | Release artifacts, installer, AUR, Nix, Homebrew, Docker, completions |
 | [Architecture](ARCHITECTURE.md) | Implementation specification and design decisions |
 
 ## Development
