@@ -255,9 +255,13 @@ States: `Idle`, `AssembleContext`, `Compact`, `StreamModel`, `ToolBatch`,
 
 1. Append the user entry to the session branch.
 2. Assemble context from the active branch, including the cached repository
-   brief in the system prompt.
-3. If the prompt budget is exceeded, write a compaction entry and rebuild.
-4. Send the model request with the profile's tool list.
+   brief in the system prompt. The stable profile prompt, tool index, and
+   project instructions come first; volatile session facts (working directory,
+   profile name) sit at the tail so the engine can reuse its prefix cache.
+3. If the prompt budget is exceeded, write a compaction entry and rebuild. A
+   `cache-boundary` entry records the reused prefix and the suffix that must
+   re-prefill.
+4. Send the model request with the profile's tool list in a stable order.
 5. Stream text, reasoning, and tool calls. Emit UI events.
 6. If there are no tool calls, run settle gates.
 7. For each tool call, in order:
@@ -407,6 +411,14 @@ usable_prompt = context_window - max_output_tokens - safety_margin
 - If no usage is available, estimate from characters with the calibrated ratio.
 - Every entry stores an optional `tokens` estimate for the tree view and budget
   accounting.
+- `usage.cached_tokens` (`prompt_tokens_details.cached_tokens`, or llama.cpp
+  `timings.cache_n`) is reported per call. The TUI header shows `cache
+  <cached>/<prompt>`; `--json` usage events carry `cached_tokens` and
+  `cache_percent`. Two consecutive calls under 70% emit a notice naming the
+  likely invalidator: a compaction, a changed prefix, or server-side eviction.
+- The request prefix (leading system block plus serialized tools) is hashed
+  with SHA-256 and recorded once per core build as a `prompt-prefix` entry, so
+  a changed prefix is visible next to the turn where it changed.
 
 ### 4.3 Tool result caps and archive
 
@@ -549,7 +561,7 @@ Entry fields:
 | `tool_result` | call_id, content, is_error, details?, artifact? |
 | `compaction` | summary, tokens_before, reason, thread_id? |
 | `checkout` | target, reason (`tree`, `fork`, `resume`) |
-| `custom` | kind plus payload (`fs-change`, `verify-config`, `verify-result`, `todo-state`, `finding`, `thread-state`, `guard-trip`, `profile-change`, `model-change`) |
+| `custom` | kind plus payload (`fs-change`, `verify-config`, `verify-result`, `todo-state`, `finding`, `thread-state`, `guard-trip`, `profile-change`, `model-change`, `prompt-prefix`, `cache-boundary`, `cache-cold`) |
 | `error` | code, message, recoverable |
 
 An assistant entry with `tool_calls` is a batch. The tool results that answer it
@@ -1403,7 +1415,8 @@ cursor = "#c0caf5"
 - Context: `used/window` and a gauge. `used` is the estimated prompt tokens of
   the next request; during streaming, completion tokens are shown separately.
   Thresholds: normal, warning at 70%, error at 85%.
-- Throughput: rolling tokens/second over the last few seconds.
+- Throughput: rolling tokens/second over the last few seconds, plus
+  `cache <cached>/<prompt>` when the engine reports prefix-cache hits.
 - Session: short id and trusted/untrusted marker.
 - At narrow widths, drop throughput, then session id, then profile; never drop
   cwd, context, or model. With no model selected, the model slot reads
@@ -1459,7 +1472,8 @@ cursor = "#c0caf5"
 
 `lh --print "<prompt>"` runs one turn without the TUI, streams to stdout, and
 exits with the turn status. `--json` emits newline-delimited events for
-scripting. The same core and session code is used. This is not a second
+scripting; `usage` events include `prompt_tokens`, `cached_tokens`, and
+`cache_percent`. The same core and session code is used. This is not a second
 implementation.
 
 ### 9.8 Agent Client Protocol

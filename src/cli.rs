@@ -919,7 +919,14 @@ fn render_event(event: AgentEvent, json: bool) -> Result<Option<TurnStatus>> {
                 json!({"type":"tool_finished","call_id":call_id,"name":name,"is_error":is_error,"duration_ms":duration_ms,"preview":preview,"artifact":artifact})
             }
             AgentEvent::Usage(usage) => {
-                json!({"type":"usage","prompt_tokens":usage.prompt_tokens,"completion_tokens":usage.completion_tokens,"reasoning_tokens":usage.reasoning_tokens})
+                json!({
+                    "type":"usage",
+                    "prompt_tokens":usage.prompt_tokens,
+                    "completion_tokens":usage.completion_tokens,
+                    "cached_tokens":usage.cached_tokens,
+                    "cache_percent":usage.cache_percent(),
+                    "reasoning_tokens":usage.reasoning_tokens,
+                })
             }
             AgentEvent::Context { used, window } => {
                 json!({"type":"context","used":used,"window":window})
@@ -976,8 +983,14 @@ fn render_event(event: AgentEvent, json: bool) -> Result<Option<TurnStatus>> {
         AgentEvent::Guard { code, message } => eprintln!("[{code}] {message}"),
         AgentEvent::Error { code, message, .. } => eprintln!("[{code}] {message}"),
         AgentEvent::Usage(usage) => {
+            let cache = match (usage.cached_tokens, usage.cache_percent()) {
+                (Some(cached), Some(percent)) => {
+                    format!(" cache {cached}/{} ({percent}%)", usage.prompt_tokens)
+                }
+                _ => String::new(),
+            };
             eprintln!(
-                "[usage] prompt {} completion {}",
+                "[usage] prompt {} completion {}{cache}",
                 usage.prompt_tokens, usage.completion_tokens
             );
         }

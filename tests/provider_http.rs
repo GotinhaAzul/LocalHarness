@@ -31,11 +31,14 @@ struct Script {
 #[derive(Clone, Default)]
 struct FakeState {
     requests: Arc<Mutex<Vec<serde_json::Value>>>,
+    /// The exact bytes of every request, for prefix comparisons.
+    bodies: Arc<Mutex<Vec<String>>>,
     script: Arc<Mutex<VecDeque<Script>>>,
 }
 
 async fn chat(AxumState(state): AxumState<FakeState>, body: String) -> Response {
     let value: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
+    state.bodies.lock().unwrap().push(body);
     state.requests.lock().unwrap().push(value);
     let script = state.script.lock().unwrap().pop_front();
     let Some(script) = script else {
@@ -200,6 +203,82 @@ fn tool_deltas(
             _ => None,
         })
         .collect()
+}
+
+fn request_with(system: &str, user: &str) -> ChatRequest {
+    let mut request = request();
+    request.messages = vec![
+        ChatMessage::System {
+            content: system.into(),
+        },
+        ChatMessage::User {
+            content: user.into(),
+            images: Vec::new(),
+        },
+    ];
+    request
+}
+
+/// Two consecutive requests must agree byte-for-byte on everything before the
+/// conversation: the model fields, the leading system message, and the tool
+/// schemas. This is the prefix a local engine can keep in its KV cache.
+#[tokio::test]
+async fn consecutive_requests_share_the_prefix_up_to_the_conversation() {
+    let (base, state) = spawn().await;
+    for _ in 0..2 {
+        state.script.lock().unwrap().push_back(Script {
+            status: 200,
+            body: "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n"
+                .into(),
+            chunked: false,
+        });
+    }
+    let provider = provider(&base);
+    let prompt = "# Stable system prompt\n\n## Operating rules\n\n- Inspect before acting.";
+    for user in ["first question", "second question"] {
+        let events = collect_stream(
+            &provider,
+            request_with(prompt, user),
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(
+            events.iter().all(Result::is_ok),
+            "stream failed: {events:?}"
+        );
+    }
+
+    let bodies = state.bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 2);
+    let first = bodies[0].as_bytes();
+    let second = bodies[1].as_bytes();
+    let common = first
+        .iter()
+        .zip(second)
+        .take_while(|(left, right)| left == right)
+        .count();
+
+    let system = serde_json::to_string(&serde_json::json!({"content": prompt, "role": "system"}))
+        .expect("system message json");
+    let system_end = first
+        .windows(system.len())
+        .position(|window| window == system.as_bytes())
+        .expect("the system message is on the wire")
+        + system.len();
+    assert!(
+        common >= system_end,
+        "the requests diverged at {common}, inside the system prefix ending at {system_end}"
+    );
+    assert!(first[common..].starts_with(b"first question"));
+    assert!(second[common..].starts_with(b"second question"));
+
+    let first_body: serde_json::Value = serde_json::from_str(&bodies[0]).unwrap();
+    let second_body: serde_json::Value = serde_json::from_str(&bodies[1]).unwrap();
+    assert_eq!(
+        first_body["tools"], second_body["tools"],
+        "tool order and schema bytes must not drift between requests"
+    );
+    assert_eq!(first_body["tools"][0]["function"]["name"], "read");
 }
 
 async fn tool_stream(body: &str) -> Vec<(usize, Option<String>, Option<String>, String)> {

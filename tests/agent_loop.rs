@@ -1041,6 +1041,138 @@ async fn cache_and_timing_reports_are_stored_with_the_reply() {
 }
 
 #[tokio::test]
+async fn two_cold_model_calls_raise_a_cache_alarm() {
+    let cold = |completion: u32| Usage {
+        prompt_tokens: 100,
+        completion_tokens: completion,
+        total_tokens: 100 + completion,
+        cached_tokens: Some(10),
+        ..Usage::default()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness(
+        dir.path(),
+        vec![
+            Script::Events(vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call_1".into()),
+                    name: Some("read".into()),
+                    arguments: Some(json!({"path": "missing.rs"}).to_string()),
+                },
+                StreamEvent::Finish("tool_calls".into()),
+                StreamEvent::Usage(cold(5)),
+            ]),
+            Script::Events(vec![
+                StreamEvent::Delta("done".into()),
+                StreamEvent::Finish("stop".into()),
+                StreamEvent::Usage(cold(2)),
+            ]),
+        ],
+        &["read"],
+    );
+    let (outcome, events) = run(&harness, "read it").await;
+    assert_eq!(outcome.status, TurnStatus::Done, "{outcome:?}");
+    let alarm = events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::Notice(message)
+                if message.contains("prompt cache hit 10%")
+                    && message.contains("two consecutive requests") =>
+            {
+                Some(message.clone())
+            }
+            _ => None,
+        })
+        .expect("cache alarm after two cold calls");
+    assert!(
+        alarm.contains("server evicted") || alarm.contains("another slot"),
+        "{alarm}"
+    );
+    let session = harness.session.lock().unwrap();
+    let entry = session
+        .latest_custom_on_path("cache-cold")
+        .expect("cold cache sample is recorded");
+    let EntryKind::Custom(data) = &entry.kind else {
+        panic!("cache-cold must be a custom entry");
+    };
+    assert_eq!(data.payload["cache_percent"], 10);
+    assert_eq!(data.payload["prompt_tokens"], 100);
+    assert_eq!(data.payload["cached_tokens"], 10);
+}
+
+#[tokio::test]
+async fn compaction_logs_a_cache_boundary_and_reuses_the_base_prefix() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut harness = harness(dir.path(), vec![text_script("after compaction")], &["read"]);
+    let mut core = Arc::try_unwrap(harness.core).unwrap_or_else(|_| panic!("sole owner"));
+    core.budget = TokenBudget::new(4096, 1024);
+    let base = core.system_prompt.clone();
+    harness.core = Arc::new(core);
+    let (outcome, _) = run(&harness, &"x".repeat(8000)).await;
+    assert_eq!(outcome.status, TurnStatus::Done, "{outcome:?}");
+
+    let session = harness.session.lock().unwrap();
+    let entry = session
+        .latest_custom_on_path("cache-boundary")
+        .expect("compaction logs a cache boundary");
+    let EntryKind::Custom(data) = &entry.kind else {
+        panic!("cache-boundary must be a custom entry");
+    };
+    assert_eq!(data.payload["reason"], "auto");
+    assert_eq!(
+        data.payload["reuse_prefix_chars"].as_u64().unwrap(),
+        base.chars().count() as u64,
+        "the whole pre-compaction system block is reused"
+    );
+    assert!(
+        data.payload["reprefill_chars"].as_u64().unwrap() > 0,
+        "only the new summary and state re-prefill"
+    );
+    drop(session);
+
+    let requests = harness.provider.requests.lock().unwrap();
+    let request = requests.last().expect("post-compaction request");
+    match &request.messages[0] {
+        ChatMessage::System { content } => {
+            assert!(
+                content.starts_with(&base),
+                "the base prefix must stay byte-identical through compaction"
+            );
+        }
+        other => panic!("leading message is {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn prompt_prefix_is_logged_once_and_reused_across_turns() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness(
+        dir.path(),
+        vec![text_script("first"), text_script("second")],
+        &["read"],
+    );
+    run(&harness, "one").await;
+    run(&harness, "two").await;
+    let session = harness.session.lock().unwrap();
+    let prefixes = session.customs_on_path("prompt-prefix");
+    assert_eq!(
+        prefixes.len(),
+        1,
+        "an unchanged prefix is logged once, not every turn"
+    );
+    let EntryKind::Custom(data) = &prefixes[0].kind else {
+        panic!("prompt-prefix must be a custom entry");
+    };
+    assert_eq!(
+        data.payload["hash"].as_str().unwrap().len(),
+        64,
+        "SHA-256 hex hash"
+    );
+    assert!(data.payload["chars"].as_u64().unwrap() > 0);
+}
+
+#[tokio::test]
 async fn undo_reverts_harness_edits_through_the_loop() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("a.rs"), "let x = 1;\n").unwrap();

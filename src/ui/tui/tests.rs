@@ -36,7 +36,7 @@ fn header(model: &str, session: &str) -> HeaderData {
         completion: 0,
         reasoning: 0,
         tok_s: 24.0,
-        cache: Some(91),
+        cache: Some((940, 1000)),
         session: session.into(),
         trust: true,
         window_guess: false,
@@ -106,6 +106,10 @@ fn header_at_120_contains_cwd_model_and_context() {
     assert!(text.contains("qwen3.5-35b-a3b"), "model missing:\n{text}");
     assert!(text.contains("12.4k/64k"), "context missing:\n{text}");
     assert!(text.contains("tok/s"));
+    assert!(
+        text.contains("cache 940/1000"),
+        "cached and total prompt tokens missing:\n{text}"
+    );
     assert!(text.contains("▰"), "context gauge missing:\n{text}");
 }
 

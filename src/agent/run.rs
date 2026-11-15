@@ -334,11 +334,13 @@ async fn run_loop(
         });
         return TurnOutcome::budget(&code, message);
     }
+    record_prompt_prefix(core);
     let mut loop_guard = LoopGuard::new();
     let verify_configured = !core.config.verify.steps.is_empty();
     let gate_tools = gates::GateTools::from_names(core.tools.iter().map(|tool| tool.name()));
     let read_available = core.tools.iter().any(|tool| tool.name() == "read");
     let mut pending_compaction = false;
+    let mut cache_watch = CacheWatch::default();
     let mut call_ledger = CallLedger::from_session(&core.session.lock().expect("session lock"));
     let mut compacted_since_model_call = false;
     let mut invalid_tool_calls = 0u32;
@@ -403,6 +405,7 @@ async fn run_loop(
             } else {
                 "auto"
             };
+            let system_before_compaction = leading_system(&assembled).to_string();
             let mut result = compact_session(
                 &core.session,
                 findings.as_ref(),
@@ -428,6 +431,26 @@ async fn run_loop(
             match result {
                 Ok(compacted) => {
                     compacted_since_model_call = true;
+                    let system_after_compaction = leading_system(&assembled);
+                    let reuse = context::common_prefix_chars(
+                        &system_before_compaction,
+                        system_after_compaction,
+                    );
+                    let reprefill = system_after_compaction
+                        .chars()
+                        .count()
+                        .saturating_sub(reuse);
+                    append_custom(
+                        &core.session,
+                        "cache-boundary",
+                        json!({
+                            "reason": reason,
+                            "reuse_prefix_chars": reuse,
+                            "reprefill_chars": reprefill,
+                            "chars_before": system_before_compaction.chars().count(),
+                            "chars_after": system_after_compaction.chars().count(),
+                        }),
+                    );
                     let _ = tx.send(AgentEvent::Compacted {
                         summary: compacted.summary,
                         tokens_before: compacted.tokens_before,
@@ -507,6 +530,8 @@ async fn run_loop(
         } else if let Some(reason) = &core.vision.blocked {
             ChatMessage::strip_images(&mut messages, reason);
         }
+        let request_prefix =
+            context::prompt_prefix(leading_system(&assembled), &core.tool_specs_json);
         let extra_body = match core
             .model_profile
             .request_extra_body(!core.tool_specs.is_empty())
@@ -677,6 +702,27 @@ async fn run_loop(
                 "the turn ended because the prompt was truncated. Run /compact to rebuild a fitting summary, or /new to start a fresh branch; do not continue this one.".into(),
             ));
             return TurnOutcome::ok(TurnStatus::ContextTruncated);
+        }
+        if let Some(cold) = cache_watch.observe(
+            assistant.usage.as_ref(),
+            &request_prefix,
+            compacted_since_model_call.then_some("system block rewritten"),
+        ) {
+            let message = format!(
+                "prompt cache hit {}% on two consecutive requests; likely invalidator: {}. Keep one session on one server slot and avoid changing the profile or tool list mid-session.",
+                cold.percent, cold.invalidator
+            );
+            append_custom(
+                &core.session,
+                "cache-cold",
+                json!({
+                    "cache_percent": cold.percent,
+                    "likely_invalidator": cold.invalidator,
+                    "prompt_tokens": assistant.usage.as_ref().map(|usage| usage.prompt_tokens),
+                    "cached_tokens": assistant.usage.as_ref().and_then(|usage| usage.cached_tokens),
+                }),
+            );
+            let _ = tx.send(AgentEvent::Notice(message));
         }
         let mut assistant = assistant;
         // A successful reply means the current context fits. A later fill can
@@ -2171,6 +2217,108 @@ fn append_custom(session: &crate::tools::SessionHandle, kind: &str, payload: Val
     }
 }
 
+/// Fingerprint the request prefix and record it on the session branch when it
+/// changes. The base system prompt and the serialized tools array are the
+/// bytes every request starts with; the volatile session facts sit at the tail
+/// of the system block, and compaction reports its own cache boundary.
+fn record_prompt_prefix(core: &Core) -> context::PromptPrefix {
+    let prefix = context::prompt_prefix(&core.system_prompt, &core.tool_specs_json);
+    let unchanged = core
+        .session
+        .lock()
+        .ok()
+        .and_then(|session| {
+            session
+                .latest_custom_on_path("prompt-prefix")
+                .and_then(|entry| match &entry.kind {
+                    EntryKind::Custom(data) => data
+                        .payload
+                        .get("hash")
+                        .and_then(Value::as_str)
+                        .map(|hash| hash == prefix.hash),
+                    _ => None,
+                })
+        })
+        .unwrap_or(false);
+    if !unchanged {
+        let stable = super::prompt::stable_prefix_chars(&core.system_prompt);
+        let stable_chars = core.system_prompt[..stable].chars().count();
+        append_custom(
+            &core.session,
+            "prompt-prefix",
+            json!({
+                "hash": prefix.hash,
+                "chars": prefix.chars,
+                "stable_chars": stable_chars,
+                "tools_chars": core.tool_specs_json.chars().count(),
+            }),
+        );
+        tracing::info!(hash = %prefix.hash, "prompt prefix");
+    }
+    prefix
+}
+
+/// The leading system message, which is the prefix the conversation follows.
+fn leading_system(assembled: &crate::context::AssembledContext) -> &str {
+    match assembled.messages.first() {
+        Some(ChatMessage::System { content }) => content,
+        _ => "",
+    }
+}
+
+/// A cold prefix-cache streak worth reporting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CacheCold {
+    percent: u32,
+    invalidator: &'static str,
+}
+
+/// Tracks prefix-cache hits across consecutive model calls in a turn. Engines
+/// that do not report `cached_tokens` are ignored rather than guessed at.
+#[derive(Debug, Default)]
+struct CacheWatch {
+    last_prefix: Option<String>,
+    cold_calls: u32,
+    warned: bool,
+}
+
+impl CacheWatch {
+    /// Observe one model call. Returns a report on the second consecutive call
+    /// below 70% so a single noisy sample does not raise an alarm.
+    fn observe(
+        &mut self,
+        usage: Option<&Usage>,
+        prefix: &context::PromptPrefix,
+        compaction_reason: Option<&str>,
+    ) -> Option<CacheCold> {
+        let previous = self.last_prefix.replace(prefix.hash.clone());
+        let usage = usage?;
+        let percent = usage.cache_percent()?;
+        if percent >= 70 {
+            self.cold_calls = 0;
+            self.warned = false;
+            return None;
+        }
+        self.cold_calls += 1;
+        if self.cold_calls < 2 || self.warned {
+            return None;
+        }
+        self.warned = true;
+        let prefix_changed = previous.is_some_and(|hash| hash != prefix.hash);
+        let invalidator = if compaction_reason.is_some() {
+            "the compaction rewrote the system block"
+        } else if prefix_changed {
+            "the prompt prefix (system prompt or tool list) changed"
+        } else {
+            "the server evicted the prefix or moved the request to another slot"
+        };
+        Some(CacheCold {
+            percent,
+            invalidator,
+        })
+    }
+}
+
 /// Exact rendered-prompt count when `/tokenize` answers.
 async fn exact_prompt_tokens(
     core: &Core,
@@ -2695,6 +2843,62 @@ mod tests {
         account_tools(cost, &mut assembled);
         assert_eq!(assembled.char_count, 2_620);
         assert_eq!(assembled.estimated_tokens, 1_010);
+    }
+
+    #[test]
+    fn cold_cache_alarm_needs_two_consecutive_calls() {
+        let prefix = crate::context::prompt_prefix("system", "[]");
+        let cold = Usage {
+            prompt_tokens: 100,
+            cached_tokens: Some(10),
+            ..Usage::default()
+        };
+        let warm = Usage {
+            prompt_tokens: 100,
+            cached_tokens: Some(90),
+            ..Usage::default()
+        };
+        let mut watch = CacheWatch::default();
+        assert!(watch.observe(Some(&cold), &prefix, None).is_none());
+        let report = watch
+            .observe(Some(&cold), &prefix, None)
+            .expect("second cold call alarms");
+        assert_eq!(report.percent, 10);
+        assert!(report.invalidator.contains("server evicted"));
+        assert!(
+            watch.observe(Some(&cold), &prefix, None).is_none(),
+            "one alarm per cold streak"
+        );
+        watch.observe(Some(&warm), &prefix, None);
+        assert!(watch.observe(Some(&cold), &prefix, None).is_none());
+    }
+
+    #[test]
+    fn cold_cache_alarm_names_a_changed_prefix_or_compaction() {
+        let first = crate::context::prompt_prefix("system", "[]");
+        let second = crate::context::prompt_prefix("system changed", "[]");
+        let cold = Usage {
+            prompt_tokens: 100,
+            cached_tokens: Some(0),
+            ..Usage::default()
+        };
+        let mut watch = CacheWatch::default();
+        watch.observe(Some(&cold), &first, None);
+        let report = watch
+            .observe(Some(&cold), &second, None)
+            .expect("changed prefix alarm");
+        assert!(report.invalidator.contains("prefix"));
+        let mut watch = CacheWatch::default();
+        watch.observe(Some(&cold), &first, None);
+        let report = watch
+            .observe(Some(&cold), &first, Some("auto"))
+            .expect("compaction alarm");
+        assert!(report.invalidator.contains("compaction"));
+        // An engine that does not report cached tokens never guesses.
+        let mut watch = CacheWatch::default();
+        let unknown = Usage::new(100, 1);
+        watch.observe(Some(&unknown), &first, None);
+        assert!(watch.observe(Some(&unknown), &first, None).is_none());
     }
 
     #[test]

@@ -149,13 +149,13 @@ One append-only JSONL file per session tree under `~/.local/share/localharness/s
 /export     write a Markdown transcript
 ```
 
-Compaction is deterministic, not model-written. Tool output is archived with an id, and `recall` reads an exact range. `--no-session` writes nothing: no session file, no artifacts. Session files, artifacts, evidence, and reports are redacted on disk by default; `--no-redact` is the explicit opt-out and is recorded in the session header. Redaction applies only to what is written to disk: in a live session the model sees the real tool output, so it has no placeholder to copy into a file. A resumed session replays the saved, redacted form with a note, and `write`/`edit`/`patch`/`undo` refuse content that adds a `[REDACTED:...]` placeholder the file does not already hold.
+Compaction is deterministic, not model-written. Tool output is archived with an id, and `recall` reads an exact range. The request prefix is cache-stable: tool order and schema key order do not drift, volatile session facts sit at the end of the system block, and a compaction logs how much of the prefix the engine can keep. `--no-session` writes nothing: no session file, no artifacts. Session files, artifacts, evidence, and reports are redacted on disk by default; `--no-redact` is the explicit opt-out and is recorded in the session header. Redaction applies only to what is written to disk: in a live session the model sees the real tool output, so it has no placeholder to copy into a file. A resumed session replays the saved, redacted form with a note, and `write`/`edit`/`patch`/`undo` refuse content that adds a `[REDACTED:...]` placeholder the file does not already hold.
 
 ## 04 · One binary, two front ends
 
 ### The TUI
 
-The terminal interface is the default. Tool calls render as cards, diffs and streamed Markdown are styled, and the context gauge stays visible.
+The terminal interface is the default. Tool calls render as cards, diffs and streamed Markdown are styled, and the context gauge stays visible. When the engine reports a prefix-cache hit, the header also shows `cache <cached>/<prompt>` tokens; `--json` usage events carry the same counts.
 
 | Key | Action |
 |---|---|
