@@ -972,6 +972,14 @@ pub struct BudgetConfig {
     /// checkpoints.
     pub stall_calls: u32,
     pub verify_attempts: u32,
+    /// Characters one tool result may occupy in context. Unset scales with
+    /// the usable prompt (4%, clamped to 2500..16000).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_cap_chars: Option<usize>,
+    /// Characters one batch of tool results may occupy. Unset scales with
+    /// the usable prompt (12%, clamped to 8000..40000).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch_cap_chars: Option<usize>,
 }
 
 impl Default for BudgetConfig {
@@ -982,6 +990,8 @@ impl Default for BudgetConfig {
             max_wall_minutes: 30,
             stall_calls: 12,
             verify_attempts: 2,
+            result_cap_chars: None,
+            batch_cap_chars: None,
         }
     }
 }

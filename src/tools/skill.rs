@@ -222,6 +222,7 @@ mod tests {
             lsp: Default::default(),
             sandbox: None,
             vision: Default::default(),
+            caps: Default::default(),
         }
     }
 

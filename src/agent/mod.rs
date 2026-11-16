@@ -297,6 +297,11 @@ impl Core {
             lsp: self.registry.lsp(),
             sandbox: self.sandbox.clone(),
             vision: self.vision.clone(),
+            caps: crate::context::ResultCaps::for_usable_prompt(self.budget.usable_prompt())
+                .with_overrides(
+                    self.config.budgets.result_cap_chars,
+                    self.config.budgets.batch_cap_chars,
+                ),
         }
     }
 

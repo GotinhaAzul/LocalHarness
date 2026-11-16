@@ -618,6 +618,7 @@ mod tests {
             lsp: Arc::new(crate::tools::lsp::LspService::new()),
             sandbox: None,
             vision: Default::default(),
+            caps: Default::default(),
         };
         (dir, ctx)
     }

@@ -186,6 +186,9 @@ pub struct ToolContext {
     pub sandbox: Option<Arc<crate::sandbox::Sandbox>>,
     /// How images reach the model; `read` uses it for image files.
     pub vision: Arc<crate::media::VisionSettings>,
+    /// Result caps for this turn. Tools that size their own output fit it
+    /// within [`crate::context::ResultCaps::tool_budget`].
+    pub caps: crate::context::ResultCaps,
 }
 
 impl ToolContext {

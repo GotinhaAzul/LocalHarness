@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 use crate::context::compact::{
     FindingSummary, build_summary_keeping, recent_tail_start, summary_budget, tail_budget,
 };
-use crate::context::{self, BATCH_CAP_CHARS, StaticPrompt, TokenBudget, ToolSpecCost};
+use crate::context::{self, StaticPrompt, TokenBudget, ToolSpecCost};
 use crate::provider::{
     CallAccumulator, ChatMessage, ChatRequest, ErrorClass, ProviderError, StreamEvent, Usage,
 };
@@ -1053,6 +1053,10 @@ async fn run_loop(
             gate_tools,
             read_available,
             turn_start.as_deref(),
+            context::ResultCaps::for_usable_prompt(budget.usable_prompt()).with_overrides(
+                core.config.budgets.result_cap_chars,
+                core.config.budgets.batch_cap_chars,
+            ),
         )
         .await;
         let _ = tx.send(AgentEvent::State(AgentState::PostTool));
@@ -1927,6 +1931,7 @@ async fn execute_batch(
     gate_tools: gates::GateTools,
     read_available: bool,
     turn_start: Option<&str>,
+    caps: context::ResultCaps,
 ) -> BatchOutcome {
     let mut deferred: Vec<CustomData> = Vec::new();
     let mut inferred_mutations = 0usize;
@@ -1939,7 +1944,10 @@ async fn execute_batch(
     let mut thread_split: Option<ThreadSplit> = None;
     let mut invalid_calls = 0u32;
 
-    let ctx = core.tool_context_with(cancel.clone());
+    // Caps follow this turn's budget, which window detection may have
+    // resized since the core was built.
+    let mut ctx = core.tool_context_with(cancel.clone());
+    ctx.caps = caps;
     let active: Vec<&str> = core.tools.iter().map(|tool| tool.name()).collect();
 
     // Hunk review: from a turn's second file mutation (or every mutation in
@@ -2477,11 +2485,10 @@ async fn execute_batch(
                 } else {
                     context::Preview::Head
                 };
-                context::cap_result_with(&ctx.artifacts, &result.content, preview)
+                context::cap_result_limited(&ctx.artifacts, &result.content, preview, ctx.caps)
             }
         };
-        if cap_override.is_none() && batch_chars + capped.content.chars().count() > BATCH_CAP_CHARS
-        {
+        if cap_override.is_none() && batch_chars + capped.content.chars().count() > ctx.caps.batch {
             match ctx.artifacts.write(&result.content) {
                 Ok(artifact) => {
                     capped.content = format!(
@@ -2916,8 +2923,9 @@ async fn finish_review(
             "[tool] {} - {}\n{}",
             call.call.name, call.summary_args, result.content
         );
-        let mut capped = context::cap_result_with(&ctx.artifacts, &text, context::Preview::Head);
-        if *batch_chars + capped.content.chars().count() > BATCH_CAP_CHARS {
+        let mut capped =
+            context::cap_result_limited(&ctx.artifacts, &text, context::Preview::Head, ctx.caps);
+        if *batch_chars + capped.content.chars().count() > ctx.caps.batch {
             match ctx.artifacts.write(&text) {
                 Ok(artifact) => {
                     capped.content = format!(

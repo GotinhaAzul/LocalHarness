@@ -64,6 +64,15 @@ impl Tool for GrepTool {
     }
 }
 
+/// One output line and whether the output may be cut before it (the start
+/// of a context group or a separator), so a cut never splits a match from
+/// its context.
+struct OutLine {
+    text: String,
+    is_match: bool,
+    cut_before: bool,
+}
+
 struct ScanOutcome {
     matches: usize,
     truncated: bool,
@@ -155,7 +164,7 @@ fn run(ctx: &ToolContext, args: &Value) -> Result<ToolResult, ToolResult> {
         )
     })?;
 
-    let mut out: Vec<String> = Vec::new();
+    let mut out: Vec<OutLine> = Vec::new();
     let mut matches = 0usize;
     let mut files_with_matches = 0usize;
     let mut truncated = false;
@@ -228,16 +237,47 @@ fn run(ctx: &ToolContext, args: &Value) -> Result<ToolResult, ToolResult> {
         })));
     }
 
-    let mut text = prefix + &out.join("\n");
-    if truncated {
+    // Fit whole groups within the result budget, so the loop never cuts the
+    // output mid-line and the trailer states what was shown.
+    let budget = ctx
+        .caps
+        .tool_budget()
+        .saturating_sub(prefix.chars().count() + 120);
+    let mut keep = out.len();
+    let mut used = 0usize;
+    let mut last_cut = 0usize;
+    for (index, line) in out.iter().enumerate() {
+        if line.cut_before {
+            last_cut = index;
+        }
+        used += line.text.chars().count() + 1;
+        if used > budget && index > 0 {
+            keep = if last_cut > 0 { last_cut } else { index };
+            break;
+        }
+    }
+    // Drop a trailing separator left at the cut.
+    while keep > 0 && out[keep - 1].text == "--" && !out[keep - 1].is_match {
+        keep -= 1;
+    }
+    let shown = out[..keep].iter().filter(|line| line.is_match).count();
+    let lines: Vec<&str> = out[..keep].iter().map(|line| line.text.as_str()).collect();
+    let mut text = prefix + &lines.join("\n");
+    let more = if truncated { "+" } else { "" };
+    if shown < matches {
+        text.push_str(&format!(
+            "\n[{shown} of {matches}{more} matches shown; narrow the pattern or pass path= or glob=]"
+        ));
+    } else if truncated {
         text.push_str(&format!(
             "\n[truncated at {max_matches} matches; narrow the pattern, path, or glob]"
         ));
     }
     Ok(ToolResult::ok(text).with_details(json!({
         "matches": matches,
+        "shown": shown,
         "files": files_with_matches,
-        "truncated": truncated,
+        "truncated": truncated || shown < matches,
         "literal_fallback": fallback.is_some(),
     })))
 }
@@ -248,7 +288,7 @@ fn scan_file(
     regex: &Regex,
     context: usize,
     budget: usize,
-    out: &mut Vec<String>,
+    out: &mut Vec<OutLine>,
 ) -> ScanOutcome {
     if budget == 0 {
         return ScanOutcome::none();
@@ -293,17 +333,28 @@ fn scan_file(
         // A separator marks a gap between context groups. Without context
         // lines every hit already stands alone, so it would only add a line
         // per match (as in grep itself, which prints none there).
-        if context > 0 && previous.map(|prev| lo > prev + 1).unwrap_or(false) {
-            out.push("--".to_string());
+        let new_group = previous.map(|prev| lo > prev + 1).unwrap_or(true);
+        if context > 0 && previous.is_some() && new_group {
+            out.push(OutLine {
+                text: "--".to_string(),
+                is_match: false,
+                cut_before: true,
+            });
         }
         for (offset, line) in lines[start..=hi].iter().enumerate() {
             let index = start + offset;
             let line = clip(line, MAX_LINE_CHARS);
-            if hits.binary_search(&index).is_ok() {
-                out.push(format!("{label}:{}:{line}", index + 1));
+            let is_match = hits.binary_search(&index).is_ok();
+            let text = if is_match {
+                format!("{label}:{}:{line}", index + 1)
             } else {
-                out.push(format!("{label}-{}-{line}", index + 1));
-            }
+                format!("{label}-{}-{line}", index + 1)
+            };
+            out.push(OutLine {
+                text,
+                is_match,
+                cut_before: offset == 0 && (new_group || context == 0),
+            });
         }
         emitted_until = Some(hi);
     }
@@ -334,6 +385,49 @@ mod tests {
     use super::*;
     use crate::tools::write::test_context;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn output_ends_on_a_whole_match_and_counts_what_was_shown() {
+        let dir = tempfile::tempdir().unwrap();
+        let body: String = (1..=150)
+            .map(|n| format!("fn handler_{n}(request: Request) -> Response {{ todo!() }}\n"))
+            .collect();
+        std::fs::write(dir.path().join("a.rs"), body).unwrap();
+        let ctx = test_context(dir.path());
+
+        let result = GrepTool
+            .call(&ctx, json!({"pattern": "fn ", "path": "a.rs"}))
+            .await;
+        assert!(!result.is_error, "{}", result.content);
+        assert!(result.content.chars().count() <= ctx.caps.tool_budget());
+        let details = result.details.unwrap();
+        let shown = details["shown"].as_u64().unwrap() as usize;
+        assert!(shown > 5 && shown < 150, "{shown}");
+        let (body, trailer) = result.content.rsplit_once('\n').unwrap();
+        assert_eq!(
+            trailer,
+            format!("[{shown} of 150 matches shown; narrow the pattern or pass path= or glob=]")
+        );
+        assert_eq!(body.lines().count(), shown);
+        for line in body.lines() {
+            assert!(line.ends_with("{ todo!() }"), "{line}");
+        }
+
+        // With context, the cut falls between groups.
+        let grouped = GrepTool
+            .call(
+                &ctx,
+                json!({"pattern": "handler_\\d*0\\(", "path": "a.rs", "context": 2}),
+            )
+            .await;
+        let body = grouped.content.rsplit_once('\n').unwrap().0;
+        assert!(!body.ends_with("--"), "{}", grouped.content);
+        let last = body.lines().last().unwrap();
+        assert!(
+            last.starts_with("a.rs-"),
+            "group ends on its trailing context: {last}"
+        );
+    }
 
     #[tokio::test]
     async fn separators_appear_only_between_context_groups() {

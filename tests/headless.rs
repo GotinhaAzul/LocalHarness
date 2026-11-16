@@ -1063,7 +1063,7 @@ struct SecretFake {
 async fn secret_chat(State(fake): State<SecretFake>) -> Response {
     let call = fake.calls.fetch_add(1, Ordering::SeqCst);
     let frames = if call == 0 {
-        let command = format!("echo {}; seq 1 800", fake.key);
+        let command = format!("echo {}; seq 1 3000", fake.key);
         let arguments = serde_json::json!({ "command": command }).to_string();
         format!(
             "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",

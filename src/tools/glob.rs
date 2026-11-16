@@ -119,6 +119,18 @@ fn run(ctx: &ToolContext, args: &Value) -> Result<ToolResult, ToolResult> {
 
     found.sort();
     found.truncate(MAX_PATHS);
+    // Whole paths within the result budget, so the loop never cuts a path.
+    let budget = ctx.caps.tool_budget().saturating_sub(80);
+    let mut used = 0usize;
+    let fit = found
+        .iter()
+        .position(|path| {
+            used += path.chars().count() + 1;
+            used > budget
+        })
+        .unwrap_or(found.len())
+        .max(1);
+    found.truncate(fit);
     let truncated = total > found.len();
 
     if found.is_empty() {
@@ -177,6 +189,27 @@ mod tests {
         assert!(!result.content.contains("ci.yml"), "{}", result.content);
         let result = GlobTool.call(&ctx, json!({"pattern": "**/.git*/**"})).await;
         assert!(!result.content.contains("config.yml"), "{}", result.content);
+    }
+
+    #[tokio::test]
+    async fn stops_at_whole_paths_within_the_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let deep = dir.path().join("some/fairly/deep/directory/structure");
+        std::fs::create_dir_all(&deep).unwrap();
+        for n in 0..150 {
+            std::fs::write(deep.join(format!("module_number_{n:03}.rs")), "").unwrap();
+        }
+        let ctx = test_context(dir.path());
+        let result = GlobTool.call(&ctx, json!({"pattern": "**/*.rs"})).await;
+        assert!(result.content.chars().count() <= ctx.caps.tool_budget());
+        let (body, trailer) = result.content.rsplit_once('\n').unwrap();
+        let shown = body.lines().count();
+        assert!(shown < 150);
+        assert!(body.lines().all(|line| line.ends_with(".rs")));
+        assert_eq!(
+            trailer,
+            format!("[showing {shown} of 150 paths; narrow the pattern or path]")
+        );
     }
 
     #[tokio::test]

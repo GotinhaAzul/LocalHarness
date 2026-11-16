@@ -16,6 +16,8 @@ const DEFAULT_LINES: u64 = 150;
 const MAX_LINES: u64 = 800;
 /// NUL bytes in this prefix mark a file as binary.
 const BINARY_SNIFF: usize = 8 * 1024;
+/// Characters kept free for the `[lines a-b of n; next start=c]` trailer.
+const TRAILER_RESERVE: usize = 80;
 
 pub struct ReadTool;
 
@@ -215,27 +217,41 @@ pub(crate) fn run(ctx: &ToolContext, args: &Value) -> Result<ToolResult, ToolRes
         .map(|end| usize::try_from(end).unwrap_or(usize::MAX))
         .unwrap_or(total)
         .min(total);
-    let last = available_end.min(start.saturating_add(limit).saturating_sub(1));
-    let capped = last < available_end;
+    let requested_last = available_end.min(start.saturating_add(limit).saturating_sub(1));
 
-    let width = last.to_string().len();
+    let width = requested_last.to_string().len();
     let mut text = String::new();
     if let Some(snapshot) = &snapshot {
         text.push_str(&format!("[{display}#{snapshot}]\n"));
     }
-    for (offset, line) in lines[first..last].iter().enumerate() {
+    // Whole lines within the result budget, so the loop never cuts the
+    // output and the trailer names exactly the lines the model saw.
+    let budget = ctx.caps.tool_budget().saturating_sub(TRAILER_RESERVE);
+    let mut used = text.chars().count();
+    let mut last = start.saturating_sub(1);
+    for (offset, line) in lines[first..requested_last].iter().enumerate() {
         let number = start + offset;
-        match &snapshot {
-            Some(_) => text.push_str(&format!(
+        let rendered = match &snapshot {
+            Some(_) => format!(
                 "{:>width$}  {}  {}\n",
                 number,
                 line_hash(line),
                 line,
                 width = width
-            )),
-            None => text.push_str(&format!("{:>width$}  {}\n", number, line, width = width)),
+            ),
+            None => format!("{:>width$}  {}\n", number, line, width = width),
+        };
+        let chars = rendered.chars().count();
+        // Always show at least one line; an overlong single line is left to
+        // the loop's fallback cut.
+        if number > start && used + chars > budget {
+            break;
         }
+        used += chars;
+        text.push_str(&rendered);
+        last = number;
     }
+    let capped = last < available_end;
     while text.ends_with('\n') {
         text.pop();
     }
@@ -401,7 +417,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let body: String = (1..=500).map(|n| format!("line{n}\n")).collect();
         std::fs::write(dir.path().join("a.txt"), body).unwrap();
-        let ctx = test_context(dir.path());
+        // Range semantics, not the result budget, are under test here.
+        let ctx = wide_context(dir.path());
 
         let result = ReadTool
             .call(&ctx, json!({"path": "a.txt", "start": 100, "end": 400}))
@@ -443,6 +460,82 @@ mod tests {
             result.content.contains("lines 1-2 of 5; next start=3"),
             "{}",
             result.content
+        );
+    }
+
+    fn wide_context(dir: &std::path::Path) -> ToolContext {
+        let mut ctx = test_context(dir);
+        ctx.caps = crate::context::ResultCaps {
+            result: 16_000,
+            batch: 40_000,
+        };
+        ctx
+    }
+
+    fn source_file(lines: usize) -> String {
+        (1..=lines)
+            .map(|n| format!("    let value_{n} = compute_something(argument_{n}, other_{n});\n"))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn default_read_fits_whole_lines_in_the_result_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), source_file(481)).unwrap();
+        let ctx = test_context(dir.path());
+
+        let result = ReadTool.call(&ctx, json!({"path": "a.rs"})).await;
+        assert!(!result.is_error, "{}", result.content);
+        let details = result.details.unwrap();
+        let last = details["end"].as_u64().unwrap() as usize;
+        assert!(last > 10 && last < 150, "{last}");
+        assert_eq!(details["capped"], true);
+        // The loop never needs to cut it.
+        assert!(result.content.chars().count() <= ctx.caps.tool_budget());
+        // Only whole lines, and the trailer names exactly the lines shown.
+        let (body, trailer) = result.content.split_once("\n\n[").unwrap();
+        assert_eq!(body.lines().count(), last);
+        for (n, line) in body.lines().enumerate() {
+            assert!(line.ends_with(&format!("other_{});", n + 1)), "{line}");
+        }
+        assert_eq!(
+            trailer,
+            format!("lines 1-{last} of 481; next start={}]", last + 1)
+        );
+        // Coverage equals the shown range.
+        let path = ctx.resolve("a.rs").unwrap();
+        let reads = crate::tools::write::lock_reads(&ctx);
+        let coverage = reads.coverage(&path).unwrap();
+        assert_eq!(
+            coverage.seen,
+            vec![crate::tools::LineRange {
+                start: 1,
+                end: last
+            }]
+        );
+        assert!(!coverage.result_truncated);
+    }
+
+    #[tokio::test]
+    async fn a_large_window_reads_the_default_page_in_one_call() {
+        let dir = tempfile::tempdir().unwrap();
+        // Typical source density: about 45 characters per line.
+        let body: String = (1..=481)
+            .map(|n| format!("    let value_{n} = compute(input_{n});\n"))
+            .collect();
+        std::fs::write(dir.path().join("a.rs"), body).unwrap();
+        let mut ctx = test_context(dir.path());
+        ctx.caps = crate::context::ResultCaps::for_usable_prompt(
+            crate::context::TokenBudget::new(65_536, 8192).usable_prompt(),
+        );
+
+        let result = ReadTool.call(&ctx, json!({"path": "a.rs"})).await;
+        let details = result.details.unwrap();
+        assert_eq!(details["end"], 150);
+        assert!(
+            result
+                .content
+                .ends_with("[lines 1-150 of 481; next start=151]")
         );
     }
 
@@ -540,7 +633,8 @@ mod tests {
     async fn empty_and_full_reads_are_fully_covered() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("empty.txt"), "").unwrap();
-        let ctx = test_context(dir.path());
+        // Range semantics, not the result budget, are under test here.
+        let ctx = wide_context(dir.path());
 
         let path = ctx.resolve("empty.txt").unwrap();
         let _ = ReadTool.call(&ctx, json!({"path": "empty.txt"})).await;
@@ -560,7 +654,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let body: String = (1..=400).map(|n| format!("line{n}\n")).collect();
         std::fs::write(dir.path().join("a.txt"), body).unwrap();
-        let ctx = test_context(dir.path());
+        // Range semantics, not the result budget, are under test here.
+        let ctx = wide_context(dir.path());
 
         let path = ctx.resolve("a.txt").unwrap();
         let first = ReadTool

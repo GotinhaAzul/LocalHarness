@@ -64,6 +64,7 @@ impl Fixture {
             lsp: Arc::new(localharness::tools::lsp::LspService::new()),
             sandbox: None,
             vision: Default::default(),
+            caps: Default::default(),
             edit_mode: localharness::config::EditMode::Text,
         };
         Fixture {
