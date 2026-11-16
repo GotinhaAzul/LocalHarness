@@ -21,6 +21,7 @@ pub mod repo_map;
 pub mod review;
 pub mod skill;
 pub mod surface;
+pub mod symbol;
 pub mod test;
 pub mod thread;
 pub mod todo;

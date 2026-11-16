@@ -38,6 +38,7 @@ impl Tool for ReadTool {
             json!({
                 "path": {"type": "string", "description": "File to read, relative to the working directory."},
                 "paths": {"type": "array", "items": {"type": "string"}, "description": "Instead of path: up to 6 files, each optionally with a range, e.g. [\"a.rs\", \"b.rs:10-40\"]."},
+                "symbol": {"type": "string", "description": "Instead of a range: a declaration name (fn, class, Type::method) whose whole extent to return."},
                 "start": {"type": "integer", "description": "First line to return, 1-based."},
                 "end": {"type": "integer", "description": "Last line to return, inclusive (up to 800 lines after start)."},
                 "limit": {"type": "integer", "description": "Lines to return when end is absent (default 150, max 800)."}
@@ -55,6 +56,12 @@ impl Tool for ReadTool {
     }
 
     async fn call(&self, ctx: &ToolContext, args: Value) -> ToolResult {
+        if args.get("symbol").is_some() {
+            return match crate::tools::symbol::read_symbol(ctx, &args).await {
+                Ok(result) => result,
+                Err(err) => err,
+            };
+        }
         if let Ok(raw) = required_str(&args, "path")
             && let Ok(path) = ctx.resolve(&raw)
             && crate::media::image::is_image_file(&path)
