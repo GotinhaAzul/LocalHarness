@@ -2,6 +2,7 @@
 
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
+use std::time::Duration;
 use std::time::Instant;
 
 use chrono::{Duration as ChronoDuration, Utc};
@@ -712,20 +713,68 @@ async fn run_loop(
             window: budget.context_window,
         });
 
-        let mut partial = None;
-        let result = stream_assistant(
-            core,
-            request,
-            tx,
-            cancel,
-            &mut budget,
-            assembled.estimated_tokens,
-            assembled.char_count,
-            tool_specs_cost,
-            &mut partial,
-            &mut call_ledger,
-        )
-        .await;
+        // A transient failure (dropped connection, 5xx, 429, stalled
+        // stream) sends the same request again: nothing from the failed reply
+        // was appended and none of its tools ran. The partial text is logged,
+        // not replayed to the model. Retries do not count as model calls.
+        let mut retry = RetryState::new(&core.config.model);
+        let (result, mut partial) = loop {
+            let mut partial = None;
+            let result = stream_assistant(
+                core,
+                request.clone(),
+                tx,
+                cancel,
+                &mut budget,
+                assembled.estimated_tokens,
+                assembled.char_count,
+                tool_specs_cost,
+                &mut partial,
+                &mut call_ledger,
+            )
+            .await;
+            let err = match result {
+                Err(err) if err.is_transient() => err,
+                other => break (other, partial),
+            };
+            let Some(delay) = retry.next_delay(&err) else {
+                break (Err(retry.exhausted(err)), partial);
+            };
+            let partial_chars = partial
+                .as_ref()
+                .and_then(|partial: &AssistantData| partial.content.as_ref())
+                .map(|text| text.chars().count())
+                .unwrap_or(0);
+            append_custom(
+                &core.session,
+                "model-retry",
+                json!({
+                    "attempt": retry.attempts,
+                    "code": err.class.code(),
+                    "status": err.status,
+                    "message": err.message,
+                    "delay_ms": delay.as_millis() as u64,
+                    "discarded_chars": partial_chars,
+                }),
+            );
+            let _ = tx.send(AgentEvent::Notice(format!(
+                "[retry {}/{}] model call failed ({}): {}; retrying in {:.1}s",
+                retry.attempts,
+                retry.max,
+                err.class.code(),
+                crate::text::clip(&err.message, 200),
+                delay.as_secs_f64()
+            )));
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    break (
+                        Err(ProviderError::new(ErrorClass::Cancelled, "generation cancelled")),
+                        None,
+                    );
+                }
+                _ = tokio::time::sleep(delay) => {}
+            }
+        };
 
         let assistant = match result {
             Ok(assistant) => assistant,
@@ -1918,6 +1967,68 @@ fn mutation_call_indexes(calls: &[ToolCall], active: &[&str]) -> Vec<usize> {
 
 struct ThreadSplit {
     kickoff: Option<String>,
+}
+
+/// Bounded retry of transient model-call failures within one turn.
+struct RetryState {
+    /// Retries already scheduled.
+    attempts: u32,
+    max: u32,
+    waited: Duration,
+    deadline: Duration,
+    base: Duration,
+}
+
+impl RetryState {
+    fn new(config: &crate::config::ModelConfig) -> Self {
+        Self {
+            attempts: 0,
+            max: config.retries,
+            waited: Duration::ZERO,
+            deadline: Duration::from_secs(config.retry_deadline_secs),
+            base: Duration::from_millis(config.retry_backoff_ms),
+        }
+    }
+
+    /// The wait before the next attempt, or `None` when the retries or the
+    /// deadline are spent. Backoff is 1x, 4x, 15x the base with +-20%
+    /// jitter; a `Retry-After` is honored when it is longer.
+    fn next_delay(&mut self, err: &ProviderError) -> Option<Duration> {
+        if self.attempts >= self.max {
+            return None;
+        }
+        let step = [1u32, 4, 15][(self.attempts as usize).min(2)];
+        let backoff = self.base.mul_f64(f64::from(step) * jitter());
+        let delay = err.retry_after.map_or(backoff, |after| after.max(backoff));
+        if self.waited + delay > self.deadline {
+            return None;
+        }
+        self.attempts += 1;
+        self.waited += delay;
+        Some(delay)
+    }
+
+    /// The final error, naming how many attempts were made.
+    fn exhausted(&self, mut err: ProviderError) -> ProviderError {
+        if self.attempts > 0 {
+            err.message = format!(
+                "{} (gave up after {} attempts)",
+                err.message,
+                self.attempts + 1
+            );
+        }
+        err
+    }
+}
+
+/// A factor in 0.8..1.2 from the clock, so concurrent clients do not retry
+/// in lockstep. No randomness crate is needed for this.
+fn jitter() -> f64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.subsec_nanos())
+        .unwrap_or(0);
+    0.8 + f64::from(nanos % 1000) / 1000.0 * 0.4
 }
 
 /// Arguments as the loop guard compares them: a `read` of the same path set

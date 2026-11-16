@@ -98,8 +98,9 @@ async fn chat(State(fake): State<Fake>, body: String) -> Response {
             false,
         ),
         Script::Fail => {
+            // A permanent failure: a 5xx would be retried within the turn.
             return Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .status(StatusCode::BAD_REQUEST)
                 .header(
                     header::CONTENT_TYPE,
                     HeaderValue::from_static("application/json"),

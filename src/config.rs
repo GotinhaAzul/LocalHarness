@@ -618,6 +618,14 @@ pub struct ModelConfig {
     pub connect_timeout_secs: u64,
     pub first_token_timeout_secs: u64,
     pub stream_idle_timeout_secs: u64,
+    /// Times a model call that failed for a transient reason (connection,
+    /// 5xx, 429, a dropped or stalled stream) is sent again within the turn.
+    /// 0 ends the turn on the first failure.
+    pub retries: u32,
+    /// Longest total wait across those retries, `Retry-After` included.
+    pub retry_deadline_secs: u64,
+    /// First backoff step; later steps are 4x and 15x this, with jitter.
+    pub retry_backoff_ms: u64,
 }
 
 impl Default for ModelConfig {
@@ -643,6 +651,9 @@ impl Default for ModelConfig {
             connect_timeout_secs: 5,
             first_token_timeout_secs: 120,
             stream_idle_timeout_secs: 120,
+            retries: 3,
+            retry_deadline_secs: 120,
+            retry_backoff_ms: 1000,
         }
     }
 }

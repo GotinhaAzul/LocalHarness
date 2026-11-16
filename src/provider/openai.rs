@@ -107,17 +107,16 @@ impl OpenAiCompatProvider {
         let status = response.status();
         if !status.is_success() {
             let code = status.as_u16();
+            let retry_after = retry_after(response.headers());
             let text = response.text().await.unwrap_or_default();
             let text = truncate_body(&text);
             if code == 400 && mentions_stream_options(&text) {
                 return Attempt::RetryWithoutUsage;
             }
             if let Some(err) = classify_http(code, &text, &self.model) {
-                return Attempt::Failed(ProviderError::with_status(
-                    err.class,
-                    code,
-                    self.scrub(err.message),
-                ));
+                let mut err = ProviderError::with_status(err.class, code, self.scrub(err.message));
+                err.retry_after = retry_after;
+                return Attempt::Failed(err);
             }
             return Attempt::Failed(ProviderError::with_status(
                 ErrorClass::BadRequest,
@@ -516,6 +515,19 @@ fn is_context_error(message: &str) -> bool {
             || message.contains("limit"))
 }
 
+/// `Retry-After` in seconds. The HTTP-date form is not used by inference
+/// servers and is ignored.
+fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(Duration::from_secs)
+}
+
 fn classify_http(code: u16, body: &str, model: &str) -> Option<ProviderError> {
     let body_lower = body.to_ascii_lowercase();
     let message = match code {
@@ -542,6 +554,7 @@ fn classify_http(code: u16, body: &str, model: &str) -> Option<ProviderError> {
         400 | 422 if is_context_error(body) => ErrorClass::ContextTooSmall,
         400 | 422 => ErrorClass::BadRequest,
         408 | 504 => ErrorClass::Connection,
+        429 => ErrorClass::RateLimited,
         500..=599 => ErrorClass::Server,
         _ => ErrorClass::BadRequest,
     };

@@ -29,6 +29,8 @@ use tokio_util::sync::CancellationToken;
 enum Script {
     Events(Vec<StreamEvent>),
     EventsThenWait(Vec<StreamEvent>),
+    /// Stream some events, then fail (a connection that drops mid-reply).
+    EventsThenError(Vec<StreamEvent>, ProviderError),
     Error(ProviderError),
     /// Emit a deterministic loop when the resolved temperature is hot, and a
     /// clean answer otherwise. Used to show a sampler preset preventing the
@@ -103,6 +105,12 @@ impl Provider for ScriptedProvider {
                 _cancel.cancelled().await;
             }
             Some(Script::Error(err)) => {
+                let _ = tx.send(Err(err));
+            }
+            Some(Script::EventsThenError(events, err)) => {
+                for event in events {
+                    let _ = tx.send(Ok(event));
+                }
                 let _ = tx.send(Err(err));
             }
             Some(Script::SamplerLoop { hot, reps, clean }) => {
@@ -261,6 +269,8 @@ fn base_config() -> Config {
     config.model.model = "test-model".into();
     config.model.endpoint = "http://127.0.0.1:0".into();
     config.model.context_window = Some(65_536);
+    // Transient-failure retries back off in milliseconds under test.
+    config.model.retry_backoff_ms = 1;
     config.profiles.insert(
         "test".into(),
         ProfileConfig {
@@ -4688,4 +4698,183 @@ async fn a_path_deny_rule_matches_a_hash_patch_target() {
         "{}",
         results[1]
     );
+}
+
+fn http_error(class: ErrorClass, status: u16) -> ProviderError {
+    ProviderError::with_status(class, status, format!("endpoint error ({status})"))
+}
+
+fn error_entries(session: &SessionHandle) -> Vec<String> {
+    let session = session.lock().unwrap();
+    session
+        .branch_entries()
+        .into_iter()
+        .filter_map(|entry| match &entry.kind {
+            EntryKind::Error(data) => Some(data.code.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn retry_notices(events: &[AgentEvent]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::Notice(text) if text.starts_with("[retry ") => Some(text.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn transient_server_errors_are_retried_within_the_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness(
+        dir.path(),
+        vec![
+            Script::Error(http_error(ErrorClass::Server, 503)),
+            Script::Error(http_error(ErrorClass::Server, 503)),
+            text_script("recovered"),
+        ],
+        &["read"],
+    );
+    let (outcome, events) = run(&harness, "do it").await;
+    assert_eq!(outcome.status, TurnStatus::Done, "{:?}", outcome.error);
+    assert_eq!(harness.provider.requests.lock().unwrap().len(), 3);
+    let notices = retry_notices(&events);
+    assert_eq!(notices.len(), 2, "{notices:?}");
+    assert!(notices[0].starts_with("[retry 1/3]"), "{notices:?}");
+    assert!(error_entries(&harness.session).is_empty());
+    assert_eq!(last_assistant(&harness.session), "recovered");
+}
+
+#[tokio::test]
+async fn a_dropped_stream_is_retried_without_replaying_the_partial_reply() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness(
+        dir.path(),
+        vec![
+            Script::EventsThenError(
+                vec![StreamEvent::Delta("half an ans".into())],
+                ProviderError::new(ErrorClass::Connection, "stream error: connection reset"),
+            ),
+            text_script("the whole answer"),
+        ],
+        &["read"],
+    );
+    let (outcome, _) = run(&harness, "explain").await;
+    assert_eq!(outcome.status, TurnStatus::Done, "{:?}", outcome.error);
+    let requests = harness.provider.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    let replayed = format!("{:?}", requests[1].messages);
+    assert!(!replayed.contains("half an ans"), "{replayed}");
+    drop(requests);
+    assert_eq!(last_assistant(&harness.session), "the whole answer");
+}
+
+#[tokio::test]
+async fn permanent_errors_are_not_retried() {
+    for (class, status) in [
+        (ErrorClass::Auth, 401),
+        (ErrorClass::ModelNotFound, 404),
+        (ErrorClass::BadRequest, 400),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let harness = harness(
+            dir.path(),
+            vec![
+                Script::Error(http_error(class, status)),
+                text_script("never"),
+            ],
+            &["read"],
+        );
+        let (outcome, events) = run(&harness, "do it").await;
+        assert_eq!(outcome.status, TurnStatus::Error, "{status}");
+        assert_eq!(
+            harness.provider.requests.lock().unwrap().len(),
+            1,
+            "{status}"
+        );
+        assert!(retry_notices(&events).is_empty());
+    }
+}
+
+#[tokio::test]
+async fn exhausted_retries_name_the_attempts_and_retry_after_is_honored() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut limited = http_error(ErrorClass::RateLimited, 429);
+    limited.retry_after = Some(std::time::Duration::from_millis(120));
+    let harness = harness(
+        dir.path(),
+        vec![
+            Script::Error(limited),
+            Script::Error(http_error(ErrorClass::Server, 502)),
+            Script::Error(http_error(ErrorClass::Server, 502)),
+            Script::Error(http_error(ErrorClass::Server, 502)),
+        ],
+        &["read"],
+    );
+    let started = std::time::Instant::now();
+    let (outcome, events) = run(&harness, "do it").await;
+    assert!(started.elapsed() >= std::time::Duration::from_millis(120));
+    assert_eq!(outcome.status, TurnStatus::Error);
+    assert_eq!(retry_notices(&events).len(), 3);
+    let (_, message) = outcome.error.expect("error");
+    assert!(message.contains("gave up after 4 attempts"), "{message}");
+
+    // A Retry-After beyond the deadline is not waited out.
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = base_config();
+    config.model.retry_deadline_secs = 1;
+    let mut far = http_error(ErrorClass::RateLimited, 429);
+    far.retry_after = Some(std::time::Duration::from_secs(30));
+    let harness = harness_config(dir.path(), vec![Script::Error(far)], config);
+    let started = std::time::Instant::now();
+    let (outcome, _) = run(&harness, "do it").await;
+    assert_eq!(outcome.status, TurnStatus::Error);
+    assert!(started.elapsed() < std::time::Duration::from_secs(1));
+}
+
+#[tokio::test]
+async fn retries_zero_ends_the_turn_on_the_first_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = base_config();
+    config.model.retries = 0;
+    let harness = harness_config(
+        dir.path(),
+        vec![
+            Script::Error(http_error(ErrorClass::Server, 503)),
+            text_script("never"),
+        ],
+        config,
+    );
+    let (outcome, _) = run(&harness, "do it").await;
+    assert_eq!(outcome.status, TurnStatus::Error);
+    assert_eq!(harness.provider.requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn cancelling_during_a_backoff_stops_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = base_config();
+    config.model.retry_backoff_ms = 30_000;
+    let harness = harness_config(
+        dir.path(),
+        vec![Script::Error(http_error(ErrorClass::Server, 503))],
+        config,
+    );
+    let cancel = CancellationToken::new();
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let turn = tokio::spawn(run_turn(
+        harness.core.clone(),
+        "do it".to_string(),
+        tx,
+        cancel.clone(),
+    ));
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let cancelled_at = std::time::Instant::now();
+    cancel.cancel();
+    let outcome = turn.await.unwrap();
+    assert!(cancelled_at.elapsed() < std::time::Duration::from_millis(100));
+    assert_eq!(outcome.status, TurnStatus::Cancelled);
 }
