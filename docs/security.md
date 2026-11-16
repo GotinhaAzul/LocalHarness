@@ -106,6 +106,29 @@ need those guarantees. The bubblewrap executable can be overridden with
 `--path-jail` is a separate file-tool boundary; it does not change how `bash`
 runs.
 
+## Network fetch
+
+`fetch` is the only network tool in the built-in surface, and it is off by
+default: no built-in profile includes it. Enable it by naming it in a profile's
+`tools` array or with `--tools +fetch`.
+
+It accepts one absolute `http` or `https` URL and makes a `GET`. It sends no
+credentials, cookies, or authorization header, rejects a URL with userinfo, and
+caps the body at 2 MB and the request at 20 s. Returned pages are converted to
+text and tagged with external provenance, so they remain untrusted data.
+
+Every hop, redirects included, is resolved and checked before it is connected
+to, and the connection is pinned to the checked address so a second DNS answer
+cannot redirect it (DNS rebinding). Loopback, private, link-local, CGNAT, and
+cloud metadata addresses are refused unless `[fetch] allow_private` names the
+host. It fetches one URL, not a page's subresources.
+
+`fetch` classifies as a network call whose approval subject is the full URL, so
+the default mode asks for that URL and per-host rules can allow one:
+`command = "^fetch https://docs\\.rs/"`. It runs in the harness process, not in
+the `bash` sandbox, so `--sandbox` does not apply to it. Use a deny rule or
+leave the tool out of the profile when a host must not be reached.
+
 ## Instruction provenance
 
 The system prompt describes repository files, tool output, `AGENTS.md`, and

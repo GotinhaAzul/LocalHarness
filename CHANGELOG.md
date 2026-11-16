@@ -7,6 +7,47 @@ release may change defaults when the change is called out below.
 
 ## [Unreleased]
 
+### Added
+
+- The skill index is capped at 200 characters per entry and 2400 characters in
+  total; the remaining skills are listed by name and stay loadable.
+  `[skills] index = "full" | "names" | "off"` chooses the form,
+  `lh skill lint` warns when an entry would be clipped, and `lh context`
+  reports the size and the clipped names
+  ([#121](https://github.com/GotinhaAzul/LocalHarness/issues/121)).
+- `short_tool_schemas` accepts `true`, `false`, and `"auto"`. Auto sends the
+  short schemas when the system prompt plus the full schemas would exceed 20%
+  of the usable prompt, decided once per session and model so the prefix stays
+  byte-stable. The default stays the full form, and `lh doctor` prints both
+  sizes ([#122](https://github.com/GotinhaAzul/LocalHarness/issues/122)).
+- When a successful edit, write, or patch leaves the run one step from the
+  todo gate, its tool result says the next edit needs a plan. Once per turn;
+  the gate itself is unchanged
+  ([#124](https://github.com/GotinhaAzul/LocalHarness/issues/124)).
+- `read` takes `paths`: up to six entries, each optionally `path:start-end`.
+  The result budget is split between them in whole lines, and each file prints
+  under its own header with its own next-start trailer
+  ([#125](https://github.com/GotinhaAzul/LocalHarness/issues/125)).
+- `read` takes `symbol` and returns a declaration's whole extent, doc comments
+  and attributes included. The range comes from a language server that is
+  already running, otherwise from the scanner plus brace or indentation
+  matching; ambiguous names list candidates and unknown names list the nearest
+  declarations ([#126](https://github.com/GotinhaAzul/LocalHarness/issues/126)).
+- New opt-in `fetch` tool: `GET`s one public http(s) URL and returns readable
+  text, converting HTML and paging long pages by character offset. It is in no
+  built-in profile, classifies as a network call whose approval subject is the
+  full URL, sends no credentials or cookies, caps the body at 2 MB and the
+  request at 20 s, and refuses loopback, private, link-local, CGNAT, and
+  metadata addresses on every hop unless `[fetch] allow_private` names the
+  host ([#127](https://github.com/GotinhaAzul/LocalHarness/issues/127)).
+- `lh verify [--init]` shows or saves verify steps detected from the project's
+  manifest files, and `/verify [accept]` does the same in the TUI; nothing
+  from the repository runs before the user accepts. Accepted steps live in
+  `verify-steps.json` in the user data directory, keyed by project, so they
+  load without `--trust`. The header shows `verify: not configured`, and
+  `lh doctor` reports what is configured or detected
+  ([#128](https://github.com/GotinhaAzul/LocalHarness/issues/128)).
+
 ### Fixed
 
 - A compaction in the middle of one long agentic turn no longer sends a
@@ -26,21 +67,50 @@ release may change defaults when the change is called out below.
   included, and the schemas were then added again at their fixed price, so
   the estimate ran about 5-7% high and compaction started early. The ratio is
   now learned from the request minus the schemas.
-- After a compaction, the state block reports the budget in bands (under 50%,
-  over 50%, over 65%) instead of an exact percentage. The block is part of the
-  system message, and the exact figure changed on almost every model call,
-  which made the engine re-evaluate the whole conversation each time
-  ([#117](https://github.com/GotinhaAzul/LocalHarness/issues/117), partial).
-- A tool result over the cap is now cut at a line boundary, and its hint names
-  the first line that was left out (`truncated after line 46 of 153; recall
-  out-1 47-153`). It was cut mid-line and always pointed `recall` at lines
-  1-120, which the model had already seen
-  ([#118](https://github.com/GotinhaAzul/LocalHarness/issues/118), partial).
+- The post-compaction state block rides on the last message of each request
+  instead of the leading system message, so a change in changed files, verify
+  status, or the budget band costs only the tail. Hook context that fires
+  during a session renders in place on the user or tool message it belongs to,
+  and the cold-cache notice now says whether the harness rewrote the system
+  message or the tool list changed
+  ([#117](https://github.com/GotinhaAzul/LocalHarness/issues/117)).
+- Tool output is sized to the window: the per-result cap is 4% of the usable
+  prompt in characters (clamped to 2500..16000) and the per-batch cap 12%
+  (8000..40000), overridable with `[budgets] result_cap_chars` and
+  `batch_cap_chars`. `read`, `grep`, and `glob` return whole lines or entries
+  and report the real range (`lines a-b of n; next start=c`, `N of M matches
+  shown`); a blind cut at a line boundary is only the fallback
+  ([#118](https://github.com/GotinhaAzul/LocalHarness/issues/118)).
+- A token shortfall no longer ends a turn on arithmetic alone. The engine's
+  truncated flag and context-shift count still count as proof, but a ratio or
+  shortfall now needs a second witness: `prompt_tokens + cached_tokens`
+  covering the prompt, `/tokenize` against the window, or a repeat on the next
+  call. A count under 512 tokens marks the usage report unreliable: the reply
+  is kept, the session warns once, calibration from usage stops, and
+  `lh doctor` reports it
+  ([#120](https://github.com/GotinhaAzul/LocalHarness/issues/120)).
 - `grep` prints `--` separators only between context groups. With no context
   lines it printed one after every non-adjacent match.
 
 ### Changed
 
+- A model call that fails for a transient reason is retried inside the turn:
+  a connection failure, a dropped or stalled stream, a 5xx except 501/505,
+  408/504, or 429 (now its own `rate_limited` class). `[model] retries`
+  (default 3) bounds the attempts, with jittered 1x/4x/15x backoff of
+  `retry_backoff_ms` (default 1000), honoring `Retry-After` within
+  `retry_deadline_secs` (default 120). The partial reply is logged as a
+  `model-retry` entry, never replayed; retries are notices and do not count as
+  model calls. `retries = 0` restores the old behavior
+  ([#119](https://github.com/GotinhaAzul/LocalHarness/issues/119)).
+- With `[gates] auto_settle` (default true), the harness runs verify and then
+  review itself when the model settles after changing files, through the same
+  permission rules and hooks, and records `verify-result` plus
+  `review-result`. Clean results settle on the answer already written with a
+  `[harness] verify passed, review clean` notice; a failed verify or flagged
+  review continues with one user-role message carrying the results.
+  `auto_settle = false` restores the model-relayed gate messages
+  ([#123](https://github.com/GotinhaAzul/LocalHarness/issues/123)).
 - A turn stopped by the loop guard now ends with the `stalled` status instead
   of `done`: `lh -p` exits 2 instead of 0, a workflow step is no longer marked
   succeeded, and ACP reports `max_turn_requests`.
