@@ -343,3 +343,150 @@ fn tool_order_and_schema_key_order_are_stable_across_restarts() {
     let parsed: serde_json::Value = serde_json::from_str(&first_json).unwrap();
     assert_sorted_keys(&parsed);
 }
+
+/// The serialized request up to (not including) its last message: what an
+/// engine can reuse from the previous call when only the tail changed.
+fn bytes_before_last(assembled: &AssembledContext) -> Vec<u8> {
+    let trimmed = AssembledContext {
+        messages: assembled.messages[..assembled.messages.len() - 1].to_vec(),
+        estimated_tokens: 0,
+        char_count: 0,
+    };
+    message_bytes(&trimmed)
+}
+
+fn leading_system(assembled: &AssembledContext) -> &str {
+    match assembled.messages.first() {
+        Some(ChatMessage::System { content }) => content,
+        other => panic!("no leading system message: {other:?}"),
+    }
+}
+
+fn tool_step(session: &mut Session, n: usize) {
+    use localharness::session::{AssistantData, ToolCall, ToolResultData};
+    session
+        .append(EntryKind::Assistant(AssistantData {
+            content: Some(format!("step {n}")),
+            tool_calls: Some(vec![ToolCall {
+                id: format!("call_{n}"),
+                name: "read".into(),
+                arguments: serde_json::json!({"path": format!("f{n}.rs")}),
+            }]),
+            ..AssistantData::default()
+        }))
+        .unwrap();
+    session
+        .append(EntryKind::ToolResult(ToolResultData {
+            call_id: format!("call_{n}"),
+            content: format!("body of f{n}.rs"),
+            is_error: false,
+            details: None,
+            artifact: None,
+        }))
+        .unwrap();
+}
+
+fn hook_context(session: &mut Session, event: &str, text: &str) {
+    use localharness::session::CustomData;
+    session
+        .append(EntryKind::Custom(
+            CustomData::new("hook-context")
+                .with("hook", "ctx")
+                .with("event", event)
+                .with("text", text),
+        ))
+        .unwrap();
+}
+
+#[test]
+fn state_block_after_compaction_leaves_the_head_byte_identical() {
+    use localharness::session::CompactionData;
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = session(dir.path());
+    session
+        .append(EntryKind::Compaction(CompactionData {
+            summary: "[localharness] summary of earlier work".into(),
+            tokens_before: 9000,
+            reason: "auto".into(),
+            thread_id: None,
+            keep_from: None,
+        }))
+        .unwrap();
+    session
+        .append(EntryKind::User(UserData {
+            attachments: Vec::new(),
+            content: "keep going".into(),
+        }))
+        .unwrap();
+    let budget = TokenBudget::new(32_768, 4096);
+
+    tool_step(&mut session, 1);
+    let first = assemble(
+        "system",
+        &session,
+        Some("[localharness] state\nverify: not run\ncontext: under 50% of usable prompt"),
+        &budget,
+    );
+    tool_step(&mut session, 2);
+    // The state changed between the calls (a file changed, the band moved).
+    let second = assemble(
+        "system",
+        &session,
+        Some(
+            "[localharness] state\nchanged: f1.rs\nverify: failed\ncontext: over 50% of usable prompt",
+        ),
+        &budget,
+    );
+    assert_eq!(leading_system(&first), leading_system(&second));
+    assert!(!leading_system(&second).contains("[localharness] state"));
+    // Everything the first request sent before its last message is reused.
+    let reused = bytes_before_last(&first);
+    assert!(message_bytes(&second).starts_with(&reused));
+    // The model still sees the state, on the last message.
+    assert!(matches!(second.messages.last(),
+        Some(ChatMessage::Tool { content, .. }) if content.ends_with("verify: failed\ncontext: over 50% of usable prompt")));
+}
+
+#[test]
+fn hook_context_during_a_session_does_not_grow_the_head() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = session(dir.path());
+    hook_context(&mut session, "session_start", "repo uses tabs");
+    session
+        .append(EntryKind::User(UserData {
+            attachments: Vec::new(),
+            content: "fix it".into(),
+        }))
+        .unwrap();
+    hook_context(&mut session, "user_prompt", "ticket ABC-1 is open");
+    let budget = TokenBudget::new(32_768, 4096);
+    let mut previous: Option<AssembledContext> = None;
+    for n in 1..=4 {
+        tool_step(&mut session, n);
+        // A post_tool hook returns context on every call (its text is part of
+        // the tool result itself), and a stop-style hook adds more.
+        hook_context(&mut session, "post_tool", &format!("lint ok {n}"));
+        hook_context(&mut session, "stop", &format!("note {n}"));
+        let assembled = assemble("system", &session, None, &budget);
+        let head = leading_system(&assembled);
+        assert_eq!(head, "system\n\n[hook context: ctx]\nrepo uses tabs");
+        if let Some(previous) = &previous {
+            assert_eq!(leading_system(previous), head);
+            assert!(message_bytes(&assembled).starts_with(&bytes_before_last(previous)));
+        }
+        previous = Some(assembled);
+    }
+    let last = previous.unwrap();
+    // The model still sees the in-session context, in place.
+    let user = last
+        .messages
+        .iter()
+        .find_map(|m| match m {
+            ChatMessage::User { content, .. } => Some(content.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(user, "fix it\n\n[hook context: ctx]\nticket ABC-1 is open");
+    assert!(last.messages.iter().any(|m| matches!(m,
+        ChatMessage::Tool { content, .. } if content.contains("[hook context: ctx]\nnote 3"))));
+}

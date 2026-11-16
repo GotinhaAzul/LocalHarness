@@ -1237,9 +1237,17 @@ async fn a_turn_after_compaction_keeps_system_messages_leading() {
     assert!(
         matches!(&messages[0], ChatMessage::System { content }
             if content.contains("the compacted summary")
-                && content.contains("[localharness] state")),
+                && !content.contains("[localharness] state")),
         "leading system: {:?}",
         messages[0]
+    );
+    // The state block rides on the last message, where its changes cost only
+    // the tail of the request.
+    assert!(
+        matches!(messages.last(), Some(ChatMessage::User { content, .. })
+            if content.starts_with("continue") && content.contains("[localharness] state")),
+        "last message: {:?}",
+        messages.last()
     );
     assert!(
         messages

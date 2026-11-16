@@ -3218,6 +3218,7 @@ struct CacheCold {
 #[derive(Debug, Default)]
 struct CacheWatch {
     last_prefix: Option<String>,
+    last_system: Option<String>,
     cold_calls: u32,
     warned: bool,
     /// The cause observed when the streak began (or a compaction reported on
@@ -3236,6 +3237,7 @@ impl CacheWatch {
         compaction_reason: Option<&str>,
     ) -> Option<CacheCold> {
         let previous = self.last_prefix.replace(prefix.hash.clone());
+        let previous_system = self.last_system.replace(prefix.system_hash.clone());
         let usage = usage?;
         let percent = usage.cache_percent()?;
         if percent >= 70 {
@@ -3246,12 +3248,17 @@ impl CacheWatch {
         }
         self.cold_calls += 1;
         let prefix_changed = previous.is_some_and(|hash| hash != prefix.hash);
+        let system_changed = previous_system.is_some_and(|hash| hash != prefix.system_hash);
         if compaction_reason.is_some() {
             self.cold_invalidator = Some("the compaction rewrote the system block");
         } else if prefix_changed
             && self.cold_invalidator != Some("the compaction rewrote the system block")
         {
-            self.cold_invalidator = Some("the prompt prefix (system prompt or tool list) changed");
+            self.cold_invalidator = Some(if system_changed {
+                "the harness rewrote the system message"
+            } else {
+                "the tool list changed"
+            });
         } else if self.cold_invalidator.is_none() {
             self.cold_invalidator =
                 Some("the server evicted the prefix or moved the request to another slot");
@@ -3882,7 +3889,14 @@ mod tests {
         let report = watch
             .observe(Some(&cold), &second, None)
             .expect("changed prefix alarm");
-        assert!(report.invalidator.contains("prefix"));
+        assert_eq!(report.invalidator, "the harness rewrote the system message");
+        let mut watch = CacheWatch::default();
+        watch.observe(Some(&cold), &first, None);
+        let tools = crate::context::prompt_prefix("system", r#"[{"name":"x"}]"#);
+        let report = watch
+            .observe(Some(&cold), &tools, None)
+            .expect("changed tools alarm");
+        assert_eq!(report.invalidator, "the tool list changed");
         let mut watch = CacheWatch::default();
         watch.observe(Some(&cold), &first, None);
         let report = watch

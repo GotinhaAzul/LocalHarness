@@ -33,6 +33,9 @@ pub struct AssembledContext {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PromptPrefix {
     pub hash: String,
+    /// Hash of the system block alone, so a cold cache can be blamed on the
+    /// system message or on the tool list.
+    pub system_hash: String,
     /// Characters in the system block plus the serialized tools.
     pub chars: usize,
 }
@@ -45,8 +48,10 @@ pub fn prompt_prefix(system: &str, tools_json: &str) -> PromptPrefix {
     hasher.update(system.as_bytes());
     hasher.update(b"\0tools\0");
     hasher.update(tools_json.as_bytes());
+    let system_hash = format!("{:x}", Sha256::digest(system.as_bytes()));
     PromptPrefix {
         hash: format!("{:x}", hasher.finalize()),
+        system_hash,
         chars: system.chars().count() + tools_json.chars().count(),
     }
 }
@@ -76,14 +81,22 @@ pub fn assemble(
     let mut had_compaction = false;
     let path = session.context_path();
     let results = ToolResults::index(&path);
+    // Hook context waiting for the user or tool message it attaches to, and
+    // the first message index it may attach to.
+    let mut pending_hooks: Vec<String> = Vec::new();
+    let mut pending_from = 0usize;
 
     for entry in path {
+        attach_pending_hooks(&mut messages, &mut pending_hooks, pending_from);
         match &entry.kind {
             EntryKind::Session(_) | EntryKind::Checkout(_) | EntryKind::Error(_) => {}
             EntryKind::Custom(custom) => {
-                // Hook context is configured, local text. It joins the system
-                // turn so it is visible to the model without pretending to be
-                // a user turn.
+                // Hook context is configured, local text. Context written
+                // once (session start, compaction) joins the system turn.
+                // Context that fires during the session is rendered in place,
+                // on the user or tool message it belongs to: folding it into
+                // the leading system message would rewrite the head of every
+                // later request and defeat the engine's prefix cache.
                 if custom.kind == "hook-context"
                     && let Some(text) = custom.payload.get("text").and_then(|value| value.as_str())
                     && !text.trim().is_empty()
@@ -93,9 +106,33 @@ pub fn assemble(
                         .get("hook")
                         .and_then(|value| value.as_str())
                         .unwrap_or("hook");
-                    messages.push(ChatMessage::System {
-                        content: format!("[hook context: {hook}]\n{text}"),
-                    });
+                    let event = custom
+                        .payload
+                        .get("event")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("session_start");
+                    let block = format!("[hook context: {hook}]\n{text}");
+                    match event {
+                        "session_start" | "pre_compact" => {
+                            messages.push(ChatMessage::System { content: block });
+                        }
+                        // Already part of the tool result the hook ran on.
+                        "pre_tool" | "post_tool" => {}
+                        _ => {
+                            if pending_hooks.is_empty() {
+                                pending_from = messages.len();
+                            }
+                            pending_hooks.push(block);
+                            // Context recorded after the message it is about
+                            // (the last user or tool message) attaches there.
+                            if matches!(
+                                messages.last(),
+                                Some(ChatMessage::User { .. } | ChatMessage::Tool { .. })
+                            ) {
+                                pending_from = messages.len() - 1;
+                            }
+                        }
+                    }
                 }
             }
             EntryKind::Compaction(compaction) => {
@@ -136,6 +173,11 @@ pub fn assemble(
         }
     }
 
+    attach_pending_hooks(&mut messages, &mut pending_hooks, pending_from);
+    if !pending_hooks.is_empty() {
+        messages.push(ChatMessage::user(pending_hooks.join("\n\n")));
+    }
+
     // Folding keeps the logical order (base, summaries in path order, state)
     // while guaranteeing at most one system message, at the front.
     let mut messages = fold_system_messages(messages);
@@ -156,24 +198,56 @@ pub fn assemble(
     assembled
 }
 
-/// Append the post-compaction state block to the leading system message and
-/// update the counts by the difference, so a fixed term a caller already
-/// added (tool schemas) is kept. Lets a caller size the state block from a
-/// finished assembly instead of assembling (and loading images) twice.
+/// Append pending hook context to the first user or tool message at or after
+/// `from`, once one exists.
+fn attach_pending_hooks(messages: &mut [ChatMessage], pending: &mut Vec<String>, from: usize) {
+    if pending.is_empty() {
+        return;
+    }
+    let target = messages
+        .iter_mut()
+        .skip(from)
+        .find(|message| matches!(message, ChatMessage::User { .. } | ChatMessage::Tool { .. }));
+    if let Some(ChatMessage::User { content, .. } | ChatMessage::Tool { content, .. }) = target {
+        for block in pending.drain(..) {
+            content.push_str("\n\n");
+            content.push_str(&block);
+        }
+    }
+}
+
+/// Append the post-compaction state block to the **last** message of the
+/// request and update the counts by the difference, so a fixed term a caller
+/// already added (tool schemas) is kept. Lets a caller size the state block
+/// from a finished assembly instead of assembling (and loading images) twice.
+///
+/// The block changes as the session goes on (changed files, verify status,
+/// the budget band). At the tail a change costs only the bytes after it; in
+/// the leading system message it made the engine re-evaluate the whole
+/// conversation on every call. Nothing is stored: the next assembly attaches
+/// it to the new last message instead.
 pub fn attach_state(assembled: &mut AssembledContext, state: &str, budget: &TokenBudget) {
     if state.trim().is_empty() {
         return;
     }
-    let Some(system) = assembled.messages.first_mut() else {
+    let Some(last) = assembled.messages.last_mut() else {
         return;
     };
-    let before = system.char_len();
-    let ChatMessage::System { content } = system else {
-        return;
-    };
-    content.push_str("\n\n");
-    content.push_str(state);
-    let after = system.char_len();
+    let before = last.char_len();
+    match last {
+        ChatMessage::User { content, .. } | ChatMessage::Tool { content, .. } => {
+            content.push_str("\n\n");
+            content.push_str(state);
+        }
+        // A request ends with a user or tool message; if it does not, keep
+        // the old placement rather than invent a turn.
+        ChatMessage::System { content } => {
+            content.push_str("\n\n");
+            content.push_str(state);
+        }
+        ChatMessage::Assistant { .. } => return,
+    }
+    let after = last.char_len();
     assembled.char_count = assembled.char_count + after - before;
     assembled.estimated_tokens = assembled.estimated_tokens + budget.estimate_char_len(after)
         - budget.estimate_char_len(before);
@@ -845,14 +919,12 @@ mod tests {
             .unwrap();
         let budget = TokenBudget::new(32768, 4096);
         let assembled = assemble("system", &session, Some("STATE"), &budget);
-        assert_leading_system(
-            &assembled.messages,
-            "system\n\n[localharness] summary\n\nSTATE",
-        );
+        // The state block rides on the last message, not the system head.
+        assert_leading_system(&assembled.messages, "system\n\n[localharness] summary");
         assert_eq!(assembled.messages.len(), 2); // system, user
         assert!(matches!(
             &assembled.messages[1],
-            ChatMessage::User { content, .. } if content == "new"
+            ChatMessage::User { content, .. } if content == "new\n\nSTATE"
         ));
     }
 
@@ -940,10 +1012,11 @@ mod tests {
             .unwrap();
         let budget = TokenBudget::new(32768, 4096);
         let assembled = assemble("system", &session, Some("STATE"), &budget);
-        assert_leading_system(
-            &assembled.messages,
-            "system\n\n[localharness] summary\n\nSTATE",
-        );
+        assert_leading_system(&assembled.messages, "system\n\n[localharness] summary");
+        assert!(matches!(
+            assembled.messages.last(),
+            Some(ChatMessage::User { content, .. }) if content == "next\n\nSTATE"
+        ));
         let roles: Vec<&str> = assembled
             .messages
             .iter()
@@ -1093,7 +1166,7 @@ mod tests {
         assert_eq!(assembled.messages.len(), 2);
         assert!(matches!(
             &assembled.messages[1],
-            ChatMessage::User { content, .. } if content == COMPACTED_CONTINUE
+            ChatMessage::User { content, .. } if content == &format!("{COMPACTED_CONTINUE}\n\nSTATE")
         ));
     }
 
