@@ -15,6 +15,7 @@ pub mod external;
 pub mod git;
 pub mod hooks;
 pub mod host;
+pub mod html_text;
 pub mod mcp;
 pub mod media;
 pub mod paths;
