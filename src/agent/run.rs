@@ -1920,7 +1920,6 @@ struct ThreadSplit {
     kickoff: Option<String>,
 }
 
-#[allow(clippy::too_many_arguments, clippy::unnecessary_unwrap)]
 /// Arguments as the loop guard compares them: a `read` of the same path set
 /// in a different order is the same call.
 fn guard_args(name: &str, args: &Value) -> Value {
@@ -1933,6 +1932,7 @@ fn guard_args(name: &str, args: &Value) -> Value {
     args
 }
 
+#[allow(clippy::too_many_arguments, clippy::unnecessary_unwrap)]
 async fn execute_batch(
     core: &std::sync::Arc<Core>,
     tx: &UnboundedSender<AgentEvent>,
