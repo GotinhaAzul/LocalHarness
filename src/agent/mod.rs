@@ -83,6 +83,9 @@ pub struct Core {
     /// Prompt limit observed from a server that silently truncates (0 when
     /// none was seen). Shared across turns; reset when the core is rebuilt.
     pub server_window: Arc<std::sync::atomic::AtomicU32>,
+    /// Whether this endpoint's usage reports can be trusted; see
+    /// [`run::UsageCheck`].
+    pub usage_check: Arc<std::sync::Mutex<run::UsageCheck>>,
     /// Where `budget.context_window` came from.
     pub window_source: WindowSource,
     /// Trained, allocated, per-slot, and effective context values with their

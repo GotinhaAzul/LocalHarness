@@ -678,6 +678,13 @@ async fn run_doctor(config: &Config, paths: &Paths, json: bool, fix: bool) -> Re
         manifest.tool_dialect = cached.mode.clone();
         manifest.tool_probe = Some(cached);
     }
+    let usage_key = crate::provider::probe::tool_probe_key(&provider, None);
+    if let Some(message) = crate::doctor::load_usage_mismatch(
+        &paths.data_dir.join(crate::doctor::USAGE_MISMATCH_CACHE),
+        &usage_key,
+    ) {
+        manifest.note_usage_mismatch(message);
+    }
     if json {
         println!("{}", manifest.to_json_pretty());
     } else {

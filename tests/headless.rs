@@ -379,9 +379,20 @@ async fn endpoint_down_is_prescriptive() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     drop(listener);
+    // Keep the in-turn retries short; their count is part of the message.
+    std::fs::create_dir_all(&env.config_dir).unwrap();
+    std::fs::write(
+        env.config_dir.join("config.toml"),
+        "[model]\nretry_backoff_ms = 10\n",
+    )
+    .unwrap();
     let output = run_lh(&env, &base, &["--print", "hi"]).await;
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_ne!(output.status.code(), Some(0));
+    assert!(
+        stderr.contains("gave up after 4 attempts"),
+        "stderr: {stderr}"
+    );
     assert!(
         stderr.to_ascii_lowercase().contains("connect")
             || stderr.to_ascii_lowercase().contains("cannot reach")
@@ -434,11 +445,12 @@ async fn print_refuses_when_the_static_prompt_cannot_fit() {
 }
 
 #[tokio::test]
-async fn print_stops_a_truncated_turn_without_replaying_the_reply() {
+async fn print_keeps_the_reply_when_the_usage_report_is_implausible() {
     let (base, fake) = spawn_truncating().await;
     let env = env();
     // A large project instruction block pushes the prompt past the shortfall
-    // threshold; the fake server then claims only 12 prompt tokens.
+    // threshold; the fake server then claims only 12 prompt tokens. No engine
+    // truncates to 12 tokens: the usage report is wrong, not the prompt.
     std::fs::write(
         env.cwd.join("AGENTS.md"),
         "project conventions\n".repeat(700),
@@ -448,20 +460,22 @@ async fn print_stops_a_truncated_turn_without_replaying_the_reply() {
     let output = run_lh(&env, &base, &["--print", "hi", "--json"]).await;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(output.status.code(), Some(2), "stderr: {stderr}");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {stderr}\nstdout: {stdout}"
+    );
     assert!(
-        stdout
+        !stdout
             .lines()
             .any(|line| line.contains("\"code\":\"context_truncated\"")),
         "stdout: {stdout}"
     );
-    assert!(
-        stdout
-            .lines()
-            .any(|line| line.contains("\"status\":\"ContextTruncated\"")),
-        "stdout: {stdout}"
-    );
-    // The turn stopped instead of retrying on the corrupted branch.
+    let warnings = stdout
+        .lines()
+        .filter(|line| line.contains("usage report is unreliable"))
+        .count();
+    assert_eq!(warnings, 1, "stdout: {stdout}");
     assert_eq!(fake.requests.load(Ordering::SeqCst), 1);
 }
 

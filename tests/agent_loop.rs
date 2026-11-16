@@ -415,6 +415,7 @@ fn build_core_in_mode(
         tool_timeout: std::time::Duration::from_secs(10),
         path_jail: false,
         server_window: Default::default(),
+        usage_check: Default::default(),
         window_source: localharness::agent::WindowSource::Default,
         window_truth: None,
         window_notice: None,
@@ -4877,4 +4878,59 @@ async fn cancelling_during_a_backoff_stops_at_once() {
     let outcome = turn.await.unwrap();
     assert!(cancelled_at.elapsed() < std::time::Duration::from_millis(100));
     assert_eq!(outcome.status, TurnStatus::Cancelled);
+}
+
+fn reply_with_usage(text: &str, usage: Usage) -> Script {
+    Script::Events(vec![
+        StreamEvent::Delta(text.into()),
+        StreamEvent::Finish("stop".into()),
+        StreamEvent::Usage(usage),
+    ])
+}
+
+#[tokio::test]
+async fn an_implausible_prompt_token_report_keeps_the_reply_and_warns_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness(
+        dir.path(),
+        vec![
+            reply_with_usage("first answer", Usage::new(10, 4)),
+            reply_with_usage("second answer", Usage::new(10, 4)),
+        ],
+        &["read"],
+    );
+    let prompt = "Explain this log.\n".repeat(1200);
+    let (outcome, events) = run(&harness, &prompt).await;
+    assert_eq!(outcome.status, TurnStatus::Done, "{:?}", outcome.error);
+    assert_eq!(last_assistant(&harness.session), "first answer");
+    let warnings = |events: &[AgentEvent]| {
+        events
+            .iter()
+            .filter(
+                |e| matches!(e, AgentEvent::Notice(n) if n.contains("usage report is unreliable")),
+            )
+            .count()
+    };
+    assert_eq!(warnings(&events), 1);
+    assert!(error_entries(&harness.session).is_empty());
+    // The next turn is not flagged again.
+    let (outcome, events) = run(&harness, &prompt).await;
+    assert_eq!(outcome.status, TurnStatus::Done);
+    assert_eq!(warnings(&events), 0);
+}
+
+#[tokio::test]
+async fn uncached_only_usage_reports_are_not_truncation() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut usage = Usage::new(600, 4);
+    usage.cached_tokens = Some(5200);
+    let harness = harness(dir.path(), vec![reply_with_usage("fine", usage)], &["read"]);
+    let prompt = "Explain this log.\n".repeat(1200);
+    let (outcome, events) = run(&harness, &prompt).await;
+    assert_eq!(outcome.status, TurnStatus::Done, "{:?}", outcome.error);
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Guard { code, .. } if code == "context_truncated"))
+    );
 }

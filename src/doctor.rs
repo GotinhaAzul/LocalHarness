@@ -51,6 +51,11 @@ pub struct DoctorManifest {
     pub probes_failed: Vec<String>,
     pub warnings: Vec<String>,
     pub fixes: Vec<String>,
+    /// The last time the runtime found this endpoint's `usage.prompt_tokens`
+    /// wrong (against `/tokenize`, or implausibly small). `lh doctor` sends
+    /// no chat completion, so it reports what a session observed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_report: Option<String>,
 }
 
 impl DoctorManifest {
@@ -386,7 +391,14 @@ impl DoctorManifest {
             probes_failed,
             warnings,
             fixes,
+            usage_report: None,
         }
+    }
+
+    /// Attach a usage-report mismatch a session recorded for this endpoint.
+    pub fn note_usage_mismatch(&mut self, message: String) {
+        self.warnings.push(format!("usage report: {message}"));
+        self.usage_report = Some(message);
     }
 
     /// Warn when the active model profile asks for a sampler the engine does
@@ -684,6 +696,36 @@ fn join_or_none(values: &[String]) -> String {
     }
 }
 
+/// File the runtime writes when an endpoint's usage report proves wrong.
+pub const USAGE_MISMATCH_CACHE: &str = "usage-mismatch-cache.json";
+
+/// Record that the endpoint at `key` reported unreliable prompt tokens.
+pub fn store_usage_mismatch(
+    path: &std::path::Path,
+    key: &str,
+    message: &str,
+) -> std::io::Result<()> {
+    let mut cache: std::collections::BTreeMap<String, String> = std::fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default();
+    cache.insert(key.to_string(), message.to_string());
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let bytes = serde_json::to_vec_pretty(&cache).map_err(std::io::Error::other)?;
+    let temporary = path.with_extension("json.tmp");
+    std::fs::write(&temporary, bytes)?;
+    std::fs::rename(&temporary, path)
+}
+
+/// The recorded mismatch for `key`, if any.
+pub fn load_usage_mismatch(path: &std::path::Path, key: &str) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    let cache: std::collections::BTreeMap<String, String> = serde_json::from_slice(&bytes).ok()?;
+    cache.get(key).cloned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -727,7 +769,28 @@ mod tests {
             fixes: vec![
                 "llama.cpp: llama-server -m <model> --jinja --ctx-size 65536 --port 8080".into(),
             ],
+            usage_report: None,
         }
+    }
+
+    #[test]
+    fn a_recorded_usage_mismatch_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(USAGE_MISMATCH_CACHE);
+        assert!(load_usage_mismatch(&path, "key").is_none());
+        store_usage_mismatch(&path, "key", "reported 10, tokenizer counts 6000").unwrap();
+        let message = load_usage_mismatch(&path, "key").expect("stored");
+        assert!(load_usage_mismatch(&path, "other").is_none());
+        let mut manifest = sample_manifest();
+        manifest.note_usage_mismatch(message);
+        assert!(
+            manifest
+                .to_text()
+                .contains("usage report: reported 10, tokenizer counts 6000"),
+            "{}",
+            manifest.to_text()
+        );
+        assert!(manifest.to_json_pretty().contains("\"usage_report\""));
     }
 
     #[test]
@@ -1037,3 +1100,4 @@ mod tests {
         );
     }
 }
+

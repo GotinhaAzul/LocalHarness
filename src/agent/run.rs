@@ -855,8 +855,65 @@ async fn run_loop(
             }
         }
 
-        if let Some(signal) = detect_truncation(&mut budget, &assistant, assembled.estimated_tokens)
-        {
+        let signal = match detect_truncation(&mut budget, &assistant, assembled.estimated_tokens) {
+            Some(signal) => {
+                let exact = if signal.kind == SignalKind::Engine {
+                    None
+                } else {
+                    exact_prompt_tokens(core, &assembled).await
+                };
+                let mut check = core.usage_check.lock().expect("usage check lock");
+                let verdict = judge_truncation(
+                    signal,
+                    assistant.usage.as_ref(),
+                    assembled.estimated_tokens,
+                    exact,
+                    &budget,
+                    &mut check,
+                );
+                let warn = |check: &mut UsageCheck, code: &str, message: String| {
+                    if !check.warned {
+                        check.warned = true;
+                        append_custom(&core.session, code, json!({"message": message}));
+                        let _ = tx.send(AgentEvent::Notice(message));
+                    }
+                };
+                match verdict {
+                    TruncationVerdict::Confirmed(signal) => Some(signal),
+                    TruncationVerdict::UsageUnreliable(message) => {
+                        // `lh doctor` reports what the session observed.
+                        let key =
+                            crate::provider::probe::tool_probe_key(core.provider.as_ref(), None);
+                        if let Err(error) = crate::doctor::store_usage_mismatch(
+                            &core
+                                .paths
+                                .data_dir
+                                .join(crate::doctor::USAGE_MISMATCH_CACHE),
+                            &key,
+                            &message,
+                        ) {
+                            tracing::warn!(%error, "cannot record the usage mismatch");
+                        }
+                        // Always worth one notice, even after a suspicion.
+                        check.warned = false;
+                        warn(&mut check, "usage-unreliable", message);
+                        None
+                    }
+                    TruncationVerdict::Suspected(message) => {
+                        warn(&mut check, "truncation-suspected", message);
+                        None
+                    }
+                    TruncationVerdict::Dismissed => None,
+                }
+            }
+            None => {
+                if let Ok(mut check) = core.usage_check.lock() {
+                    check.shortfall_streak = 0;
+                }
+                None
+            }
+        };
+        if let Some(signal) = signal {
             // A reply written against a prompt the server cut is not
             // trustworthy: do not append it, and do not continue this branch
             // silently.
@@ -1345,10 +1402,122 @@ fn static_prompt_warning(static_prompt: &StaticPrompt, budget: &TokenBudget) -> 
     ))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct TruncationSignal {
     source: String,
     limit: Option<u32>,
     prompt_tokens: Option<u32>,
+    kind: SignalKind,
+}
+
+/// How much a truncation signal proves on its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SignalKind {
+    /// The engine said so (`truncated=true`, a context shift).
+    Engine,
+    /// More characters per reported token than any real text has.
+    Ratio,
+    /// The reported count is well under the harness estimate.
+    Shortfall,
+}
+
+/// What the loop does with a truncation signal after looking for a second
+/// witness.
+#[derive(Debug, Clone, PartialEq)]
+enum TruncationVerdict {
+    /// End the turn: the prompt was cut.
+    Confirmed(TruncationSignal),
+    /// The usage report, not the prompt, is wrong: keep the reply, warn once
+    /// and stop learning from usage on this endpoint.
+    UsageUnreliable(String),
+    /// Not confirmed yet: keep the reply, warn once naming both
+    /// explanations.
+    Suspected(String),
+    /// Explained (uncached-only report, or the estimate was off).
+    Dismissed,
+}
+
+/// Fewest prompt tokens a real truncation leaves. Engines cut at their
+/// window (2048 at the smallest common default), not at a handful of tokens;
+/// a lower report is a broken usage field.
+const MIN_PLAUSIBLE_TRUNCATED_PROMPT: u32 = 512;
+
+/// Usage-report health for one endpoint, shared across turns.
+#[derive(Debug, Default)]
+pub struct UsageCheck {
+    /// The endpoint's `prompt_tokens` disagreed with its own tokenizer or was
+    /// implausible: usage no longer calibrates or flags truncation.
+    pub unreliable: bool,
+    /// Consecutive calls with an unconfirmed shortfall.
+    pub shortfall_streak: u32,
+    /// The one-time notice was shown.
+    pub warned: bool,
+}
+
+/// Look for a second witness before ending a turn on arithmetic.
+///
+/// The engine's own flags are proof. A ratio or shortfall is a suspicion: an
+/// uncached-only report (`prompt_tokens + cached_tokens` covers the prompt)
+/// explains it; `/tokenize` decides between a cut prompt (the exact count
+/// exceeds the window) and a wrong report (it fits); a count no engine would
+/// truncate to is a wrong report; a physically impossible text density with a
+/// plausible count is a cut; a plain shortfall must repeat on the next call.
+fn judge_truncation(
+    signal: TruncationSignal,
+    usage: Option<&Usage>,
+    estimated_tokens: u32,
+    exact_tokens: Option<u32>,
+    budget: &TokenBudget,
+    check: &mut UsageCheck,
+) -> TruncationVerdict {
+    if signal.kind == SignalKind::Engine {
+        return TruncationVerdict::Confirmed(signal);
+    }
+    if check.unreliable {
+        return TruncationVerdict::Dismissed;
+    }
+    let reported = usage.map(|usage| usage.prompt_tokens).unwrap_or(0);
+    let short = |count: u32| {
+        estimated_tokens.saturating_sub(count) > budget.safety_margin
+            && count < estimated_tokens * 3 / 4
+    };
+    if let Some(cached) = usage.and_then(|usage| usage.cached_tokens)
+        && cached > 0
+        && !short(reported.saturating_add(cached))
+    {
+        return TruncationVerdict::Dismissed;
+    }
+    if let Some(exact) = exact_tokens {
+        if exact > budget.context_window {
+            return TruncationVerdict::Confirmed(signal);
+        }
+        let disagrees =
+            exact.saturating_sub(reported) > budget.safety_margin && reported < exact * 3 / 4;
+        if disagrees {
+            check.unreliable = true;
+            return TruncationVerdict::UsageUnreliable(format!(
+                "the server reported {reported} prompt tokens, but its own tokenizer counts {exact} for this prompt, which fits the {}-token window. The usage report is wrong, not the prompt; the reply was kept and usage is no longer used to calibrate the estimate on this endpoint.",
+                budget.context_window
+            ));
+        }
+        return TruncationVerdict::Dismissed;
+    }
+    if reported < MIN_PLAUSIBLE_TRUNCATED_PROMPT {
+        check.unreliable = true;
+        return TruncationVerdict::UsageUnreliable(format!(
+            "the server reported {reported} prompt tokens for a prompt the harness estimates at {estimated_tokens}. No engine truncates to that, so the usage report is unreliable; the reply was kept and usage is no longer used to calibrate the estimate on this endpoint. `lh doctor` compares the report with the tokenizer."
+        ));
+    }
+    if signal.kind == SignalKind::Ratio {
+        return TruncationVerdict::Confirmed(signal);
+    }
+    check.shortfall_streak += 1;
+    if check.shortfall_streak >= 2 {
+        return TruncationVerdict::Confirmed(signal);
+    }
+    TruncationVerdict::Suspected(format!(
+        "the server counted {reported} prompt tokens for a prompt the harness estimates at {estimated_tokens}. Either the server truncated the prompt (raise the engine context) or its usage report is unreliable; run `lh doctor` to compare it with the tokenizer. The turn continues; a second shortfall in a row ends it."
+    ))
 }
 
 impl TruncationSignal {
@@ -1389,6 +1558,7 @@ fn detect_truncation(
                 .into(),
             limit: Some(limit),
             prompt_tokens: assistant.usage.as_ref().map(|usage| usage.prompt_tokens),
+            kind: SignalKind::Ratio,
         });
     }
     let usage = assistant.usage.as_ref()?;
@@ -1397,6 +1567,7 @@ fn detect_truncation(
             source: "the engine reported truncated=true".into(),
             limit: Some(usage.prompt_tokens).filter(|tokens| *tokens > 0),
             prompt_tokens: Some(usage.prompt_tokens),
+            kind: SignalKind::Engine,
         });
     }
     if usage.context_shift.unwrap_or(0) > 0 {
@@ -1407,6 +1578,7 @@ fn detect_truncation(
             ),
             limit: None,
             prompt_tokens: Some(usage.prompt_tokens),
+            kind: SignalKind::Engine,
         });
     }
     if usage.prompt_tokens > 0 && estimated_tokens >= 2_048 {
@@ -1422,6 +1594,7 @@ fn detect_truncation(
                 ),
                 limit: None,
                 prompt_tokens: Some(usage.prompt_tokens),
+                kind: SignalKind::Shortfall,
             });
         }
     }
@@ -1796,6 +1969,12 @@ async fn stream_assistant(
     let mut accum = StreamAccum::new();
     accum.strip_reasoning = core.model_profile.strip_reasoning();
     let mut failure: Option<ProviderError> = None;
+    // An endpoint whose usage report proved wrong teaches nothing.
+    let calibrate = !core
+        .usage_check
+        .lock()
+        .map(|check| check.unreliable)
+        .unwrap_or(false);
     while let Some(item) = erx.recv().await {
         if let Some(err) = handle_stream_item(
             item,
@@ -1805,6 +1984,7 @@ async fn stream_assistant(
             estimated_tokens,
             char_count,
             tool_specs_cost,
+            calibrate,
             cancel,
         ) {
             failure = Some(err);
@@ -1851,6 +2031,7 @@ fn handle_stream_item(
     estimated_tokens: u32,
     char_count: usize,
     tool_specs_cost: ToolSpecCost,
+    calibrate: bool,
     cancel: &CancellationToken,
 ) -> Option<ProviderError> {
     if cancel.is_cancelled() {
@@ -1884,7 +2065,7 @@ fn handle_stream_item(
             None
         }
         Ok(StreamEvent::Usage(usage)) => {
-            if usage.prompt_tokens > 0 {
+            if usage.prompt_tokens > 0 && calibrate {
                 // The schemas have their own fixed price; learn the prose
                 // ratio from the rest of the request only.
                 budget.calibrate_with_fixed(char_count, usage.prompt_tokens, tool_specs_cost);
@@ -3874,6 +4055,7 @@ mod tests {
             tool_timeout: std::time::Duration::from_secs(10),
             path_jail: false,
             server_window: Default::default(),
+            usage_check: Default::default(),
             window_source: WindowSource::Default,
             window_truth: None,
             window_notice: None,
@@ -4127,6 +4309,113 @@ mod tests {
             ..AssistantData::default()
         };
         assert!(detect_truncation(&mut budget, &assistant, 4000).is_none());
+    }
+
+    fn signal(kind: SignalKind) -> TruncationSignal {
+        TruncationSignal {
+            source: "test".into(),
+            limit: None,
+            prompt_tokens: None,
+            kind,
+        }
+    }
+
+    #[test]
+    fn arithmetic_truncation_needs_a_second_witness() {
+        let budget = TokenBudget::new(32_768, 4096);
+        let usage = |prompt: u32, cached: Option<u32>| Usage {
+            prompt_tokens: prompt,
+            cached_tokens: cached,
+            ..Usage::default()
+        };
+        let judge = |kind, usage: &Usage, exact, check: &mut UsageCheck| {
+            judge_truncation(signal(kind), Some(usage), 6000, exact, &budget, check)
+        };
+
+        // Engine flags are proof, even on an endpoint marked unreliable.
+        let mut check = UsageCheck {
+            unreliable: true,
+            ..UsageCheck::default()
+        };
+        assert!(matches!(
+            judge(SignalKind::Engine, &usage(100, None), None, &mut check),
+            TruncationVerdict::Confirmed(_)
+        ));
+
+        // An implausible count is a broken report, not a cut.
+        let mut check = UsageCheck::default();
+        assert!(matches!(
+            judge(SignalKind::Ratio, &usage(10, None), None, &mut check),
+            TruncationVerdict::UsageUnreliable(_)
+        ));
+        assert!(check.unreliable);
+        assert_eq!(
+            judge(SignalKind::Ratio, &usage(10, None), None, &mut check),
+            TruncationVerdict::Dismissed
+        );
+
+        // Uncached-only reporting is explained by cached_tokens.
+        let mut check = UsageCheck::default();
+        assert_eq!(
+            judge(
+                SignalKind::Shortfall,
+                &usage(900, Some(5000)),
+                None,
+                &mut check
+            ),
+            TruncationVerdict::Dismissed
+        );
+
+        // The tokenizer decides: fits the window -> wrong report; exceeds
+        // it -> a real cut; agrees with the server -> the estimate was off.
+        let mut check = UsageCheck::default();
+        assert!(matches!(
+            judge(
+                SignalKind::Shortfall,
+                &usage(1500, None),
+                Some(5900),
+                &mut check
+            ),
+            TruncationVerdict::UsageUnreliable(_)
+        ));
+        let mut check = UsageCheck::default();
+        assert!(matches!(
+            judge(
+                SignalKind::Shortfall,
+                &usage(1500, None),
+                Some(40_000),
+                &mut check
+            ),
+            TruncationVerdict::Confirmed(_)
+        ));
+        let mut check = UsageCheck::default();
+        assert_eq!(
+            judge(
+                SignalKind::Shortfall,
+                &usage(1500, None),
+                Some(1550),
+                &mut check
+            ),
+            TruncationVerdict::Dismissed
+        );
+
+        // A plausible count with impossible text density is a cut.
+        let mut check = UsageCheck::default();
+        assert!(matches!(
+            judge(SignalKind::Ratio, &usage(2000, None), None, &mut check),
+            TruncationVerdict::Confirmed(_)
+        ));
+
+        // A plain shortfall must repeat.
+        let mut check = UsageCheck::default();
+        assert!(matches!(
+            judge(SignalKind::Shortfall, &usage(2000, None), None, &mut check),
+            TruncationVerdict::Suspected(_)
+        ));
+        assert!(matches!(
+            judge(SignalKind::Shortfall, &usage(2000, None), None, &mut check),
+            TruncationVerdict::Confirmed(_)
+        ));
     }
 
     #[test]
