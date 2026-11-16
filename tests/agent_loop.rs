@@ -271,6 +271,8 @@ fn base_config() -> Config {
     config.model.context_window = Some(65_536);
     // Transient-failure retries back off in milliseconds under test.
     config.model.retry_backoff_ms = 1;
+    // The existing settle tests script the model's verify/review calls.
+    config.gates.auto_settle = false;
     config.profiles.insert(
         "test".into(),
         ProfileConfig {
@@ -4985,4 +4987,165 @@ async fn no_todo_notice_once_a_plan_exists() {
         results.iter().all(|r| !r.contains(TODO_NOTICE)),
         "{results:?}"
     );
+}
+
+fn git(dir: &std::path::Path, args: &[&str]) {
+    let status = std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_AUTHOR_NAME", "t")
+        .env("GIT_AUTHOR_EMAIL", "t@example.com")
+        .env("GIT_COMMITTER_NAME", "t")
+        .env("GIT_COMMITTER_EMAIL", "t@example.com")
+        .status()
+        .expect("git");
+    assert!(status.success(), "git {args:?}");
+}
+
+/// A git repository with one committed file, and a config whose settle checks
+/// the harness runs itself.
+fn auto_settle_harness(dir: &std::path::Path, scripts: Vec<Script>, verify: &str) -> Harness {
+    git(dir, &["init", "-q"]);
+    std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+    git(dir, &["add", "."]);
+    git(dir, &["commit", "-qm", "init"]);
+    let mut config = base_config();
+    config.gates.auto_settle = true;
+    config.profiles.get_mut("test").expect("test profile").tools =
+        ["read", "edit", "write", "verify", "review"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+    config.verify = VerifyConfig {
+        steps: vec![VerifyStep {
+            name: "check".into(),
+            command: vec!["sh".into(), "-c".into(), verify.into()],
+            timeout_secs: 5,
+        }],
+    };
+    harness_config(dir, scripts, config)
+}
+
+fn custom_kinds(session: &SessionHandle, kind: &str) -> usize {
+    let session = session.lock().unwrap();
+    session
+        .branch_entries()
+        .iter()
+        .filter(|entry| matches!(&entry.kind, EntryKind::Custom(c) if c.kind == kind))
+        .count()
+}
+
+#[tokio::test]
+async fn auto_settle_runs_verify_and_review_without_extra_model_calls() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = auto_settle_harness(
+        dir.path(),
+        vec![
+            call_script("c1", "write", json!({"path":"b.txt","content":"two\n"})),
+            text_script("changed a.txt"),
+        ],
+        "true",
+    );
+    let (outcome, events) = run(&harness, "change a.txt").await;
+    assert_eq!(outcome.status, TurnStatus::Done, "{:?}", outcome.error);
+    // The edit, then the final answer: no relay calls for verify or review.
+    assert_eq!(harness.provider.requests.lock().unwrap().len(), 2);
+    assert_eq!(last_assistant(&harness.session), "changed a.txt");
+    assert_eq!(custom_kinds(&harness.session, "verify-result"), 1);
+    assert_eq!(custom_kinds(&harness.session, "review-result"), 1);
+    assert!(events.iter().any(|e| matches!(e,
+        AgentEvent::Notice(n) if n == "[harness] verify passed, review clean")));
+    assert!(events.iter().any(|e| matches!(e,
+        AgentEvent::ToolStarted { name, summary, .. } if name == "verify" && summary.contains("harness"))));
+    // No orphan tool result: every result pairs with a model call.
+    let session = harness.session.lock().unwrap();
+    assert!(localharness::context::validate_tool_pairs(&session).is_ok());
+}
+
+#[tokio::test]
+async fn a_failing_harness_verify_continues_once_with_the_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = auto_settle_harness(
+        dir.path(),
+        vec![
+            call_script("c1", "write", json!({"path":"b.txt","content":"broken\n"})),
+            text_script("done"),
+            call_script(
+                "c2",
+                "edit",
+                json!({"path":"b.txt","old":"broken","new":"fixed"}),
+            ),
+            text_script("fixed it"),
+        ],
+        "grep -q broken b.txt && { echo 'check failed: b.txt is broken'; exit 1; } || exit 0",
+    );
+    let (outcome, _) = run(&harness, "change a.txt").await;
+    assert_eq!(outcome.status, TurnStatus::Done, "{:?}", outcome.error);
+    assert_eq!(harness.provider.requests.lock().unwrap().len(), 4);
+    let nudges: Vec<String> = user_messages(&harness.session)
+        .into_iter()
+        .filter(|m| m.starts_with("[localharness] settle checks"))
+        .collect();
+    assert_eq!(nudges.len(), 1, "{nudges:?}");
+    assert!(nudges[0].contains("verify FAILED"), "{}", nudges[0]);
+    assert!(nudges[0].contains("b.txt is broken"), "{}", nudges[0]);
+    assert_eq!(last_assistant(&harness.session), "fixed it");
+}
+
+#[tokio::test]
+async fn a_flagged_harness_review_reaches_the_model_with_the_verify_result() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = auto_settle_harness(
+        dir.path(),
+        vec![
+            call_script("c0", "read", json!({"path":"a.txt"})),
+            call_script(
+                "c1",
+                "edit",
+                json!({"path":"a.txt","old":"one","new":"one // TODO"}),
+            ),
+            text_script("done"),
+            text_script("left the marker on purpose"),
+        ],
+        "true",
+    );
+    let (outcome, _) = run(&harness, "change a.txt").await;
+    assert_eq!(outcome.status, TurnStatus::Done, "{:?}", outcome.error);
+    let nudge = user_messages(&harness.session)
+        .into_iter()
+        .find(|m| m.starts_with("[localharness] settle checks"))
+        .expect("continuation");
+    assert!(nudge.contains("verify passed"), "{nudge}");
+    assert!(nudge.contains("review flagged"), "{nudge}");
+    // Review runs once; the second answer settles.
+    assert_eq!(harness.provider.requests.lock().unwrap().len(), 4);
+}
+
+#[tokio::test]
+async fn harness_settle_checks_fire_tool_hooks() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = auto_settle_harness(dir.path(), Vec::new(), "true");
+    // Rebuild with hooks on both tool events.
+    let mut config = base.core.config.clone();
+    config.hooks.entries.insert(
+        "pre".into(),
+        hook_config(HookEvent::PreTool, "context.sh", 5),
+    );
+    config.hooks.entries.insert(
+        "post".into(),
+        hook_config(HookEvent::PostTool, "context.sh", 5),
+    );
+    let harness = harness_config(
+        dir.path(),
+        vec![
+            call_script("c1", "write", json!({"path":"b.txt","content":"two\n"})),
+            text_script("done"),
+        ],
+        config,
+    );
+    let (outcome, _) = run(&harness, "change b.txt").await;
+    assert_eq!(outcome.status, TurnStatus::Done, "{:?}", outcome.error);
+    // The model's write, then the harness's verify and review.
+    assert_eq!(hook_invocations(&harness.session, "pre_tool").len(), 3);
+    assert_eq!(hook_invocations(&harness.session, "post_tool").len(), 3);
 }

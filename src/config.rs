@@ -34,6 +34,8 @@ pub struct Config {
     pub verify: VerifyConfig,
     /// When file mutations pause for interactive hunk review.
     pub review: ReviewMode,
+    /// Settle gates (`[gates]`).
+    pub gates: GatesConfig,
     /// Lifecycle hooks, keyed by hook name (`[hooks.<name>]`).
     pub hooks: HooksConfig,
     /// Model Context Protocol servers, keyed by server name (`[mcp.<name>]`).
@@ -57,6 +59,22 @@ pub struct Config {
     /// True when the user passed `--sandbox` or `--no-sandbox`.
     #[serde(skip)]
     pub sandbox_explicit: bool,
+}
+
+/// Settle-gate behavior.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GatesConfig {
+    /// Run verify and review from the harness when the model tries to settle,
+    /// instead of asking the model to call them. A clean result settles on
+    /// the answer already written; a failure continues with one message.
+    pub auto_settle: bool,
+}
+
+impl Default for GatesConfig {
+    fn default() -> Self {
+        Self { auto_settle: true }
+    }
 }
 
 /// How strictly `bash` and `bg` are isolated from the host.

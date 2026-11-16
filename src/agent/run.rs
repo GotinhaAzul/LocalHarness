@@ -1083,6 +1083,43 @@ async fn run_loop(
                 }
                 return TurnOutcome::ok(TurnStatus::Done);
             }
+            // Auto-settle: run verify and review here instead of asking the
+            // model to relay them. Clean results settle on the answer the
+            // model already wrote; a failure or a flagged review continues
+            // with one message that carries both results.
+            let mut facts = facts;
+            if core.config.gates.auto_settle
+                && core.permissions.mode() != crate::policy::PermissionMode::Plan
+            {
+                let checks = gates::auto_checks(&facts, &progress, gate_tools);
+                if checks.verify || checks.review {
+                    let caps = context::ResultCaps::for_usable_prompt(budget.usable_prompt())
+                        .with_overrides(
+                            core.config.budgets.result_cap_chars,
+                            core.config.budgets.batch_cap_chars,
+                        );
+                    let outcome = auto_settle(core, tx, cancel, &mut progress, checks, caps).await;
+                    if cancel.is_cancelled() {
+                        append_error(&core.session, "cancelled", "settle checks cancelled", true);
+                        return TurnOutcome::ok(TurnStatus::Cancelled);
+                    }
+                    match outcome {
+                        Some(message) if progress.can_continue_settle() => {
+                            progress.settle_continuations += 1;
+                            if let Err(err) = append_user(&core.session, &message) {
+                                return TurnOutcome::error("session_write", err.to_string());
+                            }
+                            continue;
+                        }
+                        _ => {}
+                    }
+                    facts = gates::analyze_turn_since(
+                        &core.session.lock().expect("session lock"),
+                        verify_configured,
+                        turn_start.as_deref(),
+                    );
+                }
+            }
             match gates::settle(&facts, &mut progress, gate_tools) {
                 SettleDecision::Done => {
                     if gate_tools.verify
@@ -2148,6 +2185,224 @@ fn mutation_call_indexes(calls: &[ToolCall], active: &[&str]) -> Vec<usize> {
 
 struct ThreadSplit {
     kickoff: Option<String>,
+}
+
+/// Run the settle checks the harness owns ([`gates::AutoChecks`]). Returns
+/// `None` when everything that ran is clean, or the one continuation message
+/// for the model when verify failed or review flagged a risk.
+async fn auto_settle(
+    core: &std::sync::Arc<Core>,
+    tx: &UnboundedSender<AgentEvent>,
+    cancel: &CancellationToken,
+    progress: &mut RunProgress,
+    checks: gates::AutoChecks,
+    caps: context::ResultCaps,
+) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    let mut clean: Vec<&str> = Vec::new();
+    let mut failed = false;
+    if checks.verify {
+        progress.verify_attempts += 1;
+        let result = run_settle_check(core, tx, cancel, "verify", caps).await?;
+        let passed = !result.is_error
+            && result
+                .details
+                .as_ref()
+                .and_then(|details| details.pointer("/session/0/passed"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+        if passed {
+            clean.push("verify passed");
+        } else {
+            failed = true;
+            parts.push(format!(
+                "verify FAILED (run by the harness after your last change):\n{}",
+                result.content
+            ));
+        }
+    }
+    if checks.review && !failed {
+        progress.review_nudged = true;
+        let result = run_settle_check(core, tx, cancel, "review", caps).await?;
+        let findings = result
+            .details
+            .as_ref()
+            .and_then(|details| details.get("findings"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        if result.is_error {
+            // Not a repository, or a rule or hook refused it: nothing to
+            // act on, and not a reason to hold the answer back.
+            clean.push("review skipped");
+        } else if findings > 0 {
+            failed = true;
+            parts.push(format!(
+                "review flagged {findings} risk(s) (run by the harness):\n{}",
+                result.content
+            ));
+        } else {
+            clean.push("review clean");
+        }
+    }
+    if !failed {
+        if !clean.is_empty() {
+            let _ = tx.send(AgentEvent::Notice(format!(
+                "[harness] {}",
+                clean.join(", ")
+            )));
+        }
+        return None;
+    }
+    if !clean.is_empty() {
+        parts.insert(0, clean.join(", "));
+    }
+    Some(format!(
+        "[localharness] settle checks: {}\n\nFix what failed, then finish; the checks run again when you do.",
+        parts.join("\n\n")
+    ))
+}
+
+/// Run one settle check (`verify` or `review`) as the harness: permission
+/// rules and `pre_tool`/`post_tool` hooks apply exactly as for a model call,
+/// its session entries (`verify-result`) are recorded the same way, and a
+/// `review-result` entry marks the review as done. The result reaches the
+/// model only inside a user-role message, so no orphan tool result enters the
+/// context path. `None` when the tool is not active or the run was cancelled.
+async fn run_settle_check(
+    core: &std::sync::Arc<Core>,
+    tx: &UnboundedSender<AgentEvent>,
+    cancel: &CancellationToken,
+    name: &str,
+    caps: context::ResultCaps,
+) -> Option<ToolResult> {
+    let tool = core.tools.iter().find(|tool| tool.name() == name)?.clone();
+    let args = json!({});
+    let call = ToolCall {
+        id: format!("harness_{name}"),
+        name: name.to_string(),
+        arguments: args.clone(),
+    };
+    let _ = tx.send(AgentEvent::ToolStarted {
+        call_id: call.id.clone(),
+        name: name.to_string(),
+        summary: "run by the harness at settle".into(),
+    });
+    let started = std::time::Instant::now();
+    let verdict = super::authorize::decide(core, tool.as_ref(), &call, &args).await;
+    for notice in &verdict.notices {
+        let _ = tx.send(AgentEvent::Notice(notice.clone()));
+    }
+    let mut result = match verdict.decision {
+        crate::policy::Decision::Deny { code, message } => ToolResult::err(&code, message),
+        crate::policy::Decision::Ask(request) => {
+            match super::authorize::confirm(core, request, cancel).await {
+                Ok(()) => ToolResult::ok(""),
+                Err(denied) => denied,
+            }
+        }
+        crate::policy::Decision::Allow => ToolResult::ok(""),
+    };
+    let mut executed = false;
+    if !result.is_error
+        && let Some(required) = verdict.provenance
+        && let Err(denied) =
+            super::authorize::confirm_provenance(core, &call, &args, required).await
+    {
+        result = denied;
+    }
+    if !result.is_error {
+        let ctx = core.tool_context_with(cancel.clone());
+        result = tokio::select! {
+            _ = cancel.cancelled() => return None,
+            result = tool.call(&ctx, args.clone()) => result,
+        };
+        executed = true;
+    }
+    if executed {
+        let post = crate::hooks::post_tool(
+            &hook_env(core),
+            name,
+            &args,
+            &result.content,
+            result.is_error,
+            started.elapsed().as_millis() as u64,
+        )
+        .await;
+        for warning in &post.warnings {
+            let _ = tx.send(AgentEvent::Notice(format!("[hook] {warning}")));
+            result.content = format!("[hook warning] {warning}\n\n{}", result.content);
+        }
+        for context in post.contexts {
+            result.content.push_str(&format!(
+                "\n\n[hook context from {}]\n{}",
+                context.hook, context.text
+            ));
+        }
+        if let Some(block) = post.blocked {
+            result = ToolResult::err(
+                "hook_block",
+                format!(
+                    "hook {:?} blocked the {name} result: {}",
+                    block.hook, block.reason
+                ),
+            );
+        }
+    }
+    for note in verdict.notes {
+        result.content = format!("{note}\n\n{}", result.content);
+    }
+    // Record the same session facts a model-called run records.
+    if !result.is_error
+        && let Some(entries) = result
+            .details
+            .as_ref()
+            .and_then(|details| details.get("session"))
+            .and_then(Value::as_array)
+    {
+        for entry in entries {
+            let Some(kind) = entry.get("kind").and_then(Value::as_str) else {
+                continue;
+            };
+            let mut payload = entry.as_object().cloned().unwrap_or_default();
+            payload.remove("kind");
+            let custom = CustomData {
+                kind: kind.to_string(),
+                payload,
+            };
+            if let Ok(mut session) = core.session.lock()
+                && let Err(error) = session.append(EntryKind::Custom(custom))
+            {
+                tracing::warn!(%error, "cannot record the settle check");
+            }
+        }
+    }
+    if name == "review" && executed {
+        append_custom(
+            &core.session,
+            "review-result",
+            json!({
+                "findings": result.details.as_ref().and_then(|d| d.get("findings")).cloned(),
+                "harness": true,
+            }),
+        );
+    }
+    // The content goes into a user message; cap it like a tool result.
+    let capped = context::cap_result_limited(
+        &core.artifacts,
+        &result.content,
+        context::Preview::HeadTail,
+        caps,
+    );
+    result.content = capped.content;
+    let _ = tx.send(AgentEvent::ToolFinished {
+        call_id: call.id.clone(),
+        name: name.to_string(),
+        is_error: result.is_error,
+        duration_ms: started.elapsed().as_millis() as u64,
+        preview: preview(tool_body(&result.content), 300),
+        artifact: capped.artifact,
+    });
+    Some(result)
 }
 
 /// Bounded retry of transient model-call failures within one turn.
