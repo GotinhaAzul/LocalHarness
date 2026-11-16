@@ -38,6 +38,8 @@ pub struct Config {
     pub gates: GatesConfig,
     /// Skill index in the system prompt (`[skills]`).
     pub skills: SkillsConfig,
+    /// The opt-in `fetch` tool (`[fetch]`).
+    pub fetch: FetchConfig,
     /// Lifecycle hooks, keyed by hook name (`[hooks.<name>]`).
     pub hooks: HooksConfig,
     /// Model Context Protocol servers, keyed by server name (`[mcp.<name>]`).
@@ -61,6 +63,15 @@ pub struct Config {
     /// True when the user passed `--sandbox` or `--no-sandbox`.
     #[serde(skip)]
     pub sandbox_explicit: bool,
+}
+
+/// `[fetch]`: settings for the opt-in `fetch` tool.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FetchConfig {
+    /// Hosts (`host` or `host:port`) that may resolve to loopback, private or
+    /// link-local addresses. Everything else must be public.
+    pub allow_private: Vec<String>,
 }
 
 /// `[skills]`: how much of the skill index the system prompt carries.

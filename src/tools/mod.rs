@@ -6,6 +6,7 @@ pub mod bg;
 pub mod detect;
 pub mod edit;
 pub mod evidence;
+pub mod fetch;
 pub mod finding;
 pub mod git;
 pub mod glob;
@@ -506,6 +507,11 @@ pub trait Tool: Send + Sync {
     fn preview_tail(&self) -> bool {
         false
     }
+    /// An opt-in tool joins a profile only by name, never through its pack
+    /// (`fetch` reaches the network and is off unless enabled).
+    fn opt_in(&self) -> bool {
+        false
+    }
     /// Whether runs of this tool append an engagement evidence entry.
     fn evidence_enabled(&self) -> bool {
         false
@@ -593,6 +599,7 @@ impl ToolRegistry {
             Arc::new(attack_path::AttackPathTool),
             Arc::new(finding::FindingTool),
             Arc::new(iocs::IocsTool),
+            Arc::new(fetch::FetchTool::default()),
         ] {
             registry.register(tool);
         }
@@ -600,6 +607,10 @@ impl ToolRegistry {
     }
 
     /// Apply `[git]` approval settings to the `git` and `pr` tools.
+    pub fn configure_fetch(&mut self, config: &crate::config::FetchConfig) {
+        self.register(Arc::new(fetch::FetchTool::new(config.clone())));
+    }
+
     pub fn configure_git(&mut self, config: &crate::config::GitConfig) {
         self.register(Arc::new(git::GitTool::new(config.clone())));
         self.register(Arc::new(pr::PrTool::new(config.clone())));
@@ -629,7 +640,10 @@ impl ToolRegistry {
         let mut selected: Vec<Arc<dyn Tool>> = Vec::new();
         for pack in packs {
             for tool in &self.tools {
-                if tool.pack() == pack && !selected.iter().any(|t| t.name() == tool.name()) {
+                if tool.pack() == pack
+                    && !tool.opt_in()
+                    && !selected.iter().any(|t| t.name() == tool.name())
+                {
                     selected.push(tool.clone());
                 }
             }
@@ -1007,7 +1021,7 @@ mod tests {
         let registry = ToolRegistry::builtin();
         assert_eq!(
             registry.names().len(),
-            26,
+            27,
             "update docs when the built-in surface changes: {:?}",
             registry.names()
         );

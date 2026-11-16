@@ -185,6 +185,12 @@ impl CallFacts {
                 let action = str_arg("action").unwrap_or_default();
                 (Some(format!("gh pr {action}")), Effect::Exec, true)
             }
+            // The full URL is the subject the user approves, and per-host
+            // rules match it (`command = "^fetch https://docs\\.rs/"`).
+            "fetch" => {
+                let url = str_arg("url").unwrap_or_default();
+                (Some(format!("fetch {url}")), Effect::Exec, true)
+            }
             _ if read_only => (None, Effect::ReadOnly, false),
             _ if SESSION_TOOLS.contains(&tool) => (None, Effect::Session, false),
             _ if EDIT_TOOLS.contains(&tool) => (None, Effect::Edit, false),

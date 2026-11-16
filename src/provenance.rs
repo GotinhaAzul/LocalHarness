@@ -64,6 +64,10 @@ pub fn origin_for(core: &Core, tool: &str) -> Origin {
     if tool == "skill" {
         return Origin::Skill;
     }
+    // A fetched page is content from outside the machine.
+    if tool == "fetch" {
+        return Origin::External;
+    }
     if core.registry.get(tool).is_none() {
         return Origin::External;
     }

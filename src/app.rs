@@ -405,6 +405,7 @@ pub async fn create_runtime(
     let mut registry = ToolRegistry::builtin();
     registry.lsp().set_gate(config.lsp.gate);
     registry.configure_git(&config.git);
+    registry.configure_fetch(&config.fetch);
     let mcp = Arc::new(crate::mcp::McpManager::new());
     let (tools, mcp_warnings) = select_tools(&registry, &config, &paths, &mcp).await?;
     let tools = permissions.filter_tools(tools, &registry);
@@ -747,6 +748,7 @@ pub async fn rebuild_core(old: &Arc<Core>, mut config: Config) -> Result<Arc<Cor
     let mut registry = ToolRegistry::builtin();
     registry.lsp().set_gate(config.lsp.gate);
     registry.configure_git(&config.git);
+    registry.configure_fetch(&config.fetch);
     // Rules change only when the config files do (for example `/trust`
     // loading the project config); workflows and profiles cannot touch them.
     let policy =

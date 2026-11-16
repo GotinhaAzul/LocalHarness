@@ -80,6 +80,12 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub no_agents_md: bool,
 
+    /// Add tools to the active profile for this run, e.g. `--tools +fetch`.
+    /// Opt-in tools such as `fetch` are enabled only this way or by naming
+    /// them in a profile's `tools`.
+    #[arg(long, global = true, value_name = "+TOOL,...", value_delimiter = ',')]
+    pub tools: Vec<String>,
+
     /// Resume the most recent session for this project.
     #[arg(long = "continue", conflicts_with = "resume")]
     pub continue_last: bool,
@@ -437,6 +443,17 @@ pub async fn run(cli: Cli) -> Result<i32> {
     }
     if cli.no_agents_md {
         config.prompt.agents_md = false;
+    }
+    if !cli.tools.is_empty() {
+        let name = config.profile_name().to_string();
+        if let Some(profile) = config.profiles.get_mut(&name) {
+            for tool in &cli.tools {
+                let tool = tool.trim().trim_start_matches('+');
+                if !tool.is_empty() && !profile.tools.iter().any(|t| t == tool) {
+                    profile.tools.push(tool.to_string());
+                }
+            }
+        }
     }
     if cli.keep_artifacts {
         config.session.keep_artifacts = true;
