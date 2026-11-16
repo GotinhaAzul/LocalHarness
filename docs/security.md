@@ -108,8 +108,9 @@ runs.
 
 ## Network fetch
 
-`fetch` is the only network tool in the built-in surface, and it is off by
-default: no built-in profile includes it. Enable it by naming it in a profile's
+`fetch` is the only built-in tool that reads arbitrary URLs (`pr` reaches
+GitHub through `gh`), and it is off by default: no built-in profile includes
+it. Enable it by naming it in a profile's
 `tools` array or with `--tools +fetch`.
 
 It accepts one absolute `http` or `https` URL and makes a `GET`. It sends no

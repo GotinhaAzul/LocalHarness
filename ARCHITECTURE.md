@@ -237,8 +237,11 @@ omission. Bundled presets: `qwen-coding`, `gemma-chat`, `glm-agent`.
   wait stays within `retry_deadline_secs` (default 120). Each retry is a
   notice, the partial reply is logged as a `model-retry` entry and never
   replayed, and retries do not count as model calls. Ctrl+C interrupts the
-  backoff, and the final error says "gave up after N attempts".
-  `retries = 0` restores the old behavior.
+  backoff, and the final error says "gave up after N attempts". A call that
+  ran out the whole-request timeout is not retried. When a reply failed after
+  streaming text, a `discard` event (also in `--json` and SSE) tells
+  frontends to drop that text; piped `lh -p` output holds each call's text
+  until the call completes. `retries = 0` restores the old behavior.
 - Error classes: `connection`, `auth`, `model_not_found`, `context_too_small`,
   `bad_request`, `rate_limited`, `server`, `cancelled`, `parse`.
 - Errors shown to the model and the user are prescriptive: what failed, what
