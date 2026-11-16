@@ -290,7 +290,10 @@ fn scan_file(
         if start > hi {
             continue;
         }
-        if previous.map(|prev| lo > prev + 1).unwrap_or(false) {
+        // A separator marks a gap between context groups. Without context
+        // lines every hit already stands alone, so it would only add a line
+        // per match (as in grep itself, which prints none there).
+        if context > 0 && previous.map(|prev| lo > prev + 1).unwrap_or(false) {
             out.push("--".to_string());
         }
         for (offset, line) in lines[start..=hi].iter().enumerate() {
@@ -331,6 +334,45 @@ mod tests {
     use super::*;
     use crate::tools::write::test_context;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn separators_appear_only_between_context_groups() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("a.txt"),
+            "hit one\nfiller\nfiller\nfiller\nhit two\nfiller\nfiller\nfiller\nhit three\n",
+        )
+        .unwrap();
+        let ctx = test_context(dir.path());
+
+        let plain = GrepTool
+            .call(&ctx, json!({"pattern": "hit", "path": "a.txt"}))
+            .await;
+        assert!(!plain.is_error, "{}", plain.content);
+        assert!(
+            plain.content.contains("a.txt:5:hit two"),
+            "{}",
+            plain.content
+        );
+        assert!(
+            !plain.content.lines().any(|line| line == "--"),
+            "no separators without context lines: {}",
+            plain.content
+        );
+
+        let grouped = GrepTool
+            .call(
+                &ctx,
+                json!({"pattern": "hit", "path": "a.txt", "context": 1}),
+            )
+            .await;
+        assert_eq!(
+            grouped.content.lines().filter(|line| *line == "--").count(),
+            2,
+            "{}",
+            grouped.content
+        );
+    }
 
     #[tokio::test]
     async fn reports_matches_with_context_markers() {

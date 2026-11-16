@@ -341,7 +341,7 @@ observable.
 | Read-before-edit | `edit`/`patch` on an existing file require a prior `read` with a matching stat stamp (`mtime`, size). `write` also requires full-line coverage of the existing file, or an explicit `overwrite: true`; a result capped by the result or batch limit marks coverage incomplete. A changed file requires a re-read. Creation is allowed. A successful `edit`/`patch`/`write` re-stamps only the file it wrote, so consecutive edits need no re-read while any outside change still does. |
 | Scope gate | Security-sensitive commands are checked against the user-set engagement scope. No scope blocks with `SEC_SCOPE` and the `/sec scope add` call. Best-effort, not a sandbox. |
 | Sandbox | When `--sandbox` is set, `bash` and `bg` run in a bubblewrap namespace (or the Landlock fallback): read-only root, hidden `$HOME`, private `/tmp`, no network, and `.git` read-only in `workspace-write`. Startup fails closed when no backend exists; a per-command wrap failure returns `SANDBOX_UNAVAILABLE`. Commands never fall back to an unsandboxed run. |
-| Loop guard | Signature is tool name plus canonical arguments. Four identical calls in a row, or an exact 2-8 call cycle repeated four times, blocks the call and ends the turn with a recovery instruction. A file change or a passing verification clears the history, so long multi-step work does not trip it. No automatic session replacement in v1. |
+| Loop guard | Signature is tool name plus canonical arguments. Four identical calls in a row, or an exact 2-8 call cycle repeated four times, blocks the call and ends the turn with a recovery instruction and the `stalled` status (exit code 2 from `lh -p`, never a successful workflow step). A file change or a passing verification clears the history, so long multi-step work does not trip it. No automatic session replacement in v1. |
 | Interactive command guard | Blocks `vim`, `less`, `top`, `htop`, `watch`, `nano`, `ssh` without a command, and similar TTY-only invocations. |
 | Budget checkpoint | Tool calls, model calls, and wall clock are checked at 120 calls, 40 model calls, and 30 minutes. A checkpoint that finds a new result, a file change, or a passing verify within the last `stall_calls` calls renews the allowance and the turn continues. A checkpoint with no recent progress ends the turn and reports why. |
 | Stall | Twelve consecutive calls with no new result fingerprint, no file change, and no successful verify. Ends the turn with the last known state. |
@@ -443,7 +443,9 @@ usable_prompt = context_window - max_output_tokens - safety_margin
   artifact size. Command tools (`bash`, `bg`, `test`, `verify`) preview the
   first and the last lines, where errors and summaries land, and name the
   omitted range: `… 380 lines omitted (12-391); recall out-3 12-131 …`.
-  Other tools preview the start.
+  Other tools preview the start, cut at a line boundary, and name the first
+  line that was left out: `(truncated after line 41 of 380; recall out-3
+  42-161 …)`.
 - `recall` reads an artifact range, capped at 4000 characters per call.
 - Artifacts are user-readable files with `0700` directories. Retention is
   configurable; default is 30 days.
@@ -536,6 +538,11 @@ step. The old branch remains in the tree and on disk.
 After a compaction, inject one short state block: changed files, last verify,
 active thread, open findings count, and the current budget. This prevents the
 model from re-reading half the repository.
+
+The block is appended to the leading system message, so its text must change
+rarely: every change makes the engine re-evaluate the conversation after it.
+The budget is therefore reported in bands (under 50%, over 50%, over 65% of
+the usable prompt), not as an exact percentage.
 
 ---
 
@@ -1033,7 +1040,7 @@ tools = ["read", "bash", "verify"]
 [tool] bash - cargo test
 PASS  cargo  42 passed (3.1s)
 ...
-(truncated; recall out-3 1-120)
+(truncated after line 41 of 380; recall out-3 42-161 · full artifact 16229 bytes)
 ```
 
 Every result starts with one header line. Success is plain; failure is an error

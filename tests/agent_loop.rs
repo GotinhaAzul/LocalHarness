@@ -1681,7 +1681,9 @@ async fn loop_guard_blocks_the_fourth_identical_call() {
         &["read"],
     );
     let (outcome, events) = run(&harness, "repeat").await;
-    assert_eq!(outcome.status, TurnStatus::Done);
+    // Not `Done`: a script or workflow must be able to tell a stopped loop
+    // from a finished task.
+    assert_eq!(outcome.status, TurnStatus::Stalled);
     assert!(events.iter().any(|event| matches!(
         event,
         AgentEvent::Guard { code, .. } if code == "loop_guard"

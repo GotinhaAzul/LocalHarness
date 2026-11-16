@@ -186,20 +186,47 @@ impl TokenBudget {
     /// Correct `chars_per_token` from a measured prompt size. Keeps a slow
     /// correction so one odd request does not skew the estimate.
     pub fn calibrate(&mut self, estimated_chars: usize, actual_prompt_tokens: u32) {
-        if actual_prompt_tokens < 16 || estimated_chars == 0 {
+        self.calibrate_with_fixed(
+            estimated_chars,
+            actual_prompt_tokens,
+            ToolSpecCost::default(),
+        );
+    }
+
+    /// [`calibrate`](Self::calibrate) for a request that also carried the
+    /// fixed `tools` array. `total_chars` and `actual_prompt_tokens` cover the
+    /// whole request; the fixed part is priced on its own (JSON density or an
+    /// exact count), so it is taken out of both before the prose ratio is
+    /// learned. Leaving it in drags the ratio toward JSON density and then
+    /// charges the schemas a second time through the fixed term.
+    pub fn calibrate_with_fixed(
+        &mut self,
+        total_chars: usize,
+        actual_prompt_tokens: u32,
+        fixed: ToolSpecCost,
+    ) {
+        if actual_prompt_tokens < 16 || total_chars == 0 {
             return;
         }
-        let measured = estimated_chars as f64 / f64::from(actual_prompt_tokens);
-        if measured > TRUNCATION_CHARS_PER_TOKEN && estimated_chars >= TRUNCATION_MIN_CHARS {
+        // Truncation is judged on the whole request, as the server saw it.
+        let measured = total_chars as f64 / f64::from(actual_prompt_tokens);
+        if measured > TRUNCATION_CHARS_PER_TOKEN && total_chars >= TRUNCATION_MIN_CHARS {
             // The server truncated the prompt (Ollama does this silently at
             // its default num_ctx). Learning from this sample would make the
             // harness think text is cheaper and grow the prompt further.
             self.truncated_at = Some(actual_prompt_tokens);
             return;
         }
-        let measured = measured.clamp(1.0, 10.0);
-        self.chars_per_token = (self.chars_per_token * 0.5 + measured * 0.5).clamp(1.0, 10.0);
         self.last_prompt_tokens = Some(actual_prompt_tokens);
+        let prose_chars = total_chars.saturating_sub(fixed.chars);
+        let prose_tokens = actual_prompt_tokens.saturating_sub(fixed.tokens);
+        if prose_tokens < 16 || prose_chars == 0 {
+            // Nothing left to learn from once the schemas are removed (the
+            // fixed estimate is at least as large as the whole report).
+            return;
+        }
+        let measured = (prose_chars as f64 / f64::from(prose_tokens)).clamp(1.0, 10.0);
+        self.chars_per_token = (self.chars_per_token * 0.5 + measured * 0.5).clamp(1.0, 10.0);
     }
 
     pub fn observe_usage(&mut self, prompt_tokens: u32, estimated_tokens: u32) {
@@ -271,6 +298,46 @@ mod tests {
         assert_eq!(budget.chars_per_token, DEFAULT_CHARS_PER_TOKEN);
         budget.calibrate(4000, 1000); // 4 chars/token measured
         assert!(budget.chars_per_token > DEFAULT_CHARS_PER_TOKEN);
+    }
+
+    #[test]
+    fn schema_json_does_not_drag_the_prose_ratio() {
+        // A request of 40k prose chars at 3.7 chars/token plus 13k chars of
+        // tool schemas the harness prices at 5000 tokens.
+        let fixed = ToolSpecCost {
+            chars: 13_000,
+            tokens: 5_000,
+        };
+        let prose_chars = 40_000usize;
+        let prose_tokens = (prose_chars as f64 / 3.7).round() as u32;
+        let actual = prose_tokens + fixed.tokens;
+        let estimate = |budget: &TokenBudget| budget.estimate_char_len(prose_chars) + fixed.tokens;
+
+        let mut budget = TokenBudget::new(65_536, 4096);
+        for _ in 0..8 {
+            budget.calibrate_with_fixed(prose_chars + fixed.chars, actual, fixed);
+        }
+        let error = (f64::from(estimate(&budget)) - f64::from(actual)).abs() / f64::from(actual);
+        assert!(error < 0.01, "estimate {} vs {actual}", estimate(&budget));
+
+        // Learning from the whole request charges the schemas twice.
+        let mut mixed = TokenBudget::new(65_536, 4096);
+        for _ in 0..8 {
+            mixed.calibrate(prose_chars + fixed.chars, actual);
+        }
+        assert!(estimate(&mixed) > actual + actual / 20);
+
+        // Truncation is still judged on the whole request.
+        let mut cut = TokenBudget::new(65_536, 4096);
+        cut.calibrate_with_fixed(prose_chars + fixed.chars, 4_096, fixed);
+        assert_eq!(cut.truncated_at, Some(4_096));
+        assert_eq!(cut.chars_per_token, DEFAULT_CHARS_PER_TOKEN);
+
+        // A report smaller than the fixed estimate teaches nothing.
+        let mut small = TokenBudget::new(65_536, 4096);
+        small.calibrate_with_fixed(14_000, 4_000, fixed);
+        assert_eq!(small.chars_per_token, DEFAULT_CHARS_PER_TOKEN);
+        assert_eq!(small.truncated_at, None);
     }
 
     #[test]

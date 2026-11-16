@@ -721,6 +721,7 @@ async fn run_loop(
             &mut budget,
             assembled.estimated_tokens,
             assembled.char_count,
+            tool_specs_cost,
             &mut partial,
             &mut call_ledger,
         )
@@ -1082,7 +1083,10 @@ async fn run_loop(
                 code: code.clone(),
                 message: message.clone(),
             });
-            return TurnOutcome::ok(TurnStatus::Done);
+            // A run the loop guard stopped did not finish its task. Reporting
+            // it as done would exit 0 from `lh -p` and mark a workflow step
+            // succeeded; it is the same outcome as the stall guard.
+            return TurnOutcome::ok(TurnStatus::Stalled);
         }
         if batch.cancelled {
             append_error(
@@ -1720,6 +1724,7 @@ async fn stream_assistant(
     budget: &mut TokenBudget,
     estimated_tokens: u32,
     char_count: usize,
+    tool_specs_cost: ToolSpecCost,
     partial: &mut Option<AssistantData>,
     ledger: &mut CallLedger,
 ) -> Result<AssistantData, ProviderError> {
@@ -1746,6 +1751,7 @@ async fn stream_assistant(
             budget,
             estimated_tokens,
             char_count,
+            tool_specs_cost,
             cancel,
         ) {
             failure = Some(err);
@@ -1791,6 +1797,7 @@ fn handle_stream_item(
     budget: &mut TokenBudget,
     estimated_tokens: u32,
     char_count: usize,
+    tool_specs_cost: ToolSpecCost,
     cancel: &CancellationToken,
 ) -> Option<ProviderError> {
     if cancel.is_cancelled() {
@@ -1825,7 +1832,9 @@ fn handle_stream_item(
         }
         Ok(StreamEvent::Usage(usage)) => {
             if usage.prompt_tokens > 0 {
-                budget.calibrate(char_count, usage.prompt_tokens);
+                // The schemas have their own fixed price; learn the prose
+                // ratio from the rest of the request only.
+                budget.calibrate_with_fixed(char_count, usage.prompt_tokens, tool_specs_cost);
                 budget.observe_usage(usage.prompt_tokens, estimated_tokens);
             }
             // Merge every report; the single `AgentEvent::Usage` is emitted

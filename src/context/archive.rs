@@ -62,21 +62,12 @@ pub fn cap_result_with(store: &ArtifactStore, content: &str, preview: Preview) -
                 truncated: true,
             }
         }
-        Ok(artifact) => {
-            let preview = split_preview(content, PREVIEW_CHARS);
-            let mut capped = String::with_capacity(preview.len() + 120);
-            capped.push_str(preview);
-            capped.push_str(&format!(
-                "\n\n(truncated; recall {} 1-120 · full artifact {} bytes)",
-                artifact.id, artifact.bytes
-            ));
-            CappedContent {
-                content: capped,
-                artifact: Some(artifact.id),
-                original_chars,
-                truncated: true,
-            }
-        }
+        Ok(artifact) => CappedContent {
+            content: head_preview(content, &artifact.id, artifact.bytes),
+            artifact: Some(artifact.id),
+            original_chars,
+            truncated: true,
+        },
         Err(err) => {
             tracing::warn!(%err, "cannot archive tool result; truncating in place");
             CappedContent {
@@ -87,6 +78,44 @@ pub fn cap_result_with(store: &ArtifactStore, content: &str, preview: Preview) -
             }
         }
     }
+}
+
+/// The first whole lines of `content` within `PREVIEW_CHARS`, with the first
+/// line that was left out named for `recall`. Cutting inside a line shows the
+/// model half a statement, and a hint that always starts at line 1 sends it
+/// back for text it already has.
+fn head_preview(content: &str, id: &str, bytes: usize) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    let mut shown = 0;
+    let mut used = 0;
+    while shown < lines.len() {
+        let width = lines[shown].chars().count() + 1;
+        if used + width > PREVIEW_CHARS {
+            break;
+        }
+        used += width;
+        shown += 1;
+    }
+    if shown == 0 || shown == lines.len() {
+        // One line longer than the preview (or nothing to continue from):
+        // fall back to a plain character preview.
+        return format!(
+            "{}\n\n(truncated; recall {id} 1-120 · full artifact {bytes} bytes)",
+            split_preview(content, PREVIEW_CHARS)
+        );
+    }
+    let mut out = String::with_capacity(used + 120);
+    for line in &lines[..shown] {
+        out.push_str(line);
+        out.push('\n');
+    }
+    let next = shown + 1;
+    out.push_str(&format!(
+        "\n(truncated after line {shown} of {}; recall {id} {next}-{} · full artifact {bytes} bytes)",
+        lines.len(),
+        lines.len().min(shown + 120)
+    ));
+    out
 }
 
 /// The first lines and the last lines of `content` within `PREVIEW_CHARS`,
@@ -210,6 +239,33 @@ mod tests {
         assert!(capped.content.contains("recall out-1 1-120"));
         let full = store.read_all(capped.artifact.as_deref().unwrap()).unwrap();
         assert_eq!(full.len(), 10_000);
+    }
+
+    #[test]
+    fn head_preview_ends_on_a_line_and_names_the_next_one() {
+        let store = ArtifactStore::ephemeral();
+        let mut content = String::from("[tool] read - src/lib.rs\n");
+        for n in 1..=150 {
+            content.push_str(&format!(
+                "{n:>3}  let value_{n} = compute_something({n});\n"
+            ));
+        }
+        let capped = cap_result(&store, &content);
+        assert!(capped.truncated);
+        let body = capped.content.split("\n\n(truncated").next().unwrap();
+        let shown = body.lines().count();
+        // Every shown line is a whole line of the original.
+        for (shown_line, original) in body.lines().zip(content.lines()) {
+            assert_eq!(shown_line, original);
+        }
+        assert!(shown > 10 && shown < 151, "{shown}");
+        let hint = format!(
+            "(truncated after line {shown} of 151; recall out-1 {}-{}",
+            shown + 1,
+            151.min(shown + 120)
+        );
+        assert!(capped.content.contains(&hint), "{}", capped.content);
+        assert!(capped.content.chars().count() <= RESULT_CAP_CHARS);
     }
 
     #[test]

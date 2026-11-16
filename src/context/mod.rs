@@ -518,8 +518,24 @@ pub fn state_block(
             findings.open, findings.high
         ));
     }
-    out.push_str(&format!("context: {:.0}% of usable prompt", used_percent));
+    out.push_str(context_band(used_percent));
     out
+}
+
+/// The budget line of the state block, in coarse bands.
+///
+/// The block is part of the leading system message, so every change to it
+/// makes the engine re-evaluate the whole conversation that follows. An exact
+/// percentage moves on almost every call (one percent of a 32k window is less
+/// than one tool result); a band moves at most twice between compactions.
+fn context_band(used_percent: f32) -> &'static str {
+    if used_percent >= 65.0 {
+        "context: over 65% of usable prompt"
+    } else if used_percent >= 50.0 {
+        "context: over 50% of usable prompt"
+    } else {
+        "context: under 50% of usable prompt"
+    }
 }
 
 #[cfg(test)]
@@ -546,6 +562,22 @@ mod tests {
             true,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn state_block_is_stable_while_the_context_grows_within_a_band() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = session(dir.path());
+        // Consecutive calls a few hundred tokens apart must not rewrite the
+        // system message the block is appended to.
+        let first = state_block(&session, None, 31.2);
+        assert_eq!(first, state_block(&session, None, 33.9));
+        assert_eq!(first, state_block(&session, None, 49.9));
+        assert!(first.ends_with("context: under 50% of usable prompt"));
+        let middle = state_block(&session, None, 50.0);
+        assert_ne!(first, middle);
+        assert_eq!(middle, state_block(&session, None, 64.9));
+        assert!(state_block(&session, None, 79.0).ends_with("context: over 65% of usable prompt"));
     }
 
     #[test]
