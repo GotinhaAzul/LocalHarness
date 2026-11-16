@@ -30,18 +30,19 @@ impl Tool for ReadTool {
     }
 
     fn description(&self) -> &'static str {
-        "Read a text file with line numbers (default 150 lines, max 800). PNG, JPEG, and WebP images are shown to models with vision input."
+        "Read a text file with line numbers (default 150 lines, max 800; paths reads up to 6 files at once). PNG, JPEG, and WebP images are shown to models with vision input."
     }
 
     fn schema(&self) -> Value {
         crate::tools::object_schema(
             json!({
                 "path": {"type": "string", "description": "File to read, relative to the working directory."},
+                "paths": {"type": "array", "items": {"type": "string"}, "description": "Instead of path: up to 6 files, each optionally with a range, e.g. [\"a.rs\", \"b.rs:10-40\"]."},
                 "start": {"type": "integer", "description": "First line to return, 1-based."},
                 "end": {"type": "integer", "description": "Last line to return, inclusive (up to 800 lines after start)."},
                 "limit": {"type": "integer", "description": "Lines to return when end is absent (default 150, max 800)."}
             }),
-            &["path"],
+            &[],
         )
     }
 
@@ -111,6 +112,128 @@ async fn read_image(ctx: &ToolContext, raw: &str) -> ToolResult {
 }
 
 pub(crate) fn run(ctx: &ToolContext, args: &Value) -> Result<ToolResult, ToolResult> {
+    if args.get("paths").is_some() {
+        return run_many(ctx, args);
+    }
+    run_one(ctx, args, ctx.caps.tool_budget())
+}
+
+/// Most entries one `read` accepts in `paths`.
+pub const MAX_PATHS: usize = 6;
+
+/// One `paths` entry: a path with an optional `:start-end` (or `:start`)
+/// suffix.
+fn parse_entry(entry: &str) -> (String, Option<u64>, Option<u64>) {
+    if let Some((path, range)) = entry.rsplit_once(':')
+        && !path.is_empty()
+        && !range.is_empty()
+    {
+        let (start, end) = match range.split_once('-') {
+            Some((start, end)) => (start, Some(end)),
+            None => (range, None),
+        };
+        if let Ok(start) = start.parse::<u64>() {
+            match end.map(str::parse::<u64>) {
+                None => return (path.to_string(), Some(start), None),
+                Some(Ok(end)) => return (path.to_string(), Some(start), Some(end)),
+                Some(Err(_)) => {}
+            }
+        }
+    }
+    (entry.to_string(), None, None)
+}
+
+/// `read` with `paths`: several files or ranges in one result, the budget
+/// split between them in whole lines, each under its own header and with its
+/// own `next start=` trailer. A failing entry is reported inline.
+fn run_many(ctx: &ToolContext, args: &Value) -> Result<ToolResult, ToolResult> {
+    if args.get("path").is_some() {
+        return Err(ToolResult::err(
+            "invalid_args",
+            "pass either path or paths, not both; for several files use {\"paths\": [\"a.rs\", \"b.rs:10-40\"]}",
+        ));
+    }
+    if ["start", "end", "limit"]
+        .iter()
+        .any(|key| args.get(*key).is_some())
+    {
+        return Err(ToolResult::err(
+            "invalid_args",
+            "start/end/limit apply to path only; give each paths entry its own range, e.g. \"src/a.rs:40-120\"",
+        ));
+    }
+    let entries: Vec<String> = match args.get("paths").and_then(Value::as_array) {
+        Some(items) => items
+            .iter()
+            .map(|item| item.as_str().map(str::to_string))
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| ToolResult::err("invalid_args", "paths must be an array of strings"))?,
+        None => {
+            return Err(ToolResult::err(
+                "invalid_args",
+                "paths must be an array of strings, e.g. [\"src/a.rs\", \"src/b.rs:10-40\"]",
+            ));
+        }
+    };
+    if entries.is_empty() || entries.len() > MAX_PATHS {
+        return Err(ToolResult::err(
+            "invalid_args",
+            format!(
+                "paths takes 1 to {MAX_PATHS} entries, got {}; split the files over several reads",
+                entries.len()
+            ),
+        ));
+    }
+    let header_room = entries.len() * 80;
+    let per_file = ctx
+        .caps
+        .tool_budget()
+        .saturating_sub(header_room)
+        .checked_div(entries.len())
+        .unwrap_or(0)
+        .max(200);
+    let mut text = String::new();
+    let mut files = Vec::new();
+    let mut failures = 0usize;
+    for entry in &entries {
+        let (path, start, end) = parse_entry(entry);
+        let mut one = json!({ "path": path });
+        if let Some(start) = start {
+            one["start"] = json!(start);
+        }
+        if let Some(end) = end {
+            one["end"] = json!(end);
+        }
+        if !text.is_empty() {
+            text.push_str("\n\n");
+        }
+        match run_one(ctx, &one, per_file) {
+            Ok(result) => {
+                let details = result.details.clone().unwrap_or(Value::Null);
+                let display = details["path"].as_str().unwrap_or(&path).to_string();
+                text.push_str(&format!(
+                    "== {display} (lines {}-{} of {}) ==\n{}",
+                    details["start"], details["end"], details["total_lines"], result.content
+                ));
+                files.push(details);
+            }
+            Err(error) => {
+                failures += 1;
+                text.push_str(&format!("== {path} ==\n{}", error.content));
+                files.push(json!({ "path": path, "error": error.content }));
+            }
+        }
+    }
+    if failures == entries.len() {
+        return Err(ToolResult::err(
+            "READ_FAILED",
+            format!("none of the paths could be read:\n{text}"),
+        ));
+    }
+    Ok(ToolResult::ok(text).with_details(json!({ "files": files })))
+}
+
+fn run_one(ctx: &ToolContext, args: &Value, budget: usize) -> Result<ToolResult, ToolResult> {
     let raw = required_str(args, "path")?;
     let path = ctx.resolve(&raw)?;
     let display = display_path(&ctx.cwd, &path);
@@ -226,7 +349,7 @@ pub(crate) fn run(ctx: &ToolContext, args: &Value) -> Result<ToolResult, ToolRes
     }
     // Whole lines within the result budget, so the loop never cuts the
     // output and the trailer names exactly the lines the model saw.
-    let budget = ctx.caps.tool_budget().saturating_sub(TRAILER_RESERVE);
+    let budget = budget.saturating_sub(TRAILER_RESERVE);
     let mut used = text.chars().count();
     let mut last = start.saturating_sub(1);
     for (offset, line) in lines[first..requested_last].iter().enumerate() {
@@ -537,6 +660,109 @@ mod tests {
                 .content
                 .ends_with("[lines 1-150 of 481; next start=151]")
         );
+    }
+
+    #[tokio::test]
+    async fn paths_reads_several_ranges_in_one_result() {
+        use crate::tools::LineRange;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn a() {}\nfn b() {}\n").unwrap();
+        std::fs::write(dir.path().join("b.rs"), source_file(60)).unwrap();
+        let ctx = test_context(dir.path());
+
+        let result = ReadTool
+            .call(&ctx, json!({"paths": ["a.rs", "b.rs:10-40", "missing.rs"]}))
+            .await;
+        assert!(!result.is_error, "{}", result.content);
+        assert!(
+            result
+                .content
+                .starts_with("== a.rs (lines 1-2 of 2) ==\n1  fn a() {}\n2  fn b() {}"),
+            "{}",
+            result.content
+        );
+        let b_header = result.content.find("== b.rs (lines 10-").expect("b header");
+        let missing = result
+            .content
+            .find("== missing.rs ==\n[READ_FAILED]")
+            .expect("inline error");
+        assert!(b_header < missing);
+        // b.rs did not fit its share whole; it carries its own trailer.
+        let b_part = &result.content[b_header..missing];
+        let shown_end = b_part
+            .lines()
+            .filter(|line| line.contains("other_"))
+            .count()
+            + 9;
+        assert!(
+            b_part.contains(&format!("of 60; next start={}]", shown_end + 1)),
+            "{b_part}"
+        );
+        assert!(result.content.chars().count() <= ctx.caps.tool_budget());
+
+        // Coverage per file equals what was shown.
+        let reads = crate::tools::write::lock_reads(&ctx);
+        let a = ctx.resolve("a.rs").unwrap();
+        let b = ctx.resolve("b.rs").unwrap();
+        assert!(reads.is_fully_read(&a));
+        assert_eq!(
+            reads.coverage(&b).unwrap().seen,
+            vec![LineRange {
+                start: 10,
+                end: shown_end
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn paths_argument_errors_name_the_fix() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "x\n").unwrap();
+        let ctx = test_context(dir.path());
+        let both = ReadTool
+            .call(&ctx, json!({"path": "a.rs", "paths": ["a.rs"]}))
+            .await;
+        assert!(
+            both.content
+                .starts_with("[invalid_args] pass either path or paths"),
+            "{}",
+            both.content
+        );
+        let many = ReadTool
+            .call(&ctx, json!({"paths": ["a", "b", "c", "d", "e", "f", "g"]}))
+            .await;
+        assert!(
+            many.content
+                .starts_with("[invalid_args] paths takes 1 to 6"),
+            "{}",
+            many.content
+        );
+        let none = ReadTool
+            .call(&ctx, json!({"paths": ["nope.rs", "gone.rs"]}))
+            .await;
+        assert!(none.is_error, "{}", none.content);
+        // A path that contains a colon but no numeric range is read as-is.
+        assert_eq!(parse_entry("a.rs"), ("a.rs".into(), None, None));
+        assert_eq!(parse_entry("a.rs:5"), ("a.rs".into(), Some(5), None));
+        assert_eq!(parse_entry("a.rs:5-9"), ("a.rs".into(), Some(5), Some(9)));
+        assert_eq!(parse_entry("c:dir"), ("c:dir".into(), None, None));
+    }
+
+    #[tokio::test]
+    async fn edit_passes_the_read_gate_after_a_paths_read() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "let a = 1;\n").unwrap();
+        std::fs::write(dir.path().join("b.rs"), "let b = 2;\n").unwrap();
+        let ctx = test_context(dir.path());
+        let _ = ReadTool
+            .call(&ctx, json!({"paths": ["a.rs", "b.rs"]}))
+            .await;
+        for (file, old) in [("a.rs", "a = 1"), ("b.rs", "b = 2")] {
+            let edited = crate::tools::edit::EditTool
+                .call(&ctx, json!({"path": file, "old": old, "new": "z = 0"}))
+                .await;
+            assert!(!edited.is_error, "{}", edited.content);
+        }
     }
 
     #[tokio::test]

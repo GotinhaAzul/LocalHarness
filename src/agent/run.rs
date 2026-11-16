@@ -1921,6 +1921,18 @@ struct ThreadSplit {
 }
 
 #[allow(clippy::too_many_arguments, clippy::unnecessary_unwrap)]
+/// Arguments as the loop guard compares them: a `read` of the same path set
+/// in a different order is the same call.
+fn guard_args(name: &str, args: &Value) -> Value {
+    let mut args = args.clone();
+    if name == "read"
+        && let Some(paths) = args.get_mut("paths").and_then(Value::as_array_mut)
+    {
+        paths.sort_by(|a, b| a.as_str().cmp(&b.as_str()));
+    }
+    args
+}
+
 async fn execute_batch(
     core: &std::sync::Arc<Core>,
     tx: &UnboundedSender<AgentEvent>,
@@ -2283,8 +2295,11 @@ async fn execute_batch(
                         if result.is_error {
                             // A review guard rejected the call; skip execution.
                         } else {
-                            let signature =
-                                format!("{}:{}", call.name, super::repair::canonical_json(&args));
+                            let signature = format!(
+                                "{}:{}",
+                                call.name,
+                                super::repair::canonical_json(&guard_args(&call.name, &args))
+                            );
                             match loop_guard.check_and_record(signature) {
                                 LoopDecision::Tripped { reason } => {
                                     result = ToolResult::err("loop_guard", reason.clone());
@@ -3581,6 +3596,19 @@ fn compact_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loop_guard_treats_a_reordered_path_set_as_the_same_read() {
+        let sig = |args: Value| crate::agent::repair::canonical_json(&guard_args("read", &args));
+        assert_eq!(
+            sig(json!({"paths": ["b.rs", "a.rs:1-9"]})),
+            sig(json!({"paths": ["a.rs:1-9", "b.rs"]}))
+        );
+        assert_ne!(
+            sig(json!({"paths": ["a.rs"]})),
+            sig(json!({"paths": ["a.rs", "b.rs"]}))
+        );
+    }
 
     #[test]
     fn static_refusal_names_a_guessed_window() {
