@@ -626,10 +626,37 @@ fn run_man_page() -> Result<i32> {
 /// files only; it does not open a session, start a turn, or contact a model.
 fn run_context(config: &Config, paths: &Paths, json: bool) -> Result<i32> {
     let agents = crate::agent::agents_md::AgentsMd::load(&paths.cwd, config.prompt.agents_md);
+    let skills = crate::skills::SkillIndex::load(paths, config.trust);
+    let index = skills.index_text_with(config.skills.index);
+    let clipped = skills.clipped_names();
     if json {
-        println!("{}", serde_json::to_string_pretty(&agents.manifest_json())?);
+        let mut manifest = agents.manifest_json();
+        if let Some(object) = manifest.as_object_mut() {
+            object.insert(
+                "skill_index".into(),
+                serde_json::json!({
+                    "mode": config.skills.index,
+                    "skills": skills.skills.len(),
+                    "chars": index.chars().count(),
+                    "clipped": clipped,
+                }),
+            );
+        }
+        println!("{}", serde_json::to_string_pretty(&manifest)?);
     } else {
         print!("{}", agents.manifest_text());
+        println!(
+            "skill index: {} skills, {} chars",
+            skills.skills.len(),
+            index.chars().count()
+        );
+        if !clipped.is_empty() {
+            println!(
+                "  clipped (description over {} chars; shorten it): {}",
+                crate::skills::INDEX_ENTRY_CAP,
+                clipped.join(", ")
+            );
+        }
         for warning in &agents.warnings {
             eprintln!("warning: {warning}");
         }

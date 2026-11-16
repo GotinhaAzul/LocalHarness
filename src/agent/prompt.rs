@@ -117,7 +117,7 @@ pub(crate) fn build_system_prompt_with_agents(
 
     let index = skills
         .advertised_for(&crate::tools::active_packs(tools))
-        .index_text();
+        .index_text_with(config.skills.index);
     if !index.trim().is_empty() {
         let can_load = tools.iter().any(|tool| tool.name() == "skill");
         if can_load {
@@ -192,6 +192,31 @@ mod tests {
     use crate::config::Config;
     use crate::skills::SkillIndex;
     use crate::tools::ToolRegistry;
+
+    #[test]
+    fn the_skill_index_setting_shrinks_or_drops_the_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut paths = Paths::discover(dir.path()).unwrap();
+        paths.data_dir = dir.path().join("data");
+        paths.config_dir = dir.path().join("config");
+        let mut config = Config::builtin();
+        config.profile_name = "coding".into();
+        let tools = ToolRegistry::builtin()
+            .select(config.profile(), &[])
+            .unwrap();
+        let mut prompt_for = |mode| {
+            config.skills.index = mode;
+            build_system_prompt(&config, &paths, &SkillIndex::bundled(), &tools, None)
+        };
+        let full = prompt_for(crate::skills::IndexMode::Full);
+        let names = prompt_for(crate::skills::IndexMode::Names);
+        let off = prompt_for(crate::skills::IndexMode::Off);
+        assert!(full.contains("## Skills") && full.contains("code-review: "));
+        assert!(names.contains("## Skills") && !names.contains("code-review: "));
+        assert!(names.contains("code-review"));
+        assert!(!off.contains("## Skills"));
+        assert!(full.len() > names.len() && names.len() > off.len());
+    }
 
     #[test]
     fn prompt_contains_rules_and_ends_with_session_facts() {

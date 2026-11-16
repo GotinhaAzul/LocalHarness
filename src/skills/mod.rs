@@ -40,7 +40,7 @@ pub const INDEX_NAMES_CAP: usize = 600;
 
 /// How much of the skill index the system prompt shows. `Full` gives a capped
 /// description per skill, `Names` one line of names, and `Off` nothing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum IndexMode {
     #[default]
@@ -396,6 +396,16 @@ impl SkillIndex {
             }
             IndexMode::Full => full_index(&ordered),
         }
+    }
+
+    /// Names of the skills whose index entry the per-entry cap cuts, for
+    /// `lh context`.
+    pub fn clipped_names(&self) -> Vec<String> {
+        self.skills
+            .iter()
+            .filter(|skill| clipped_in_index(skill))
+            .map(|skill| skill.name.clone())
+            .collect()
     }
 
     /// Skills in index order. Shared home-directory skills (`~/.claude` and

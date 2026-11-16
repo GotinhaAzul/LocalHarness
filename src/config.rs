@@ -36,6 +36,8 @@ pub struct Config {
     pub review: ReviewMode,
     /// Settle gates (`[gates]`).
     pub gates: GatesConfig,
+    /// Skill index in the system prompt (`[skills]`).
+    pub skills: SkillsConfig,
     /// Lifecycle hooks, keyed by hook name (`[hooks.<name>]`).
     pub hooks: HooksConfig,
     /// Model Context Protocol servers, keyed by server name (`[mcp.<name>]`).
@@ -59,6 +61,14 @@ pub struct Config {
     /// True when the user passed `--sandbox` or `--no-sandbox`.
     #[serde(skip)]
     pub sandbox_explicit: bool,
+}
+
+/// `[skills]`: how much of the skill index the system prompt carries.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SkillsConfig {
+    /// `full` (capped entries), `names` (one line of names), or `off`.
+    pub index: crate::skills::IndexMode,
 }
 
 /// Settle-gate behavior.
