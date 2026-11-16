@@ -566,15 +566,20 @@ impl LspService {
     /// language server that is already running for `path`. Never starts a
     /// server: `read` with `symbol` must not pay a cold start, so without a
     /// live client it falls back to the built-in scanner.
-    pub async fn running_symbols(&self, path: &Path, text: &str) -> Option<Vec<SymbolRange>> {
+    pub async fn running_symbols(
+        &self,
+        path: &Path,
+        text: &str,
+        cwd: &Path,
+    ) -> Option<Vec<SymbolRange>> {
         let extension = path
             .extension()
             .and_then(|extension| extension.to_str())
             .unwrap_or("")
             .to_ascii_lowercase();
         let spec = server_spec_for_ext(&extension)?;
-        let fallback = path.parent().unwrap_or(path);
-        let root = project_root(path, root_markers(&extension), fallback);
+        // The same root (and so the same client key) the `lsp` tool uses.
+        let root = project_root(path, root_markers(&extension), cwd);
         let key = format!("{}|{}", spec.binary, root.display());
         let client = self.client_for_key(&key)?;
         let mut guard = client.lock().await;

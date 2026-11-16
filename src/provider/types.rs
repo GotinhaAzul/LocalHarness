@@ -341,6 +341,9 @@ pub struct ProviderError {
     pub status: Option<u16>,
     /// The server's `Retry-After`, when it sent one.
     pub retry_after: Option<std::time::Duration>,
+    /// A failure that sending again would only repeat (the whole-request
+    /// deadline ran out), even though its class is transient.
+    pub no_retry: bool,
 }
 
 impl ProviderError {
@@ -350,6 +353,7 @@ impl ProviderError {
             message: message.into(),
             status: None,
             retry_after: None,
+            no_retry: false,
         }
     }
 
@@ -358,6 +362,9 @@ impl ProviderError {
     /// rate limit. Credentials, a missing model, a rejected request and a
     /// parse failure fail the same way every time.
     pub fn is_transient(&self) -> bool {
+        if self.no_retry {
+            return false;
+        }
         match self.class {
             ErrorClass::Connection | ErrorClass::RateLimited => true,
             // 501 and 505 are answers about the request, not the server's
@@ -373,6 +380,7 @@ impl ProviderError {
             message: message.into(),
             status: Some(status),
             retry_after: None,
+            no_retry: false,
         }
     }
 }

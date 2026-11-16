@@ -310,11 +310,25 @@ fn is_raw_text(name: &str) -> bool {
         || name.eq_ignore_ascii_case("textarea")
 }
 
+/// Longest quoted attribute value scanned before giving up on its quote.
+const MAX_QUOTED_SCAN: usize = 16 * 1024;
+
 /// Byte index of the `>` that ends a tag, ignoring `>` inside quoted values.
+/// A quote that never closes would swallow the rest of the page and leave its
+/// markup as text, so then the first `>` after `from` ends the tag instead.
 fn find_tag_end(src: &str, from: usize) -> Option<usize> {
     let bytes = src.as_bytes();
     let mut quote = 0u8;
+    let mut first_gt = None;
     for (index, &byte) in bytes.iter().enumerate().skip(from) {
+        if byte == b'>' && first_gt.is_none() {
+            first_gt = Some(index);
+        }
+        // No real attribute value is this long; stop rescanning a hostile
+        // page to its end for every unterminated quote.
+        if quote != 0 && first_gt.is_some() && index - from > MAX_QUOTED_SCAN {
+            return first_gt;
+        }
         if quote != 0 {
             if byte == quote {
                 quote = 0;
@@ -325,7 +339,7 @@ fn find_tag_end(src: &str, from: usize) -> Option<usize> {
             return Some(index);
         }
     }
-    None
+    first_gt
 }
 
 /// Byte index of the `<` that opens the closing tag for a raw-text element.
@@ -1405,5 +1419,78 @@ if a &amp;&amp; b {
             }
         }
         assert_eq!(collected, text);
+    }
+
+    #[test]
+    fn arbitrary_fragment_soup_never_panics() {
+        const PIECES: &[&str] = &[
+            "<",
+            ">",
+            "</",
+            "<pre>",
+            "</pre>",
+            "<code class=\"language-",
+            "\">",
+            "<a href=\"",
+            "https://x.y/é",
+            "<li>",
+            "<ol>",
+            "</ul>",
+            "<table><tr><td>",
+            "&",
+            "&#",
+            "&#x",
+            "1F600;",
+            "&amp",
+            ";",
+            "é",
+            "日本",
+            "🦀",
+            "\u{200d}",
+            "<!--",
+            "-->",
+            "<script>",
+            "</script>",
+            "<br/>",
+            "<img alt=\"",
+            "'",
+            "\"",
+            "<h7>",
+            "<h1>",
+            "\n",
+            "  ",
+            "\t",
+            "<![CDATA[",
+            "]]>",
+            "<main>",
+            "<style>",
+            "&nbsp;",
+            "<<",
+            ">>",
+            "</a",
+            "=",
+        ];
+        let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+        for _ in 0..2000 {
+            let mut doc = String::new();
+            let len = (state % 60) as usize;
+            for _ in 0..len {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                doc.push_str(PIECES[(state >> 33) as usize % PIECES.len()]);
+            }
+            let text = html_to_text(&doc);
+            assert!(!text.contains("<script>"), "{doc:?} -> {text:?}");
+            let total = text.chars().count();
+            let mut offset = 0;
+            let mut guard = 0;
+            while let (_, Some(next)) = page_text(&text, offset, 7) {
+                assert!(next > offset && next <= total, "{doc:?}");
+                offset = next;
+                guard += 1;
+                assert!(guard <= total + 1);
+            }
+        }
     }
 }

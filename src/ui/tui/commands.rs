@@ -1489,6 +1489,8 @@ impl App {
         self.options.skills =
             SkillIndex::load(&paths, true).advertised_for(&crate::tools::active_packs(&core.tools));
         self.header.trust = true;
+        // A trusted project may bring its own .harness/verify.toml.
+        self.header.verify_off = self.config.verify.steps.is_empty();
         self.header.profile = self.config.profile_name().to_string();
         self.header.tool_mode = core.tool_mode_label().unwrap_or_default();
         self.window = core.effective_window().0;

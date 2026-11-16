@@ -72,7 +72,7 @@ pub async fn read_symbol(ctx: &ToolContext, args: &Value) -> Result<ToolResult, 
             )
         })?;
 
-    let lsp = ctx.lsp.running_symbols(&path, &text).await;
+    let lsp = ctx.lsp.running_symbols(&path, &text, &ctx.cwd).await;
     let resolution = match lsp {
         Some(ranges) if !ranges.is_empty() => resolve_lsp(&ranges, &symbol, &path, &text),
         _ => resolve(&path, &text, &symbol),

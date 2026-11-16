@@ -364,6 +364,12 @@ pub enum AgentEvent {
         approval_required: bool,
     },
     Notice(String),
+    /// The model call failed after streaming part of a reply and is being
+    /// sent again: the last `chars` characters of streamed text were
+    /// discarded and will not be part of the answer.
+    Discard {
+        chars: usize,
+    },
     /// A reviewed batch is waiting for the frontend's hunk decisions. The
     /// answer goes back through `HunkReviewer::submit`/`cancel` with `id`.
     HunkReview {

@@ -1727,6 +1727,7 @@ async fn run_headless(runtime: crate::app::Runtime, prompt: String, json: bool) 
     let handle = tokio::spawn(async move { run_turn(core, prompt, tx, cancel_turn).await });
 
     let mut first_signal = false;
+    let mut text = HeadlessText::new();
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
@@ -1744,7 +1745,7 @@ async fn run_headless(runtime: crate::app::Runtime, prompt: String, json: bool) 
             event = rx.recv() => {
                 match event {
                     Some(event) => {
-                        if render_event(event, json)?.is_some() {
+                        if render_event(event, json, &mut text)?.is_some() {
                             break;
                         }
                     }
@@ -1753,6 +1754,7 @@ async fn run_headless(runtime: crate::app::Runtime, prompt: String, json: bool) 
             }
         }
     }
+    text.flush()?;
     let outcome = handle.await.context("agent task panicked")?;
     let status = outcome.status;
     if runtime.core.permissions.mode() == crate::policy::PermissionMode::Plan
@@ -1783,8 +1785,57 @@ async fn run_headless(runtime: crate::app::Runtime, prompt: String, json: bool) 
     })
 }
 
+/// Plain `lh -p` answer text. On a terminal it streams. Piped, it is held
+/// until the model call finishes, so a reply that fails partway and is
+/// retried does not leave its partial text in front of the real answer.
+struct HeadlessText {
+    stream: bool,
+    pending: String,
+}
+
+impl HeadlessText {
+    fn new() -> Self {
+        use std::io::IsTerminal;
+        Self {
+            stream: std::io::stdout().is_terminal(),
+            pending: String::new(),
+        }
+    }
+
+    fn push(&mut self, text: &str) -> Result<()> {
+        if self.stream {
+            print!("{text}");
+            std::io::stdout().flush()?;
+        } else {
+            self.pending.push_str(text);
+        }
+        Ok(())
+    }
+
+    fn discard(&mut self, chars: usize) {
+        if self.stream {
+            eprintln!("\n[retry] the {chars} characters above were a failed partial reply");
+        } else {
+            let keep = self.pending.chars().count().saturating_sub(chars);
+            self.pending = self.pending.chars().take(keep).collect();
+        }
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        if !self.pending.is_empty() {
+            print!("{}", std::mem::take(&mut self.pending));
+            std::io::stdout().flush()?;
+        }
+        Ok(())
+    }
+}
+
 /// Render one event in plain or JSON mode. Returns the final status when done.
-fn render_event(event: AgentEvent, json: bool) -> Result<Option<TurnStatus>> {
+fn render_event(
+    event: AgentEvent,
+    json: bool,
+    text: &mut HeadlessText,
+) -> Result<Option<TurnStatus>> {
     if json {
         let value = crate::events::event_json(&event);
         println!("{}", serde_json::to_string(&value)?);
@@ -1794,11 +1845,14 @@ fn render_event(event: AgentEvent, json: bool) -> Result<Option<TurnStatus>> {
         return Ok(None);
     }
 
+    match &event {
+        AgentEvent::TextDelta(_) | AgentEvent::ReasoningDelta(_) | AgentEvent::Discard { .. } => {}
+        // Any other event ends the model call's text.
+        _ => text.flush()?,
+    }
     match event {
-        AgentEvent::TextDelta(text) => {
-            print!("{text}");
-            std::io::stdout().flush()?;
-        }
+        AgentEvent::TextDelta(delta) => text.push(&delta)?,
+        AgentEvent::Discard { chars } => text.discard(chars),
         AgentEvent::ReasoningDelta(_) => {}
         AgentEvent::ToolStarted { name, summary, .. } => {
             eprintln!("[tool] {name} {summary}");
@@ -1878,6 +1932,17 @@ fn init_logging(paths: &Paths, debug: bool) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn piped_answers_drop_a_discarded_partial_reply() {
+        let mut text = super::HeadlessText {
+            stream: false,
+            pending: String::new(),
+        };
+        text.push("half an ans").unwrap();
+        text.discard("half an ans".len());
+        text.push("the whole answer").unwrap();
+        assert_eq!(text.pending, "the whole answer");
+    }
     use super::*;
 
     #[test]

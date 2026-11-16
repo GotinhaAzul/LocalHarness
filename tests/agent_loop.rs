@@ -4765,8 +4765,14 @@ async fn a_dropped_stream_is_retried_without_replaying_the_partial_reply() {
         ],
         &["read"],
     );
-    let (outcome, _) = run(&harness, "explain").await;
+    let (outcome, events) = run(&harness, "explain").await;
     assert_eq!(outcome.status, TurnStatus::Done, "{:?}", outcome.error);
+    // Frontends are told to drop the streamed partial text.
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Discard { chars } if *chars == "half an ans".len()))
+    );
     let requests = harness.provider.requests.lock().unwrap();
     assert_eq!(requests.len(), 2);
     let replayed = format!("{:?}", requests[1].messages);
@@ -5148,4 +5154,101 @@ async fn harness_settle_checks_fire_tool_hooks() {
     // The model's write, then the harness's verify and review.
     assert_eq!(hook_invocations(&harness.session, "pre_tool").len(), 3);
     assert_eq!(hook_invocations(&harness.session, "post_tool").len(), 3);
+}
+
+#[tokio::test]
+async fn hook_context_does_not_push_a_sized_read_into_the_blind_cut() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let body: String = (1..=400)
+        .map(|n| format!("    let value_{n} = compute(input_{n});\n"))
+        .collect();
+    std::fs::write(dir.path().join("a.rs"), body).unwrap();
+    let hooks = tempfile::tempdir().unwrap();
+    let script = hooks.path().join("long_context.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '{{\"decision\":\"allow\",\"context\":\"{}\"}}'\n",
+            "lint note ".repeat(60)
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut config = base_config();
+    config.model.context_window = Some(8192);
+    config.profiles.get_mut("test").unwrap().tools = vec!["read".into()];
+    config.hooks.entries.insert(
+        "post".into(),
+        HookConfig {
+            event: HookEvent::PostTool,
+            command: vec![script.display().to_string()],
+            timeout_secs: 5,
+            on_error: None,
+        },
+    );
+    let harness = harness_config(
+        dir.path(),
+        vec![
+            call_script("c1", "read", json!({"path": "a.rs"})),
+            text_script("done"),
+        ],
+        config,
+    );
+    let _ = run(&harness, "read it").await;
+    let result = tool_results(&harness.session).remove(0);
+    assert!(!result.contains("(truncated"), "{result}");
+    assert!(result.contains("; next start="), "{result}");
+    assert!(result.contains("[hook context from post]"), "{result}");
+}
+
+#[tokio::test]
+async fn a_denied_harness_verify_is_skipped_not_reported_as_a_failure() {
+    use localharness::policy::RuleAction;
+    let dir = tempfile::tempdir().unwrap();
+    let base = auto_settle_harness(dir.path(), Vec::new(), "false");
+    let mut config = base.core.config.clone();
+    config.permissions.rules = vec![rule("no-verify", Some("verify"), None, RuleAction::Deny)];
+    let harness = harness_config(
+        dir.path(),
+        vec![
+            call_script("c1", "write", json!({"path":"b.txt","content":"two\n"})),
+            text_script("done"),
+        ],
+        config,
+    );
+    let (outcome, events) = run(&harness, "change b.txt").await;
+    assert_eq!(outcome.status, TurnStatus::Done, "{:?}", outcome.error);
+    // The step would fail if it ran; it must not have run.
+    assert_eq!(custom_kinds(&harness.session, "verify-result"), 0);
+    assert_eq!(harness.provider.requests.lock().unwrap().len(), 2);
+    assert!(
+        user_messages(&harness.session)
+            .iter()
+            .all(|m| !m.contains("verify FAILED")),
+    );
+    assert!(events.iter().any(|e| matches!(e,
+        AgentEvent::Notice(n) if n.contains("verify skipped"))));
+    assert_eq!(custom_kinds(&harness.session, "guard-trip"), 1);
+}
+
+#[tokio::test]
+async fn a_harness_verify_that_needs_approval_without_a_frontend_is_skipped() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = auto_settle_harness(dir.path(), Vec::new(), "false");
+    let config = base.core.config.clone();
+    let harness = harness_in_mode(
+        dir.path(),
+        vec![
+            call_script("c1", "write", json!({"path":"b.txt","content":"two\n"})),
+            text_script("done"),
+        ],
+        config,
+        Vec::new(),
+        PermissionMode::AcceptEdits,
+    );
+    let (outcome, _) = run(&harness, "change b.txt").await;
+    assert_eq!(outcome.status, TurnStatus::Done, "{:?}", outcome.error);
+    assert_eq!(custom_kinds(&harness.session, "verify-result"), 0);
+    assert_eq!(harness.provider.requests.lock().unwrap().len(), 2);
 }

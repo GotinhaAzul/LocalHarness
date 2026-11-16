@@ -745,6 +745,11 @@ async fn run_loop(
                 .and_then(|partial: &AssistantData| partial.content.as_ref())
                 .map(|text| text.chars().count())
                 .unwrap_or(0);
+            if partial_chars > 0 {
+                let _ = tx.send(AgentEvent::Discard {
+                    chars: partial_chars,
+                });
+            }
             append_custom(
                 &core.session,
                 "model-retry",
@@ -1514,13 +1519,12 @@ fn judge_truncation(
         return TruncationVerdict::Dismissed;
     }
     let reported = usage.map(|usage| usage.prompt_tokens).unwrap_or(0);
-    let short = |count: u32| {
-        estimated_tokens.saturating_sub(count) > budget.safety_margin
-            && count < estimated_tokens * 3 / 4
-    };
+    // Only when the sum lands on the estimate: where cached tokens are a
+    // subset of `prompt_tokens`, a looser test would hide a real cut.
     if let Some(cached) = usage.and_then(|usage| usage.cached_tokens)
         && cached > 0
-        && !short(reported.saturating_add(cached))
+        && estimated_tokens.saturating_sub(reported.saturating_add(cached)) <= budget.safety_margin
+        && reported.saturating_add(cached) <= estimated_tokens.saturating_add(budget.safety_margin)
     {
         return TruncationVerdict::Dismissed;
     }
@@ -2203,7 +2207,8 @@ async fn auto_settle(
     let mut failed = false;
     if checks.verify {
         progress.verify_attempts += 1;
-        let result = run_settle_check(core, tx, cancel, "verify", caps).await?;
+        let SettleCheck { result, executed } =
+            run_settle_check(core, tx, cancel, "verify", caps).await?;
         let passed = !result.is_error
             && result
                 .details
@@ -2213,6 +2218,12 @@ async fn auto_settle(
                 .unwrap_or(false);
         if passed {
             clean.push("verify passed");
+        } else if !executed {
+            // Refused by a rule, a hook or the frontend: nothing for the model
+            // to fix, and asking again would be refused again. Settle records
+            // the run as unverified.
+            progress.verify_attempts = progress.limits.verify_attempts;
+            clean.push("verify skipped (not permitted)");
         } else {
             failed = true;
             parts.push(format!(
@@ -2223,7 +2234,7 @@ async fn auto_settle(
     }
     if checks.review && !failed {
         progress.review_nudged = true;
-        let result = run_settle_check(core, tx, cancel, "review", caps).await?;
+        let SettleCheck { result, .. } = run_settle_check(core, tx, cancel, "review", caps).await?;
         let findings = result
             .details
             .as_ref()
@@ -2274,7 +2285,7 @@ async fn run_settle_check(
     cancel: &CancellationToken,
     name: &str,
     caps: context::ResultCaps,
-) -> Option<ToolResult> {
+) -> Option<SettleCheck> {
     let tool = core.tools.iter().find(|tool| tool.name() == name)?.clone();
     let args = json!({});
     let call = ToolCall {
@@ -2303,6 +2314,14 @@ async fn run_settle_check(
         crate::policy::Decision::Allow => ToolResult::ok(""),
     };
     let mut executed = false;
+    // The frontend (ACP) may add its own approval gate; it can only deny.
+    if !result.is_error
+        && let Some(approver) = &core.approver
+        && let crate::tools::ToolApproval::Deny(message) =
+            approver.approve(&call, &args, tool.read_only()).await
+    {
+        result = ToolResult::err("permission_denied", message);
+    }
     if !result.is_error
         && let Some(required) = verdict.provenance
         && let Err(denied) =
@@ -2402,7 +2421,14 @@ async fn run_settle_check(
         preview: preview(tool_body(&result.content), 300),
         artifact: capped.artifact,
     });
-    Some(result)
+    Some(SettleCheck { result, executed })
+}
+
+/// One harness-run settle check: its result, and whether the tool ran (a
+/// permission rule, a hook or the frontend may refuse it).
+struct SettleCheck {
+    result: ToolResult,
+    executed: bool,
 }
 
 /// Bounded retry of transient model-call failures within one turn.
@@ -3061,6 +3087,15 @@ async fn execute_batch(
         );
         let cap_override = tool.as_deref().and_then(|tool| tool.result_cap());
         let content_chars = result.content.chars().count();
+        // Text the harness added around the tool's own output (the header,
+        // notes, hook warnings and context) gets room of its own: a tool that
+        // sized its output to the cap must not be cut, losing its trailer and
+        // the hook's context, because a hook appended a paragraph.
+        let added = content_chars.saturating_sub(scan_output.chars().count());
+        let result_caps = context::ResultCaps {
+            result: ctx.caps.result + added.min(ctx.caps.result),
+            ..ctx.caps
+        };
         let mut capped = match cap_override {
             Some(limit) if content_chars <= limit => context::CappedContent {
                 content: result.content.clone(),
@@ -3074,7 +3109,7 @@ async fn execute_batch(
                 } else {
                     context::Preview::Head
                 };
-                context::cap_result_limited(&ctx.artifacts, &result.content, preview, ctx.caps)
+                context::cap_result_limited(&ctx.artifacts, &result.content, preview, result_caps)
             }
         };
         if cap_override.is_none() && batch_chars + capped.content.chars().count() > ctx.caps.batch {
@@ -3094,12 +3129,25 @@ async fn execute_batch(
         }
         // A read whose result was capped did not show the model the whole
         // file. Record that so `write` requires an explicit overwrite.
-        if call.name == "read"
-            && capped.truncated
-            && let Some(path) = &args_path
-            && let Ok(resolved) = ctx.resolve(path)
-        {
-            crate::tools::write::lock_reads(&ctx).mark_result_truncated(&resolved);
+        if call.name == "read" && capped.truncated {
+            let mut targets: Vec<String> = args_path.iter().cloned().collect();
+            if let Some(list) = evidence_args
+                .as_ref()
+                .unwrap_or(&call.arguments)
+                .get("paths")
+                .and_then(Value::as_array)
+            {
+                targets.extend(
+                    list.iter()
+                        .filter_map(Value::as_str)
+                        .map(|entry| crate::tools::read::entry_path(entry).to_string()),
+                );
+            }
+            for path in targets {
+                if let Ok(resolved) = ctx.resolve(&path) {
+                    crate::tools::write::lock_reads(&ctx).mark_result_truncated(&resolved);
+                }
+            }
         }
         batch_chars += capped.content.chars().count();
         let tool_result = ToolResult {

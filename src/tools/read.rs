@@ -125,8 +125,27 @@ pub(crate) fn run(ctx: &ToolContext, args: &Value) -> Result<ToolResult, ToolRes
     run_one(ctx, args, ctx.caps.tool_budget())
 }
 
+/// [`run`] for a single `path` with an explicit character budget instead of
+/// the result cap. `@file` mentions size against their own attachment
+/// budget, not a tool result's.
+pub(crate) fn run_with_budget(
+    ctx: &ToolContext,
+    args: &Value,
+    budget: usize,
+) -> Result<ToolResult, ToolResult> {
+    run_one(ctx, args, budget)
+}
+
 /// Most entries one `read` accepts in `paths`.
 pub const MAX_PATHS: usize = 6;
+
+/// The file of one `paths` entry, without its range.
+pub fn entry_path(entry: &str) -> &str {
+    match parse_entry(entry) {
+        (_, Some(_), _) => entry.rsplit_once(':').map_or(entry, |(path, _)| path),
+        _ => entry,
+    }
+}
 
 /// One `paths` entry: a path with an optional `:start-end` (or `:start`)
 /// suffix.

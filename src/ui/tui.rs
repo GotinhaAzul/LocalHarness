@@ -1426,6 +1426,7 @@ impl App {
                 }
                 self.turn_state = Some(state);
             }
+            AgentEvent::Discard { chars } => self.transcript.discard_text(chars),
             AgentEvent::TextDelta(text) => {
                 let tokens = (text.chars().count() as u64).div_ceil(4).max(1);
                 self.record_tokens(tokens);

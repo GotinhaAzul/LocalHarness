@@ -180,13 +180,16 @@ impl OpenAiCompatProvider {
                 result = tokio::time::timeout_at(idle_until, stream.next()) => {
                     match result {
                         Err(_) if idle_until >= total_deadline => {
-                            return Attempt::Failed(ProviderError::new(
+                            let mut err = ProviderError::new(
                                 ErrorClass::Connection,
                                 format!(
                                     "request exceeded {} s; raise model.request_timeout_secs or reduce context.",
                                     self.timeouts.total.as_secs()
                                 ),
-                            ));
+                            );
+                            // Another full-length attempt would only repeat it.
+                            err.no_retry = true;
+                            return Attempt::Failed(err);
                         }
                         Err(_) if !saw_event => {
                             return Attempt::Failed(ProviderError::new(
