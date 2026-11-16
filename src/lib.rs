@@ -15,6 +15,7 @@ pub mod external;
 pub mod git;
 pub mod hooks;
 pub mod host;
+pub mod html_text;
 pub mod mcp;
 pub mod media;
 pub mod paths;
@@ -30,6 +31,7 @@ pub mod skills;
 pub mod text;
 pub mod tools;
 pub mod ui;
+pub mod verify_setup;
 pub mod workflows;
 
 pub use agent::{Core, run_turn};

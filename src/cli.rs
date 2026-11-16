@@ -80,6 +80,12 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub no_agents_md: bool,
 
+    /// Add tools to the active profile for this run, e.g. `--tools +fetch`.
+    /// Opt-in tools such as `fetch` are enabled only this way or by naming
+    /// them in a profile's `tools`.
+    #[arg(long, global = true, value_name = "+TOOL,...", value_delimiter = ',')]
+    pub tools: Vec<String>,
+
     /// Resume the most recent session for this project.
     #[arg(long = "continue", conflicts_with = "resume")]
     pub continue_last: bool,
@@ -161,6 +167,13 @@ pub struct Cli {
 
 #[derive(Debug, clap::Subcommand)]
 pub enum Command {
+    /// Show or set up the verify steps for this project.
+    Verify {
+        /// Detect steps from the project's manifest files and save them for
+        /// this project (in the user data directory). Nothing is run.
+        #[arg(long)]
+        init: bool,
+    },
     /// Print the engine capability manifest and profile mismatches.
     Doctor {
         /// Emit one stable JSON object.
@@ -372,6 +385,13 @@ pub async fn run(cli: Cli) -> Result<i32> {
             config.verify = crate::config::VerifyConfig::load(&verify_path)?;
         }
     }
+    // Steps the user accepted for this project (`lh verify --init`, the TUI
+    // offer). They live in the user's data directory, not the repository.
+    if config.verify.steps.is_empty()
+        && let Some(steps) = crate::verify_setup::accepted_steps(&paths)
+    {
+        config.verify.steps = steps;
+    }
 
     let project_profiles = paths.project_dir().join("profiles");
     config.load_profile_dirs(
@@ -437,6 +457,17 @@ pub async fn run(cli: Cli) -> Result<i32> {
     }
     if cli.no_agents_md {
         config.prompt.agents_md = false;
+    }
+    if !cli.tools.is_empty() {
+        let name = config.profile_name().to_string();
+        if let Some(profile) = config.profiles.get_mut(&name) {
+            for tool in &cli.tools {
+                let tool = tool.trim().trim_start_matches('+');
+                if !tool.is_empty() && !profile.tools.iter().any(|t| t == tool) {
+                    profile.tools.push(tool.to_string());
+                }
+            }
+        }
     }
     if cli.keep_artifacts {
         config.session.keep_artifacts = true;
@@ -504,6 +535,9 @@ pub async fn run(cli: Cli) -> Result<i32> {
     }
     if let Some(Command::Context { json, .. }) = &cli.command {
         return run_context(&config, &paths, *json);
+    }
+    if let Some(Command::Verify { init }) = &cli.command {
+        return run_verify(&config, &paths, *init);
     }
     if let Some(Command::Doctor { json, fix }) = &cli.command {
         return run_doctor(&config, &paths, *json, *fix).await;
@@ -585,6 +619,31 @@ pub async fn run(cli: Cli) -> Result<i32> {
         );
     }
 
+    // No verify steps: say so once, with what was detected. Headless never
+    // prompts; the TUI offers the steps once per project.
+    if config.verify.steps.is_empty() {
+        let detected = crate::tools::project::detect_verify_steps(&paths.cwd);
+        if cli.print.is_some() {
+            eprintln!(
+                "[notice] {}",
+                crate::verify_setup::unconfigured_notice(
+                    &detected,
+                    "Save them with `lh verify --init`."
+                )
+            );
+        } else if !detected.steps.is_empty()
+            && crate::verify_setup::take_offer(&paths)
+            && let Ok(mut session) = runtime.core.session.lock()
+        {
+            session
+                .warnings
+                .push(crate::verify_setup::unconfigured_notice(
+                    &detected,
+                    "Type /verify accept to save them for this project.",
+                ));
+        }
+    }
+
     // Every core rebuild shares this manager, so one shutdown stops every
     // MCP server this process started.
     let mcp = runtime.core.mcp.clone();
@@ -602,6 +661,47 @@ pub async fn run(cli: Cli) -> Result<i32> {
     };
     mcp.shutdown().await;
     outcome
+}
+
+/// `lh verify [--init]`: show the verify steps, or detect and save them.
+fn run_verify(config: &Config, paths: &Paths, init: bool) -> Result<i32> {
+    if !config.verify.steps.is_empty() && !init {
+        println!("verify: {} step(s) configured", config.verify.steps.len());
+        for step in &config.verify.steps {
+            println!("  {}: {}", step.name, step.command.join(" "));
+        }
+        return Ok(0);
+    }
+    if !init {
+        let detected = crate::tools::project::detect_verify_steps(&paths.cwd);
+        println!(
+            "{}",
+            crate::verify_setup::unconfigured_notice(
+                &detected,
+                "Save them with `lh verify --init`."
+            )
+        );
+        return Ok(0);
+    }
+    let (detected, path) = crate::verify_setup::accept_detected(paths)
+        .with_context(|| "cannot save the verify steps")?;
+    if detected.steps.is_empty() {
+        println!(
+            "no verify steps detected in {}; looked for Cargo.toml, package.json, pyproject.toml/setup.py/pytest.ini, and go.mod. Add [[steps]] to a [verify] config section instead.",
+            paths.cwd.display()
+        );
+        return Ok(1);
+    }
+    println!(
+        "saved {} verify step(s) for {} in {}:",
+        detected.steps.len(),
+        paths.cwd.display(),
+        path.display()
+    );
+    for step in &detected.steps {
+        println!("  {}: {}", step.name, step.command);
+    }
+    Ok(0)
 }
 
 /// `lh completions <shell>`: write a completion script for packaging.
@@ -626,10 +726,37 @@ fn run_man_page() -> Result<i32> {
 /// files only; it does not open a session, start a turn, or contact a model.
 fn run_context(config: &Config, paths: &Paths, json: bool) -> Result<i32> {
     let agents = crate::agent::agents_md::AgentsMd::load(&paths.cwd, config.prompt.agents_md);
+    let skills = crate::skills::SkillIndex::load(paths, config.trust);
+    let index = skills.index_text_with(config.skills.index);
+    let clipped = skills.clipped_names();
     if json {
-        println!("{}", serde_json::to_string_pretty(&agents.manifest_json())?);
+        let mut manifest = agents.manifest_json();
+        if let Some(object) = manifest.as_object_mut() {
+            object.insert(
+                "skill_index".into(),
+                serde_json::json!({
+                    "mode": config.skills.index,
+                    "skills": skills.skills.len(),
+                    "chars": index.chars().count(),
+                    "clipped": clipped,
+                }),
+            );
+        }
+        println!("{}", serde_json::to_string_pretty(&manifest)?);
     } else {
         print!("{}", agents.manifest_text());
+        println!(
+            "skill index: {} skills, {} chars",
+            skills.skills.len(),
+            index.chars().count()
+        );
+        if !clipped.is_empty() {
+            println!(
+                "  clipped (description over {} chars; shorten it): {}",
+                crate::skills::INDEX_ENTRY_CAP,
+                clipped.join(", ")
+            );
+        }
         for warning in &agents.warnings {
             eprintln!("warning: {warning}");
         }
@@ -677,6 +804,38 @@ async fn run_doctor(config: &Config, paths: &Paths, json: bool, fix: bool) -> Re
     if let Some(cached) = crate::provider::probe::load_tool_probe(&probe_path, &probe_key) {
         manifest.tool_dialect = cached.mode.clone();
         manifest.tool_probe = Some(cached);
+    }
+    manifest.verify = Some(crate::doctor::VerifyStatus {
+        configured: config.verify.steps.len(),
+        detected: if config.verify.steps.is_empty() {
+            crate::tools::project::detect_verify_steps(&paths.cwd)
+                .steps
+                .iter()
+                .map(|step| format!("{}: {}", step.name, step.command))
+                .collect()
+        } else {
+            Vec::new()
+        },
+    });
+    if let Ok(tools) = crate::tools::ToolRegistry::builtin().select(config.profile(), &[]) {
+        let (full_chars, short_chars) = crate::tools::schema_sizes(&tools);
+        manifest.tool_schemas = Some(crate::doctor::SchemaSizes {
+            full_chars,
+            short_chars,
+            setting: match profile.tool_schemas() {
+                crate::config::ToolSchemas::Full => "full",
+                crate::config::ToolSchemas::Short => "short",
+                crate::config::ToolSchemas::Auto => "auto",
+            }
+            .into(),
+        });
+    }
+    let usage_key = crate::provider::probe::tool_probe_key(&provider, None);
+    if let Some(message) = crate::doctor::load_usage_mismatch(
+        &paths.data_dir.join(crate::doctor::USAGE_MISMATCH_CACHE),
+        &usage_key,
+    ) {
+        manifest.note_usage_mismatch(message);
     }
     if json {
         println!("{}", manifest.to_json_pretty());
@@ -1568,6 +1727,7 @@ async fn run_headless(runtime: crate::app::Runtime, prompt: String, json: bool) 
     let handle = tokio::spawn(async move { run_turn(core, prompt, tx, cancel_turn).await });
 
     let mut first_signal = false;
+    let mut text = HeadlessText::new();
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
@@ -1585,7 +1745,7 @@ async fn run_headless(runtime: crate::app::Runtime, prompt: String, json: bool) 
             event = rx.recv() => {
                 match event {
                     Some(event) => {
-                        if render_event(event, json)?.is_some() {
+                        if render_event(event, json, &mut text)?.is_some() {
                             break;
                         }
                     }
@@ -1594,6 +1754,7 @@ async fn run_headless(runtime: crate::app::Runtime, prompt: String, json: bool) 
             }
         }
     }
+    text.flush()?;
     let outcome = handle.await.context("agent task panicked")?;
     let status = outcome.status;
     if runtime.core.permissions.mode() == crate::policy::PermissionMode::Plan
@@ -1624,8 +1785,57 @@ async fn run_headless(runtime: crate::app::Runtime, prompt: String, json: bool) 
     })
 }
 
+/// Plain `lh -p` answer text. On a terminal it streams. Piped, it is held
+/// until the model call finishes, so a reply that fails partway and is
+/// retried does not leave its partial text in front of the real answer.
+struct HeadlessText {
+    stream: bool,
+    pending: String,
+}
+
+impl HeadlessText {
+    fn new() -> Self {
+        use std::io::IsTerminal;
+        Self {
+            stream: std::io::stdout().is_terminal(),
+            pending: String::new(),
+        }
+    }
+
+    fn push(&mut self, text: &str) -> Result<()> {
+        if self.stream {
+            print!("{text}");
+            std::io::stdout().flush()?;
+        } else {
+            self.pending.push_str(text);
+        }
+        Ok(())
+    }
+
+    fn discard(&mut self, chars: usize) {
+        if self.stream {
+            eprintln!("\n[retry] the {chars} characters above were a failed partial reply");
+        } else {
+            let keep = self.pending.chars().count().saturating_sub(chars);
+            self.pending = self.pending.chars().take(keep).collect();
+        }
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        if !self.pending.is_empty() {
+            print!("{}", std::mem::take(&mut self.pending));
+            std::io::stdout().flush()?;
+        }
+        Ok(())
+    }
+}
+
 /// Render one event in plain or JSON mode. Returns the final status when done.
-fn render_event(event: AgentEvent, json: bool) -> Result<Option<TurnStatus>> {
+fn render_event(
+    event: AgentEvent,
+    json: bool,
+    text: &mut HeadlessText,
+) -> Result<Option<TurnStatus>> {
     if json {
         let value = crate::events::event_json(&event);
         println!("{}", serde_json::to_string(&value)?);
@@ -1635,11 +1845,14 @@ fn render_event(event: AgentEvent, json: bool) -> Result<Option<TurnStatus>> {
         return Ok(None);
     }
 
+    match &event {
+        AgentEvent::TextDelta(_) | AgentEvent::ReasoningDelta(_) | AgentEvent::Discard { .. } => {}
+        // Any other event ends the model call's text.
+        _ => text.flush()?,
+    }
     match event {
-        AgentEvent::TextDelta(text) => {
-            print!("{text}");
-            std::io::stdout().flush()?;
-        }
+        AgentEvent::TextDelta(delta) => text.push(&delta)?,
+        AgentEvent::Discard { chars } => text.discard(chars),
         AgentEvent::ReasoningDelta(_) => {}
         AgentEvent::ToolStarted { name, summary, .. } => {
             eprintln!("[tool] {name} {summary}");
@@ -1719,6 +1932,17 @@ fn init_logging(paths: &Paths, debug: bool) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn piped_answers_drop_a_discarded_partial_reply() {
+        let mut text = super::HeadlessText {
+            stream: false,
+            pending: String::new(),
+        };
+        text.push("half an ans").unwrap();
+        text.discard("half an ans".len());
+        text.push("the whole answer").unwrap();
+        assert_eq!(text.pending, "the whole answer");
+    }
     use super::*;
 
     #[test]

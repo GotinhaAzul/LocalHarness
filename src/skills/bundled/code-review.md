@@ -1,7 +1,6 @@
 ---
 name: code-review
-description: "Review a diff or a change set for correctness, security, tests, compatibility, and maintainability; report findings by severity with a clear verdict."
-when: "reviewing changes, a pull request, a patch, or your own work before handing it back"
+description: "Review a diff, PR, or patch for correctness, security, tests, compatibility, and maintainability; report findings by severity with a verdict. Use for a PR, patch, or your own work."
 ---
 
 # Review a change

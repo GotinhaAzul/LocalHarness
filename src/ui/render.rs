@@ -298,6 +298,18 @@ impl Transcript {
         self.mark_tail_dirty();
     }
 
+    /// Drop the last `chars` characters of the streaming reply (a failed
+    /// model call that is being retried).
+    pub fn discard_text(&mut self, chars: usize) {
+        if let Some(block) = self.live_assistant.as_mut()
+            && let BlockKind::Assistant { text, .. } = &mut block.kind
+        {
+            let keep = text.chars().count().saturating_sub(chars);
+            *text = text.chars().take(keep).collect();
+            self.mark_tail_dirty();
+        }
+    }
+
     pub fn reasoning_delta(&mut self, delta: &str) {
         if delta.is_empty() {
             return;

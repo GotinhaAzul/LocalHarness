@@ -83,6 +83,9 @@ pub struct Core {
     /// Prompt limit observed from a server that silently truncates (0 when
     /// none was seen). Shared across turns; reset when the core is rebuilt.
     pub server_window: Arc<std::sync::atomic::AtomicU32>,
+    /// Whether this endpoint's usage reports can be trusted; see
+    /// [`run::UsageCheck`].
+    pub usage_check: Arc<std::sync::Mutex<run::UsageCheck>>,
     /// Where `budget.context_window` came from.
     pub window_source: WindowSource,
     /// Trained, allocated, per-slot, and effective context values with their
@@ -297,6 +300,11 @@ impl Core {
             lsp: self.registry.lsp(),
             sandbox: self.sandbox.clone(),
             vision: self.vision.clone(),
+            caps: crate::context::ResultCaps::for_usable_prompt(self.budget.usable_prompt())
+                .with_overrides(
+                    self.config.budgets.result_cap_chars,
+                    self.config.budgets.batch_cap_chars,
+                ),
         }
     }
 
@@ -356,6 +364,12 @@ pub enum AgentEvent {
         approval_required: bool,
     },
     Notice(String),
+    /// The model call failed after streaming part of a reply and is being
+    /// sent again: the last `chars` characters of streamed text were
+    /// discarded and will not be part of the answer.
+    Discard {
+        chars: usize,
+    },
     /// A reviewed batch is waiting for the frontend's hunk decisions. The
     /// answer goes back through `HunkReviewer::submit`/`cancel` with `id`.
     HunkReview {

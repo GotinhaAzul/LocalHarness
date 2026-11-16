@@ -29,6 +29,8 @@ use tokio_util::sync::CancellationToken;
 enum Script {
     Events(Vec<StreamEvent>),
     EventsThenWait(Vec<StreamEvent>),
+    /// Stream some events, then fail (a connection that drops mid-reply).
+    EventsThenError(Vec<StreamEvent>, ProviderError),
     Error(ProviderError),
     /// Emit a deterministic loop when the resolved temperature is hot, and a
     /// clean answer otherwise. Used to show a sampler preset preventing the
@@ -103,6 +105,12 @@ impl Provider for ScriptedProvider {
                 _cancel.cancelled().await;
             }
             Some(Script::Error(err)) => {
+                let _ = tx.send(Err(err));
+            }
+            Some(Script::EventsThenError(events, err)) => {
+                for event in events {
+                    let _ = tx.send(Ok(event));
+                }
                 let _ = tx.send(Err(err));
             }
             Some(Script::SamplerLoop { hot, reps, clean }) => {
@@ -261,6 +269,10 @@ fn base_config() -> Config {
     config.model.model = "test-model".into();
     config.model.endpoint = "http://127.0.0.1:0".into();
     config.model.context_window = Some(65_536);
+    // Transient-failure retries back off in milliseconds under test.
+    config.model.retry_backoff_ms = 1;
+    // The existing settle tests script the model's verify/review calls.
+    config.gates.auto_settle = false;
     config.profiles.insert(
         "test".into(),
         ProfileConfig {
@@ -405,6 +417,7 @@ fn build_core_in_mode(
         tool_timeout: std::time::Duration::from_secs(10),
         path_jail: false,
         server_window: Default::default(),
+        usage_check: Default::default(),
         window_source: localharness::agent::WindowSource::Default,
         window_truth: None,
         window_notice: None,
@@ -1237,9 +1250,17 @@ async fn a_turn_after_compaction_keeps_system_messages_leading() {
     assert!(
         matches!(&messages[0], ChatMessage::System { content }
             if content.contains("the compacted summary")
-                && content.contains("[localharness] state")),
+                && !content.contains("[localharness] state")),
         "leading system: {:?}",
         messages[0]
+    );
+    // The state block rides on the last message, where its changes cost only
+    // the tail of the request.
+    assert!(
+        matches!(messages.last(), Some(ChatMessage::User { content, .. })
+            if content.starts_with("continue") && content.contains("[localharness] state")),
+        "last message: {:?}",
+        messages.last()
     );
     assert!(
         messages
@@ -4680,4 +4701,554 @@ async fn a_path_deny_rule_matches_a_hash_patch_target() {
         "{}",
         results[1]
     );
+}
+
+fn http_error(class: ErrorClass, status: u16) -> ProviderError {
+    ProviderError::with_status(class, status, format!("endpoint error ({status})"))
+}
+
+fn error_entries(session: &SessionHandle) -> Vec<String> {
+    let session = session.lock().unwrap();
+    session
+        .branch_entries()
+        .into_iter()
+        .filter_map(|entry| match &entry.kind {
+            EntryKind::Error(data) => Some(data.code.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn retry_notices(events: &[AgentEvent]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::Notice(text) if text.starts_with("[retry ") => Some(text.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn transient_server_errors_are_retried_within_the_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness(
+        dir.path(),
+        vec![
+            Script::Error(http_error(ErrorClass::Server, 503)),
+            Script::Error(http_error(ErrorClass::Server, 503)),
+            text_script("recovered"),
+        ],
+        &["read"],
+    );
+    let (outcome, events) = run(&harness, "do it").await;
+    assert_eq!(outcome.status, TurnStatus::Done, "{:?}", outcome.error);
+    assert_eq!(harness.provider.requests.lock().unwrap().len(), 3);
+    let notices = retry_notices(&events);
+    assert_eq!(notices.len(), 2, "{notices:?}");
+    assert!(notices[0].starts_with("[retry 1/3]"), "{notices:?}");
+    assert!(error_entries(&harness.session).is_empty());
+    assert_eq!(last_assistant(&harness.session), "recovered");
+}
+
+#[tokio::test]
+async fn a_dropped_stream_is_retried_without_replaying_the_partial_reply() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness(
+        dir.path(),
+        vec![
+            Script::EventsThenError(
+                vec![StreamEvent::Delta("half an ans".into())],
+                ProviderError::new(ErrorClass::Connection, "stream error: connection reset"),
+            ),
+            text_script("the whole answer"),
+        ],
+        &["read"],
+    );
+    let (outcome, events) = run(&harness, "explain").await;
+    assert_eq!(outcome.status, TurnStatus::Done, "{:?}", outcome.error);
+    // Frontends are told to drop the streamed partial text.
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Discard { chars } if *chars == "half an ans".len()))
+    );
+    let requests = harness.provider.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    let replayed = format!("{:?}", requests[1].messages);
+    assert!(!replayed.contains("half an ans"), "{replayed}");
+    drop(requests);
+    assert_eq!(last_assistant(&harness.session), "the whole answer");
+}
+
+#[tokio::test]
+async fn permanent_errors_are_not_retried() {
+    for (class, status) in [
+        (ErrorClass::Auth, 401),
+        (ErrorClass::ModelNotFound, 404),
+        (ErrorClass::BadRequest, 400),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let harness = harness(
+            dir.path(),
+            vec![
+                Script::Error(http_error(class, status)),
+                text_script("never"),
+            ],
+            &["read"],
+        );
+        let (outcome, events) = run(&harness, "do it").await;
+        assert_eq!(outcome.status, TurnStatus::Error, "{status}");
+        assert_eq!(
+            harness.provider.requests.lock().unwrap().len(),
+            1,
+            "{status}"
+        );
+        assert!(retry_notices(&events).is_empty());
+    }
+}
+
+#[tokio::test]
+async fn exhausted_retries_name_the_attempts_and_retry_after_is_honored() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut limited = http_error(ErrorClass::RateLimited, 429);
+    limited.retry_after = Some(std::time::Duration::from_millis(120));
+    let harness = harness(
+        dir.path(),
+        vec![
+            Script::Error(limited),
+            Script::Error(http_error(ErrorClass::Server, 502)),
+            Script::Error(http_error(ErrorClass::Server, 502)),
+            Script::Error(http_error(ErrorClass::Server, 502)),
+        ],
+        &["read"],
+    );
+    let started = std::time::Instant::now();
+    let (outcome, events) = run(&harness, "do it").await;
+    assert!(started.elapsed() >= std::time::Duration::from_millis(120));
+    assert_eq!(outcome.status, TurnStatus::Error);
+    assert_eq!(retry_notices(&events).len(), 3);
+    let (_, message) = outcome.error.expect("error");
+    assert!(message.contains("gave up after 4 attempts"), "{message}");
+
+    // A Retry-After beyond the deadline is not waited out.
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = base_config();
+    config.model.retry_deadline_secs = 1;
+    let mut far = http_error(ErrorClass::RateLimited, 429);
+    far.retry_after = Some(std::time::Duration::from_secs(30));
+    let harness = harness_config(dir.path(), vec![Script::Error(far)], config);
+    let started = std::time::Instant::now();
+    let (outcome, _) = run(&harness, "do it").await;
+    assert_eq!(outcome.status, TurnStatus::Error);
+    assert!(started.elapsed() < std::time::Duration::from_secs(1));
+}
+
+#[tokio::test]
+async fn retries_zero_ends_the_turn_on_the_first_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = base_config();
+    config.model.retries = 0;
+    let harness = harness_config(
+        dir.path(),
+        vec![
+            Script::Error(http_error(ErrorClass::Server, 503)),
+            text_script("never"),
+        ],
+        config,
+    );
+    let (outcome, _) = run(&harness, "do it").await;
+    assert_eq!(outcome.status, TurnStatus::Error);
+    assert_eq!(harness.provider.requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn cancelling_during_a_backoff_stops_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = base_config();
+    config.model.retry_backoff_ms = 30_000;
+    let harness = harness_config(
+        dir.path(),
+        vec![Script::Error(http_error(ErrorClass::Server, 503))],
+        config,
+    );
+    let cancel = CancellationToken::new();
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let turn = tokio::spawn(run_turn(
+        harness.core.clone(),
+        "do it".to_string(),
+        tx,
+        cancel.clone(),
+    ));
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let cancelled_at = std::time::Instant::now();
+    cancel.cancel();
+    let outcome = turn.await.unwrap();
+    assert!(cancelled_at.elapsed() < std::time::Duration::from_millis(100));
+    assert_eq!(outcome.status, TurnStatus::Cancelled);
+}
+
+fn reply_with_usage(text: &str, usage: Usage) -> Script {
+    Script::Events(vec![
+        StreamEvent::Delta(text.into()),
+        StreamEvent::Finish("stop".into()),
+        StreamEvent::Usage(usage),
+    ])
+}
+
+#[tokio::test]
+async fn an_implausible_prompt_token_report_keeps_the_reply_and_warns_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness(
+        dir.path(),
+        vec![
+            reply_with_usage("first answer", Usage::new(10, 4)),
+            reply_with_usage("second answer", Usage::new(10, 4)),
+        ],
+        &["read"],
+    );
+    let prompt = "Explain this log.\n".repeat(1200);
+    let (outcome, events) = run(&harness, &prompt).await;
+    assert_eq!(outcome.status, TurnStatus::Done, "{:?}", outcome.error);
+    assert_eq!(last_assistant(&harness.session), "first answer");
+    let warnings = |events: &[AgentEvent]| {
+        events
+            .iter()
+            .filter(
+                |e| matches!(e, AgentEvent::Notice(n) if n.contains("usage report is unreliable")),
+            )
+            .count()
+    };
+    assert_eq!(warnings(&events), 1);
+    assert!(error_entries(&harness.session).is_empty());
+    // The next turn is not flagged again.
+    let (outcome, events) = run(&harness, &prompt).await;
+    assert_eq!(outcome.status, TurnStatus::Done);
+    assert_eq!(warnings(&events), 0);
+}
+
+#[tokio::test]
+async fn uncached_only_usage_reports_are_not_truncation() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut usage = Usage::new(600, 4);
+    usage.cached_tokens = Some(5200);
+    let harness = harness(dir.path(), vec![reply_with_usage("fine", usage)], &["read"]);
+    let prompt = "Explain this log.\n".repeat(1200);
+    let (outcome, events) = run(&harness, &prompt).await;
+    assert_eq!(outcome.status, TurnStatus::Done, "{:?}", outcome.error);
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Guard { code, .. } if code == "context_truncated"))
+    );
+}
+
+const TODO_NOTICE: &str = "the next edit needs a plan: call todo action=\"plan\" first";
+
+#[tokio::test]
+async fn the_mutation_before_the_todo_gate_carries_an_advance_notice() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness(
+        dir.path(),
+        vec![
+            call_script("c1", "write", json!({"path":"a.txt","content":"a"})),
+            call_script("c2", "write", json!({"path":"b.txt","content":"b"})),
+            call_script("c3", "todo", json!({"action":"plan","tasks":["a","b","c"]})),
+            call_script("c4", "write", json!({"path":"c.txt","content":"c"})),
+            call_script("c5", "write", json!({"path":"d.txt","content":"d"})),
+            text_script("done"),
+        ],
+        &["write", "todo"],
+    );
+    let (outcome, _) = run(&harness, "make files").await;
+    assert_ne!(outcome.status, TurnStatus::Blocked, "{:?}", outcome.error);
+    let results = tool_results(&harness.session);
+    assert!(!results[0].contains(TODO_NOTICE), "{}", results[0]);
+    assert!(results[1].contains(TODO_NOTICE), "{}", results[1]);
+    // With a plan in place the gate is open; no notice, and never twice.
+    assert_eq!(
+        results.iter().filter(|r| r.contains(TODO_NOTICE)).count(),
+        1,
+        "{results:?}"
+    );
+    assert!(dir.path().join("d.txt").exists());
+}
+
+#[tokio::test]
+async fn no_todo_notice_once_a_plan_exists() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness(
+        dir.path(),
+        vec![
+            call_script("c1", "todo", json!({"action":"plan","tasks":["a","b"]})),
+            call_script("c2", "write", json!({"path":"a.txt","content":"a"})),
+            call_script("c3", "write", json!({"path":"b.txt","content":"b"})),
+            text_script("done"),
+        ],
+        &["write", "todo"],
+    );
+    let _ = run(&harness, "make files").await;
+    let results = tool_results(&harness.session);
+    assert!(
+        results.iter().all(|r| !r.contains(TODO_NOTICE)),
+        "{results:?}"
+    );
+}
+
+fn git(dir: &std::path::Path, args: &[&str]) {
+    let status = std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_AUTHOR_NAME", "t")
+        .env("GIT_AUTHOR_EMAIL", "t@example.com")
+        .env("GIT_COMMITTER_NAME", "t")
+        .env("GIT_COMMITTER_EMAIL", "t@example.com")
+        .status()
+        .expect("git");
+    assert!(status.success(), "git {args:?}");
+}
+
+/// A git repository with one committed file, and a config whose settle checks
+/// the harness runs itself.
+fn auto_settle_harness(dir: &std::path::Path, scripts: Vec<Script>, verify: &str) -> Harness {
+    git(dir, &["init", "-q"]);
+    std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+    git(dir, &["add", "."]);
+    git(dir, &["commit", "-qm", "init"]);
+    let mut config = base_config();
+    config.gates.auto_settle = true;
+    config.profiles.get_mut("test").expect("test profile").tools =
+        ["read", "edit", "write", "verify", "review"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+    config.verify = VerifyConfig {
+        steps: vec![VerifyStep {
+            name: "check".into(),
+            command: vec!["sh".into(), "-c".into(), verify.into()],
+            timeout_secs: 5,
+        }],
+    };
+    harness_config(dir, scripts, config)
+}
+
+fn custom_kinds(session: &SessionHandle, kind: &str) -> usize {
+    let session = session.lock().unwrap();
+    session
+        .branch_entries()
+        .iter()
+        .filter(|entry| matches!(&entry.kind, EntryKind::Custom(c) if c.kind == kind))
+        .count()
+}
+
+#[tokio::test]
+async fn auto_settle_runs_verify_and_review_without_extra_model_calls() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = auto_settle_harness(
+        dir.path(),
+        vec![
+            call_script("c1", "write", json!({"path":"b.txt","content":"two\n"})),
+            text_script("changed a.txt"),
+        ],
+        "true",
+    );
+    let (outcome, events) = run(&harness, "change a.txt").await;
+    assert_eq!(outcome.status, TurnStatus::Done, "{:?}", outcome.error);
+    // The edit, then the final answer: no relay calls for verify or review.
+    assert_eq!(harness.provider.requests.lock().unwrap().len(), 2);
+    assert_eq!(last_assistant(&harness.session), "changed a.txt");
+    assert_eq!(custom_kinds(&harness.session, "verify-result"), 1);
+    assert_eq!(custom_kinds(&harness.session, "review-result"), 1);
+    assert!(events.iter().any(|e| matches!(e,
+        AgentEvent::Notice(n) if n == "[harness] verify passed, review clean")));
+    assert!(events.iter().any(|e| matches!(e,
+        AgentEvent::ToolStarted { name, summary, .. } if name == "verify" && summary.contains("harness"))));
+    // No orphan tool result: every result pairs with a model call.
+    let session = harness.session.lock().unwrap();
+    assert!(localharness::context::validate_tool_pairs(&session).is_ok());
+}
+
+#[tokio::test]
+async fn a_failing_harness_verify_continues_once_with_the_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = auto_settle_harness(
+        dir.path(),
+        vec![
+            call_script("c1", "write", json!({"path":"b.txt","content":"broken\n"})),
+            text_script("done"),
+            call_script(
+                "c2",
+                "edit",
+                json!({"path":"b.txt","old":"broken","new":"fixed"}),
+            ),
+            text_script("fixed it"),
+        ],
+        "grep -q broken b.txt && { echo 'check failed: b.txt is broken'; exit 1; } || exit 0",
+    );
+    let (outcome, _) = run(&harness, "change a.txt").await;
+    assert_eq!(outcome.status, TurnStatus::Done, "{:?}", outcome.error);
+    assert_eq!(harness.provider.requests.lock().unwrap().len(), 4);
+    let nudges: Vec<String> = user_messages(&harness.session)
+        .into_iter()
+        .filter(|m| m.starts_with("[localharness] settle checks"))
+        .collect();
+    assert_eq!(nudges.len(), 1, "{nudges:?}");
+    assert!(nudges[0].contains("verify FAILED"), "{}", nudges[0]);
+    assert!(nudges[0].contains("b.txt is broken"), "{}", nudges[0]);
+    assert_eq!(last_assistant(&harness.session), "fixed it");
+}
+
+#[tokio::test]
+async fn a_flagged_harness_review_reaches_the_model_with_the_verify_result() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = auto_settle_harness(
+        dir.path(),
+        vec![
+            call_script("c0", "read", json!({"path":"a.txt"})),
+            call_script(
+                "c1",
+                "edit",
+                json!({"path":"a.txt","old":"one","new":"one // TODO"}),
+            ),
+            text_script("done"),
+            text_script("left the marker on purpose"),
+        ],
+        "true",
+    );
+    let (outcome, _) = run(&harness, "change a.txt").await;
+    assert_eq!(outcome.status, TurnStatus::Done, "{:?}", outcome.error);
+    let nudge = user_messages(&harness.session)
+        .into_iter()
+        .find(|m| m.starts_with("[localharness] settle checks"))
+        .expect("continuation");
+    assert!(nudge.contains("verify passed"), "{nudge}");
+    assert!(nudge.contains("review flagged"), "{nudge}");
+    // Review runs once; the second answer settles.
+    assert_eq!(harness.provider.requests.lock().unwrap().len(), 4);
+}
+
+#[tokio::test]
+async fn harness_settle_checks_fire_tool_hooks() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = auto_settle_harness(dir.path(), Vec::new(), "true");
+    // Rebuild with hooks on both tool events.
+    let mut config = base.core.config.clone();
+    config.hooks.entries.insert(
+        "pre".into(),
+        hook_config(HookEvent::PreTool, "context.sh", 5),
+    );
+    config.hooks.entries.insert(
+        "post".into(),
+        hook_config(HookEvent::PostTool, "context.sh", 5),
+    );
+    let harness = harness_config(
+        dir.path(),
+        vec![
+            call_script("c1", "write", json!({"path":"b.txt","content":"two\n"})),
+            text_script("done"),
+        ],
+        config,
+    );
+    let (outcome, _) = run(&harness, "change b.txt").await;
+    assert_eq!(outcome.status, TurnStatus::Done, "{:?}", outcome.error);
+    // The model's write, then the harness's verify and review.
+    assert_eq!(hook_invocations(&harness.session, "pre_tool").len(), 3);
+    assert_eq!(hook_invocations(&harness.session, "post_tool").len(), 3);
+}
+
+#[tokio::test]
+async fn hook_context_does_not_push_a_sized_read_into_the_blind_cut() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let body: String = (1..=400)
+        .map(|n| format!("    let value_{n} = compute(input_{n});\n"))
+        .collect();
+    std::fs::write(dir.path().join("a.rs"), body).unwrap();
+    let hooks = tempfile::tempdir().unwrap();
+    let script = hooks.path().join("long_context.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '{{\"decision\":\"allow\",\"context\":\"{}\"}}'\n",
+            "lint note ".repeat(60)
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut config = base_config();
+    config.model.context_window = Some(8192);
+    config.profiles.get_mut("test").unwrap().tools = vec!["read".into()];
+    config.hooks.entries.insert(
+        "post".into(),
+        HookConfig {
+            event: HookEvent::PostTool,
+            command: vec![script.display().to_string()],
+            timeout_secs: 5,
+            on_error: None,
+        },
+    );
+    let harness = harness_config(
+        dir.path(),
+        vec![
+            call_script("c1", "read", json!({"path": "a.rs"})),
+            text_script("done"),
+        ],
+        config,
+    );
+    let _ = run(&harness, "read it").await;
+    let result = tool_results(&harness.session).remove(0);
+    assert!(!result.contains("(truncated"), "{result}");
+    assert!(result.contains("; next start="), "{result}");
+    assert!(result.contains("[hook context from post]"), "{result}");
+}
+
+#[tokio::test]
+async fn a_denied_harness_verify_is_skipped_not_reported_as_a_failure() {
+    use localharness::policy::RuleAction;
+    let dir = tempfile::tempdir().unwrap();
+    let base = auto_settle_harness(dir.path(), Vec::new(), "false");
+    let mut config = base.core.config.clone();
+    config.permissions.rules = vec![rule("no-verify", Some("verify"), None, RuleAction::Deny)];
+    let harness = harness_config(
+        dir.path(),
+        vec![
+            call_script("c1", "write", json!({"path":"b.txt","content":"two\n"})),
+            text_script("done"),
+        ],
+        config,
+    );
+    let (outcome, events) = run(&harness, "change b.txt").await;
+    assert_eq!(outcome.status, TurnStatus::Done, "{:?}", outcome.error);
+    // The step would fail if it ran; it must not have run.
+    assert_eq!(custom_kinds(&harness.session, "verify-result"), 0);
+    assert_eq!(harness.provider.requests.lock().unwrap().len(), 2);
+    assert!(
+        user_messages(&harness.session)
+            .iter()
+            .all(|m| !m.contains("verify FAILED")),
+    );
+    assert!(events.iter().any(|e| matches!(e,
+        AgentEvent::Notice(n) if n.contains("verify skipped"))));
+    assert_eq!(custom_kinds(&harness.session, "guard-trip"), 1);
+}
+
+#[tokio::test]
+async fn a_harness_verify_that_needs_approval_without_a_frontend_is_skipped() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = auto_settle_harness(dir.path(), Vec::new(), "false");
+    let config = base.core.config.clone();
+    let harness = harness_in_mode(
+        dir.path(),
+        vec![
+            call_script("c1", "write", json!({"path":"b.txt","content":"two\n"})),
+            text_script("done"),
+        ],
+        config,
+        Vec::new(),
+        PermissionMode::AcceptEdits,
+    );
+    let (outcome, _) = run(&harness, "change b.txt").await;
+    assert_eq!(outcome.status, TurnStatus::Done, "{:?}", outcome.error);
+    assert_eq!(custom_kinds(&harness.session, "verify-result"), 0);
+    assert_eq!(harness.provider.requests.lock().unwrap().len(), 2);
 }

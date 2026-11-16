@@ -35,6 +35,8 @@ pub struct HeaderData {
     pub trust: bool,
     /// The context window is a fallback or an upper bound, not a measurement.
     pub window_guess: bool,
+    /// No verify steps are configured: the verify gate is off.
+    pub verify_off: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -268,6 +270,12 @@ fn header_sides(
     }
     if !data.trust {
         left.push(vec![Span::styled("untrusted", theme.style(Role::Warning))]);
+    }
+    if data.verify_off {
+        left.push(vec![Span::styled(
+            "verify: not configured",
+            theme.style(Role::Muted),
+        )]);
     }
 
     let (model, model_role) = if data.logged_in {

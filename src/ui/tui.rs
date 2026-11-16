@@ -91,6 +91,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
         "approve the next sensitive action after a provenance warning",
     ),
     ("trust", "show the trust state"),
+    (
+        "verify",
+        "show the verify steps, or accept the detected ones",
+    ),
     ("export", "write the branch as Markdown"),
     ("clear", "clear the transcript view"),
     ("debug", "toggle the debug panel"),
@@ -113,6 +117,7 @@ fn command_usage(name: &str) -> &'static str {
         }
         "approve" => "/approve   (after a provenance warning; one action)",
         "trust" => "/trust [confirm]",
+        "verify" => "/verify [accept]   (accept: save the detected steps for this project)",
         "commit" => "/commit [confirm|cancel|edit <message>]   (no argument: show or draft)",
         "pr" => "/pr [confirm|cancel]   (no argument: show the pending action)",
         "plan" => "/plan [approve|exit]   (no argument: enter plan mode, or show the plan)",
@@ -482,6 +487,7 @@ impl App {
             session: short_session_id(&session_id),
             trust,
             window_guess: !runtime.core.effective_window().1.is_reliable(),
+            verify_off: config.verify.steps.is_empty(),
         };
         let (bg_tx, bg_rx) = mpsc::unbounded_channel();
         let mut app = App {
@@ -1420,6 +1426,7 @@ impl App {
                 }
                 self.turn_state = Some(state);
             }
+            AgentEvent::Discard { chars } => self.transcript.discard_text(chars),
             AgentEvent::TextDelta(text) => {
                 let tokens = (text.chars().count() as u64).div_ceil(4).max(1);
                 self.record_tokens(tokens);

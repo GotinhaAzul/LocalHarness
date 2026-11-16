@@ -1,7 +1,6 @@
 ---
 name: issue-to-pr
-description: "Carry an issue to a pull request: read the issue and comments, reproduce the problem, plan the change, implement, test, self-review the diff, and write a PR body that matches the evidence."
-when: "starting work from a GitHub or tracker issue, or asked to turn an issue into a pull request"
+description: "Carry an issue to a PR: read the issue and comments, reproduce, plan, implement, test, self-review the diff, write a PR body that matches the evidence. Use when starting from an issue."
 ---
 
 # From issue to pull request

@@ -379,9 +379,20 @@ async fn endpoint_down_is_prescriptive() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     drop(listener);
+    // Keep the in-turn retries short; their count is part of the message.
+    std::fs::create_dir_all(&env.config_dir).unwrap();
+    std::fs::write(
+        env.config_dir.join("config.toml"),
+        "[model]\nretry_backoff_ms = 10\n",
+    )
+    .unwrap();
     let output = run_lh(&env, &base, &["--print", "hi"]).await;
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_ne!(output.status.code(), Some(0));
+    assert!(
+        stderr.contains("gave up after 4 attempts"),
+        "stderr: {stderr}"
+    );
     assert!(
         stderr.to_ascii_lowercase().contains("connect")
             || stderr.to_ascii_lowercase().contains("cannot reach")
@@ -434,11 +445,12 @@ async fn print_refuses_when_the_static_prompt_cannot_fit() {
 }
 
 #[tokio::test]
-async fn print_stops_a_truncated_turn_without_replaying_the_reply() {
+async fn print_keeps_the_reply_when_the_usage_report_is_implausible() {
     let (base, fake) = spawn_truncating().await;
     let env = env();
     // A large project instruction block pushes the prompt past the shortfall
-    // threshold; the fake server then claims only 12 prompt tokens.
+    // threshold; the fake server then claims only 12 prompt tokens. No engine
+    // truncates to 12 tokens: the usage report is wrong, not the prompt.
     std::fs::write(
         env.cwd.join("AGENTS.md"),
         "project conventions\n".repeat(700),
@@ -448,20 +460,22 @@ async fn print_stops_a_truncated_turn_without_replaying_the_reply() {
     let output = run_lh(&env, &base, &["--print", "hi", "--json"]).await;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(output.status.code(), Some(2), "stderr: {stderr}");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {stderr}\nstdout: {stdout}"
+    );
     assert!(
-        stdout
+        !stdout
             .lines()
             .any(|line| line.contains("\"code\":\"context_truncated\"")),
         "stdout: {stdout}"
     );
-    assert!(
-        stdout
-            .lines()
-            .any(|line| line.contains("\"status\":\"ContextTruncated\"")),
-        "stdout: {stdout}"
-    );
-    // The turn stopped instead of retrying on the corrupted branch.
+    let warnings = stdout
+        .lines()
+        .filter(|line| line.contains("usage report is unreliable"))
+        .count();
+    assert_eq!(warnings, 1, "stdout: {stdout}");
     assert_eq!(fake.requests.load(Ordering::SeqCst), 1);
 }
 
@@ -1063,7 +1077,7 @@ struct SecretFake {
 async fn secret_chat(State(fake): State<SecretFake>) -> Response {
     let call = fake.calls.fetch_add(1, Ordering::SeqCst);
     let frames = if call == 0 {
-        let command = format!("echo {}; seq 1 800", fake.key);
+        let command = format!("echo {}; seq 1 3000", fake.key);
         let arguments = serde_json::json!({ "command": command }).to_string();
         format!(
             "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
@@ -1218,4 +1232,46 @@ async fn no_redact_keeps_raw_output_and_is_recorded_in_the_header() {
         "no-redact should keep the raw value in the artifact at {}",
         env.data_dir.display()
     );
+}
+
+#[tokio::test]
+async fn print_in_an_unconfigured_project_names_the_detected_steps_and_runs_none() {
+    let (base, _fake) = spawn().await;
+    let env = env();
+    std::fs::write(env.cwd.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+    // A marker a detected step would create if anything ran it.
+    let output = run_lh(&env, &base, &["--print", "hi"]).await;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
+    let notices = stderr
+        .lines()
+        .filter(|line| line.contains("verify: not configured"))
+        .count();
+    assert_eq!(notices, 1, "stderr: {stderr}");
+    assert!(stderr.contains("cargo check --all-targets"), "{stderr}");
+    assert!(stderr.contains("lh verify --init"), "{stderr}");
+    assert!(!env.cwd.join("target").exists(), "no detected step may run");
+}
+
+#[tokio::test]
+async fn verify_init_saves_the_detected_steps_for_later_runs() {
+    let (base, _fake) = spawn().await;
+    let env = env();
+    std::fs::write(env.cwd.join("go.mod"), "module example.com/x\n").unwrap();
+    let output = run_lh(&env, &base, &["verify"]).await;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("verify: not configured"), "{stdout}");
+
+    let output = run_lh(&env, &base, &["verify", "--init"]).await;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(0), "{stdout}");
+    assert!(stdout.contains("go vet ./..."), "{stdout}");
+
+    // Later runs load them without --trust; the notice is gone.
+    let output = run_lh(&env, &base, &["verify"]).await;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("verify: 2 step(s) configured"), "{stdout}");
+    let output = run_lh(&env, &base, &["--print", "hi"]).await;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("verify: not configured"), "{stderr}");
 }

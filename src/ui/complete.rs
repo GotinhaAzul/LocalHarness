@@ -141,6 +141,7 @@ pub fn takes_args(command: &str) -> bool {
             | "workflow"
             | "sec"
             | "trust"
+            | "verify"
             | "commit"
             | "pr"
             | "plan"
@@ -286,6 +287,10 @@ fn complete_argument(
         ("trust", []) => vec![Candidate::new(
             "confirm",
             "trust this project for the session",
+        )],
+        ("verify", []) => vec![Candidate::new(
+            "accept",
+            "save the detected verify steps for this project",
         )],
         ("commit", []) => vec![
             Candidate::new("confirm", "commit the previewed changes"),

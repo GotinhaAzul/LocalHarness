@@ -1,7 +1,6 @@
 ---
 name: test-repair
-description: "Repair one failing test or a small cluster of related failures: reproduce, classify, form one hypothesis, make the smallest fix, then prove the exact test and the suite."
-when: "a test fails, the suite is red, or a change broke a specific behavior"
+description: "Repair a failing test or a small cluster: reproduce, classify, form one hypothesis, make the smallest fix, then prove the test and the suite. Use when a test fails or the suite is red."
 ---
 
 # Repair a failing test

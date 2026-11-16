@@ -307,6 +307,8 @@ pub enum ErrorClass {
     ModelNotFound,
     ContextTooSmall,
     BadRequest,
+    /// HTTP 429: the server asked the client to slow down.
+    RateLimited,
     Server,
     Cancelled,
     Parse,
@@ -323,6 +325,7 @@ impl ErrorClass {
             ErrorClass::ModelNotFound => "model_not_found",
             ErrorClass::ContextTooSmall => "context_too_small",
             ErrorClass::BadRequest => "bad_request",
+            ErrorClass::RateLimited => "rate_limited",
             ErrorClass::Server => "server",
             ErrorClass::Cancelled => "cancelled",
             ErrorClass::Parse => "parse",
@@ -336,6 +339,11 @@ pub struct ProviderError {
     pub class: ErrorClass,
     pub message: String,
     pub status: Option<u16>,
+    /// The server's `Retry-After`, when it sent one.
+    pub retry_after: Option<std::time::Duration>,
+    /// A failure that sending again would only repeat (the whole-request
+    /// deadline ran out), even though its class is transient.
+    pub no_retry: bool,
 }
 
 impl ProviderError {
@@ -344,6 +352,25 @@ impl ProviderError {
             class,
             message: message.into(),
             status: None,
+            retry_after: None,
+            no_retry: false,
+        }
+    }
+
+    /// Whether sending the same request again may succeed: a dropped or
+    /// stalled connection, a timeout, an overloaded or failing server, or a
+    /// rate limit. Credentials, a missing model, a rejected request and a
+    /// parse failure fail the same way every time.
+    pub fn is_transient(&self) -> bool {
+        if self.no_retry {
+            return false;
+        }
+        match self.class {
+            ErrorClass::Connection | ErrorClass::RateLimited => true,
+            // 501 and 505 are answers about the request, not the server's
+            // state.
+            ErrorClass::Server => !matches!(self.status, Some(501 | 505)),
+            _ => false,
         }
     }
 
@@ -352,6 +379,8 @@ impl ProviderError {
             class,
             message: message.into(),
             status: Some(status),
+            retry_after: None,
+            no_retry: false,
         }
     }
 }

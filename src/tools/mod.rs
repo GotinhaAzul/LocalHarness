@@ -6,6 +6,7 @@ pub mod bg;
 pub mod detect;
 pub mod edit;
 pub mod evidence;
+pub mod fetch;
 pub mod finding;
 pub mod git;
 pub mod glob;
@@ -15,12 +16,14 @@ pub mod iocs;
 pub mod lsp;
 pub mod patch;
 pub mod pr;
+pub mod project;
 pub mod read;
 pub mod recall;
 pub mod repo_map;
 pub mod review;
 pub mod skill;
 pub mod surface;
+pub mod symbol;
 pub mod test;
 pub mod thread;
 pub mod todo;
@@ -186,6 +189,9 @@ pub struct ToolContext {
     pub sandbox: Option<Arc<crate::sandbox::Sandbox>>,
     /// How images reach the model; `read` uses it for image files.
     pub vision: Arc<crate::media::VisionSettings>,
+    /// Result caps for this turn. Tools that size their own output fit it
+    /// within [`crate::context::ResultCaps::tool_budget`].
+    pub caps: crate::context::ResultCaps,
 }
 
 impl ToolContext {
@@ -501,6 +507,11 @@ pub trait Tool: Send + Sync {
     fn preview_tail(&self) -> bool {
         false
     }
+    /// An opt-in tool joins a profile only by name, never through its pack
+    /// (`fetch` reaches the network and is off unless enabled).
+    fn opt_in(&self) -> bool {
+        false
+    }
     /// Whether runs of this tool append an engagement evidence entry.
     fn evidence_enabled(&self) -> bool {
         false
@@ -588,6 +599,7 @@ impl ToolRegistry {
             Arc::new(attack_path::AttackPathTool),
             Arc::new(finding::FindingTool),
             Arc::new(iocs::IocsTool),
+            Arc::new(fetch::FetchTool::default()),
         ] {
             registry.register(tool);
         }
@@ -595,6 +607,10 @@ impl ToolRegistry {
     }
 
     /// Apply `[git]` approval settings to the `git` and `pr` tools.
+    pub fn configure_fetch(&mut self, config: &crate::config::FetchConfig) {
+        self.register(Arc::new(fetch::FetchTool::new(config.clone())));
+    }
+
     pub fn configure_git(&mut self, config: &crate::config::GitConfig) {
         self.register(Arc::new(git::GitTool::new(config.clone())));
         self.register(Arc::new(pr::PrTool::new(config.clone())));
@@ -624,7 +640,10 @@ impl ToolRegistry {
         let mut selected: Vec<Arc<dyn Tool>> = Vec::new();
         for pack in packs {
             for tool in &self.tools {
-                if tool.pack() == pack && !selected.iter().any(|t| t.name() == tool.name()) {
+                if tool.pack() == pack
+                    && !tool.opt_in()
+                    && !selected.iter().any(|t| t.name() == tool.name())
+                {
                     selected.push(tool.clone());
                 }
             }
@@ -677,6 +696,80 @@ impl ToolRegistry {
             })
             .collect()
     }
+}
+
+/// Serialized `tools` array size in characters, in the full and the short
+/// form.
+pub fn schema_sizes(tools: &[Arc<dyn Tool>]) -> (usize, usize) {
+    let size = |short| {
+        let specs = ToolRegistry::specs_with(tools, short);
+        if specs.is_empty() {
+            0
+        } else {
+            crate::provider::tools_json(&specs).chars().count()
+        }
+    };
+    (size(false), size(true))
+}
+
+/// The outcome of `short_tool_schemas = "auto"`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SchemaChoice {
+    pub short: bool,
+    /// Static prompt share of the usable prompt with the full schemas.
+    pub full_share: f64,
+    pub full_chars: usize,
+    pub short_chars: usize,
+}
+
+impl SchemaChoice {
+    pub fn line(&self) -> String {
+        if self.short {
+            format!(
+                "tool schemas: short (auto; the static prompt would take {:.0}% of the usable prompt with full schemas; saves {} chars)",
+                self.full_share * 100.0,
+                self.full_chars.saturating_sub(self.short_chars)
+            )
+        } else {
+            format!(
+                "tool schemas: full (auto; the static prompt takes {:.0}% of the usable prompt)",
+                self.full_share * 100.0
+            )
+        }
+    }
+}
+
+/// Decide `short_tool_schemas = "auto"` once for a session and model: the
+/// short form when the system prompt plus the full schemas would exceed
+/// [`crate::config::AUTO_SHORT_SCHEMA_SHARE`] of the usable prompt. Rewrites
+/// `specs` in place when it picks the short form; an empty `specs` (no native
+/// tool calls) is left alone.
+pub fn choose_schemas(
+    tools: &[Arc<dyn Tool>],
+    specs: &mut Vec<crate::provider::ToolSpec>,
+    system_prompt: &str,
+    budget: &crate::context::TokenBudget,
+) -> Option<SchemaChoice> {
+    if specs.is_empty() {
+        return None;
+    }
+    let (full_chars, short_chars) = schema_sizes(tools);
+    let full_json = crate::provider::tools_json(specs);
+    let cost = crate::context::ToolSpecCost::from_json(&full_json, budget);
+    let total = budget
+        .estimate_text(system_prompt)
+        .saturating_add(cost.tokens);
+    let full_share = f64::from(total) / f64::from(budget.usable_prompt().max(1));
+    let short = full_share > crate::config::AUTO_SHORT_SCHEMA_SHARE;
+    if short {
+        *specs = ToolRegistry::specs_with(tools, true);
+    }
+    Some(SchemaChoice {
+        short,
+        full_share,
+        full_chars,
+        short_chars,
+    })
 }
 
 /// First sentence of a tool description, capped for schemas sent to weak models.
@@ -928,7 +1021,7 @@ mod tests {
         let registry = ToolRegistry::builtin();
         assert_eq!(
             registry.names().len(),
-            26,
+            27,
             "update docs when the built-in surface changes: {:?}",
             registry.names()
         );

@@ -87,7 +87,11 @@ pub async fn resolve(ctx: &ToolContext, text: &str, char_budget: usize) -> Resol
             }
             continue;
         }
-        let result = match crate::tools::read::run(ctx, &json!({ "path": raw, "limit": 800 })) {
+        let result = match crate::tools::read::run_with_budget(
+            ctx,
+            &json!({ "path": raw, "limit": 800 }),
+            usize::MAX,
+        ) {
             Ok(result) | Err(result) => result,
         };
         if result.is_error {

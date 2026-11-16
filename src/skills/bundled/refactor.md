@@ -1,7 +1,6 @@
 ---
 name: refactor
-description: "Refactor code without changing behavior: define the behavior contract, capture a green baseline, move in small verified steps, and stop when the diff stops being mechanical."
-when: "renaming, extracting, moving, simplifying, or restructuring code that already works"
+description: "Refactor without changing behavior: define the contract, keep a green baseline, move in verified steps, and stop when the diff stops being mechanical. Use for renames, extracts, or moves."
 ---
 
 # Refactor without changing behavior

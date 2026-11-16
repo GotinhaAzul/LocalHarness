@@ -117,6 +117,23 @@ pub enum Effect {
     Exec,
 }
 
+/// `path` without a trailing `:start` or `:start-end` line range.
+fn strip_line_range(path: &str) -> &str {
+    let Some((file, range)) = path.rsplit_once(':') else {
+        return path;
+    };
+    let digits = |text: &str| !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit());
+    let is_range = match range.split_once('-') {
+        Some((start, end)) => digits(start) && digits(end),
+        None => digits(range),
+    };
+    if !file.is_empty() && is_range {
+        file
+    } else {
+        path
+    }
+}
+
 /// Harness-state tools: they never touch the workspace or run commands.
 const SESSION_TOOLS: &[&str] = &["todo", "thread", "finding"];
 /// File tools that `accept-edits` runs unasked.
@@ -147,10 +164,12 @@ impl CallFacts {
             paths.push(relative(&path, cwd));
         }
         if let Some(list) = args.get("paths").and_then(Value::as_array) {
+            // `read` entries may carry a range (`src/a.rs:10-40`); rules match
+            // the file, so a deny on `.env` must also catch `.env:1-5`.
             paths.extend(
                 list.iter()
                     .filter_map(Value::as_str)
-                    .map(|path| relative(path, cwd)),
+                    .map(|path| relative(strip_line_range(path), cwd)),
             );
         }
         let (command, effect, network) = match tool {
@@ -184,6 +203,12 @@ impl CallFacts {
             "pr" => {
                 let action = str_arg("action").unwrap_or_default();
                 (Some(format!("gh pr {action}")), Effect::Exec, true)
+            }
+            // The full URL is the subject the user approves, and per-host
+            // rules match it (`command = "^fetch https://docs\\.rs/"`).
+            "fetch" => {
+                let url = str_arg("url").unwrap_or_default();
+                (Some(format!("fetch {url}")), Effect::Exec, true)
             }
             _ if read_only => (None, Effect::ReadOnly, false),
             _ if SESSION_TOOLS.contains(&tool) => (None, Effect::Session, false),
@@ -845,6 +870,24 @@ mod tests {
                 other => panic!("{call:?}: {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn a_read_range_suffix_does_not_slip_past_a_path_rule() {
+        assert_eq!(strip_line_range(".env:1-5"), ".env");
+        assert_eq!(strip_line_range("src/a.rs:10"), "src/a.rs");
+        assert_eq!(strip_line_range("c:dir"), "c:dir");
+        assert_eq!(strip_line_range("a.rs:1-x"), "a.rs:1-x");
+        let facts = CallFacts::new(
+            "read",
+            true,
+            &serde_json::json!({"paths": ["src/a.rs", ".env:1-5"]}),
+            Path::new("/work"),
+        );
+        assert_eq!(
+            facts.paths,
+            vec!["src/a.rs".to_string(), ".env".to_string()]
+        );
     }
 
     #[test]

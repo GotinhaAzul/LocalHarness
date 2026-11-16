@@ -40,6 +40,7 @@ fn header(model: &str, session: &str) -> HeaderData {
         session: session.into(),
         trust: true,
         window_guess: false,
+        verify_off: false,
     }
 }
 

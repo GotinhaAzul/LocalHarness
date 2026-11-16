@@ -284,6 +284,32 @@ fn language_for(path: &Path) -> Option<&'static str> {
 }
 
 fn extract_symbols(path: &Path, text: &str) -> Vec<Symbol> {
+    extract_symbols_limited(path, text, MAX_SYMBOLS_PER_FILE)
+}
+
+/// One top-level or nested declaration found by the scanner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Declaration {
+    /// 1-based line of the declaration.
+    pub line: usize,
+    pub kind: &'static str,
+    pub name: String,
+}
+
+/// Every declaration the scanner recognizes in `text`, uncapped, for
+/// resolving a name to its line (`read` with `symbol`).
+pub fn declarations(path: &Path, text: &str) -> Vec<Declaration> {
+    extract_symbols_limited(path, text, usize::MAX)
+        .into_iter()
+        .map(|symbol| Declaration {
+            line: symbol.line,
+            kind: symbol.kind,
+            name: symbol.name,
+        })
+        .collect()
+}
+
+fn extract_symbols_limited(path: &Path, text: &str, limit: usize) -> Vec<Symbol> {
     let extension = path
         .extension()
         .and_then(|extension| extension.to_str())
@@ -291,7 +317,7 @@ fn extract_symbols(path: &Path, text: &str) -> Vec<Symbol> {
         .to_ascii_lowercase();
     let mut symbols = Vec::new();
     for (index, raw) in text.lines().enumerate() {
-        if symbols.len() >= MAX_SYMBOLS_PER_FILE {
+        if symbols.len() >= limit {
             break;
         }
         let trimmed = raw.trim_start();

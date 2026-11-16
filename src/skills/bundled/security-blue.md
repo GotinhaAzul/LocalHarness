@@ -1,6 +1,6 @@
 ---
 name: security-blue
-description: "Defensive security: incident triage, evidence preservation, log and IOC analysis, detection engineering, secure code review, dependency and supply-chain review, hardening, containment, and reporting. Use for alerts, suspicious activity, security reviews, vulnerability triage, or hardening a host, service, or codebase."
+description: "Defensive security: incident triage, evidence, log/IOC analysis, detection engineering, secure code review, supply chain, hardening, reporting. Use for alerts or suspicious activity."
 ---
 
 # Blue team

@@ -125,6 +125,8 @@ pub struct RunProgress {
     /// after every successful model reply so a later context fill can check
     /// again.
     pub presend_compaction_used: bool,
+    /// Whether the advance notice for the todo gate was attached this turn.
+    pub todo_notice_sent: bool,
 }
 
 impl RunProgress {
@@ -147,6 +149,7 @@ impl RunProgress {
             settle_continuations: 0,
             verify_attempts: 0,
             review_nudged: false,
+            todo_notice_sent: false,
             context_retry_used: false,
             last_stop: None,
             output_recoveries: 0,

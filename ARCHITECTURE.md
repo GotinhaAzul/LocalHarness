@@ -228,10 +228,22 @@ omission. Bundled presets: `qwen-coding`, `gemma-chat`, `glm-agent`.
 
 - Connect timeout 5 s; first token 120 s; stream idle 120 s; total request
   timeout 15 min, all configurable.
-- One retry on connection failure before any tokens. No retry after tokens
-  have streamed.
+- The provider still retries a connection failure once before any token. On
+  top of that, the loop sends the request again when a call fails for a
+  transient reason: a connection failure, a dropped or stalled stream, a 5xx
+  except 501/505, 408/504, or 429 (its own `rate_limited` class). Up to
+  `[model] retries` (default 3), with jittered 1x/4x/15x backoff of
+  `retry_backoff_ms` (default 1000), honoring `Retry-After` while the total
+  wait stays within `retry_deadline_secs` (default 120). Each retry is a
+  notice, the partial reply is logged as a `model-retry` entry and never
+  replayed, and retries do not count as model calls. Ctrl+C interrupts the
+  backoff, and the final error says "gave up after N attempts". A call that
+  ran out the whole-request timeout is not retried. When a reply failed after
+  streaming text, a `discard` event (also in `--json` and SSE) tells
+  frontends to drop that text; piped `lh -p` output holds each call's text
+  until the call completes. `retries = 0` restores the old behavior.
 - Error classes: `connection`, `auth`, `model_not_found`, `context_too_small`,
-  `bad_request`, `server`, `cancelled`, `parse`.
+  `bad_request`, `rate_limited`, `server`, `cancelled`, `parse`.
 - Errors shown to the model and the user are prescriptive: what failed, what
   the harness tried, and the next action. No stack traces in tool results.
 
@@ -379,6 +391,21 @@ Guards are inert when their required tool is absent from the active profile.
 At most two settle continuations per turn, shared by verify and todo gates.
 The review nudge is one-shot and does not count against the verify cap.
 
+With `[gates] auto_settle` (default true), the harness runs the checks itself
+when the model settles after changing files: `verify` while attempts remain,
+then `review`, through the same permission rules and `pre_tool`/`post_tool`
+hooks as a model call. It records the usual `verify-result` entry plus a
+`review-result` entry. Clean results settle on the answer already written, with
+a `[harness] verify passed, review clean` notice; a failed verify or a flagged
+review continues once with a user-role message carrying the results, so no
+orphan tool result enters the context path. `auto_settle = false` keeps the
+model-relayed gate messages.
+
+One step before the todo gate — the second mutation, or the first edit of a
+second file, with no plan — the successful mutation's tool result ends with one
+line saying the next edit needs a plan. It appears once per turn; the gate
+itself is unchanged.
+
 ### 3.7 Output recovery
 
 Local servers often lack a reasoning or tool parser, and small models loop.
@@ -393,7 +420,7 @@ continues. Nudges are capped at three per turn.
 | Exact repetition | The stream is checked as it grows; a tail of one unit repeated at least 5 times and 600 bytes stops generation, keeps one copy, and nudges. Repeated loops end the turn as `stalled`. |
 | `finish_reason = length` | A cut tool call (arguments not valid JSON) does not run; the model is told to send smaller calls. Cut prose is continued. A reply that spent the budget thinking is told to act. |
 | Empty reply | One nudge to call a tool or answer. |
-| Silent prompt truncation | A usage report under 1 token per 6 characters on a prompt of 12,000+ characters means the server dropped part of the prompt. Calibration skips the sample, the budget shrinks to the observed window for the rest of the session, the reply is discarded, and the call is retried once after compaction. |
+| Silent prompt truncation | The engine's `truncated` flag and context-shift count are proof and end the turn. Arithmetic signals need a second witness: `prompt_tokens + cached_tokens` covering the prompt means an uncached-only report; `/tokenize` decides between a cut prompt (it exceeds the window) and a wrong report (it fits); a count under 512 tokens is a broken usage field; impossible characters per token with a plausible count is a confirmed cut; a plain shortfall must repeat on the next call. A wrong report keeps the reply, warns once, stops calibrating from usage on that endpoint, and is recorded for `lh doctor`, which reports it without sending a chat completion. |
 
 ---
 
@@ -429,15 +456,24 @@ usable_prompt = context_window - max_output_tokens - safety_margin
   `timings.cache_n`) is reported per call. The TUI header shows `cache
   <cached>/<prompt>`; `--json` usage events carry `cached_tokens` and
   `cache_percent`. Two consecutive calls under 70% emit a notice naming the
-  likely invalidator: a compaction, a changed prefix, or server-side eviction.
+  likely invalidator: a compaction, a rewritten system message, a changed
+  tool list, or server-side eviction.
 - The request prefix (leading system block plus serialized tools) is hashed
   with SHA-256 and recorded once per core build as a `prompt-prefix` entry, so
   a changed prefix is visible next to the turn where it changed.
 
 ### 4.3 Tool result caps and archive
 
-- A tool result is capped at 2500 characters by default; batch total is capped
-  at 8000 characters.
+- One tool result may occupy 4% of the usable prompt in characters (at 3.5
+  characters per token), clamped to 2500..16000; one batch may occupy 12%,
+  clamped to 8000..40000. Small windows therefore keep the original
+  2500/8000. `[budgets] result_cap_chars` and `batch_cap_chars` override
+  either.
+- `read`, `grep`, and `glob` size their own output within the cap in whole
+  lines or entries and report the real range: `[lines a-b of n; next
+  start=c]`, or `N of M matches shown`. A `read`'s recorded coverage is
+  exactly the lines shown. The loop's blind cut is only a fallback, at a
+  line boundary.
 - Larger output is written to an artifact under the session's artifact
   directory. The tool result contains a short preview plus `[out-N]` and the
   artifact size. Command tools (`bash`, `bg`, `test`, `verify`) preview the
@@ -539,10 +575,17 @@ After a compaction, inject one short state block: changed files, last verify,
 active thread, open findings count, and the current budget. This prevents the
 model from re-reading half the repository.
 
-The block is appended to the leading system message, so its text must change
-rarely: every change makes the engine re-evaluate the conversation after it.
-The budget is therefore reported in bands (under 50%, over 50%, over 65% of
-the usable prompt), not as an exact percentage.
+Assembly attaches the block to the last message of each request, at assembly
+time; it is not stored, and it is not part of the system message. A change in
+changed files, verify status, or the budget band therefore costs only the tail
+instead of making the engine re-evaluate the whole conversation. The budget is
+reported in bands (under 50%, over 50%, over 65% of the usable prompt), not as
+an exact percentage.
+
+Hook context follows the prefix rule too. `session_start` and `pre_compact`
+context joins the leading system message, written once; `user_prompt` and
+`stop` context is rendered in place on the user or tool message it belongs to;
+`pre_tool`/`post_tool` context lives only in the tool result.
 
 ---
 
@@ -742,12 +785,12 @@ only the marker and the `rewind` entry are appended.
 
 ### 6.1 Built-in tool surface
 
-Twenty-six tools. Static per model call. The default `coding` profile includes
+Twenty-seven tools. Static per model call. The default `coding` profile includes
 core and coding; `full` adds the security pack.
 
 | Pack | Tool | Purpose |
 |---|---|---|
-| Core | `read` | Read a file with line numbers |
+| Core | `read` | Read a file with line numbers; `paths` for up to six files or ranges, `symbol` for one declaration |
 | Core | `write` | Create or replace a file |
 | Core | `edit` | Exact-text replacement |
 | Core | `patch` | Exact-anchor edit by default; hash mode takes line anchors with recovery diagnostics |
@@ -772,10 +815,21 @@ core and coding; `full` adds the security pack.
 | Security | `attack_path` | Ranked graph paths, choke points, node detail |
 | Security | `finding` | Engagement findings ledger, report, and PoC replay |
 | Security | `iocs` | Extract and defang indicators |
+| Opt-in | `fetch` | GET a public http(s) URL as readable text; never selected by a pack |
 
 Tool descriptions stay under roughly 200 characters. Schemas are flat objects
 with the minimum required fields. Every error is a recovery instruction with a
 code and, where useful, the exact call shape.
+
+`fetch` is off by default: no profile includes it, and it joins one only when
+the profile's `tools` names it or `--tools +fetch` adds it.
+
+`short_tool_schemas` accepts `true`, `false`, or `"auto"`. `"auto"` sends the
+short form when the system prompt plus the full schemas would exceed 20% of the
+usable prompt; the choice is made once per session and model so the prefix
+stays byte-stable. The default stays the full form, because the `lh eval`
+tool-call and edit suites have not been run against real models for the short
+form. `lh doctor` prints both sizes.
 
 ### 6.2 Tool contracts
 
@@ -783,8 +837,16 @@ code and, where useful, the exact call shape.
 - `content` is text, capped. `details` is structured but never sent to the
   model unless summarized.
 - `read` returns line numbers and caps at 150 lines by default, 800 maximum.
-  Binary files are detected and refused with a message. With
-  `edit_mode = "hash"` in the model profile it also prints a
+  `paths` takes up to six entries, each optionally `path:start-end`, and
+  splits the result budget between them in whole lines; every file prints
+  under its own header with its own trailer. `symbol` returns one
+  declaration's whole extent, doc comments and attributes included: the range
+  comes from a language server already running (never started for this),
+  otherwise from the `repo_map` scanner plus brace or indentation matching,
+  and the result says which. `Type::method` and `Class.method` select inside a
+  container; an ambiguous name lists candidates, and an unknown name lists the
+  nearest declarations. Binary files are detected and refused with a message.
+  With `edit_mode = "hash"` in the model profile it also prints a
   `[path#snapshot]` header and an 8-hex content hash before each line; text
   mode output is unchanged.
 - In hash edit mode, `patch` takes `path#snapshot` and an `ops` array of
@@ -827,7 +889,19 @@ code and, where useful, the exact call shape.
   verification is configured.
 - `verify` runs configured steps sequentially without a shell, caps combined
   output at 1 MiB, and returns a compact pass/fail summary. It records
-  `verify-result`.
+  `verify-result`. With no steps configured, `lh verify [--init]` shows or
+  saves the steps detected from manifest files, and `/verify [accept]` does
+  the same in the TUI; nothing from the repository runs before the user
+  accepts. Accepted steps live in `verify-steps.json` in the user data
+  directory, keyed by project, so they load without `--trust`. `lh doctor`
+  reports what is configured or detected.
+- `fetch` GETs one public http(s) URL and returns readable text: HTML is
+  converted (scripts, navigation, and page chrome dropped; code blocks
+  fenced), while text, Markdown, and JSON pass through. The body is capped at
+  2 MB and 20 s, and pages by character offset within the result budget. It
+  refuses loopback, private, link-local, CGNAT, and metadata addresses on
+  every hop, unless `[fetch] allow_private` names the host. Results carry
+  external provenance.
 - `recall` reads an archived artifact range and names the artifact in the
   result.
 - `thread` has `split`, `note`, `close`, `status`; `split` requires a title or
@@ -996,7 +1070,7 @@ recorded. This is the documented non-blocking auto-accept.
 | `detect` | 300 rule files, 500 files / 250k lines per run, 500 hits |
 | `attack_path` | 400 nodes for full betweenness; 5000 simple paths |
 | `iocs` | 100 per category, 2,000,000 input chars |
-| tool result | 2500 chars per result, 8000 chars per batch |
+| tool result | 4% of the usable prompt (2500..16000 chars) per result, 12% (8000..40000) per batch; `[budgets]` can override |
 | `AGENTS.md` | 32 KiB total, 12 KiB per file; chain from repo root to cwd |
 | compaction | `clamp(usable prompt / 3, 1200, 4500)` chars, max 40% of usable |
 
@@ -1094,8 +1168,14 @@ allowed-tools: read grep bash
 - `allowed-tools` is intersected with the active profile. It can never add a
   tool the profile did not select.
 - The harness injects a compact index (name, description, when) into the system
-  prompt. Full text loads on `/skill <name>`, when the `skill` tool loads it, or
-  when a workflow names it.
+  prompt, capped at 200 characters per entry (clipped on a word boundary) and
+  2400 characters in total; past that the remaining skills are listed by name
+  on one bounded line and stay loadable through the `skill` tool. Shared
+  `~/.claude` and `~/.agents` skills sort behind bundled, native, and project
+  skills. `[skills] index = "full" | "names" | "off"` chooses how much the
+  prompt carries. Full text loads on `/skill <name>`, when the `skill` tool
+  loads it, or when a workflow names it. `lh context` reports the index size
+  and names the skills whose entry was clipped.
 - Skills are instructions, not executable code. A script shipped in a skill
   directory is never run automatically; `bash`/`bg` targeting one requires
   per-execution approval with the command shown.
@@ -1107,7 +1187,8 @@ allowed-tools: read grep bash
   loader's validator. Lint errors: bad name, long description, body over 500
   lines, missing/unreadable/oversize reference, grant-shaped frontmatter, and
   duplicate names. Warnings: body over 300 lines, more than ten references,
-  home paths, and secret shapes. Eval runs a deterministic fake provider and
+  home paths, secret shapes, and an index entry that the 200-character cap
+  would clip. Eval runs a deterministic fake provider and
   reports trigger precision/recall, average loaded tokens, and false-load cost;
   a skip fixture that loads exits 1.
 
@@ -1656,6 +1737,8 @@ cursor = "#c0caf5"
 - Throughput: rolling tokens/second over the last few seconds, plus
   `cache <cached>/<prompt>` when the engine reports prefix-cache hits.
 - Session: short id and trusted/untrusted marker.
+- Verify: `verify: not configured` when no steps are set; the marker drops
+  once steps are configured.
 - At narrow widths, drop throughput, then session id, then profile; never drop
   cwd, context, or model. With no model selected, the model slot reads
   `not logged in` and the footer says the same.
@@ -1895,6 +1978,10 @@ strip_reasoning = true
   tools/
   prompts/
 ```
+
+`verify.toml` is a project file and needs `--trust`. Steps accepted through
+`lh verify --init` or `/verify accept` are stored per project in
+`verify-steps.json` in the user data directory, so they load without trust.
 
 `AGENTS.md` files between the repository root and the working directory are
 read as untrusted project instructions, nearest last. They are data, not

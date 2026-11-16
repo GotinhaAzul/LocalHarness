@@ -175,6 +175,8 @@ pub fn analyze_turn_since(
                         facts.todo_final_done = facts.todo_plan_present && all_done;
                     }
                 }
+                // A review the harness ran at settle counts like a call.
+                "review-result" => facts.review_called = true,
                 "verify-result" => {
                     facts.verify_called = true;
                     facts.last_verify_passed =
@@ -259,6 +261,34 @@ pub enum SettleDecision {
     Block { message: String },
 }
 
+/// Which checks the harness should run itself when the model settles
+/// (`[gates] auto_settle`). Mirrors [`settle`]: the todo gate goes first and
+/// is left to it; verify runs while attempts remain; review runs once after
+/// changes, when verify is not needed or passed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AutoChecks {
+    pub verify: bool,
+    pub review: bool,
+}
+
+pub fn auto_checks(facts: &TurnFacts, progress: &RunProgress, tools: GateTools) -> AutoChecks {
+    let none = AutoChecks {
+        verify: false,
+        review: false,
+    };
+    if tools.todo && facts.multi_step() && !facts.todo_plan_present {
+        return none;
+    }
+    let verify = tools.verify
+        && facts.verify_configured
+        && (facts.unverified_mutations
+            || (facts.todo_final_done && !facts.last_verify_passed.unwrap_or(false)))
+        && progress.verify_attempts < progress.limits.verify_attempts;
+    let review =
+        tools.review && facts.mutations > 0 && !facts.review_called && !progress.review_nudged;
+    AutoChecks { verify, review }
+}
+
 /// Decide whether the turn settles or continues with a gate instruction.
 pub fn settle(facts: &TurnFacts, progress: &mut RunProgress, tools: GateTools) -> SettleDecision {
     if tools.todo && facts.multi_step() && !facts.todo_plan_present {
@@ -329,6 +359,20 @@ pub fn todo_edit_gate(
             "this run has {mutations} mutation(s) across {files} file(s); a plan is now required. Call todo with {{\"action\":\"plan\",\"tasks\":[\"...\"]}} first, then retry this edit."
         ),
     ))
+}
+
+/// One line for the result of a mutation that leaves the run one step from
+/// [`todo_edit_gate`]: `mutations` and `files` count this mutation. `None`
+/// when a plan exists or the gate is still more than one step away.
+pub fn todo_gate_notice(
+    mutations: usize,
+    files: usize,
+    plan_present: bool,
+) -> Option<&'static str> {
+    if plan_present || !(mutations >= 2 || files >= 2) {
+        return None;
+    }
+    Some("[localharness] the next edit needs a plan: call todo action=\"plan\" first.")
 }
 
 #[cfg(test)]

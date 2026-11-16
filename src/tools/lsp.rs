@@ -562,6 +562,42 @@ impl LspService {
     /// or no fresh batch arrives. A clean batch returns a short "none" line.
     /// This method never reports an error: a missing language server must not
     /// turn a successful edit into a failed tool call.
+    /// Declarations with their full line ranges (1-based, inclusive) from a
+    /// language server that is already running for `path`. Never starts a
+    /// server: `read` with `symbol` must not pay a cold start, so without a
+    /// live client it falls back to the built-in scanner.
+    pub async fn running_symbols(
+        &self,
+        path: &Path,
+        text: &str,
+        cwd: &Path,
+    ) -> Option<Vec<SymbolRange>> {
+        let extension = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let spec = server_spec_for_ext(&extension)?;
+        // The same root (and so the same client key) the `lsp` tool uses.
+        let root = project_root(path, root_markers(&extension), cwd);
+        let key = format!("{}|{}", spec.binary, root.display());
+        let client = self.client_for_key(&key)?;
+        let mut guard = client.lock().await;
+        guard.last_used = Instant::now();
+        let (synced_uri, _) = guard.sync_document(path, text).await.ok()?;
+        let result = guard
+            .request(
+                "textDocument/documentSymbol",
+                json!({"textDocument": {"uri": synced_uri.as_str()}}),
+                REQUEST_TIMEOUT,
+            )
+            .await
+            .ok()?;
+        let mut out = Vec::new();
+        flatten_symbol_ranges(result.as_array()?, None, &mut out);
+        Some(out)
+    }
+
     pub async fn diagnostics_after_edit(&self, ctx: &ToolContext, path: &Path) -> Option<String> {
         let extension = path
             .extension()
@@ -1207,6 +1243,46 @@ fn symbol_line(symbol: &Value) -> Option<u64> {
         .pointer("/start/line")
         .and_then(Value::as_u64)
         .map(|line| line + 1)
+}
+
+/// A declaration's name and full range from a language server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SymbolRange {
+    pub name: String,
+    /// `Container::name` for a nested declaration.
+    pub qualified: Option<String>,
+    pub kind: &'static str,
+    pub start: usize,
+    pub end: usize,
+}
+
+fn flatten_symbol_ranges(symbols: &[Value], parent: Option<&str>, out: &mut Vec<SymbolRange>) {
+    for symbol in symbols {
+        let Some(name) = symbol.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        let range = symbol
+            .get("range")
+            .or_else(|| symbol.pointer("/location/range"));
+        let line = |key: &str| {
+            range
+                .and_then(|range| range.pointer(key))
+                .and_then(Value::as_u64)
+                .map(|line| line as usize + 1)
+        };
+        if let (Some(start), Some(end)) = (line("/start/line"), line("/end/line")) {
+            out.push(SymbolRange {
+                name: name.to_string(),
+                qualified: parent.map(|parent| format!("{parent}::{name}")),
+                kind: symbol_kind(symbol.get("kind").and_then(Value::as_u64).unwrap_or(0)),
+                start,
+                end: end.max(start),
+            });
+        }
+        if let Some(children) = symbol.get("children").and_then(Value::as_array) {
+            flatten_symbol_ranges(children, Some(name), out);
+        }
+    }
 }
 
 fn render_outline(symbols: &[Value]) -> Vec<String> {

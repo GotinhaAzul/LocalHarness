@@ -2,6 +2,7 @@
 
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
+use std::time::Duration;
 use std::time::Instant;
 
 use chrono::{Duration as ChronoDuration, Utc};
@@ -12,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 use crate::context::compact::{
     FindingSummary, build_summary_keeping, recent_tail_start, summary_budget, tail_budget,
 };
-use crate::context::{self, BATCH_CAP_CHARS, StaticPrompt, TokenBudget, ToolSpecCost};
+use crate::context::{self, StaticPrompt, TokenBudget, ToolSpecCost};
 use crate::provider::{
     CallAccumulator, ChatMessage, ChatRequest, ErrorClass, ProviderError, StreamEvent, Usage,
 };
@@ -712,20 +713,73 @@ async fn run_loop(
             window: budget.context_window,
         });
 
-        let mut partial = None;
-        let result = stream_assistant(
-            core,
-            request,
-            tx,
-            cancel,
-            &mut budget,
-            assembled.estimated_tokens,
-            assembled.char_count,
-            tool_specs_cost,
-            &mut partial,
-            &mut call_ledger,
-        )
-        .await;
+        // A transient failure (dropped connection, 5xx, 429, stalled
+        // stream) sends the same request again: nothing from the failed reply
+        // was appended and none of its tools ran. The partial text is logged,
+        // not replayed to the model. Retries do not count as model calls.
+        let mut retry = RetryState::new(&core.config.model);
+        let (result, mut partial) = loop {
+            let mut partial = None;
+            let result = stream_assistant(
+                core,
+                request.clone(),
+                tx,
+                cancel,
+                &mut budget,
+                assembled.estimated_tokens,
+                assembled.char_count,
+                tool_specs_cost,
+                &mut partial,
+                &mut call_ledger,
+            )
+            .await;
+            let err = match result {
+                Err(err) if err.is_transient() => err,
+                other => break (other, partial),
+            };
+            let Some(delay) = retry.next_delay(&err) else {
+                break (Err(retry.exhausted(err)), partial);
+            };
+            let partial_chars = partial
+                .as_ref()
+                .and_then(|partial: &AssistantData| partial.content.as_ref())
+                .map(|text| text.chars().count())
+                .unwrap_or(0);
+            if partial_chars > 0 {
+                let _ = tx.send(AgentEvent::Discard {
+                    chars: partial_chars,
+                });
+            }
+            append_custom(
+                &core.session,
+                "model-retry",
+                json!({
+                    "attempt": retry.attempts,
+                    "code": err.class.code(),
+                    "status": err.status,
+                    "message": err.message,
+                    "delay_ms": delay.as_millis() as u64,
+                    "discarded_chars": partial_chars,
+                }),
+            );
+            let _ = tx.send(AgentEvent::Notice(format!(
+                "[retry {}/{}] model call failed ({}): {}; retrying in {:.1}s",
+                retry.attempts,
+                retry.max,
+                err.class.code(),
+                crate::text::clip(&err.message, 200),
+                delay.as_secs_f64()
+            )));
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    break (
+                        Err(ProviderError::new(ErrorClass::Cancelled, "generation cancelled")),
+                        None,
+                    );
+                }
+                _ = tokio::time::sleep(delay) => {}
+            }
+        };
 
         let assistant = match result {
             Ok(assistant) => assistant,
@@ -806,8 +860,65 @@ async fn run_loop(
             }
         }
 
-        if let Some(signal) = detect_truncation(&mut budget, &assistant, assembled.estimated_tokens)
-        {
+        let signal = match detect_truncation(&mut budget, &assistant, assembled.estimated_tokens) {
+            Some(signal) => {
+                let exact = if signal.kind == SignalKind::Engine {
+                    None
+                } else {
+                    exact_prompt_tokens(core, &assembled).await
+                };
+                let mut check = core.usage_check.lock().expect("usage check lock");
+                let verdict = judge_truncation(
+                    signal,
+                    assistant.usage.as_ref(),
+                    assembled.estimated_tokens,
+                    exact,
+                    &budget,
+                    &mut check,
+                );
+                let warn = |check: &mut UsageCheck, code: &str, message: String| {
+                    if !check.warned {
+                        check.warned = true;
+                        append_custom(&core.session, code, json!({"message": message}));
+                        let _ = tx.send(AgentEvent::Notice(message));
+                    }
+                };
+                match verdict {
+                    TruncationVerdict::Confirmed(signal) => Some(signal),
+                    TruncationVerdict::UsageUnreliable(message) => {
+                        // `lh doctor` reports what the session observed.
+                        let key =
+                            crate::provider::probe::tool_probe_key(core.provider.as_ref(), None);
+                        if let Err(error) = crate::doctor::store_usage_mismatch(
+                            &core
+                                .paths
+                                .data_dir
+                                .join(crate::doctor::USAGE_MISMATCH_CACHE),
+                            &key,
+                            &message,
+                        ) {
+                            tracing::warn!(%error, "cannot record the usage mismatch");
+                        }
+                        // Always worth one notice, even after a suspicion.
+                        check.warned = false;
+                        warn(&mut check, "usage-unreliable", message);
+                        None
+                    }
+                    TruncationVerdict::Suspected(message) => {
+                        warn(&mut check, "truncation-suspected", message);
+                        None
+                    }
+                    TruncationVerdict::Dismissed => None,
+                }
+            }
+            None => {
+                if let Ok(mut check) = core.usage_check.lock() {
+                    check.shortfall_streak = 0;
+                }
+                None
+            }
+        };
+        if let Some(signal) = signal {
             // A reply written against a prompt the server cut is not
             // trustworthy: do not append it, and do not continue this branch
             // silently.
@@ -977,6 +1088,43 @@ async fn run_loop(
                 }
                 return TurnOutcome::ok(TurnStatus::Done);
             }
+            // Auto-settle: run verify and review here instead of asking the
+            // model to relay them. Clean results settle on the answer the
+            // model already wrote; a failure or a flagged review continues
+            // with one message that carries both results.
+            let mut facts = facts;
+            if core.config.gates.auto_settle
+                && core.permissions.mode() != crate::policy::PermissionMode::Plan
+            {
+                let checks = gates::auto_checks(&facts, &progress, gate_tools);
+                if checks.verify || checks.review {
+                    let caps = context::ResultCaps::for_usable_prompt(budget.usable_prompt())
+                        .with_overrides(
+                            core.config.budgets.result_cap_chars,
+                            core.config.budgets.batch_cap_chars,
+                        );
+                    let outcome = auto_settle(core, tx, cancel, &mut progress, checks, caps).await;
+                    if cancel.is_cancelled() {
+                        append_error(&core.session, "cancelled", "settle checks cancelled", true);
+                        return TurnOutcome::ok(TurnStatus::Cancelled);
+                    }
+                    match outcome {
+                        Some(message) if progress.can_continue_settle() => {
+                            progress.settle_continuations += 1;
+                            if let Err(err) = append_user(&core.session, &message) {
+                                return TurnOutcome::error("session_write", err.to_string());
+                            }
+                            continue;
+                        }
+                        _ => {}
+                    }
+                    facts = gates::analyze_turn_since(
+                        &core.session.lock().expect("session lock"),
+                        verify_configured,
+                        turn_start.as_deref(),
+                    );
+                }
+            }
             match gates::settle(&facts, &mut progress, gate_tools) {
                 SettleDecision::Done => {
                     if gate_tools.verify
@@ -1053,6 +1201,10 @@ async fn run_loop(
             gate_tools,
             read_available,
             turn_start.as_deref(),
+            context::ResultCaps::for_usable_prompt(budget.usable_prompt()).with_overrides(
+                core.config.budgets.result_cap_chars,
+                core.config.budgets.batch_cap_chars,
+            ),
         )
         .await;
         let _ = tx.send(AgentEvent::State(AgentState::PostTool));
@@ -1292,10 +1444,121 @@ fn static_prompt_warning(static_prompt: &StaticPrompt, budget: &TokenBudget) -> 
     ))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct TruncationSignal {
     source: String,
     limit: Option<u32>,
     prompt_tokens: Option<u32>,
+    kind: SignalKind,
+}
+
+/// How much a truncation signal proves on its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SignalKind {
+    /// The engine said so (`truncated=true`, a context shift).
+    Engine,
+    /// More characters per reported token than any real text has.
+    Ratio,
+    /// The reported count is well under the harness estimate.
+    Shortfall,
+}
+
+/// What the loop does with a truncation signal after looking for a second
+/// witness.
+#[derive(Debug, Clone, PartialEq)]
+enum TruncationVerdict {
+    /// End the turn: the prompt was cut.
+    Confirmed(TruncationSignal),
+    /// The usage report, not the prompt, is wrong: keep the reply, warn once
+    /// and stop learning from usage on this endpoint.
+    UsageUnreliable(String),
+    /// Not confirmed yet: keep the reply, warn once naming both
+    /// explanations.
+    Suspected(String),
+    /// Explained (uncached-only report, or the estimate was off).
+    Dismissed,
+}
+
+/// Fewest prompt tokens a real truncation leaves. Engines cut at their
+/// window (2048 at the smallest common default), not at a handful of tokens;
+/// a lower report is a broken usage field.
+const MIN_PLAUSIBLE_TRUNCATED_PROMPT: u32 = 512;
+
+/// Usage-report health for one endpoint, shared across turns.
+#[derive(Debug, Default)]
+pub struct UsageCheck {
+    /// The endpoint's `prompt_tokens` disagreed with its own tokenizer or was
+    /// implausible: usage no longer calibrates or flags truncation.
+    pub unreliable: bool,
+    /// Consecutive calls with an unconfirmed shortfall.
+    pub shortfall_streak: u32,
+    /// The one-time notice was shown.
+    pub warned: bool,
+}
+
+/// Look for a second witness before ending a turn on arithmetic.
+///
+/// The engine's own flags are proof. A ratio or shortfall is a suspicion: an
+/// uncached-only report (`prompt_tokens + cached_tokens` covers the prompt)
+/// explains it; `/tokenize` decides between a cut prompt (the exact count
+/// exceeds the window) and a wrong report (it fits); a count no engine would
+/// truncate to is a wrong report; a physically impossible text density with a
+/// plausible count is a cut; a plain shortfall must repeat on the next call.
+fn judge_truncation(
+    signal: TruncationSignal,
+    usage: Option<&Usage>,
+    estimated_tokens: u32,
+    exact_tokens: Option<u32>,
+    budget: &TokenBudget,
+    check: &mut UsageCheck,
+) -> TruncationVerdict {
+    if signal.kind == SignalKind::Engine {
+        return TruncationVerdict::Confirmed(signal);
+    }
+    if check.unreliable {
+        return TruncationVerdict::Dismissed;
+    }
+    let reported = usage.map(|usage| usage.prompt_tokens).unwrap_or(0);
+    // Only when the sum lands on the estimate: where cached tokens are a
+    // subset of `prompt_tokens`, a looser test would hide a real cut.
+    if let Some(cached) = usage.and_then(|usage| usage.cached_tokens)
+        && cached > 0
+        && estimated_tokens.saturating_sub(reported.saturating_add(cached)) <= budget.safety_margin
+        && reported.saturating_add(cached) <= estimated_tokens.saturating_add(budget.safety_margin)
+    {
+        return TruncationVerdict::Dismissed;
+    }
+    if let Some(exact) = exact_tokens {
+        if exact > budget.context_window {
+            return TruncationVerdict::Confirmed(signal);
+        }
+        let disagrees =
+            exact.saturating_sub(reported) > budget.safety_margin && reported < exact * 3 / 4;
+        if disagrees {
+            check.unreliable = true;
+            return TruncationVerdict::UsageUnreliable(format!(
+                "the server reported {reported} prompt tokens, but its own tokenizer counts {exact} for this prompt, which fits the {}-token window. The usage report is wrong, not the prompt; the reply was kept and usage is no longer used to calibrate the estimate on this endpoint.",
+                budget.context_window
+            ));
+        }
+        return TruncationVerdict::Dismissed;
+    }
+    if reported < MIN_PLAUSIBLE_TRUNCATED_PROMPT {
+        check.unreliable = true;
+        return TruncationVerdict::UsageUnreliable(format!(
+            "the server reported {reported} prompt tokens for a prompt the harness estimates at {estimated_tokens}. No engine truncates to that, so the usage report is unreliable; the reply was kept and usage is no longer used to calibrate the estimate on this endpoint. `lh doctor` compares the report with the tokenizer."
+        ));
+    }
+    if signal.kind == SignalKind::Ratio {
+        return TruncationVerdict::Confirmed(signal);
+    }
+    check.shortfall_streak += 1;
+    if check.shortfall_streak >= 2 {
+        return TruncationVerdict::Confirmed(signal);
+    }
+    TruncationVerdict::Suspected(format!(
+        "the server counted {reported} prompt tokens for a prompt the harness estimates at {estimated_tokens}. Either the server truncated the prompt (raise the engine context) or its usage report is unreliable; run `lh doctor` to compare it with the tokenizer. The turn continues; a second shortfall in a row ends it."
+    ))
 }
 
 impl TruncationSignal {
@@ -1336,6 +1599,7 @@ fn detect_truncation(
                 .into(),
             limit: Some(limit),
             prompt_tokens: assistant.usage.as_ref().map(|usage| usage.prompt_tokens),
+            kind: SignalKind::Ratio,
         });
     }
     let usage = assistant.usage.as_ref()?;
@@ -1344,6 +1608,7 @@ fn detect_truncation(
             source: "the engine reported truncated=true".into(),
             limit: Some(usage.prompt_tokens).filter(|tokens| *tokens > 0),
             prompt_tokens: Some(usage.prompt_tokens),
+            kind: SignalKind::Engine,
         });
     }
     if usage.context_shift.unwrap_or(0) > 0 {
@@ -1354,6 +1619,7 @@ fn detect_truncation(
             ),
             limit: None,
             prompt_tokens: Some(usage.prompt_tokens),
+            kind: SignalKind::Engine,
         });
     }
     if usage.prompt_tokens > 0 && estimated_tokens >= 2_048 {
@@ -1369,6 +1635,7 @@ fn detect_truncation(
                 ),
                 limit: None,
                 prompt_tokens: Some(usage.prompt_tokens),
+                kind: SignalKind::Shortfall,
             });
         }
     }
@@ -1743,6 +2010,12 @@ async fn stream_assistant(
     let mut accum = StreamAccum::new();
     accum.strip_reasoning = core.model_profile.strip_reasoning();
     let mut failure: Option<ProviderError> = None;
+    // An endpoint whose usage report proved wrong teaches nothing.
+    let calibrate = !core
+        .usage_check
+        .lock()
+        .map(|check| check.unreliable)
+        .unwrap_or(false);
     while let Some(item) = erx.recv().await {
         if let Some(err) = handle_stream_item(
             item,
@@ -1752,6 +2025,7 @@ async fn stream_assistant(
             estimated_tokens,
             char_count,
             tool_specs_cost,
+            calibrate,
             cancel,
         ) {
             failure = Some(err);
@@ -1798,6 +2072,7 @@ fn handle_stream_item(
     estimated_tokens: u32,
     char_count: usize,
     tool_specs_cost: ToolSpecCost,
+    calibrate: bool,
     cancel: &CancellationToken,
 ) -> Option<ProviderError> {
     if cancel.is_cancelled() {
@@ -1831,7 +2106,7 @@ fn handle_stream_item(
             None
         }
         Ok(StreamEvent::Usage(usage)) => {
-            if usage.prompt_tokens > 0 {
+            if usage.prompt_tokens > 0 && calibrate {
                 // The schemas have their own fixed price; learn the prose
                 // ratio from the rest of the request only.
                 budget.calibrate_with_fixed(char_count, usage.prompt_tokens, tool_specs_cost);
@@ -1916,6 +2191,320 @@ struct ThreadSplit {
     kickoff: Option<String>,
 }
 
+/// Run the settle checks the harness owns ([`gates::AutoChecks`]). Returns
+/// `None` when everything that ran is clean, or the one continuation message
+/// for the model when verify failed or review flagged a risk.
+async fn auto_settle(
+    core: &std::sync::Arc<Core>,
+    tx: &UnboundedSender<AgentEvent>,
+    cancel: &CancellationToken,
+    progress: &mut RunProgress,
+    checks: gates::AutoChecks,
+    caps: context::ResultCaps,
+) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    let mut clean: Vec<&str> = Vec::new();
+    let mut failed = false;
+    if checks.verify {
+        progress.verify_attempts += 1;
+        let SettleCheck { result, executed } =
+            run_settle_check(core, tx, cancel, "verify", caps).await?;
+        let passed = !result.is_error
+            && result
+                .details
+                .as_ref()
+                .and_then(|details| details.pointer("/session/0/passed"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+        if passed {
+            clean.push("verify passed");
+        } else if !executed {
+            // Refused by a rule, a hook or the frontend: nothing for the model
+            // to fix, and asking again would be refused again. Settle records
+            // the run as unverified.
+            progress.verify_attempts = progress.limits.verify_attempts;
+            clean.push("verify skipped (not permitted)");
+        } else {
+            failed = true;
+            parts.push(format!(
+                "verify FAILED (run by the harness after your last change):\n{}",
+                result.content
+            ));
+        }
+    }
+    if checks.review && !failed {
+        progress.review_nudged = true;
+        let SettleCheck { result, .. } = run_settle_check(core, tx, cancel, "review", caps).await?;
+        let findings = result
+            .details
+            .as_ref()
+            .and_then(|details| details.get("findings"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        if result.is_error {
+            // Not a repository, or a rule or hook refused it: nothing to
+            // act on, and not a reason to hold the answer back.
+            clean.push("review skipped");
+        } else if findings > 0 {
+            failed = true;
+            parts.push(format!(
+                "review flagged {findings} risk(s) (run by the harness):\n{}",
+                result.content
+            ));
+        } else {
+            clean.push("review clean");
+        }
+    }
+    if !failed {
+        if !clean.is_empty() {
+            let _ = tx.send(AgentEvent::Notice(format!(
+                "[harness] {}",
+                clean.join(", ")
+            )));
+        }
+        return None;
+    }
+    if !clean.is_empty() {
+        parts.insert(0, clean.join(", "));
+    }
+    Some(format!(
+        "[localharness] settle checks: {}\n\nFix what failed, then finish; the checks run again when you do.",
+        parts.join("\n\n")
+    ))
+}
+
+/// Run one settle check (`verify` or `review`) as the harness: permission
+/// rules and `pre_tool`/`post_tool` hooks apply exactly as for a model call,
+/// its session entries (`verify-result`) are recorded the same way, and a
+/// `review-result` entry marks the review as done. The result reaches the
+/// model only inside a user-role message, so no orphan tool result enters the
+/// context path. `None` when the tool is not active or the run was cancelled.
+async fn run_settle_check(
+    core: &std::sync::Arc<Core>,
+    tx: &UnboundedSender<AgentEvent>,
+    cancel: &CancellationToken,
+    name: &str,
+    caps: context::ResultCaps,
+) -> Option<SettleCheck> {
+    let tool = core.tools.iter().find(|tool| tool.name() == name)?.clone();
+    let args = json!({});
+    let call = ToolCall {
+        id: format!("harness_{name}"),
+        name: name.to_string(),
+        arguments: args.clone(),
+    };
+    let _ = tx.send(AgentEvent::ToolStarted {
+        call_id: call.id.clone(),
+        name: name.to_string(),
+        summary: "run by the harness at settle".into(),
+    });
+    let started = std::time::Instant::now();
+    let verdict = super::authorize::decide(core, tool.as_ref(), &call, &args).await;
+    for notice in &verdict.notices {
+        let _ = tx.send(AgentEvent::Notice(notice.clone()));
+    }
+    let mut result = match verdict.decision {
+        crate::policy::Decision::Deny { code, message } => ToolResult::err(&code, message),
+        crate::policy::Decision::Ask(request) => {
+            match super::authorize::confirm(core, request, cancel).await {
+                Ok(()) => ToolResult::ok(""),
+                Err(denied) => denied,
+            }
+        }
+        crate::policy::Decision::Allow => ToolResult::ok(""),
+    };
+    let mut executed = false;
+    // The frontend (ACP) may add its own approval gate; it can only deny.
+    if !result.is_error
+        && let Some(approver) = &core.approver
+        && let crate::tools::ToolApproval::Deny(message) =
+            approver.approve(&call, &args, tool.read_only()).await
+    {
+        result = ToolResult::err("permission_denied", message);
+    }
+    if !result.is_error
+        && let Some(required) = verdict.provenance
+        && let Err(denied) =
+            super::authorize::confirm_provenance(core, &call, &args, required).await
+    {
+        result = denied;
+    }
+    if !result.is_error {
+        let ctx = core.tool_context_with(cancel.clone());
+        result = tokio::select! {
+            _ = cancel.cancelled() => return None,
+            result = tool.call(&ctx, args.clone()) => result,
+        };
+        executed = true;
+    }
+    if executed {
+        let post = crate::hooks::post_tool(
+            &hook_env(core),
+            name,
+            &args,
+            &result.content,
+            result.is_error,
+            started.elapsed().as_millis() as u64,
+        )
+        .await;
+        for warning in &post.warnings {
+            let _ = tx.send(AgentEvent::Notice(format!("[hook] {warning}")));
+            result.content = format!("[hook warning] {warning}\n\n{}", result.content);
+        }
+        for context in post.contexts {
+            result.content.push_str(&format!(
+                "\n\n[hook context from {}]\n{}",
+                context.hook, context.text
+            ));
+        }
+        if let Some(block) = post.blocked {
+            result = ToolResult::err(
+                "hook_block",
+                format!(
+                    "hook {:?} blocked the {name} result: {}",
+                    block.hook, block.reason
+                ),
+            );
+        }
+    }
+    for note in verdict.notes {
+        result.content = format!("{note}\n\n{}", result.content);
+    }
+    // Record the same session facts a model-called run records.
+    if !result.is_error
+        && let Some(entries) = result
+            .details
+            .as_ref()
+            .and_then(|details| details.get("session"))
+            .and_then(Value::as_array)
+    {
+        for entry in entries {
+            let Some(kind) = entry.get("kind").and_then(Value::as_str) else {
+                continue;
+            };
+            let mut payload = entry.as_object().cloned().unwrap_or_default();
+            payload.remove("kind");
+            let custom = CustomData {
+                kind: kind.to_string(),
+                payload,
+            };
+            if let Ok(mut session) = core.session.lock()
+                && let Err(error) = session.append(EntryKind::Custom(custom))
+            {
+                tracing::warn!(%error, "cannot record the settle check");
+            }
+        }
+    }
+    if name == "review" && executed {
+        append_custom(
+            &core.session,
+            "review-result",
+            json!({
+                "findings": result.details.as_ref().and_then(|d| d.get("findings")).cloned(),
+                "harness": true,
+            }),
+        );
+    }
+    // The content goes into a user message; cap it like a tool result.
+    let capped = context::cap_result_limited(
+        &core.artifacts,
+        &result.content,
+        context::Preview::HeadTail,
+        caps,
+    );
+    result.content = capped.content;
+    let _ = tx.send(AgentEvent::ToolFinished {
+        call_id: call.id.clone(),
+        name: name.to_string(),
+        is_error: result.is_error,
+        duration_ms: started.elapsed().as_millis() as u64,
+        preview: preview(tool_body(&result.content), 300),
+        artifact: capped.artifact,
+    });
+    Some(SettleCheck { result, executed })
+}
+
+/// One harness-run settle check: its result, and whether the tool ran (a
+/// permission rule, a hook or the frontend may refuse it).
+struct SettleCheck {
+    result: ToolResult,
+    executed: bool,
+}
+
+/// Bounded retry of transient model-call failures within one turn.
+struct RetryState {
+    /// Retries already scheduled.
+    attempts: u32,
+    max: u32,
+    waited: Duration,
+    deadline: Duration,
+    base: Duration,
+}
+
+impl RetryState {
+    fn new(config: &crate::config::ModelConfig) -> Self {
+        Self {
+            attempts: 0,
+            max: config.retries,
+            waited: Duration::ZERO,
+            deadline: Duration::from_secs(config.retry_deadline_secs),
+            base: Duration::from_millis(config.retry_backoff_ms),
+        }
+    }
+
+    /// The wait before the next attempt, or `None` when the retries or the
+    /// deadline are spent. Backoff is 1x, 4x, 15x the base with +-20%
+    /// jitter; a `Retry-After` is honored when it is longer.
+    fn next_delay(&mut self, err: &ProviderError) -> Option<Duration> {
+        if self.attempts >= self.max {
+            return None;
+        }
+        let step = [1u32, 4, 15][(self.attempts as usize).min(2)];
+        let backoff = self.base.mul_f64(f64::from(step) * jitter());
+        let delay = err.retry_after.map_or(backoff, |after| after.max(backoff));
+        if self.waited + delay > self.deadline {
+            return None;
+        }
+        self.attempts += 1;
+        self.waited += delay;
+        Some(delay)
+    }
+
+    /// The final error, naming how many attempts were made.
+    fn exhausted(&self, mut err: ProviderError) -> ProviderError {
+        if self.attempts > 0 {
+            err.message = format!(
+                "{} (gave up after {} attempts)",
+                err.message,
+                self.attempts + 1
+            );
+        }
+        err
+    }
+}
+
+/// A factor in 0.8..1.2 from the clock, so concurrent clients do not retry
+/// in lockstep. No randomness crate is needed for this.
+fn jitter() -> f64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.subsec_nanos())
+        .unwrap_or(0);
+    0.8 + f64::from(nanos % 1000) / 1000.0 * 0.4
+}
+
+/// Arguments as the loop guard compares them: a `read` of the same path set
+/// in a different order is the same call.
+fn guard_args(name: &str, args: &Value) -> Value {
+    let mut args = args.clone();
+    if name == "read"
+        && let Some(paths) = args.get_mut("paths").and_then(Value::as_array_mut)
+    {
+        paths.sort_by(|a, b| a.as_str().cmp(&b.as_str()));
+    }
+    args
+}
+
 #[allow(clippy::too_many_arguments, clippy::unnecessary_unwrap)]
 async fn execute_batch(
     core: &std::sync::Arc<Core>,
@@ -1927,6 +2516,7 @@ async fn execute_batch(
     gate_tools: gates::GateTools,
     read_available: bool,
     turn_start: Option<&str>,
+    caps: context::ResultCaps,
 ) -> BatchOutcome {
     let mut deferred: Vec<CustomData> = Vec::new();
     let mut inferred_mutations = 0usize;
@@ -1939,7 +2529,10 @@ async fn execute_batch(
     let mut thread_split: Option<ThreadSplit> = None;
     let mut invalid_calls = 0u32;
 
-    let ctx = core.tool_context_with(cancel.clone());
+    // Caps follow this turn's budget, which window detection may have
+    // resized since the core was built.
+    let mut ctx = core.tool_context_with(cancel.clone());
+    ctx.caps = caps;
     let active: Vec<&str> = core.tools.iter().map(|tool| tool.name()).collect();
 
     // Hunk review: from a turn's second file mutation (or every mutation in
@@ -2275,8 +2868,11 @@ async fn execute_batch(
                         if result.is_error {
                             // A review guard rejected the call; skip execution.
                         } else {
-                            let signature =
-                                format!("{}:{}", call.name, super::repair::canonical_json(&args));
+                            let signature = format!(
+                                "{}:{}",
+                                call.name,
+                                super::repair::canonical_json(&guard_args(&call.name, &args))
+                            );
                             match loop_guard.check_and_record(signature) {
                                 LoopDecision::Tripped { reason } => {
                                     result = ToolResult::err("loop_guard", reason.clone());
@@ -2451,6 +3047,33 @@ async fn execute_batch(
             });
         }
 
+        // Advance notice for the todo gate: when this mutation leaves the run
+        // one step from it, say so on this result, so the next edit is not
+        // generated in full only to be rejected and generated again.
+        if executed
+            && !result.is_error
+            && gate_tools.todo
+            && !progress.todo_notice_sent
+            && matches!(call.name.as_str(), "edit" | "write" | "patch")
+            && let Some(path) = &args_path
+        {
+            let current = gates::analyze_turn_since(
+                &core.session.lock().expect("session lock"),
+                false,
+                turn_start,
+            );
+            let mut files = inferred_files.clone();
+            files.insert(path.clone());
+            if let Some(notice) = gates::todo_gate_notice(
+                current.mutations + inferred_mutations + 1,
+                unique_file_count(&current.files, &files),
+                plan_present || current.todo_plan_present,
+            ) {
+                progress.todo_notice_sent = true;
+                result.content.push_str(&format!("\n\n{notice}"));
+            }
+        }
+
         let evidence_output = result.content.clone();
         if let Some(note) = routed_note {
             result.content = format!("{note}\n{}", result.content);
@@ -2464,6 +3087,15 @@ async fn execute_batch(
         );
         let cap_override = tool.as_deref().and_then(|tool| tool.result_cap());
         let content_chars = result.content.chars().count();
+        // Text the harness added around the tool's own output (the header,
+        // notes, hook warnings and context) gets room of its own: a tool that
+        // sized its output to the cap must not be cut, losing its trailer and
+        // the hook's context, because a hook appended a paragraph.
+        let added = content_chars.saturating_sub(scan_output.chars().count());
+        let result_caps = context::ResultCaps {
+            result: ctx.caps.result + added.min(ctx.caps.result),
+            ..ctx.caps
+        };
         let mut capped = match cap_override {
             Some(limit) if content_chars <= limit => context::CappedContent {
                 content: result.content.clone(),
@@ -2477,11 +3109,10 @@ async fn execute_batch(
                 } else {
                     context::Preview::Head
                 };
-                context::cap_result_with(&ctx.artifacts, &result.content, preview)
+                context::cap_result_limited(&ctx.artifacts, &result.content, preview, result_caps)
             }
         };
-        if cap_override.is_none() && batch_chars + capped.content.chars().count() > BATCH_CAP_CHARS
-        {
+        if cap_override.is_none() && batch_chars + capped.content.chars().count() > ctx.caps.batch {
             match ctx.artifacts.write(&result.content) {
                 Ok(artifact) => {
                     capped.content = format!(
@@ -2498,12 +3129,25 @@ async fn execute_batch(
         }
         // A read whose result was capped did not show the model the whole
         // file. Record that so `write` requires an explicit overwrite.
-        if call.name == "read"
-            && capped.truncated
-            && let Some(path) = &args_path
-            && let Ok(resolved) = ctx.resolve(path)
-        {
-            crate::tools::write::lock_reads(&ctx).mark_result_truncated(&resolved);
+        if call.name == "read" && capped.truncated {
+            let mut targets: Vec<String> = args_path.iter().cloned().collect();
+            if let Some(list) = evidence_args
+                .as_ref()
+                .unwrap_or(&call.arguments)
+                .get("paths")
+                .and_then(Value::as_array)
+            {
+                targets.extend(
+                    list.iter()
+                        .filter_map(Value::as_str)
+                        .map(|entry| crate::tools::read::entry_path(entry).to_string()),
+                );
+            }
+            for path in targets {
+                if let Ok(resolved) = ctx.resolve(&path) {
+                    crate::tools::write::lock_reads(&ctx).mark_result_truncated(&resolved);
+                }
+            }
         }
         batch_chars += capped.content.chars().count();
         let tool_result = ToolResult {
@@ -2916,8 +3560,9 @@ async fn finish_review(
             "[tool] {} - {}\n{}",
             call.call.name, call.summary_args, result.content
         );
-        let mut capped = context::cap_result_with(&ctx.artifacts, &text, context::Preview::Head);
-        if *batch_chars + capped.content.chars().count() > BATCH_CAP_CHARS {
+        let mut capped =
+            context::cap_result_limited(&ctx.artifacts, &text, context::Preview::Head, ctx.caps);
+        if *batch_chars + capped.content.chars().count() > ctx.caps.batch {
             match ctx.artifacts.write(&text) {
                 Ok(artifact) => {
                     capped.content = format!(
@@ -3195,6 +3840,7 @@ struct CacheCold {
 #[derive(Debug, Default)]
 struct CacheWatch {
     last_prefix: Option<String>,
+    last_system: Option<String>,
     cold_calls: u32,
     warned: bool,
     /// The cause observed when the streak began (or a compaction reported on
@@ -3213,6 +3859,7 @@ impl CacheWatch {
         compaction_reason: Option<&str>,
     ) -> Option<CacheCold> {
         let previous = self.last_prefix.replace(prefix.hash.clone());
+        let previous_system = self.last_system.replace(prefix.system_hash.clone());
         let usage = usage?;
         let percent = usage.cache_percent()?;
         if percent >= 70 {
@@ -3223,12 +3870,17 @@ impl CacheWatch {
         }
         self.cold_calls += 1;
         let prefix_changed = previous.is_some_and(|hash| hash != prefix.hash);
+        let system_changed = previous_system.is_some_and(|hash| hash != prefix.system_hash);
         if compaction_reason.is_some() {
             self.cold_invalidator = Some("the compaction rewrote the system block");
         } else if prefix_changed
             && self.cold_invalidator != Some("the compaction rewrote the system block")
         {
-            self.cold_invalidator = Some("the prompt prefix (system prompt or tool list) changed");
+            self.cold_invalidator = Some(if system_changed {
+                "the harness rewrote the system message"
+            } else {
+                "the tool list changed"
+            });
         } else if self.cold_invalidator.is_none() {
             self.cold_invalidator =
                 Some("the server evicted the prefix or moved the request to another slot");
@@ -3575,6 +4227,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn loop_guard_treats_a_reordered_path_set_as_the_same_read() {
+        let sig = |args: Value| crate::agent::repair::canonical_json(&guard_args("read", &args));
+        assert_eq!(
+            sig(json!({"paths": ["b.rs", "a.rs:1-9"]})),
+            sig(json!({"paths": ["a.rs:1-9", "b.rs"]}))
+        );
+        assert_ne!(
+            sig(json!({"paths": ["a.rs"]})),
+            sig(json!({"paths": ["a.rs", "b.rs"]}))
+        );
+    }
+
+    #[test]
     fn static_refusal_names_a_guessed_window() {
         let prompt = crate::context::budget::StaticPrompt::new(2000, 1000, 100);
         let budget = TokenBudget::new(4096, 4096);
@@ -3720,6 +4385,7 @@ mod tests {
             tool_timeout: std::time::Duration::from_secs(10),
             path_jail: false,
             server_window: Default::default(),
+            usage_check: Default::default(),
             window_source: WindowSource::Default,
             window_truth: None,
             window_notice: None,
@@ -3846,7 +4512,14 @@ mod tests {
         let report = watch
             .observe(Some(&cold), &second, None)
             .expect("changed prefix alarm");
-        assert!(report.invalidator.contains("prefix"));
+        assert_eq!(report.invalidator, "the harness rewrote the system message");
+        let mut watch = CacheWatch::default();
+        watch.observe(Some(&cold), &first, None);
+        let tools = crate::context::prompt_prefix("system", r#"[{"name":"x"}]"#);
+        let report = watch
+            .observe(Some(&cold), &tools, None)
+            .expect("changed tools alarm");
+        assert_eq!(report.invalidator, "the tool list changed");
         let mut watch = CacheWatch::default();
         watch.observe(Some(&cold), &first, None);
         let report = watch
@@ -3966,6 +4639,113 @@ mod tests {
             ..AssistantData::default()
         };
         assert!(detect_truncation(&mut budget, &assistant, 4000).is_none());
+    }
+
+    fn signal(kind: SignalKind) -> TruncationSignal {
+        TruncationSignal {
+            source: "test".into(),
+            limit: None,
+            prompt_tokens: None,
+            kind,
+        }
+    }
+
+    #[test]
+    fn arithmetic_truncation_needs_a_second_witness() {
+        let budget = TokenBudget::new(32_768, 4096);
+        let usage = |prompt: u32, cached: Option<u32>| Usage {
+            prompt_tokens: prompt,
+            cached_tokens: cached,
+            ..Usage::default()
+        };
+        let judge = |kind, usage: &Usage, exact, check: &mut UsageCheck| {
+            judge_truncation(signal(kind), Some(usage), 6000, exact, &budget, check)
+        };
+
+        // Engine flags are proof, even on an endpoint marked unreliable.
+        let mut check = UsageCheck {
+            unreliable: true,
+            ..UsageCheck::default()
+        };
+        assert!(matches!(
+            judge(SignalKind::Engine, &usage(100, None), None, &mut check),
+            TruncationVerdict::Confirmed(_)
+        ));
+
+        // An implausible count is a broken report, not a cut.
+        let mut check = UsageCheck::default();
+        assert!(matches!(
+            judge(SignalKind::Ratio, &usage(10, None), None, &mut check),
+            TruncationVerdict::UsageUnreliable(_)
+        ));
+        assert!(check.unreliable);
+        assert_eq!(
+            judge(SignalKind::Ratio, &usage(10, None), None, &mut check),
+            TruncationVerdict::Dismissed
+        );
+
+        // Uncached-only reporting is explained by cached_tokens.
+        let mut check = UsageCheck::default();
+        assert_eq!(
+            judge(
+                SignalKind::Shortfall,
+                &usage(900, Some(5000)),
+                None,
+                &mut check
+            ),
+            TruncationVerdict::Dismissed
+        );
+
+        // The tokenizer decides: fits the window -> wrong report; exceeds
+        // it -> a real cut; agrees with the server -> the estimate was off.
+        let mut check = UsageCheck::default();
+        assert!(matches!(
+            judge(
+                SignalKind::Shortfall,
+                &usage(1500, None),
+                Some(5900),
+                &mut check
+            ),
+            TruncationVerdict::UsageUnreliable(_)
+        ));
+        let mut check = UsageCheck::default();
+        assert!(matches!(
+            judge(
+                SignalKind::Shortfall,
+                &usage(1500, None),
+                Some(40_000),
+                &mut check
+            ),
+            TruncationVerdict::Confirmed(_)
+        ));
+        let mut check = UsageCheck::default();
+        assert_eq!(
+            judge(
+                SignalKind::Shortfall,
+                &usage(1500, None),
+                Some(1550),
+                &mut check
+            ),
+            TruncationVerdict::Dismissed
+        );
+
+        // A plausible count with impossible text density is a cut.
+        let mut check = UsageCheck::default();
+        assert!(matches!(
+            judge(SignalKind::Ratio, &usage(2000, None), None, &mut check),
+            TruncationVerdict::Confirmed(_)
+        ));
+
+        // A plain shortfall must repeat.
+        let mut check = UsageCheck::default();
+        assert!(matches!(
+            judge(SignalKind::Shortfall, &usage(2000, None), None, &mut check),
+            TruncationVerdict::Suspected(_)
+        ));
+        assert!(matches!(
+            judge(SignalKind::Shortfall, &usage(2000, None), None, &mut check),
+            TruncationVerdict::Confirmed(_)
+        ));
     }
 
     #[test]

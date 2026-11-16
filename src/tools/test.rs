@@ -12,6 +12,7 @@ use tokio::io::AsyncReadExt;
 use tokio::process::{ChildStderr, ChildStdout, Command};
 
 use crate::text::clip;
+use crate::tools::project::{Runner, detect_runner, is_executable};
 use crate::tools::{
     Tool, ToolContext, ToolPack, ToolResult, display_path, object_schema, optional_str,
     optional_u64,
@@ -144,134 +145,6 @@ impl Default for TestTool {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Runner detection
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Runner {
-    Cargo,
-    Vitest,
-    Jest,
-    Pytest,
-    Go,
-    Npm,
-}
-
-impl Runner {
-    fn name(self) -> &'static str {
-        match self {
-            Runner::Cargo => "cargo",
-            Runner::Vitest => "vitest",
-            Runner::Jest => "jest",
-            Runner::Pytest => "pytest",
-            Runner::Go => "go",
-            Runner::Npm => "npm",
-        }
-    }
-}
-
-fn detect_runner(cwd: &Path, path: Option<&Path>) -> Result<Runner, ToolResult> {
-    let extension = path
-        .and_then(|path| path.extension())
-        .and_then(|extension| extension.to_str())
-        .map(|extension| extension.to_ascii_lowercase());
-
-    match extension.as_deref() {
-        Some("rs") if cwd.join("Cargo.toml").exists() => return Ok(Runner::Cargo),
-        Some("go") if cwd.join("go.mod").exists() => return Ok(Runner::Go),
-        Some("py") if python_project(cwd) => return Ok(Runner::Pytest),
-        Some("ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs") => {
-            if let Some(runner) = node_runner(cwd) {
-                return Ok(runner);
-            }
-        }
-        _ => {}
-    }
-
-    if cwd.join("Cargo.toml").exists() {
-        return Ok(Runner::Cargo);
-    }
-    if cwd.join("package.json").is_file()
-        && let Some(runner) = node_runner(cwd)
-    {
-        return Ok(runner);
-    }
-    if python_project(cwd) {
-        return Ok(Runner::Pytest);
-    }
-    if cwd.join("go.mod").exists() {
-        return Ok(Runner::Go);
-    }
-
-    Err(ToolResult::err(
-        "NO_TEST_RUNNER",
-        format!(
-            "no test runner detected in {}; looked for Cargo.toml, package.json with vitest/jest or an npm test script, pyproject.toml/setup.py/pytest.ini, and go.mod. Pass \"path\" to a test file or add one of those files.",
-            cwd.display()
-        ),
-    ))
-}
-
-fn python_project(cwd: &Path) -> bool {
-    [
-        "pyproject.toml",
-        "setup.py",
-        "setup.cfg",
-        "pytest.ini",
-        "tox.ini",
-        "conftest.py",
-        "requirements.txt",
-    ]
-    .iter()
-    .any(|marker| cwd.join(marker).exists())
-}
-
-fn node_runner(cwd: &Path) -> Option<Runner> {
-    let package = std::fs::read_to_string(cwd.join("package.json")).ok();
-    let parsed: Value = package
-        .as_deref()
-        .and_then(|text| serde_json::from_str(text).ok())
-        .unwrap_or(Value::Null);
-
-    let mut signals = String::new();
-    for key in ["dependencies", "devDependencies", "peerDependencies"] {
-        if let Some(map) = parsed.get(key).and_then(Value::as_object) {
-            for name in map.keys() {
-                signals.push_str(name);
-                signals.push('\n');
-            }
-        }
-    }
-    if let Some(scripts) = parsed.get("scripts").and_then(Value::as_object) {
-        for (name, value) in scripts {
-            signals.push_str(name);
-            signals.push('\n');
-            if let Some(value) = value.as_str() {
-                signals.push_str(value);
-                signals.push('\n');
-            }
-        }
-    }
-
-    let local_vitest = is_executable(&cwd.join("node_modules/.bin/vitest"));
-    let local_jest = is_executable(&cwd.join("node_modules/.bin/jest"));
-    if local_vitest || signals.contains("vitest") {
-        return Some(Runner::Vitest);
-    }
-    if local_jest || signals.contains("jest") {
-        return Some(Runner::Jest);
-    }
-    if parsed
-        .get("scripts")
-        .and_then(|scripts| scripts.get("test"))
-        .is_some()
-    {
-        return Some(Runner::Npm);
-    }
-    None
-}
-
 fn find_binary(name: &str) -> Option<PathBuf> {
     if name.contains('/') {
         let path = PathBuf::from(name);
@@ -285,24 +158,6 @@ fn find_binary(name: &str) -> Option<PathBuf> {
         }
     }
     None
-}
-
-fn is_executable(path: &Path) -> bool {
-    let Ok(meta) = std::fs::metadata(path) else {
-        return false;
-    };
-    if !meta.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        meta.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -699,56 +554,6 @@ mod tests {
             std::fs::write(dir.path().join(name), contents).expect("write fixture");
         }
         dir
-    }
-
-    #[test]
-    fn detects_cargo_project() {
-        let dir = temp_project(&[("Cargo.toml", "[package]\nname = \"x\"\n")]);
-        assert_eq!(
-            detect_runner(dir.path(), None).expect("cargo"),
-            Runner::Cargo
-        );
-    }
-
-    #[test]
-    fn detects_vitest_and_jest_from_package_json() {
-        let vitest = temp_project(&[(
-            "package.json",
-            r#"{"devDependencies":{"vitest":"^1.0.0"},"scripts":{"test":"vitest run"}}"#,
-        )]);
-        assert_eq!(
-            detect_runner(vitest.path(), None).expect("vitest"),
-            Runner::Vitest
-        );
-        let jest = temp_project(&[(
-            "package.json",
-            r#"{"devDependencies":{"jest":"^29.0.0"},"scripts":{"test":"jest"}}"#,
-        )]);
-        assert_eq!(
-            detect_runner(jest.path(), None).expect("jest"),
-            Runner::Jest
-        );
-        let npm = temp_project(&[("package.json", r#"{"scripts":{"test":"node check.js"}}"#)]);
-        assert_eq!(detect_runner(npm.path(), None).expect("npm"), Runner::Npm);
-    }
-
-    #[test]
-    fn detects_pytest_and_go() {
-        let py = temp_project(&[("pyproject.toml", "[project]\nname = \"x\"\n")]);
-        assert_eq!(
-            detect_runner(py.path(), None).expect("pytest"),
-            Runner::Pytest
-        );
-        let go = temp_project(&[("go.mod", "module example.com/x\n")]);
-        assert_eq!(detect_runner(go.path(), None).expect("go"), Runner::Go);
-    }
-
-    #[test]
-    fn unknown_project_names_the_markers() {
-        let dir = temp_project(&[]);
-        let error = detect_runner(dir.path(), None).expect_err("no runner");
-        assert!(error.content.starts_with("[NO_TEST_RUNNER]"));
-        assert!(error.content.contains("Cargo.toml"));
     }
 
     #[test]

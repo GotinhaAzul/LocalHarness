@@ -1,7 +1,6 @@
 ---
 name: security-methods
-description: "Class-specific vulnerability methods for authorized security work: native memory safety, web injection and traversal, crypto misuse, races, auth/JWT and directory attack paths, SSRF and request smuggling, deserialization and prototype pollution, HTTP/spec differentials, and LLM application security. Use to pick the right checks, prove impact with a reproducible PoC, and reject false positives. Requires authorization; scope comes from security-red."
-when: the task is an authorized security review or penetration test and you need the concrete method for a bug class, or are about to call something confirmed
+description: "Vulnerability methods for authorized work: memory safety, web injection, crypto, races, auth, SSRF, smuggling, deserialization, prototype pollution, LLM apps; prove with a PoC."
 ---
 
 # Security methods

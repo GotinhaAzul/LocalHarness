@@ -24,6 +24,31 @@ use serde_yaml::Value;
 /// Most reference files picked up from one skill directory.
 const MAX_REFERENCES: usize = 40;
 
+/// One skill's line in the system-prompt index is capped at this many
+/// characters, ellipsis included. A longer description stays on disk and
+/// loads when the skill is activated.
+pub const INDEX_ENTRY_CAP: usize = 200;
+
+/// The whole skill index text is capped at this many characters, including
+/// the trailing names-only line. Installed skills therefore cannot grow the
+/// static prompt without bound.
+pub const INDEX_TOTAL_CAP: usize = 2400;
+
+/// The trailing names-only line is capped at this many characters; past that
+/// the line ends with `and N more`.
+pub const INDEX_NAMES_CAP: usize = 600;
+
+/// How much of the skill index the system prompt shows. `Full` gives a capped
+/// description per skill, `Names` one line of names, and `Off` nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IndexMode {
+    #[default]
+    Full,
+    Names,
+    Off,
+}
+
 /// Where a skill reference's text lives.
 #[derive(Debug, Clone)]
 pub enum ReferenceSource {
@@ -346,18 +371,181 @@ impl SkillIndex {
 
     /// Compact index injected into the system prompt. Only name, description,
     /// and the optional trigger hint are included; bodies and references stay
-    /// on disk until the skill is activated.
+    /// on disk until the skill is activated. Each entry is clipped to
+    /// [`INDEX_ENTRY_CAP`] at a word boundary, and entries stop once the whole
+    /// index would pass [`INDEX_TOTAL_CAP`]; the remaining skills are listed by
+    /// name so they stay discoverable and loadable with the `skill` tool.
     pub fn index_text(&self) -> String {
-        let mut out = String::new();
-        for skill in &self.skills {
-            out.push_str(&format!("- {}: {}", skill.name, skill.description));
-            if let Some(when) = &skill.when {
-                out.push_str(&format!(" (when: {when})"));
+        self.index_text_with(IndexMode::Full)
+    }
+
+    /// The index in the requested [`IndexMode`]. `Names` writes one line of
+    /// names and `Off` writes nothing, for small context windows.
+    pub fn index_text_with(&self, mode: IndexMode) -> String {
+        let ordered = self.index_order();
+        match mode {
+            IndexMode::Off => String::new(),
+            IndexMode::Names => {
+                let names: Vec<&str> = ordered.iter().map(|skill| skill.name.as_str()).collect();
+                // Leave room for the trailing newline inside the total cap.
+                let mut line = name_list(&names, INDEX_TOTAL_CAP - 1);
+                if !line.is_empty() {
+                    line.push('\n');
+                }
+                line
             }
+            IndexMode::Full => full_index(&ordered),
+        }
+    }
+
+    /// Names of the skills whose index entry the per-entry cap cuts, for
+    /// `lh context`.
+    pub fn clipped_names(&self) -> Vec<String> {
+        self.skills
+            .iter()
+            .filter(|skill| clipped_in_index(skill))
+            .map(|skill| skill.name.clone())
+            .collect()
+    }
+
+    /// Skills in index order. Shared home-directory skills (`~/.claude` and
+    /// `~/.agents`) move behind everything else so a library installed for
+    /// another agent cannot crowd out the bundled, native, and project skills
+    /// this workspace selected. The sort is stable, so precedence is otherwise
+    /// unchanged.
+    fn index_order(&self) -> Vec<&Skill> {
+        let mut ordered: Vec<&Skill> = self.skills.iter().collect();
+        ordered.sort_by_key(|skill| match skill.origin {
+            SkillOrigin::GlobalClaude | SkillOrigin::GlobalAgents => 1u8,
+            _ => 0u8,
+        });
+        ordered
+    }
+}
+
+/// Write full entries until the total cap, then one names-only line. Entries
+/// are moved back into the name list until both fit inside
+/// [`INDEX_TOTAL_CAP`].
+fn full_index(ordered: &[&Skill]) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    let mut used = 0usize;
+    let mut rest_from = ordered.len();
+    for (index, skill) in ordered.iter().enumerate() {
+        let line = index_entry(skill);
+        let projected = used + line.chars().count() + 1;
+        if projected > INDEX_TOTAL_CAP {
+            rest_from = index;
+            break;
+        }
+        used = projected;
+        lines.push(line);
+    }
+
+    let mut rest: Vec<&Skill> = ordered[rest_from..].to_vec();
+    while !rest.is_empty() {
+        let tail = names_tail(&rest, INDEX_NAMES_CAP);
+        if used + tail.chars().count() < INDEX_TOTAL_CAP {
+            break;
+        }
+        // Make room by moving the last full entry back into the name list.
+        if rest_from == 0 {
+            break;
+        }
+        let Some(line) = lines.pop() else {
+            break;
+        };
+        used = used.saturating_sub(line.chars().count() + 1);
+        rest_from -= 1;
+        rest.insert(0, ordered[rest_from]);
+    }
+
+    let mut out = String::new();
+    for line in &lines {
+        out.push_str(line);
+        out.push('\n');
+    }
+    if !rest.is_empty() {
+        let tail = names_tail(&rest, INDEX_NAMES_CAP);
+        if !tail.is_empty() {
+            out.push_str(&tail);
             out.push('\n');
         }
-        out
     }
+    out
+}
+
+fn names_tail(skills: &[&Skill], budget: usize) -> String {
+    const HEAD: &str = "- more (load with the skill tool by name): ";
+    let head = HEAD.chars().count();
+    if budget <= head {
+        return String::new();
+    }
+    let names: Vec<&str> = skills.iter().map(|skill| skill.name.as_str()).collect();
+    format!("{HEAD}{}", name_list(&names, budget - head))
+}
+
+/// Comma-separated names bounded by `cap` characters. Past the cap the list
+/// ends with `and N more`, so the reader knows names exist that are not shown.
+fn name_list(names: &[&str], cap: usize) -> String {
+    let mut shown = names.len();
+    loop {
+        let omitted = names.len() - shown;
+        let body = names[..shown].join(", ");
+        let line = if omitted == 0 {
+            body
+        } else if body.is_empty() {
+            format!("and {omitted} more")
+        } else {
+            format!("{body}, and {omitted} more")
+        };
+        if line.chars().count() <= cap || shown == 0 {
+            return line;
+        }
+        shown -= 1;
+    }
+}
+
+/// The index line for one skill, before the per-entry cap is applied.
+fn index_entry_uncapped(skill: &Skill) -> String {
+    let mut line = format!("- {}: {}", skill.name, skill.description);
+    if let Some(when) = &skill.when {
+        line.push_str(&format!(" (when: {when})"));
+    }
+    line
+}
+
+/// True when the description and trigger hint are too long for the index and
+/// the model would see a cut entry. `lh skill lint` reports these so an author
+/// can shorten the text instead of losing the trigger words.
+pub fn clipped_in_index(skill: &Skill) -> bool {
+    index_entry_uncapped(skill).chars().count() > INDEX_ENTRY_CAP
+}
+
+/// One index line, cut at a word boundary and marked with an ellipsis when it
+/// passes [`INDEX_ENTRY_CAP`].
+fn index_entry(skill: &Skill) -> String {
+    let line = index_entry_uncapped(skill);
+    if line.chars().count() <= INDEX_ENTRY_CAP {
+        return line;
+    }
+    let head: Vec<char> = line.chars().take(INDEX_ENTRY_CAP - 1).collect();
+    let boundary = head
+        .iter()
+        .rposition(|ch| ch.is_whitespace())
+        .unwrap_or(head.len());
+    // Back up to a word boundary only when it is near the cap. A single very
+    // long token (a URL, a hash) should not throw away most of the entry.
+    let cut = if boundary + 32 >= head.len() {
+        boundary
+    } else {
+        head.len()
+    };
+    let mut out: String = head[..cut].iter().collect();
+    while out.ends_with(|ch: char| ch.is_whitespace() || ch == ',' || ch == ';' || ch == ':') {
+        out.pop();
+    }
+    out.push('…');
+    out
 }
 
 /// Scan every skill root for `paths` and return every discovered skill in
@@ -802,6 +990,39 @@ mod tests {
         .unwrap();
     }
 
+    /// A skill with embedded instructions, for index tests that never touch
+    /// disk.
+    fn synthetic_skill(name: &str, description: &str, origin: SkillOrigin) -> Skill {
+        Skill {
+            name: name.to_string(),
+            description: description.to_string(),
+            when: None,
+            source: None,
+            dir: None,
+            bundled: origin.is_bundled(),
+            packs: Vec::new(),
+            allowed_tools: Vec::new(),
+            origin,
+            unknown: std::collections::BTreeMap::new(),
+            shadow: false,
+            text: SkillText::Embedded(
+                "---\nname: synthetic\ndescription: synthetic\n---\n\nBODY\n",
+            ),
+            reference_store: ReferenceStore::None,
+        }
+    }
+
+    /// A description at the Agent Skills limit, long enough that every entry
+    /// must be clipped.
+    fn long_description() -> String {
+        let mut description = String::new();
+        while description.len() < validate::DESCRIPTION_MAX {
+            description.push_str("remedy ");
+        }
+        description.truncate(validate::DESCRIPTION_MAX);
+        description
+    }
+
     #[test]
     fn frontmatter_parses() {
         let dir = tempfile::tempdir().unwrap();
@@ -954,11 +1175,8 @@ mod tests {
                 "{name} has no description"
             );
             assert!(
-                skill
-                    .when
-                    .as_deref()
-                    .is_some_and(|when| !when.trim().is_empty()),
-                "{name} has no when"
+                !clipped_in_index(skill),
+                "{name} does not fit the index entry cap"
             );
             assert!(
                 skill.body().lines().count() < 120,
@@ -977,6 +1195,210 @@ mod tests {
         let index_text = index.index_text();
         for name in CODING_PACK {
             assert!(index_text.contains(name), "index is missing {name}");
+        }
+    }
+
+    #[test]
+    fn bundled_entries_fit_the_cap_and_shrink_the_prompt() {
+        // Before the cap, the eleven bundled entries with their `when` hints
+        // repeated totaled 3557 characters. The incident asks for at least 500
+        // fewer, with every entry inside the per-entry cap.
+        let index = bundled();
+        for skill in &index.skills {
+            assert!(
+                !clipped_in_index(skill),
+                "{} would be clipped in the index",
+                skill.name
+            );
+        }
+        let length = index.index_text().chars().count();
+        assert!(
+            length <= 3557 - 500,
+            "bundled index is {length} characters; the cap must save at least 500"
+        );
+    }
+
+    #[test]
+    fn index_caps_entries_and_total_and_keeps_every_name() {
+        // Sixty skills at the Agent Skills description limit. The full entry
+        // budget is INDEX_TOTAL_CAP; the trailing names line lives inside that
+        // same budget and is itself at most INDEX_NAMES_CAP characters, so the
+        // whole text never exceeds INDEX_TOTAL_CAP.
+        let description = long_description();
+        let skills: Vec<Skill> = (0..60)
+            .map(|index| {
+                synthetic_skill(
+                    &format!("skill-{index:02}"),
+                    &description,
+                    SkillOrigin::GlobalNative,
+                )
+            })
+            .collect();
+        let index = SkillIndex {
+            skills,
+            shadows: Vec::new(),
+        };
+        let text = index.index_text();
+        let total = text.chars().count();
+        assert!(
+            total <= INDEX_TOTAL_CAP,
+            "index is {total} characters; the total cap is {INDEX_TOTAL_CAP}"
+        );
+        assert!(
+            text.contains("- more (load with the skill tool by name):"),
+            "the index does not list the skills past the cap by name"
+        );
+        for line in text.lines() {
+            if line.starts_with("- more (load with the skill tool by name):") {
+                assert!(
+                    line.chars().count() <= INDEX_NAMES_CAP,
+                    "names tail is {} characters; the cap is {INDEX_NAMES_CAP}",
+                    line.chars().count()
+                );
+                continue;
+            }
+            assert!(
+                line.chars().count() <= INDEX_ENTRY_CAP,
+                "entry is {} characters: {line}",
+                line.chars().count()
+            );
+        }
+        // Clipping keeps the entry discoverable even when the description is
+        // cut, and skills past the cap stay in the names line.
+        for skill in &index.skills {
+            assert!(
+                text.contains(&skill.name),
+                "{} disappeared from the index",
+                skill.name
+            );
+        }
+    }
+
+    #[test]
+    fn a_skill_past_the_cap_stays_loadable_by_name() {
+        let description = long_description();
+        let skills: Vec<Skill> = (0..60)
+            .map(|index| {
+                synthetic_skill(
+                    &format!("skill-{index:02}"),
+                    &description,
+                    SkillOrigin::GlobalNative,
+                )
+            })
+            .collect();
+        let index = SkillIndex {
+            skills,
+            shadows: Vec::new(),
+        };
+        let text = index.index_text();
+        let past = index.get("skill-59").expect("past the cap");
+        // The prompt carries the name, and the full description never does.
+        assert!(text.contains("skill-59"));
+        assert!(!text.contains(&past.description));
+        // The tool resolves against the index, not the clipped text.
+        assert!(past.instructions_text().contains("BODY"));
+    }
+
+    #[test]
+    fn index_modes_list_names_or_nothing() {
+        let index = SkillIndex {
+            skills: vec![
+                synthetic_skill("alpha", "Alpha description", SkillOrigin::Bundled),
+                synthetic_skill("beta", "Beta description", SkillOrigin::GlobalNative),
+            ],
+            shadows: Vec::new(),
+        };
+        let names = index.index_text_with(IndexMode::Names);
+        assert_eq!(names.trim_end(), "alpha, beta");
+        assert!(!names.contains("description"));
+        assert!(names.chars().count() <= INDEX_TOTAL_CAP);
+        assert_eq!(index.index_text_with(IndexMode::Off), "");
+        assert_eq!(index.index_text(), index.index_text_with(IndexMode::Full));
+
+        assert_eq!(IndexMode::default(), IndexMode::Full);
+        assert_eq!(
+            serde_json::from_str::<IndexMode>("\"full\"").unwrap(),
+            IndexMode::Full
+        );
+        assert_eq!(
+            serde_json::from_str::<IndexMode>("\"names\"").unwrap(),
+            IndexMode::Names
+        );
+        assert_eq!(
+            serde_json::from_str::<IndexMode>("\"off\"").unwrap(),
+            IndexMode::Off
+        );
+        assert!(serde_json::from_str::<IndexMode>("\"Off\"").is_err());
+    }
+
+    #[test]
+    fn clipped_in_index_flags_entries_past_the_cap() {
+        let prefix = "- demo: ".len();
+        let exact = synthetic_skill(
+            "demo",
+            &"x".repeat(INDEX_ENTRY_CAP - prefix),
+            SkillOrigin::Bundled,
+        );
+        assert!(!clipped_in_index(&exact));
+        assert_eq!(index_entry(&exact).chars().count(), INDEX_ENTRY_CAP);
+
+        let long = synthetic_skill("demo", &"x".repeat(INDEX_ENTRY_CAP), SkillOrigin::Bundled);
+        assert!(clipped_in_index(&long));
+        let clipped = index_entry(&long);
+        assert_eq!(clipped.chars().count(), INDEX_ENTRY_CAP);
+        assert!(clipped.ends_with('…'));
+
+        // A cut inside a word backs up to the whitespace before it.
+        let words = synthetic_skill("demo", &"alpha ".repeat(60), SkillOrigin::Bundled);
+        assert!(clipped_in_index(&words));
+        let clipped = index_entry(&words);
+        let stem = clipped.strip_suffix('…').expect("ellipsis");
+        let full = index_entry_uncapped(&words);
+        assert!(full.starts_with(stem));
+        assert!(
+            full[stem.len()..]
+                .chars()
+                .next()
+                .is_some_and(char::is_whitespace)
+        );
+    }
+
+    #[test]
+    fn shared_home_skills_sort_behind_bundled_native_and_project_skills() {
+        let long = long_description();
+        let mut skills: Vec<Skill> = (0..20)
+            .map(|index| {
+                synthetic_skill(
+                    &format!("home-{index:02}"),
+                    &long,
+                    SkillOrigin::GlobalClaude,
+                )
+            })
+            .collect();
+        skills.push(synthetic_skill(
+            "project",
+            "Project skill",
+            SkillOrigin::ProjectNative,
+        ));
+        skills.push(synthetic_skill(
+            "native",
+            "Native skill",
+            SkillOrigin::GlobalNative,
+        ));
+        let index = SkillIndex {
+            skills,
+            shadows: Vec::new(),
+        };
+        let text = index.index_text();
+        let first_home = text.find("- home-00").expect("full home entry");
+        for name in ["project", "native"] {
+            let position = text
+                .find(&format!("- {name}: "))
+                .unwrap_or_else(|| panic!("{name} has no full entry"));
+            assert!(
+                position < first_home,
+                "{name} sorted behind a shared home skill"
+            );
         }
     }
 

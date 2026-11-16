@@ -391,6 +391,7 @@ pub(crate) fn test_context(dir: &Path) -> ToolContext {
         lsp: Arc::new(crate::tools::lsp::LspService::new()),
         sandbox: None,
         vision: Default::default(),
+        caps: Default::default(),
     }
 }
 
@@ -602,7 +603,12 @@ mod tests {
     async fn full_read_authorizes_write() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.txt"), numbered(400)).unwrap();
-        let ctx = test_context(dir.path());
+        let mut ctx = test_context(dir.path());
+        // The whole file fits one result here; coverage is under test.
+        ctx.caps = crate::context::ResultCaps {
+            result: 16_000,
+            batch: 40_000,
+        };
 
         let read = ReadTool
             .call(&ctx, json!({"path": "a.txt", "start": 1, "end": 400}))
@@ -670,7 +676,12 @@ mod tests {
     async fn truncated_result_blocks_write() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.txt"), numbered(400)).unwrap();
-        let ctx = test_context(dir.path());
+        let mut ctx = test_context(dir.path());
+        // The whole file fits one result here; coverage is under test.
+        ctx.caps = crate::context::ResultCaps {
+            result: 16_000,
+            batch: 40_000,
+        };
 
         let read = ReadTool
             .call(&ctx, json!({"path": "a.txt", "start": 1, "end": 400}))
