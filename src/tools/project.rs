@@ -292,7 +292,14 @@ fn node_steps(cwd: &Path) -> DetectedVerify {
     // The npm placeholder runs no tests, so a real test tool wins over it.
     let real_test_script = script("test").is_some_and(|script| !is_placeholder_test(script));
     if real_test_script {
-        steps.push(DetectedStep::new("test", format!("{manager} test")));
+        // `bun test` is Bun's own test runner, not the package script; only
+        // `bun run test` runs what `scripts.test` says.
+        let command = if manager == "bun" {
+            "bun run test".to_string()
+        } else {
+            format!("{manager} test")
+        };
+        steps.push(DetectedStep::new("test", command));
     } else if has_dependency(&parsed, "vitest") {
         steps.push(DetectedStep::new("test", "npx vitest run"));
     } else if has_dependency(&parsed, "jest") {
@@ -520,6 +527,16 @@ mod tests {
                 ("test", "npx vitest run"),
             ]
         );
+    }
+
+    #[test]
+    fn bun_runs_the_package_test_script_not_its_own_runner() {
+        let dir = temp_project(&[
+            ("package.json", r#"{"scripts":{"test":"playwright test"}}"#),
+            ("bun.lock", ""),
+        ]);
+        let detected = detect_verify_steps(dir.path());
+        assert_eq!(steps(&detected), vec![("test", "bun run test")]);
     }
 
     #[test]

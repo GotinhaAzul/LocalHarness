@@ -63,6 +63,19 @@ pub async fn read_symbol(ctx: &ToolContext, args: &Value) -> Result<ToolResult, 
     })?;
     let path = ctx.resolve(&raw)?;
     let display = display_path(&ctx.cwd, &path);
+    // The same size limit as a plain read, checked before the whole file is
+    // loaded and scanned.
+    if let Ok(meta) = std::fs::metadata(&path)
+        && meta.len() > crate::tools::read::MAX_BYTES
+    {
+        return Err(ToolResult::err(
+            "FILE_TOO_LARGE",
+            format!(
+                "{display} is {} bytes; read caps at 4 MB. Use grep to find the declaration's line and read a range.",
+                meta.len()
+            ),
+        ));
+    }
     let text = std::fs::read(&path)
         .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
         .map_err(|err| {
@@ -661,6 +674,22 @@ mod tests {
             ambiguous.content
         );
         assert!(ambiguous.content.contains("grep"), "{}", ambiguous.content);
+    }
+
+    #[tokio::test]
+    async fn an_oversized_file_is_refused_before_it_is_scanned() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = std::fs::File::create(dir.path().join("big.rs")).unwrap();
+        file.set_len(crate::tools::read::MAX_BYTES + 1).unwrap();
+        let ctx = test_context(dir.path());
+        let result = ReadTool
+            .call(&ctx, json!({"path": "big.rs", "symbol": "main"}))
+            .await;
+        assert!(
+            result.content.starts_with("[FILE_TOO_LARGE]"),
+            "{}",
+            result.content
+        );
     }
 
     #[tokio::test]

@@ -11,7 +11,7 @@ use crate::tools::{
 };
 
 /// Hard cap on the bytes read from disk.
-const MAX_BYTES: u64 = 4 * 1024 * 1024;
+pub(crate) const MAX_BYTES: u64 = 4 * 1024 * 1024;
 const DEFAULT_LINES: u64 = 150;
 const MAX_LINES: u64 = 800;
 /// NUL bytes in this prefix mark a file as binary.
