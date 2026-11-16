@@ -2766,6 +2766,33 @@ async fn execute_batch(
             });
         }
 
+        // Advance notice for the todo gate: when this mutation leaves the run
+        // one step from it, say so on this result, so the next edit is not
+        // generated in full only to be rejected and generated again.
+        if executed
+            && !result.is_error
+            && gate_tools.todo
+            && !progress.todo_notice_sent
+            && matches!(call.name.as_str(), "edit" | "write" | "patch")
+            && let Some(path) = &args_path
+        {
+            let current = gates::analyze_turn_since(
+                &core.session.lock().expect("session lock"),
+                false,
+                turn_start,
+            );
+            let mut files = inferred_files.clone();
+            files.insert(path.clone());
+            if let Some(notice) = gates::todo_gate_notice(
+                current.mutations + inferred_mutations + 1,
+                unique_file_count(&current.files, &files),
+                plan_present || current.todo_plan_present,
+            ) {
+                progress.todo_notice_sent = true;
+                result.content.push_str(&format!("\n\n{notice}"));
+            }
+        }
+
         let evidence_output = result.content.clone();
         if let Some(note) = routed_note {
             result.content = format!("{note}\n{}", result.content);

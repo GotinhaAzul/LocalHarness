@@ -331,6 +331,20 @@ pub fn todo_edit_gate(
     ))
 }
 
+/// One line for the result of a mutation that leaves the run one step from
+/// [`todo_edit_gate`]: `mutations` and `files` count this mutation. `None`
+/// when a plan exists or the gate is still more than one step away.
+pub fn todo_gate_notice(
+    mutations: usize,
+    files: usize,
+    plan_present: bool,
+) -> Option<&'static str> {
+    if plan_present || !(mutations >= 2 || files >= 2) {
+        return None;
+    }
+    Some("[localharness] the next edit needs a plan: call todo action=\"plan\" first.")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

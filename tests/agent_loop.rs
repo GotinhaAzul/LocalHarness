@@ -4934,3 +4934,55 @@ async fn uncached_only_usage_reports_are_not_truncation() {
             .any(|e| matches!(e, AgentEvent::Guard { code, .. } if code == "context_truncated"))
     );
 }
+
+const TODO_NOTICE: &str = "the next edit needs a plan: call todo action=\"plan\" first";
+
+#[tokio::test]
+async fn the_mutation_before_the_todo_gate_carries_an_advance_notice() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness(
+        dir.path(),
+        vec![
+            call_script("c1", "write", json!({"path":"a.txt","content":"a"})),
+            call_script("c2", "write", json!({"path":"b.txt","content":"b"})),
+            call_script("c3", "todo", json!({"action":"plan","tasks":["a","b","c"]})),
+            call_script("c4", "write", json!({"path":"c.txt","content":"c"})),
+            call_script("c5", "write", json!({"path":"d.txt","content":"d"})),
+            text_script("done"),
+        ],
+        &["write", "todo"],
+    );
+    let (outcome, _) = run(&harness, "make files").await;
+    assert_ne!(outcome.status, TurnStatus::Blocked, "{:?}", outcome.error);
+    let results = tool_results(&harness.session);
+    assert!(!results[0].contains(TODO_NOTICE), "{}", results[0]);
+    assert!(results[1].contains(TODO_NOTICE), "{}", results[1]);
+    // With a plan in place the gate is open; no notice, and never twice.
+    assert_eq!(
+        results.iter().filter(|r| r.contains(TODO_NOTICE)).count(),
+        1,
+        "{results:?}"
+    );
+    assert!(dir.path().join("d.txt").exists());
+}
+
+#[tokio::test]
+async fn no_todo_notice_once_a_plan_exists() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness(
+        dir.path(),
+        vec![
+            call_script("c1", "todo", json!({"action":"plan","tasks":["a","b"]})),
+            call_script("c2", "write", json!({"path":"a.txt","content":"a"})),
+            call_script("c3", "write", json!({"path":"b.txt","content":"b"})),
+            text_script("done"),
+        ],
+        &["write", "todo"],
+    );
+    let _ = run(&harness, "make files").await;
+    let results = tool_results(&harness.session);
+    assert!(
+        results.iter().all(|r| !r.contains(TODO_NOTICE)),
+        "{results:?}"
+    );
+}
