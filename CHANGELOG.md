@@ -21,6 +21,29 @@ release may change defaults when the change is called out below.
   It was clipped to 600 characters and flattened to one line, so a long brief
   lost its final constraints. It is now clipped only after every other
   optional section has been dropped.
+- The token estimate no longer charges the tool schemas twice. The prose
+  characters-per-token ratio was learned from the whole request, schemas
+  included, and the schemas were then added again at their fixed price, so
+  the estimate ran about 5-7% high and compaction started early. The ratio is
+  now learned from the request minus the schemas.
+- After a compaction, the state block reports the budget in bands (under 50%,
+  over 50%, over 65%) instead of an exact percentage. The block is part of the
+  system message, and the exact figure changed on almost every model call,
+  which made the engine re-evaluate the whole conversation each time
+  ([#117](https://github.com/GotinhaAzul/LocalHarness/issues/117), partial).
+- A tool result over the cap is now cut at a line boundary, and its hint names
+  the first line that was left out (`truncated after line 46 of 153; recall
+  out-1 47-153`). It was cut mid-line and always pointed `recall` at lines
+  1-120, which the model had already seen
+  ([#118](https://github.com/GotinhaAzul/LocalHarness/issues/118), partial).
+- `grep` prints `--` separators only between context groups. With no context
+  lines it printed one after every non-adjacent match.
+
+### Changed
+
+- A turn stopped by the loop guard now ends with the `stalled` status instead
+  of `done`: `lh -p` exits 2 instead of 0, a workflow step is no longer marked
+  succeeded, and ACP reports `max_turn_requests`.
 
 ## [0.2.0] - 2026-11-15
 
