@@ -51,6 +51,7 @@ impl App {
             "sec" => self.command_sec(rest),
             "approve" => self.command_approve(),
             "trust" => self.command_trust(rest).await,
+            "verify" => self.command_verify(rest).await,
             "export" => self.command_export(rest),
             "clear" => self.command_clear(),
             "debug" => {
@@ -1335,6 +1336,78 @@ impl App {
             "usage:\n/sec  (pick from a list)\n/sec summary\n/sec scope add|remove <target>\n/sec scope clear\n/sec report",
             false,
         );
+    }
+
+    pub(super) async fn command_verify(&mut self, rest: &str) {
+        let Some(old) = self.core().cloned() else {
+            self.set_notice("no runtime", Role::Error);
+            return;
+        };
+        if rest.trim() == "accept" {
+            match crate::verify_setup::accept_detected(&old.paths) {
+                Ok((detected, _)) if detected.steps.is_empty() => {
+                    self.set_notice(
+                        "no verify steps detected; add [[steps]] to a [verify] config section",
+                        Role::Warning,
+                    );
+                }
+                Ok((detected, path)) => {
+                    let mut fresh = self.config.clone();
+                    fresh.verify.steps =
+                        detected.steps.iter().map(|step| step.to_config()).collect();
+                    match app::rebuild_core(&old, fresh).await {
+                        Ok(core) => {
+                            if let Some(runtime) = &mut self.runtime {
+                                runtime.core = core.clone();
+                            }
+                            self.config = core.config.clone();
+                            self.header.verify_off = false;
+                            self.set_notice(
+                                format!(
+                                    "verify: saved {} in {}; the verify gate is active from the next turn",
+                                    crate::verify_setup::describe(&detected),
+                                    path.display()
+                                ),
+                                Role::Success,
+                            );
+                        }
+                        Err(error) => {
+                            self.set_notice(
+                                format!("saved the steps, but the runtime did not reload: {error}"),
+                                Role::Error,
+                            );
+                        }
+                    }
+                }
+                Err(error) => {
+                    self.set_notice(
+                        format!("cannot save the verify steps: {error}"),
+                        Role::Error,
+                    );
+                }
+            }
+            return;
+        }
+        let text = if self.config.verify.steps.is_empty() {
+            crate::verify_setup::unconfigured_notice(
+                &crate::tools::project::detect_verify_steps(&old.paths.cwd),
+                "Type /verify accept to save them for this project.",
+            )
+        } else {
+            let steps: Vec<String> = self
+                .config
+                .verify
+                .steps
+                .iter()
+                .map(|step| format!("  {}: {}", step.name, step.command.join(" ")))
+                .collect();
+            format!(
+                "verify: {} step(s) configured\n{}",
+                steps.len(),
+                steps.join("\n")
+            )
+        };
+        self.transcript.push_note("verify", text, false);
     }
 
     pub(super) async fn command_trust(&mut self, rest: &str) {

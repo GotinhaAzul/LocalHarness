@@ -31,6 +31,7 @@ pub mod skills;
 pub mod text;
 pub mod tools;
 pub mod ui;
+pub mod verify_setup;
 pub mod workflows;
 
 pub use agent::{Core, run_turn};

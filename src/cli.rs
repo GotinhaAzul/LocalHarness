@@ -167,6 +167,13 @@ pub struct Cli {
 
 #[derive(Debug, clap::Subcommand)]
 pub enum Command {
+    /// Show or set up the verify steps for this project.
+    Verify {
+        /// Detect steps from the project's manifest files and save them for
+        /// this project (in the user data directory). Nothing is run.
+        #[arg(long)]
+        init: bool,
+    },
     /// Print the engine capability manifest and profile mismatches.
     Doctor {
         /// Emit one stable JSON object.
@@ -378,6 +385,13 @@ pub async fn run(cli: Cli) -> Result<i32> {
             config.verify = crate::config::VerifyConfig::load(&verify_path)?;
         }
     }
+    // Steps the user accepted for this project (`lh verify --init`, the TUI
+    // offer). They live in the user's data directory, not the repository.
+    if config.verify.steps.is_empty()
+        && let Some(steps) = crate::verify_setup::accepted_steps(&paths)
+    {
+        config.verify.steps = steps;
+    }
 
     let project_profiles = paths.project_dir().join("profiles");
     config.load_profile_dirs(
@@ -522,6 +536,9 @@ pub async fn run(cli: Cli) -> Result<i32> {
     if let Some(Command::Context { json, .. }) = &cli.command {
         return run_context(&config, &paths, *json);
     }
+    if let Some(Command::Verify { init }) = &cli.command {
+        return run_verify(&config, &paths, *init);
+    }
     if let Some(Command::Doctor { json, fix }) = &cli.command {
         return run_doctor(&config, &paths, *json, *fix).await;
     }
@@ -602,6 +619,31 @@ pub async fn run(cli: Cli) -> Result<i32> {
         );
     }
 
+    // No verify steps: say so once, with what was detected. Headless never
+    // prompts; the TUI offers the steps once per project.
+    if config.verify.steps.is_empty() {
+        let detected = crate::tools::project::detect_verify_steps(&paths.cwd);
+        if cli.print.is_some() {
+            eprintln!(
+                "[notice] {}",
+                crate::verify_setup::unconfigured_notice(
+                    &detected,
+                    "Save them with `lh verify --init`."
+                )
+            );
+        } else if !detected.steps.is_empty()
+            && crate::verify_setup::take_offer(&paths)
+            && let Ok(mut session) = runtime.core.session.lock()
+        {
+            session
+                .warnings
+                .push(crate::verify_setup::unconfigured_notice(
+                    &detected,
+                    "Type /verify accept to save them for this project.",
+                ));
+        }
+    }
+
     // Every core rebuild shares this manager, so one shutdown stops every
     // MCP server this process started.
     let mcp = runtime.core.mcp.clone();
@@ -619,6 +661,47 @@ pub async fn run(cli: Cli) -> Result<i32> {
     };
     mcp.shutdown().await;
     outcome
+}
+
+/// `lh verify [--init]`: show the verify steps, or detect and save them.
+fn run_verify(config: &Config, paths: &Paths, init: bool) -> Result<i32> {
+    if !config.verify.steps.is_empty() && !init {
+        println!("verify: {} step(s) configured", config.verify.steps.len());
+        for step in &config.verify.steps {
+            println!("  {}: {}", step.name, step.command.join(" "));
+        }
+        return Ok(0);
+    }
+    if !init {
+        let detected = crate::tools::project::detect_verify_steps(&paths.cwd);
+        println!(
+            "{}",
+            crate::verify_setup::unconfigured_notice(
+                &detected,
+                "Save them with `lh verify --init`."
+            )
+        );
+        return Ok(0);
+    }
+    let (detected, path) = crate::verify_setup::accept_detected(paths)
+        .with_context(|| "cannot save the verify steps")?;
+    if detected.steps.is_empty() {
+        println!(
+            "no verify steps detected in {}; looked for Cargo.toml, package.json, pyproject.toml/setup.py/pytest.ini, and go.mod. Add [[steps]] to a [verify] config section instead.",
+            paths.cwd.display()
+        );
+        return Ok(1);
+    }
+    println!(
+        "saved {} verify step(s) for {} in {}:",
+        detected.steps.len(),
+        paths.cwd.display(),
+        path.display()
+    );
+    for step in &detected.steps {
+        println!("  {}: {}", step.name, step.command);
+    }
+    Ok(0)
 }
 
 /// `lh completions <shell>`: write a completion script for packaging.
@@ -722,6 +805,18 @@ async fn run_doctor(config: &Config, paths: &Paths, json: bool, fix: bool) -> Re
         manifest.tool_dialect = cached.mode.clone();
         manifest.tool_probe = Some(cached);
     }
+    manifest.verify = Some(crate::doctor::VerifyStatus {
+        configured: config.verify.steps.len(),
+        detected: if config.verify.steps.is_empty() {
+            crate::tools::project::detect_verify_steps(&paths.cwd)
+                .steps
+                .iter()
+                .map(|step| format!("{}: {}", step.name, step.command))
+                .collect()
+        } else {
+            Vec::new()
+        },
+    });
     if let Ok(tools) = crate::tools::ToolRegistry::builtin().select(config.profile(), &[]) {
         let (full_chars, short_chars) = crate::tools::schema_sizes(&tools);
         manifest.tool_schemas = Some(crate::doctor::SchemaSizes {

@@ -59,6 +59,18 @@ pub struct DoctorManifest {
     /// The active profile's `tools` array size in both forms.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_schemas: Option<SchemaSizes>,
+    /// Whether verify steps are configured for this project, and what the
+    /// manifests suggest when they are not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verify: Option<VerifyStatus>,
+}
+
+/// Verify configuration as `lh doctor` reports it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerifyStatus {
+    pub configured: usize,
+    /// Detected candidate steps as `name: command`, when none are configured.
+    pub detected: Vec<String>,
 }
 
 /// Serialized tool-schema sizes for `lh doctor`.
@@ -405,6 +417,7 @@ impl DoctorManifest {
             fixes,
             usage_report: None,
             tool_schemas: None,
+            verify: None,
         }
     }
 
@@ -468,6 +481,21 @@ impl DoctorManifest {
             out.push_str(&format!(" (parser: {parser})"));
         }
         out.push('\n');
+        if let Some(verify) = &self.verify {
+            if verify.configured > 0 {
+                out.push_str(&format!(
+                    "verify: {} step(s) configured\n",
+                    verify.configured
+                ));
+            } else if verify.detected.is_empty() {
+                out.push_str("verify: not configured (nothing detected)\n");
+            } else {
+                out.push_str(&format!(
+                    "verify: not configured; detected {} (save with `lh verify --init`)\n",
+                    verify.detected.join(", ")
+                ));
+            }
+        }
         if let Some(sizes) = &self.tool_schemas {
             out.push_str(&format!(
                 "tool schemas: {} · full {} chars · short {} chars\n",
@@ -790,6 +818,7 @@ mod tests {
             ],
             usage_report: None,
             tool_schemas: None,
+            verify: None,
         }
     }
 
@@ -811,6 +840,15 @@ mod tests {
             manifest.to_text()
         );
         assert!(manifest.to_json_pretty().contains("\"usage_report\""));
+        manifest.verify = Some(VerifyStatus {
+            configured: 0,
+            detected: vec!["check: cargo check --all-targets".into()],
+        });
+        assert!(
+            manifest
+                .to_text()
+                .contains("verify: not configured; detected check: cargo check --all-targets")
+        );
         manifest.tool_schemas = Some(SchemaSizes {
             full_chars: 13_040,
             short_chars: 7_643,

@@ -1233,3 +1233,45 @@ async fn no_redact_keeps_raw_output_and_is_recorded_in_the_header() {
         env.data_dir.display()
     );
 }
+
+#[tokio::test]
+async fn print_in_an_unconfigured_project_names_the_detected_steps_and_runs_none() {
+    let (base, _fake) = spawn().await;
+    let env = env();
+    std::fs::write(env.cwd.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+    // A marker a detected step would create if anything ran it.
+    let output = run_lh(&env, &base, &["--print", "hi"]).await;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
+    let notices = stderr
+        .lines()
+        .filter(|line| line.contains("verify: not configured"))
+        .count();
+    assert_eq!(notices, 1, "stderr: {stderr}");
+    assert!(stderr.contains("cargo check --all-targets"), "{stderr}");
+    assert!(stderr.contains("lh verify --init"), "{stderr}");
+    assert!(!env.cwd.join("target").exists(), "no detected step may run");
+}
+
+#[tokio::test]
+async fn verify_init_saves_the_detected_steps_for_later_runs() {
+    let (base, _fake) = spawn().await;
+    let env = env();
+    std::fs::write(env.cwd.join("go.mod"), "module example.com/x\n").unwrap();
+    let output = run_lh(&env, &base, &["verify"]).await;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("verify: not configured"), "{stdout}");
+
+    let output = run_lh(&env, &base, &["verify", "--init"]).await;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(0), "{stdout}");
+    assert!(stdout.contains("go vet ./..."), "{stdout}");
+
+    // Later runs load them without --trust; the notice is gone.
+    let output = run_lh(&env, &base, &["verify"]).await;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("verify: 2 step(s) configured"), "{stdout}");
+    let output = run_lh(&env, &base, &["--print", "hi"]).await;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("verify: not configured"), "{stderr}");
+}
