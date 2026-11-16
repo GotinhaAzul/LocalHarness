@@ -15,6 +15,7 @@ pub mod iocs;
 pub mod lsp;
 pub mod patch;
 pub mod pr;
+pub mod project;
 pub mod read;
 pub mod recall;
 pub mod repo_map;
