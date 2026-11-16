@@ -264,7 +264,7 @@ async fn invalid_names_and_long_descriptions_are_field_errors() {
 }
 
 #[tokio::test]
-async fn a_hundred_skills_add_only_names_and_descriptions_at_startup() {
+async fn a_hundred_skills_are_capped_and_stay_loadable_by_name() {
     let env = env();
     let skills = env.config.join("skills");
     for index in 0..100 {
@@ -275,23 +275,66 @@ async fn a_hundred_skills_add_only_names_and_descriptions_at_startup() {
             &format!("BODY-SENTINEL-{index}"),
         );
     }
-    let (base, fake) = spawn_fake(vec![text_frame("ok")]).await;
+    let (base, fake) = spawn_fake(vec![
+        tool_frame("skill", &serde_json::json!({"name": "skill-99"})),
+        text_frame("loaded"),
+    ])
+    .await;
     let output = run_print(&env, &base, &["--print", "hello"]).await;
     assert_ok(&output);
     let requests = fake.requests.lock().unwrap();
     let system = requests[0]["messages"][0]["content"]
         .as_str()
         .expect("system prompt");
+    // Full entries stop at the total cap. The trailing line accounts for every
+    // remaining skill: shown by name, or counted in `and N more` when even the
+    // names cannot fit.
     assert!(
-        system.contains("skill-99: Capability number 99"),
-        "{system}"
+        system.matches("Capability number").count() < 100,
+        "the index did not stop writing full entries: {system}"
     );
-    assert_eq!(system.matches("skill-").count(), 100, "{system}");
+    let tail = system
+        .lines()
+        .find(|line| line.starts_with("- more (load with the skill tool by name):"))
+        .unwrap_or_else(|| panic!("no names line:\n{system}"));
+    assert!(
+        tail.chars().count() <= localharness::skills::INDEX_NAMES_CAP,
+        "{tail}"
+    );
+    let (mut shown, mut omitted) = (0usize, 0usize);
+    for item in tail.split(": ").nth(1).unwrap().split(", ") {
+        if let Some(count) = item
+            .strip_prefix("and ")
+            .and_then(|rest| rest.strip_suffix(" more"))
+        {
+            omitted = count.parse().unwrap();
+        } else {
+            shown += 1;
+        }
+    }
+    let full = system
+        .lines()
+        .filter(|line| line.starts_with("- skill-") && line.contains(": Capability number"))
+        .count();
+    assert_eq!(full + shown + omitted, 100, "{system}");
     assert!(
         !system.contains("BODY-SENTINEL"),
         "a body reached the prompt"
     );
     assert!(system.len() < 40_000, "index is {} chars", system.len());
+
+    // A skill whose description was left out of the prompt still loads by
+    // name: the tool resolves the full index, not the clipped text.
+    let messages = requests[1]["messages"].as_array().unwrap();
+    let tool = messages
+        .iter()
+        .find(|message| message["role"] == "tool")
+        .expect("tool result");
+    let content = tool["content"].as_str().unwrap();
+    assert!(
+        content.contains("BODY-SENTINEL-99"),
+        "skill-99 did not load: {content}"
+    );
 }
 
 #[tokio::test]
@@ -735,6 +778,48 @@ async fn lint_warns_on_a_long_body_and_many_references() {
     assert!(codes.contains(&"skill_body_long"), "{codes:?}");
     assert!(codes.contains(&"skill_references_many"), "{codes:?}");
     assert!(value["warnings"].as_u64().unwrap() >= 2);
+}
+
+#[tokio::test]
+async fn lint_warns_when_an_entry_would_be_clipped_in_the_index() {
+    let env = env();
+    write_skill(
+        &env.config.join("skills"),
+        "wordy",
+        &"Trigger word ".repeat(40),
+        "Body",
+    );
+    let output = run(&env, &["skill", "lint", "wordy", "--json"]).await;
+    assert_ok(&output);
+    let value = json(&output);
+    let diagnostics = value["skills"][0]["diagnostics"].as_array().unwrap();
+    let clipped = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic["code"] == "skill_index_clipped")
+        .unwrap_or_else(|| panic!("no index warning: {diagnostics:?}"));
+    assert_eq!(clipped["severity"], "warning");
+    assert_eq!(clipped["field"], "description");
+    let message = clipped["message"].as_str().unwrap();
+    assert!(message.contains("Shorten the description"), "{message}");
+    assert!(message.contains("200"), "{message}");
+
+    // A short entry raises no index warning.
+    write_skill(
+        &env.config.join("skills"),
+        "brief",
+        "A short trigger",
+        "Body",
+    );
+    let output = run(&env, &["skill", "lint", "brief", "--json"]).await;
+    assert_ok(&output);
+    let value = json(&output);
+    let diagnostics = value["skills"][0]["diagnostics"].as_array().unwrap();
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic["code"] != "skill_index_clipped"),
+        "{diagnostics:?}"
+    );
 }
 
 #[tokio::test]

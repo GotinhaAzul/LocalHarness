@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use crate::paths::Paths;
 
 use super::validate::{self, Diagnostic, Severity};
-use super::{Discovery, SkillOrigin, discover};
+use super::{Discovery, Skill, SkillOrigin, clipped_in_index, discover};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Target {
@@ -101,7 +101,7 @@ pub fn run(paths: &Paths, trust: bool, target: &Target) -> Result<LintReport, St
                         name: skill.name.clone(),
                         path: skill.source.clone(),
                         origin: skill.origin,
-                        diagnostics: validate::validate_skill(skill, validate::Scope::Full),
+                        diagnostics: lint_diagnostics(skill),
                     });
                 }
             }
@@ -137,7 +137,7 @@ pub fn run(paths: &Paths, trust: bool, target: &Target) -> Result<LintReport, St
                     name: skill.name.clone(),
                     path: skill.source.clone(),
                     origin: skill.origin,
-                    diagnostics: validate::validate_skill(skill, validate::Scope::Full),
+                    diagnostics: lint_diagnostics(skill),
                 });
             }
             for invalid in &discovery.invalid {
@@ -164,10 +164,27 @@ pub fn run(paths: &Paths, trust: bool, target: &Target) -> Result<LintReport, St
     Ok(report)
 }
 
+/// Everything lint reports for a live skill: the shared validator plus the
+/// index budget warning.
+fn lint_diagnostics(skill: &Skill) -> Vec<Diagnostic> {
+    let mut diagnostics = validate::validate_skill(skill, validate::Scope::Full);
+    if clipped_in_index(skill) {
+        diagnostics.push(Diagnostic::warning(
+            "description",
+            "skill_index_clipped",
+            format!(
+                "index entry is longer than {} characters, so the system prompt cuts the description. Shorten the description below the limit (and drop a `when` hint that repeats it) so the trigger text the model sees is complete.",
+                super::INDEX_ENTRY_CAP
+            ),
+        ));
+    }
+    diagnostics
+}
+
 fn linted_invalid(invalid: &super::InvalidSkill) -> LintedSkill {
     let diagnostics = match &invalid.skill {
         Some(skill) => {
-            let mut diagnostics = validate::validate_skill(skill, validate::Scope::Full);
+            let mut diagnostics = lint_diagnostics(skill);
             // A metadata error discovered earlier is the reason this skill is
             // not live; keep it even if the full pass reports the same field.
             for diagnostic in &invalid.diagnostics {

@@ -1,7 +1,6 @@
 ---
 name: incident-triage
-description: "Triage an incident or alert: build a UTC timeline, separate symptom from cause, check recent changes, mitigate before finding root cause, and record evidence as you go."
-when: "an alert fires, a service is down, data looks wrong, or the user reports an active incident"
+description: "Triage an incident: UTC timeline, separate symptom from cause, check recent changes, mitigate before root cause, keep evidence. Use when an alert fires or a service is down."
 ---
 
 # Incident triage

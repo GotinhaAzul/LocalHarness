@@ -1,7 +1,6 @@
 ---
 name: dependency-upgrade
-description: "Upgrade one dependency safely: read the changelog, find breaking changes, change one package at a time, adapt the code, test, and keep a rollback path."
-when: "bumping a package, patching a CVE in a dependency, or moving to a new major version"
+description: "Upgrade a dependency safely: read the changelog, find breaking changes, change one package, adapt the code, test, and keep a rollback path. Use for version bumps or CVE patches."
 ---
 
 # Upgrade a dependency

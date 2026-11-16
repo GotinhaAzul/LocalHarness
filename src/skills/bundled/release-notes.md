@@ -1,7 +1,6 @@
 ---
 name: release-notes
-description: "Write release notes from the commits and issues actually in a release: find the range since the last tag, classify changes, link issues, add upgrade notes, and invent nothing."
-when: "preparing a release, changelog, or summary of what changed since a tag"
+description: "Write release notes from the commits and issues in a release: find the range since the last tag, classify changes, link issues, add upgrade notes. Use for a release or changelog."
 ---
 
 # Write release notes

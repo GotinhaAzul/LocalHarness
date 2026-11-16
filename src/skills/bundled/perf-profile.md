@@ -1,7 +1,6 @@
 ---
 name: perf-profile
-description: "Make a measured performance improvement: pick one metric, capture a baseline, profile before optimizing, change one thing, and re-measure under the same conditions."
-when: "something is slow, a benchmark regressed, or the user asks for a performance fix"
+description: "Make a measured perf fix: pick one metric, take a baseline, profile before optimizing, change one thing, re-measure the same way. Use when something is slow or a benchmark regresses."
 ---
 
 # Profile before optimizing

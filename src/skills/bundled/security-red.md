@@ -1,6 +1,6 @@
 ---
 name: security-red
-description: "Authorized security testing: scoping and rules of engagement, passive and active reconnaissance, enumeration, minimal-impact vulnerability validation, evidence capture, ATT&CK mapping, and reporting. Use for labs, CTFs, and engagements with explicit written authorization. Not for unauthorized access, malware, persistence, credential theft, evasion, or denial of service."
+description: "Authorized security testing: scoping, recon, enumeration, minimal-impact validation, evidence, ATT&CK mapping, reporting. For labs, CTFs, or authorized engagements only."
 ---
 
 # Authorized security testing
