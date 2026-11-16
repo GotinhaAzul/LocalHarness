@@ -500,6 +500,12 @@ pub async fn create_runtime(
             tokens.min(u32::MAX as usize) as u32,
         );
     }
+    if profile.tool_schemas() == crate::config::ToolSchemas::Auto
+        && let Some(choice) =
+            crate::tools::choose_schemas(&tools, &mut tool_specs, &system_prompt, &budget)
+    {
+        record_schema_choice(&mut session, &choice);
+    }
     let tool_specs_json = if tool_specs.is_empty() {
         String::new()
     } else {
@@ -868,6 +874,13 @@ pub async fn rebuild_core(old: &Arc<Core>, mut config: Config) -> Result<Arc<Cor
             tokens.min(u32::MAX as usize) as u32,
         );
     }
+    if model_profile.tool_schemas() == crate::config::ToolSchemas::Auto
+        && let Some(choice) =
+            crate::tools::choose_schemas(&tools, &mut tool_specs, &system_prompt, &budget)
+        && let Ok(mut session) = old.session.lock()
+    {
+        record_schema_choice(&mut session, &choice);
+    }
     let tool_specs_json = if tool_specs.is_empty() {
         String::new()
     } else {
@@ -1192,6 +1205,24 @@ async fn resolve_tool_probe(
             tracing::warn!("tool-call conformance probe timed out; assuming configured tool mode");
             None
         }
+    }
+}
+
+/// Record an automatic schema choice in the session and the startup notes.
+fn record_schema_choice(session: &mut Session, choice: &crate::tools::SchemaChoice) {
+    let line = choice.line();
+    tracing::info!("{line}");
+    if choice.short {
+        session.warnings.push(line.clone());
+    }
+    if let Err(error) = session.append(EntryKind::Custom(
+        CustomData::new("tool-schemas")
+            .with("short", choice.short)
+            .with("full_chars", choice.full_chars as u64)
+            .with("short_chars", choice.short_chars as u64)
+            .with("full_share", choice.full_share),
+    )) {
+        tracing::warn!(%error, "cannot record the tool schema choice");
     }
 }
 

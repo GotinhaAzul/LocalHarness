@@ -678,6 +678,19 @@ async fn run_doctor(config: &Config, paths: &Paths, json: bool, fix: bool) -> Re
         manifest.tool_dialect = cached.mode.clone();
         manifest.tool_probe = Some(cached);
     }
+    if let Ok(tools) = crate::tools::ToolRegistry::builtin().select(config.profile(), &[]) {
+        let (full_chars, short_chars) = crate::tools::schema_sizes(&tools);
+        manifest.tool_schemas = Some(crate::doctor::SchemaSizes {
+            full_chars,
+            short_chars,
+            setting: match profile.tool_schemas() {
+                crate::config::ToolSchemas::Full => "full",
+                crate::config::ToolSchemas::Short => "short",
+                crate::config::ToolSchemas::Auto => "auto",
+            }
+            .into(),
+        });
+    }
     let usage_key = crate::provider::probe::tool_probe_key(&provider, None);
     if let Some(message) = crate::doctor::load_usage_mismatch(
         &paths.data_dir.join(crate::doctor::USAGE_MISMATCH_CACHE),

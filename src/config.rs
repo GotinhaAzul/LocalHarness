@@ -224,7 +224,7 @@ impl Config {
                 tool_mode: ToolMode::Repair,
                 strip_reasoning: Some(true),
                 edit_mode: EditMode::Hash,
-                short_tool_schemas: Some(true),
+                short_tool_schemas: Some(ToolSchemas::Short),
                 ..ModelProfile::default()
             },
         );
@@ -238,7 +238,7 @@ impl Config {
                 parallel_tool_calls: Some(false),
                 tool_choice: Some("required".into()),
                 one_call: true,
-                short_tool_schemas: Some(true),
+                short_tool_schemas: Some(ToolSchemas::Short),
                 ..ModelProfile::default()
             },
         );
@@ -252,7 +252,7 @@ impl Config {
                 parallel_tool_calls: Some(false),
                 tool_choice: None,
                 one_call: false,
-                short_tool_schemas: Some(true),
+                short_tool_schemas: Some(ToolSchemas::Short),
                 ..ModelProfile::default()
             },
         );
@@ -1230,8 +1230,10 @@ pub struct ModelProfile {
     pub one_call: bool,
     /// How file edits are anchored: exact text (default) or content hashes.
     pub edit_mode: EditMode,
-    /// Strip property descriptions and shorten tool descriptions in requests.
-    pub short_tool_schemas: Option<bool>,
+    /// Strip property descriptions and shorten tool descriptions in requests:
+    /// `true`, `false`, or `"auto"` (short when the static prompt would take
+    /// more than [`AUTO_SHORT_SCHEMA_SHARE`] of the usable prompt).
+    pub short_tool_schemas: Option<ToolSchemas>,
     pub stop: Vec<String>,
     pub extra_body: Option<toml::Value>,
     /// Sampler values for this model. Each `Some` value overrides the global
@@ -1382,7 +1384,59 @@ impl ModelProfile {
     }
 
     pub fn short_tool_schemas(&self) -> bool {
-        self.short_tool_schemas.unwrap_or(false)
+        self.short_tool_schemas == Some(ToolSchemas::Short)
+    }
+
+    /// The configured schema form; unset is full.
+    pub fn tool_schemas(&self) -> ToolSchemas {
+        self.short_tool_schemas.unwrap_or(ToolSchemas::Full)
+    }
+}
+
+/// Share of the usable prompt above which `short_tool_schemas = "auto"`
+/// sends the short schemas.
+pub const AUTO_SHORT_SCHEMA_SHARE: f64 = 0.20;
+
+/// Which tool-schema form requests carry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolSchemas {
+    Full,
+    Short,
+    /// Decided once per session and model from the static prompt's share of
+    /// the usable prompt, so the request prefix stays byte-stable.
+    Auto,
+}
+
+impl Serialize for ToolSchemas {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            ToolSchemas::Full => serializer.serialize_bool(false),
+            ToolSchemas::Short => serializer.serialize_bool(true),
+            ToolSchemas::Auto => serializer.serialize_str("auto"),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ToolSchemas {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Bool(bool),
+            Text(String),
+        }
+        match Raw::deserialize(deserializer)? {
+            Raw::Bool(true) => Ok(ToolSchemas::Short),
+            Raw::Bool(false) => Ok(ToolSchemas::Full),
+            Raw::Text(text) => match text.trim().to_ascii_lowercase().as_str() {
+                "auto" => Ok(ToolSchemas::Auto),
+                "true" | "short" => Ok(ToolSchemas::Short),
+                "false" | "full" => Ok(ToolSchemas::Full),
+                other => Err(serde::de::Error::custom(format!(
+                    "short_tool_schemas must be true, false, or \"auto\", got {other:?}"
+                ))),
+            },
+        }
     }
 }
 
@@ -1595,6 +1649,22 @@ mod tests {
         assert_eq!(profile.tool_choice.as_deref(), Some("required"));
         assert!(profile.one_call);
         assert!(profile.short_tool_schemas());
+        // The setting takes a bool or "auto"; unset stays the full form.
+        let parse = |text: &str| -> ModelProfile { toml::from_str(text).unwrap() };
+        assert_eq!(
+            parse("short_tool_schemas = true").tool_schemas(),
+            ToolSchemas::Short
+        );
+        assert_eq!(
+            parse("short_tool_schemas = false").tool_schemas(),
+            ToolSchemas::Full
+        );
+        assert_eq!(
+            parse("short_tool_schemas = \"auto\"").tool_schemas(),
+            ToolSchemas::Auto
+        );
+        assert_eq!(parse("").tool_schemas(), ToolSchemas::Full);
+        assert!(toml::from_str::<ModelProfile>("short_tool_schemas = \"maybe\"").is_err());
 
         let shell = &cfg.profiles["shell"];
         assert_eq!(shell.tools, ["bash"]);

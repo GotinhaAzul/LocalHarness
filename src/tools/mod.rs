@@ -683,6 +683,80 @@ impl ToolRegistry {
     }
 }
 
+/// Serialized `tools` array size in characters, in the full and the short
+/// form.
+pub fn schema_sizes(tools: &[Arc<dyn Tool>]) -> (usize, usize) {
+    let size = |short| {
+        let specs = ToolRegistry::specs_with(tools, short);
+        if specs.is_empty() {
+            0
+        } else {
+            crate::provider::tools_json(&specs).chars().count()
+        }
+    };
+    (size(false), size(true))
+}
+
+/// The outcome of `short_tool_schemas = "auto"`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SchemaChoice {
+    pub short: bool,
+    /// Static prompt share of the usable prompt with the full schemas.
+    pub full_share: f64,
+    pub full_chars: usize,
+    pub short_chars: usize,
+}
+
+impl SchemaChoice {
+    pub fn line(&self) -> String {
+        if self.short {
+            format!(
+                "tool schemas: short (auto; the static prompt would take {:.0}% of the usable prompt with full schemas; saves {} chars)",
+                self.full_share * 100.0,
+                self.full_chars.saturating_sub(self.short_chars)
+            )
+        } else {
+            format!(
+                "tool schemas: full (auto; the static prompt takes {:.0}% of the usable prompt)",
+                self.full_share * 100.0
+            )
+        }
+    }
+}
+
+/// Decide `short_tool_schemas = "auto"` once for a session and model: the
+/// short form when the system prompt plus the full schemas would exceed
+/// [`crate::config::AUTO_SHORT_SCHEMA_SHARE`] of the usable prompt. Rewrites
+/// `specs` in place when it picks the short form; an empty `specs` (no native
+/// tool calls) is left alone.
+pub fn choose_schemas(
+    tools: &[Arc<dyn Tool>],
+    specs: &mut Vec<crate::provider::ToolSpec>,
+    system_prompt: &str,
+    budget: &crate::context::TokenBudget,
+) -> Option<SchemaChoice> {
+    if specs.is_empty() {
+        return None;
+    }
+    let (full_chars, short_chars) = schema_sizes(tools);
+    let full_json = crate::provider::tools_json(specs);
+    let cost = crate::context::ToolSpecCost::from_json(&full_json, budget);
+    let total = budget
+        .estimate_text(system_prompt)
+        .saturating_add(cost.tokens);
+    let full_share = f64::from(total) / f64::from(budget.usable_prompt().max(1));
+    let short = full_share > crate::config::AUTO_SHORT_SCHEMA_SHARE;
+    if short {
+        *specs = ToolRegistry::specs_with(tools, true);
+    }
+    Some(SchemaChoice {
+        short,
+        full_share,
+        full_chars,
+        short_chars,
+    })
+}
+
 /// First sentence of a tool description, capped for schemas sent to weak models.
 fn short_description(description: &str) -> String {
     let first = description.split(". ").next().unwrap_or(description).trim();

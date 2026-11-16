@@ -56,6 +56,18 @@ pub struct DoctorManifest {
     /// no chat completion, so it reports what a session observed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage_report: Option<String>,
+    /// The active profile's `tools` array size in both forms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_schemas: Option<SchemaSizes>,
+}
+
+/// Serialized tool-schema sizes for `lh doctor`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SchemaSizes {
+    pub full_chars: usize,
+    pub short_chars: usize,
+    /// `full`, `short`, or `auto`.
+    pub setting: String,
 }
 
 impl DoctorManifest {
@@ -392,6 +404,7 @@ impl DoctorManifest {
             warnings,
             fixes,
             usage_report: None,
+            tool_schemas: None,
         }
     }
 
@@ -455,6 +468,12 @@ impl DoctorManifest {
             out.push_str(&format!(" (parser: {parser})"));
         }
         out.push('\n');
+        if let Some(sizes) = &self.tool_schemas {
+            out.push_str(&format!(
+                "tool schemas: {} · full {} chars · short {} chars\n",
+                sizes.setting, sizes.full_chars, sizes.short_chars
+            ));
+        }
         match &self.tool_probe {
             Some(probe) => out.push_str(&format!(
                 "tool probe: {} · mode {} · model {} · checked {}\n",
@@ -770,6 +789,7 @@ mod tests {
                 "llama.cpp: llama-server -m <model> --jinja --ctx-size 65536 --port 8080".into(),
             ],
             usage_report: None,
+            tool_schemas: None,
         }
     }
 
@@ -791,6 +811,16 @@ mod tests {
             manifest.to_text()
         );
         assert!(manifest.to_json_pretty().contains("\"usage_report\""));
+        manifest.tool_schemas = Some(SchemaSizes {
+            full_chars: 13_040,
+            short_chars: 7_643,
+            setting: "auto".into(),
+        });
+        assert!(
+            manifest
+                .to_text()
+                .contains("tool schemas: auto · full 13040 chars · short 7643 chars")
+        );
     }
 
     #[test]

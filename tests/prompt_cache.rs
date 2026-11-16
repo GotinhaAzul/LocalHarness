@@ -490,3 +490,53 @@ fn hook_context_during_a_session_does_not_grow_the_head() {
     assert!(last.messages.iter().any(|m| matches!(m,
         ChatMessage::Tool { content, .. } if content.contains("[hook context: ctx]\nnote 3"))));
 }
+
+#[test]
+fn auto_tool_schemas_go_short_on_a_small_window_and_full_on_a_large_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = Config::builtin();
+    config.profile_name = "coding".into();
+    let profile = config.profile().clone();
+    let tools = ToolRegistry::builtin().select(&profile, &[]).unwrap();
+    let prompt = build_system_prompt(
+        &config,
+        &paths(dir.path()),
+        &SkillIndex::bundled(),
+        &tools,
+        None,
+    );
+    let static_tokens = |specs: &[ToolSpec], budget: &TokenBudget| {
+        budget.estimate_text(&prompt) + ToolSpecCost::from_json(&tools_json(specs), budget).tokens
+    };
+
+    let small = TokenBudget::new(32_768, 8192);
+    let mut specs = ToolRegistry::specs_with(&tools, false);
+    let before = static_tokens(&specs, &small);
+    let choice =
+        localharness::tools::choose_schemas(&tools, &mut specs, &prompt, &small).expect("a choice");
+    assert!(choice.short, "{choice:?}");
+    assert_eq!(
+        tools_json(&specs),
+        tools_json(&ToolRegistry::specs_with(&tools, true))
+    );
+    let after = static_tokens(&specs, &small);
+    assert!(
+        before - after >= 1800,
+        "short schemas save {} tokens",
+        before - after
+    );
+    // Decided once: the same inputs give byte-identical schemas.
+    let mut again = ToolRegistry::specs_with(&tools, false);
+    localharness::tools::choose_schemas(&tools, &mut again, &prompt, &small);
+    assert_eq!(tools_json(&again), tools_json(&specs));
+
+    let large = TokenBudget::new(131_072, 8192);
+    let mut specs = ToolRegistry::specs_with(&tools, false);
+    let choice =
+        localharness::tools::choose_schemas(&tools, &mut specs, &prompt, &large).expect("a choice");
+    assert!(!choice.short, "{choice:?}");
+    assert_eq!(
+        tools_json(&specs),
+        tools_json(&ToolRegistry::specs_with(&tools, false))
+    );
+}
