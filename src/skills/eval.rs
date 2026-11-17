@@ -1,4 +1,4 @@
-//! `lh skill eval`: trigger precision and recall over prompt fixtures.
+//! `tot skill eval`: trigger precision and recall over prompt fixtures.
 //!
 //! The CI provider is deterministic: it scores the prompt against the skill
 //! name, description, and `when` hint, loads the best match, and picks a

@@ -10,7 +10,7 @@ Two tokens carry the interface's two voices: `sun` (Skoll) colors the model,
 its reply marker and its streaming phases; `moon` (Hati) colors the harness,
 its tool rows, turn summaries, and tool phases. Missing tokens fall back to the
 default palette. User themes
-live in `~/.config/localharness/themes/<name>.toml`.
+live in `~/.config/totality/themes/<name>.toml`.
 
 ```toml
 name = "mine"

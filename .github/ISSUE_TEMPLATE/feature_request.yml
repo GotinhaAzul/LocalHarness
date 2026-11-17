@@ -5,7 +5,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        The backlog is public: read the [backlog map](https://github.com/GotinhaAzul/LocalHarness/issues/45)
+        The backlog is public: read the [backlog map](https://github.com/GotinhaAzul/Totality/issues/45)
         first. If the item is already there, comment on it instead of opening a new issue.
 
         Proposed PRs for large features need agreement on the issue before the code.

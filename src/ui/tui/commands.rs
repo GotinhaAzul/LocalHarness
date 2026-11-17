@@ -1043,7 +1043,7 @@ impl App {
         if !workflow.steps.is_empty() {
             self.set_notice(
                 format!(
-                    "workflow {name} has deterministic steps; run it from the shell with `lh workflow run {name}`"
+                    "workflow {name} has deterministic steps; run it from the shell with `tot workflow run {name}`"
                 ),
                 Role::Error,
             );
@@ -1431,7 +1431,7 @@ impl App {
                 .to_string()
         } else {
             format!(
-                "untrusted: project .harness config, profiles, skills, workflows, and tools are ignored.\nType /trust confirm to load them for this session, or restart with --trust (LH_TRUST=1). The global config is always trusted.\nProject directory: {}",
+                "untrusted: project .harness config, profiles, skills, workflows, and tools are ignored.\nType /trust confirm to load them for this session, or restart with --trust (TOT_TRUST=1). The global config is always trusted.\nProject directory: {}",
                 self.config_paths_project()
             )
         };
@@ -1513,7 +1513,7 @@ impl App {
         };
         let cwd = runtime.core.paths.cwd.clone();
         let path = if argument.is_empty() {
-            cwd.join(format!("localharness-{id}.md"))
+            cwd.join(format!("totality-{id}.md"))
         } else {
             let requested = PathBuf::from(argument);
             if requested.is_absolute() {

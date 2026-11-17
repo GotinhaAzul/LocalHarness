@@ -1,5 +1,5 @@
-//! The wire schema for agent events, shared by `lh --print --json` and the
-//! `lh serve` SSE stream.
+//! The wire schema for agent events, shared by `tot --print --json` and the
+//! `tot serve` SSE stream.
 //!
 //! [`event_name`] is an exhaustive match on [`AgentEvent`], so adding a
 //! variant fails to compile until it has a name, and both frontends pick the

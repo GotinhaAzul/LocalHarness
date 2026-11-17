@@ -13,7 +13,7 @@ impl SurfaceTool {
         let mut state = match ctx.security.lock() {
             Ok(state) => state,
             Err(_) => {
-                return ToolResult::err("SECURITY_IO", "security state is poisoned; restart lh");
+                return ToolResult::err("SECURITY_IO", "security state is poisoned; restart tot");
             }
         };
         let scope = state.scope.clone();
@@ -83,7 +83,7 @@ impl SurfaceTool {
         let mut state = match ctx.security.lock() {
             Ok(state) => state,
             Err(_) => {
-                return ToolResult::err("SECURITY_IO", "security state is poisoned; restart lh");
+                return ToolResult::err("SECURITY_IO", "security state is poisoned; restart tot");
             }
         };
         let scope = state.scope.clone();

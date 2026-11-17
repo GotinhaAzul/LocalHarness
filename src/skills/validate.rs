@@ -2,7 +2,7 @@
 //! manager.
 //!
 //! Discovery treats only metadata errors as fatal, so an old skill with a long
-//! body still loads. `lh skill lint` and `lh skill add` run the full pass:
+//! body still loads. `tot skill lint` and `tot skill add` run the full pass:
 //! body budget, reference reachability and size, duplicate names, and content
 //! that looks like a secret or an absolute home path.
 

@@ -1341,53 +1341,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4744e383959f0db86ede514b809b1c53251889093803c05267acc7d4e7030d70"
 
 [[package]]
-name = "localharness"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "axum",
- "bytes",
- "chrono",
- "clap",
- "clap_complete",
- "clap_mangen",
- "crossterm",
- "dirs",
- "fs2",
- "futures-util",
- "globset",
- "http-body-util",
- "hyper",
- "hyper-util",
- "ignore",
- "ipnet",
- "nix 0.30.1",
- "pulldown-cmark",
- "ratatui",
- "ratatui-textarea",
- "regex",
- "reqwest",
- "serde",
- "serde_json",
- "serde_yaml",
- "sha2",
- "similar",
- "subtle",
- "tempfile",
- "textwrap",
- "thiserror 2.0.21",
- "tokio",
- "tokio-util",
- "toml",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
- "unicode-width",
- "vt100",
-]
-
-[[package]]
 name = "lock_api"
 version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2868,6 +2821,53 @@ name = "toml_write"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
+
+[[package]]
+name = "totality"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "bytes",
+ "chrono",
+ "clap",
+ "clap_complete",
+ "clap_mangen",
+ "crossterm",
+ "dirs",
+ "fs2",
+ "futures-util",
+ "globset",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "ignore",
+ "ipnet",
+ "nix 0.30.1",
+ "pulldown-cmark",
+ "ratatui",
+ "ratatui-textarea",
+ "regex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2",
+ "similar",
+ "subtle",
+ "tempfile",
+ "textwrap",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+ "toml",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "unicode-width",
+ "vt100",
+]
 
 [[package]]
 name = "tower"

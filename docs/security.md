@@ -1,6 +1,6 @@
 # Security posture and engagements
 
-LocalHarness includes a first-class security pack for authorized testing,
+Totality includes a first-class security pack for authorized testing,
 labs, CTFs, and defensive work. It does not provide exploit payloads,
 persistence, credential dumping, evasion, or denial-of-service tooling.
 
@@ -87,7 +87,7 @@ What bubblewrap enforces:
   `TERM`, `TZ`, `USER`, `LOGNAME`, and `SHELL` are passed through, plus
   `HOME=/nonexistent` and `TMPDIR=/tmp`. API keys, SSH agent sockets,
   GPG/DBus variables, and `XDG_*` are dropped.
-- The sandbox fails closed. If no backend is available at startup, `lh`
+- The sandbox fails closed. If no backend is available at startup, `tot`
   refuses to run with the sandbox enabled. If a command cannot be wrapped, the
   tool returns `SANDBOX_UNAVAILABLE` and nothing runs unsandboxed.
   `--no-sandbox` is the only way to opt out.
@@ -101,7 +101,7 @@ UDP, and writes the host's real `TMPDIR` rather than a private tmpfs. It also
 requires Landlock ABI 4 or newer for the network deny; older kernels fail
 closed instead of running with an open network. Prefer bubblewrap when you
 need those guarantees. The bubblewrap executable can be overridden with
-`LH_BWRAP` (useful for tests and non-standard installs).
+`TOT_BWRAP` (useful for tests and non-standard installs).
 
 `--path-jail` is a separate file-tool boundary; it does not change how `bash`
 runs.
@@ -138,7 +138,7 @@ dispatch:
 
 - Session entries carry a provenance tag: `user`, `tool:<name>`, `skill`, or
   `external`. The tag is written to the session JSONL and appears as a
-  `provenance` event in `lh --print --json`.
+  `provenance` event in `tot --print --json`.
 - Every tool result from an untrusted source is scanned by a small detector for
   instruction patterns: "ignore previous instructions", "run this command",
   "send the contents of", "disable the sandbox", credential paths such as
@@ -167,7 +167,7 @@ there. `--sandbox` remains the process boundary.
 ## Findings
 
 Findings are engagement-global and stored in
-`~/.local/share/localharness/engagements/<engagement>/findings.jsonl`
+`~/.local/share/totality/engagements/<engagement>/findings.jsonl`
 (directory `0700`, file `0600`). Each finding records id, title, severity,
 status, target, evidence, impact, remediation, timestamps, and the session and
 entry that produced it.
@@ -351,7 +351,7 @@ Leave servers that reach out-of-scope systems out of security profiles with
 
 ## Trust
 
-Global config under `~/.config/localharness/`, `~/.claude/skills/`, and
+Global config under `~/.config/totality/`, `~/.claude/skills/`, and
 `~/.agents/skills/` is trusted because the user wrote it. Project `.harness/`
 config, profiles, skills, workflows, tools, and verify steps, plus project
 `.claude/skills/` and `.agents/skills/`, are ignored unless `--trust` is passed
@@ -362,9 +362,9 @@ the header/footer.
 directories between the git repository root and the working directory, nearest
 last. Each file is shown under a source-path header. The chain is capped at
 32 KiB total and 12 KiB per file; truncation is deterministic and warns. A
-symlink that resolves outside the repository is refused. `lh context --show`
+symlink that resolves outside the repository is refused. `tot context --show`
 prints the manifest with each path, byte count, SHA-256, and
-loaded/skipped/truncated state; `--no-agents-md` and `LH_AGENTS_MD=0` disable
+loaded/skipped/truncated state; `--no-agents-md` and `TOT_AGENTS_MD=0` disable
 the chain. The files cannot change scope, tools, gates, or the endpoint. A
 trusted project still cannot grant security scope.
 
@@ -421,9 +421,9 @@ in the system prompt. This reduces, but does not eliminate, prompt injection.
   the session entry and evidence for that result are redacted when written.
   Prefer `bash` for one-shot commands that print secrets.
 - Diagnostic logs are metadata only: timings, tool names, token counts, error
-  codes. Prompt and tool content is not logged unless `LH_DEBUG_CONTENT=1`,
+  codes. Prompt and tool content is not logged unless `TOT_DEBUG_CONTENT=1`,
   which prints a warning.
-- API keys come from config or `LH_API_KEY`, are never logged, and are redacted
+- API keys come from config or `TOT_API_KEY`, are never logged, and are redacted
   from errors.
 - Artifact retention defaults to 30 days (`--keep-artifacts`,
   `--clean-artifacts`).

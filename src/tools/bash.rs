@@ -521,7 +521,7 @@ mod tests {
         assert!(denied.is_error, "{}", denied.content);
 
         let temp = BashTool
-            .call(&ctx, json!({"command": "echo ok > /tmp/lh-sandbox-test"}))
+            .call(&ctx, json!({"command": "echo ok > /tmp/tot-sandbox-test"}))
             .await;
         assert!(
             !temp.is_error,

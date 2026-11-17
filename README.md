@@ -1,380 +1,192 @@
 <p align="center">
-  <img src="docs/assets/demo.gif" alt="LocalHarness TUI: a failing test, the model reading the file, editing it, and the verify gate passing" width="960">
-</p>
-
-<h1 align="center">LocalHarness</h1>
-
-<p align="center">
-  <strong>A local-first coding agent that enforces the loop.</strong><br>
-  One Rust binary. Any OpenAI-compatible model. A polished TUI and a scriptable headless mode.
+  <img src="docs/assets/banner.png" alt="Totality: Skoll and Hati, two pixel-art wolves, closing in on an eclipse" width="760">
 </p>
 
 <p align="center">
-  <a href="https://github.com/GotinhaAzul/LocalHarness/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/GotinhaAzul/LocalHarness/ci.yml?style=flat-square&label=CI" alt="CI"></a>
-  <a href="https://github.com/GotinhaAzul/LocalHarness/blob/main/LICENSE-MIT"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue?style=flat-square" alt="License: MIT OR Apache-2.0"></a>
-  <img src="https://img.shields.io/badge/rust-1.88%2B-orange?style=flat-square" alt="Rust 1.88+">
-  <img src="https://img.shields.io/badge/platform-linux%20x86__64%20%7C%20aarch64-lightgrey?style=flat-square" alt="Linux x86_64 and aarch64">
-  <img src="https://img.shields.io/badge/telemetry-none-3FB950?style=flat-square" alt="No telemetry">
-  <img src="https://img.shields.io/badge/interface-TUI%20%7C%20headless%20%7C%20ACP%20%7C%20HTTP-7AA2F7?style=flat-square" alt="TUI, headless, ACP, and HTTP interfaces">
+  <strong>The local-first coding agent that enforces the loop.</strong><br>
+  One Rust binary. Any OpenAI-compatible model. Nothing phones home.
 </p>
 
 <p align="center">
-  <code>27 built-in tools</code> · <code>3 packs</code> · <code>1 binary</code> · <code>0 telemetry</code>
+  <a href="https://github.com/GotinhaAzul/Totality/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/GotinhaAzul/Totality/ci.yml?style=flat-square&label=CI" alt="CI"></a>
+  <a href="https://github.com/GotinhaAzul/Totality/releases/latest"><img src="https://img.shields.io/github/v/release/GotinhaAzul/Totality?style=flat-square&color=F2A65A" alt="Latest release"></a>
+  <a href="LICENSE-MIT"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-A9B8D8?style=flat-square" alt="License: MIT OR Apache-2.0"></a>
+  <img src="https://img.shields.io/badge/telemetry-none-9CCC8A?style=flat-square" alt="No telemetry">
+</p>
+
+<p align="center">
+  <a href="#install">Install</a> ·
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#features">Features</a> ·
+  <a href="docs/usage.md">Usage guide</a> ·
+  <a href="#documentation">Docs</a> ·
+  <a href="CONTRIBUTING.md">Contributing</a>
+</p>
+
+<p align="center">
+  <img src="docs/assets/demo-short.gif" alt="Totality in a terminal: a local model edits a file and the verify gate passes" width="900">
+</p>
+
+<p align="center">
+  <a href="docs/assets/demo.mp4">Watch the full 60-second demo</a>
 </p>
 
 ---
 
-**LocalHarness owns the agent loop, the tools, the context budget, the session tree, and the interface.** Point it at any engine that speaks the OpenAI chat-completions API — llama.cpp, Ollama, vLLM, LM Studio, LiteLLM — and get the same enforced behavior. It does not ship a model, phone home, or require a Node runtime.
+Totality is a terminal coding agent for people who run their own models. Point
+it at llama.cpp, Ollama, vLLM, LM Studio, or any OpenAI-compatible gateway, and
+it does the rest of the job a hosted agent does: reads your code, plans, edits,
+runs your tests, and keeps a session you can rewind.
 
-Built for people running local or self-hosted models who want an agent they can inspect, script, and shape. The product stance is simple: **anything the model is unreliable at is enforced by code, not requested by prompt.** The harness supplies facts, measures progress, and stops loops. The model does the work.
-
-## The harness is the difference
-
-Most coding agents are a prompt, a tool loop, and a lot of trust. LocalHarness moves the trust into code.
-
-| The failure mode | What LocalHarness does instead |
-|---|---|
-| An edit before the file was read | `edit`, `write`, and `patch` refuse until the file has been read in this session. |
-| “I ran the tests” | `verify` executes the configured steps and records the result before the turn can settle. |
-| The same tool call, forever | Loop and stall guards stop a run that repeats. Budget checkpoints renew while the work is still producing new results, so long tasks are not cut short. |
-| A context window that quietly dies | Budgeted compaction, archived tool output, and `recall` for exact excerpts. |
-| A finding that sounds convincing | Evidence entries with hashes; declared PoC steps are replayed and confirmed or rejected. |
-| A shell with your whole home directory | `--sandbox` and `--path-jail` narrow the process and file boundaries. |
-
-**Local by default.** No telemetry, analytics, or phone-home. The endpoint is localhost unless you point it elsewhere, and `--no-session` writes nothing at all. The opt-in `fetch` tool is the only built-in tool that reads arbitrary URLs: it is in no profile by default (enable it in a profile's `tools` or with `--tools +fetch`), `GET`s a single public http(s) URL with no credentials or cookies (2 MB and 20 s caps), and asks in the default mode with the full URL as the approval subject, so `[permissions]` rules such as `command = "^fetch https://docs\\.rs/"` can allow a host. Loopback, private, link-local, CGNAT, and metadata addresses are refused unless `[fetch] allow_private` names the host. It runs in the harness process, not in the `bash` sandbox, so `--sandbox` does not apply to it, and it fetches only that URL, not a page's subresources or analytics.
-
-Every tool error names the next action. Every guard is a code path, not a polite sentence in a system prompt.
+What makes it different is where the trust lives. **Anything a model is
+unreliable at is enforced by code, not requested in a prompt.** Totality will not
+let an edit land on a file the model never read, will not let a turn end on "I
+ran the tests" without running them, and stops a run that is going in circles.
+A smaller local model, kept honest, gets real work done.
 
 ## Install
 
-Prebuilt static binaries for Linux x86_64 and aarch64 are attached to every
-release with SHA-256 checksums. The installer needs no Rust toolchain, no sudo,
-and installs into `~/.local/bin`:
-
 ```sh
-curl -fsSLO https://github.com/GotinhaAzul/LocalHarness/releases/latest/download/install.sh
-less install.sh          # read it before running
-sh install.sh
-lh --version
+curl -fsSLO https://github.com/GotinhaAzul/Totality/releases/latest/download/install.sh
+less install.sh   # read it first
+sh install.sh     # static binary into ~/.local/bin, checksum-verified, no sudo
 ```
 
-Download and read `install.sh` instead of piping it into a shell. It detects the
-architecture, downloads the matching static binary, verifies it against the
-release `SHA256SUMS`, and refuses to install anything on a checksum mismatch.
-Set `LH_VERSION=0.2.0` to pin a release and `LH_INSTALL_DIR` to change the
-prefix. Bash, zsh, and fish completions and the `lh.1` man page are installed
-under `$XDG_DATA_HOME` (default `~/.local/share`).
+<details>
+<summary>Other ways to install</summary>
 
-| Channel | Install |
+| Channel | Command |
 |---|---|
-| AUR (binary) | `localharness-bin` recipe in `packaging/aur/` (publish pending) |
-| AUR (source) | `localharness` recipe in `packaging/aur/` (publish pending) |
-| Nix | `nix profile install github:GotinhaAzul/LocalHarness` |
-| Docker | `docker build -f packaging/docker/Dockerfile -t localharness .` then `docker run --rm -it -v "$PWD:/workspace" localharness` |
-| Homebrew | Best-effort formula in `packaging/homebrew/`; not in a tap yet |
+| From source | `cargo install --git https://github.com/GotinhaAzul/Totality --locked` (Rust 1.88+) |
+| Nix | `nix profile install github:GotinhaAzul/Totality` |
+| Docker | `docker build -f packaging/docker/Dockerfile -t totality .` then `docker run --rm -it -v "$PWD:/workspace" totality` |
+| AUR | `totality` and `totality-bin` recipes in [`packaging/aur/`](packaging/aur/) (publish pending) |
+| Homebrew | Best-effort formula in [`packaging/homebrew/`](packaging/homebrew/) (not in a tap yet) |
 
-The Docker image is distroless, runs as a non-root user, and has no shell or
-package manager. See [docs/packaging.md](docs/packaging.md) for checksums,
-release assets, and package maintenance.
+The installer verifies the release `SHA256SUMS` and refuses to install on a
+mismatch. `TOT_VERSION` pins a release and `TOT_INSTALL_DIR` changes the prefix;
+completions and the man page go under `$XDG_DATA_HOME`. Prebuilt binaries cover
+Linux x86_64 and aarch64. See [packaging](docs/packaging.md).
 
-From source (Rust 1.88 or newer, Linux x86_64 or aarch64):
-
-```sh
-git clone https://github.com/GotinhaAzul/LocalHarness
-cd LocalHarness
-cargo install --path . --locked
-lh --version
-```
-
-Or build in place:
-
-```sh
-cargo build --release
-./target/release/lh --help
-```
-
-Dependencies are pinned in `Cargo.lock`.
+</details>
 
 ## Quick start
 
-Start any OpenAI-compatible server, then run `lh`. If the endpoint exposes exactly one model, it is selected automatically.
-
 ```sh
-# llama.cpp (tool calling requires --jinja)
+# 1. Serve a model with tool calling (llama.cpp shown; Ollama and vLLM work too)
 llama-server -m Qwen3.5-35B-A3B-Q4_K_M.gguf --ctx-size 65536 --jinja --port 8080
-lh
 
-# Ollama
-ollama serve
-ollama pull qwen3
-lh --endpoint http://127.0.0.1:11434 --model qwen3
-
-# vLLM
-vllm serve Qwen/Qwen3-35B-A3B --enable-auto-tool-choice --tool-call-parser hermes
-lh --endpoint http://127.0.0.1:8000 --model Qwen/Qwen3-35B-A3B
+# 2. Open Totality in your project
+cd your-project
+tot
 ```
 
-`lh` also starts with no reachable endpoint or model. The TUI opens with `not logged in` and turns stay disabled until you sign in:
+That's it: with one model on the endpoint, Totality picks it. Elsewhere, use
+`tot --endpoint http://host:11434 --model qwen3`, or type `/login` inside the
+app. Then ask for something:
 
 ```text
-/login http://127.0.0.1:8080             auto-select the endpoint's only model
-/login http://127.0.0.1:8080 qwen3       choose a model
-/login http://host:8000 model sk-...     remote endpoint with a bearer token
+› fix the failing parser test in @src/parser.rs
 ```
 
-`/login` validates `GET /v1/models` and saves `endpoint`, `model`, and `api_key` to the global config with `0600` permissions. `/model` opens a filterable picker over every model the endpoint exposes, including gateways such as LiteLLM or OpenRouter. Headless `--print` requires a selected model.
+Typing `@` opens a live file picker; `/` lists every command. Per-engine setup
+is in [model setup](docs/model-setup.md).
 
-Point at another endpoint with `--endpoint` or `LH_ENDPOINT` (default `http://127.0.0.1:8080`). Both `http://host:8080` and `http://host:8080/v1` work, so you can paste the base URL an engine prints. A non-local endpoint is allowed but warned about; see [docs/model-setup.md](docs/model-setup.md) for a tailnet example.
+## Features
 
-Facts come from optional endpoints (`/v1/models`, `/props`, `/tokenize`, `/api/show`). Missing probes only degrade estimates; they never fail a turn. The harness does not launch servers on its own, but `[model] start_command` can start one once when the endpoint is unreachable.
+**An enforced loop.** Read before edit, plan before the third change, verify
+before the turn ends, review the diff after. Loop and stall guards stop
+repetition without cutting off work that is still making progress. Every error
+names the next action, so a model is never left guessing.
 
-## 01 · The loop is enforced, not requested
+**Tools that know the codebase.** Edit, patch, and undo with snapshots; grep,
+glob, and a cached repo map; language-server diagnostics after edits; a test
+runner that returns the first failure, not ten thousand lines. Oversized output
+is archived and recalled by exact range.
 
-A model can forget to read a file, claim a test passed, or repeat the same failing call until the context is gone. LocalHarness makes those states visible and stoppable.
+**Hunk review.** Before a multi-file change lands, Totality shows you the hunks.
+Accept, reject, or edit each one; only what you accept is written.
 
-```text
-[tool] edit src/parser.rs
-[error] read src/parser.rs first
+**Sessions are a tree.** Fork, rewind files and conversation to any earlier
+turn, resume tomorrow. Compaction is deterministic and the request prefix stays
+cache-stable, so local engines keep their prompt cache.
 
-[tool] verify cargo test
-PASS  cargo  42 passed (3.1 s)
+**Built for local models.** Probes the engine for its real context window and
+tool-call format, repairs malformed tool calls, and ships weak-model profiles
+that narrow the toolset to what a small model can drive.
 
-✓ read-before-edit   ✓ plan gate   ✓ verify gate   ✓ review gate
-```
+**Everywhere you work.** A TUI with live `@` mentions, a headless mode for
+scripts and CI (`tot --print … --json`), a local HTTP API with server-sent
+events (`tot serve`), and the Agent Client Protocol for Zed and other editors
+(`tot acp`).
 
-- **Read before edit.** `edit`, `write`, and `patch` require a prior read of the same file. A changed file must be read again.
-- **Plan before the third mutation.** `todo` is free for two edits or two files, then a plan is required.
-- **Verify before settle.** After changes, configured steps run; a real failure blocks the turn.
-- **Review after verify.** The `review` pass checks the diff for secrets, debug statements, lockfiles, deletion-heavy changes, and source changes without tests.
-- **Stop the loop, not the work.** Loop and stall guards end a repeating run with a status, not a silent bill. Budget checkpoints renew while the run is still producing new results.
-- **Name the next action.** Every error tells the model what to do instead of leaving it to guess.
+**Shape it without forking.** Profiles, Agent Skills (`SKILL.md`, including
+`.claude/skills`), workflows with steps and approval gates, MCP servers,
+lifecycle hooks, external tools as plain executables, and TOML themes.
 
-## 02 · Tools that know the codebase
+**Security work, when you ask for it.** An opt-in profile with scope gates,
+hashed evidence for every command, findings whose proof-of-concept steps are
+replayed and confirmed, Sigma detection, and an OS sandbox. For authorized
+work only; read [security](docs/security.md) first.
 
-Twenty-four built-ins in three packs. `coding` (core + coding) is the default; `full` adds the security pack. `security` and `minimal` narrow it further; `strict` and `shell` are weak-model presets (see [configuration](docs/configuration.md#weak-model-profiles)).
+**Private by design.** No telemetry and no hosted state. Sessions and evidence
+are redacted on disk, `--no-session` writes nothing, and `--sandbox` and
+`--path-jail` narrow what the agent can touch.
 
-| Pack | Tools |
+## Why "enforced"
+
+| What a model does | What Totality does instead |
 |---|---|
-| Core | `read` `write` `edit` `patch` `undo` `bash` `grep` `glob` `todo` `skill` `verify` `recall` `thread` `bg` |
-| Coding | `repo_map` `lsp` `test` `review` |
-| Security | `surface` `evidence` `detect` `attack_path` `finding` `iocs` |
+| Edits a file it never read | `edit`, `write`, and `patch` refuse until the file is read this session |
+| Says "I ran the tests" | `verify` runs the configured steps; a failure blocks the turn |
+| Repeats the same call forever | Loop and stall guards end the run with a status |
+| Fills the context and dies | Budgeted compaction, archived output, and `recall` for exact excerpts |
+| Writes a convincing finding | Evidence entries carry hashes; declared PoC steps are replayed |
+| Runs with your whole home directory | `--sandbox` and `--path-jail` narrow processes and files |
 
-- **`repo_map`** returns a cached, budget-capped outline of files and top-level symbols; a compact version ships in the system prompt.
-- **`lsp`** adds language-server diagnostics after edits when a supported server is installed and the file belongs to a real project. A missing or cold server never fails an edit.
-- **`test`** detects vitest, jest, go, cargo, pytest, or an npm test script and returns only the first failure.
-- **`review`** reads the working tree and checks the diff before the session settles.
-- **`undo`** reverts the last `edit`, `patch`, or `write` from session snapshots, and refuses when the file changed after the harness wrote it. Changes made through `bash` are not tracked.
-- **Hunk review.** `review = "multi_file"` (the default) pauses before a turn's second file mutation, shows the proposed hunks in the TUI, and writes only what you accept. Rejected hunks are reported back to the model with their ranges, accepted hunks land atomically, and `undo` still steps back over them. `always` reviews every mutation; `off` restores immediate writes. Headless `--print` has no reviewer, so it auto-accepts and never blocks.
-- **`read`/`grep`/`glob`** respect ignore files and keep results small; oversized output is archived and available through `recall`.
-- **Hash edits (opt-in)** — `edit_mode = "hash"` makes `read` print content hashes and lets `patch` apply `PUT`/`CUT`/`REM`/`MV` line anchors from `path#snapshot`; stale anchors write nothing and return fresh ones. Exact-text `edit` remains the default. See [configuration](docs/configuration.md#hash-anchored-edits).
+## The look
 
-Tool results are capped, archived, and retrievable. The model never has to guess where an excerpt came from.
-
-## 03 · Sessions are a tree, not a log
-
-One append-only JSONL file per session tree under `~/.local/share/localharness/sessions/<project-id>/`. Branches, checkouts, and forks are non-destructive.
-
-```text
-/tree       show branches and switch
-/rewind     restore files and the conversation to an earlier turn
-/fork       branch from the current leaf
-/new        start a fresh session
-/resume     pick a previous session by prefix or suffix
-/sessions   list every session for this project
-/export     write a Markdown transcript
-```
-
-`/rewind [turns]` restores every file the harness wrote after the target to its
-snapshot there, then moves the leaf; the old branch stays in `/tree`. An edit
-made outside the harness refuses the rewind and is named; `/rewind 1 force`
-backs such files up before restoring them. `lh --rewind <session>:<entry>`
-does the same headlessly.
-
-```sh
-lh --rewind last:e42          # latest session, before entry e42
-lh --rewind 20261107-…:e9 --force
-```
-
-Compaction is deterministic, not model-written. Tool output is archived with an id, and `recall` reads an exact range. The request prefix is cache-stable: tool order and schema key order do not drift, volatile session facts sit at the end of the system block, and a compaction logs how much of the prefix the engine can keep. `--no-session` writes nothing: no session file, no artifacts. Session files, artifacts, evidence, and reports are redacted on disk by default; `--no-redact` is the explicit opt-out and is recorded in the session header. Redaction applies only to what is written to disk: in a live session the model sees the real tool output, so it has no placeholder to copy into a file. A resumed session replays the saved, redacted form with a note, and `write`/`edit`/`patch`/`undo` refuse content that adds a `[REDACTED:...]` placeholder the file does not already hold.
-
-`AGENTS.md` is read hierarchically: the chain from the git repository root to the working directory, nearest last, each with a source-path header. Files are capped at 12 KiB each and 32 KiB total, with deterministic truncation and a warning; a symlink that resolves outside the repository is refused. `lh context --show` prints the manifest (path, bytes, SHA-256, loaded/skipped/truncated), and `lh context --json` emits the same data for scripts. `--no-agents-md` or `LH_AGENTS_MD=0` skips the chain. The files are advisory: they cannot add a tool, relax a gate, or change the profile.
-
-## 04 · One binary, two front ends
-
-### The TUI
-
-The terminal interface is the default. It speaks in two voices: the model in Skoll's amber, the harness in Hati's silver-blue (the `sun` and `moon` theme tokens). Tool calls render as compact rows grouped with the thoughts between them, diffs and streamed Markdown are styled, and the context gauge stays visible. The terminal title shows whether a turn is running, waiting for approval, or done. When the engine reports a prefix-cache hit, the header also shows `cache <cached>/<prompt>` tokens; `--json` usage events carry the same counts.
-
-| Key | Action |
-|---|---|
-| `Enter` | send |
-| `Ctrl+J` | newline |
-| `Esc` | cancel the current stream |
-| `Ctrl+C` | cancel; again to quit |
-| `Ctrl+D` | quit when the input is empty |
-| `Up`/`Down` | history when input is empty; otherwise cursor |
-| `PgUp`/`PgDn`, `Home`/`End` | scroll transcript |
-| `Ctrl+R` | toggle reasoning |
-| `Ctrl+L` | redraw the whole screen |
-| `/` | slash-command completion |
-| `Tab` / `Shift+Tab` | complete commands, arguments, and paths; move back through choices |
-| Review: `a` / `r` / `e` | accept, reject, or edit the selected hunk (`A`/`R` all, `Enter` apply, `Esc` reject all) |
-
-Tab completes the token at the cursor: commands, arguments (themes, profiles, skills, workflows, session ids, models, `/login` endpoints, `/help` topics, `/sec` subcommands), and file paths. Ambiguous matches first extend to their shared prefix, then open a picker. Every command that chooses from a list — `/model`, `/profile`, `/theme` (with live preview), `/skill`, `/workflow`, `/sec`, `/resume` — opens a filterable menu when run without an argument: type to filter, arrows to move, Enter to pick. Model and profile switches load in the background, so the TUI stays responsive while the server swaps models.
-
-Write `@path` in a prompt to attach a file: `fix the panic in @src/parser.rs`. The file is read through the same path as the `read` tool and appended to your message, so the model can edit it without another read. Up to eight files per prompt, within a quarter of the usable context. `@shot.png` attaches a screenshot: a model with vision input sees the image, and a text-only model can get a description from a local vision model; the `read` tool opens images too. Images are checked by content, stripped of EXIF, and sent only to local endpoints unless you opt in. See [docs/images.md](docs/images.md).
-
-Slash commands: `/help /quit /login /model /profile /theme /tree /rewind /fork /new /resume /sessions /compact /tools /mcp /skill /workflow /sec /trust /commit /pr /plan /export /clear /debug`.
-
-Every tool call passes a permission policy first. The default mode `ask` runs read-only calls and asks before edits and commands, showing the exact command or path and a diff; `y` approves exactly that call for the session. `/plan` switches to plan mode: mutating tools are removed and refused at dispatch until `/plan approve`. Modes, rules, and `--yolo` are in [docs/configuration.md](docs/configuration.md#permissions).
-
-### Headless
-
-```sh
-lh --mode accept-edits --print "Fix the failing parser test"
-lh --print "Summarize this repo" --json
-lh --plan --print "Plan the parser refactor"   # read-only; prints the plan
-lh --continue                  # most recent session
-lh --resume 20261107-201500-1234
-```
-
-`--print` streams text to stdout, diagnostics to stderr, and exits with the turn status: `0` done, `1` error/blocked, `2` budget/stalled, `130` cancelled. `--json` emits newline-delimited events for scripts and CI. A headless run cannot answer a permission prompt, so calls that would ask are denied: pass `--mode accept-edits`, add allow rules, or use `--yolo` (explicit, recorded in the session).
-
-### Local HTTP API
-
-`lh serve` exposes sessions, turns, a Server-Sent Events stream, and cancel on loopback, for cron jobs, CI, dashboards, and scripts:
-
-```sh
-lh serve                       # prints {"listening":"http://127.0.0.1:PORT","token_file":"…"}
-curl -H "Authorization: Bearer $(cat <token_file>)" -X POST http://127.0.0.1:PORT/v1/sessions -d '{}'
-```
-
-The bearer token is written to a `0600` file. Only its path is printed. SSE event names are the `--json` event names. A session runs one turn at a time, and a second turn gets a typed `409`. A non-loopback bind needs `--allow-non-loopback`. HTTP sessions cannot answer a permission prompt, so commands and edits are denied unless the session is created with `"permission_mode": "accept-edits"`, or with `"yolo"` on a server started with `--allow-yolo`. Sessions stay resumable after the server stops. See [docs/serve.md](docs/serve.md).
-
-### Editors
-
-`lh acp` speaks the Agent Client Protocol v1 over stdio, so Zed (and other ACP editors) can host a LocalHarness thread:
-
-```json
-{
-  "agent_servers": {
-    "localharness": {
-      "type": "custom",
-      "command": "lh",
-      "args": ["--endpoint", "http://127.0.0.1:8080", "--model", "qwen3", "acp"],
-      "env": {}
-    }
-  }
-}
-```
-
-The session root is the `cwd` the editor declares, and the path jail is always on for file tools. Every tool that can change files or run processes asks the editor first; a denial leaves no side effect, and an approval never widens a harness gate. `bash` and `bg` are processes, so their boundary is the permission prompt plus `--sandbox`. Terminal access is not advertised and a terminal request gets a typed refusal. See [docs/acp.md](docs/acp.md).
-
-## 05 · Security, when you ask for it
-
-Security is opt-in. The default `coding` profile has no security tools or posture. `--profile security` adds core plus security; `--profile full` adds coding plus security. `/profile` switches during a session.
-
-Security work is for authorized labs, CTFs, and engagements only. Scope is set by the user with `/sec scope add|remove|clear`; there is no model tool for it. The scope gate blocks a known set of active-testing tools when no scope is set or when an extracted target is outside it. It is a speed bump; `--sandbox` is the process boundary.
-
-Repository files and tool output are tagged with their source. A cheap detector warns when untrusted content contains instruction-shaped phrases, and the next sensitive action needs `/approve`. Untrusted content cannot enable a tool, change scope, change the endpoint, or change permissions; that is enforced at dispatch, not in the prompt.
-
-- **Evidence.** `bash`, `bg`, and external tool runs append an evidence entry with target, command, timestamps, exit status, output artifact, and SHA-256. Secret values are redacted before session, artifact, evidence, finding, and report writes (never in what the model reads); `--no-redact` is the explicit, recorded opt-out.
-- **Surface.** `surface` parses nmap/HTTP/TLS output into one inventory; `attack_path` queries the graph derived from surface, findings, and evidence.
-- **Findings.** `finding add` auto-links the last evidence entry. A finding can carry bounded `poc_steps`; `finding verify` replays them locally and stores `reproduced`/`confirmed`, `not_reproduced`/`rejected`, or `error|skipped`/`inconclusive`.
-- **Detection.** `detect` validates and runs a Sigma subset against local JSONL logs or plain-text samples.
-- **Boundaries.** `--sandbox` runs `bash` and `bg` in an OS sandbox with bubblewrap or Landlock. `--path-jail` restricts file tools to the working directory. `--no-sandbox` is the explicit opt-out. `[permissions]` rules allow, ask, or deny calls by tool, path, command, or network before they run.
-
-Read [docs/security.md](docs/security.md) before using it on client work.
-
-## 06 · Shape it without forking
-
-Everything at the edge is configurable; the loop itself stays small and auditable.
-
-- **Profiles** select packs and tools. Built-ins are `coding` (default), `full`, `security`, `minimal`, `strict` (six tools, one call per message for weak models), and experimental `shell` (bash only); add your own in `profiles/*.toml` or `.harness/profiles/`.
-- **Prompt** customization lives in `[prompt]`: replace the one-line identity, append inline instructions, point at a Markdown file, or disable the hierarchical `AGENTS.md` chain with `agents_md = false`. Per-profile prompts still apply on top.
-- **Skills** are Markdown instructions in the Agent Skills format (`SKILL.md`). The model loads a matching skill with the `skill` tool, or you load one with `/skill <name>`. Bundled security skills advertise only when the security pack is active and remain loadable by name; eight bundled coding skills advertise with the coding pack. `.claude/skills`, `.agents/skills`, and `~/.claude/skills` load alongside the native directories, with native precedence. Install and pin a library with `lh skill add|update|remove|list`, validate it with `lh skill lint`, and test its triggers with `lh skill eval --fixtures`.
-- **Workflows** are playbooks plus a profile and tool allowlist. Optional `[[step]]` tables add conditions, bounded retries, approval gates, declared artifacts, and resume; `lh workflow run <name>` executes them. The bundled set covers coding, review, general assistance, and security.
-- **External tools** are any executable speaking one JSON object in, one JSON object out. No plugin ABI, no second runtime.
-- **Lifecycle hooks** run your command at `session_start`, `user_prompt`, `pre_tool`, `post_tool`, `pre_compact`, and `stop`. They can add context or block; a missing hook is visible and `pre_tool` fails closed. `lh hooks test <name>` exercises one.
-- **MCP servers** plug in over stdio or Streamable HTTP with one `[mcp.<name>]` table. Their tools join the profile as `<server>__<tool>`; `lh mcp list` and `/mcp` show what connected.
-- **Themes** are TOML files of semantic color tokens. `default` is bundled with four alternatives; `omarchy` is an alias for existing configs.
-
-```toml
-default_profile = "coding"
-
-[ui]
-theme = "default"
-
-[prompt]
-identity = ""                 # replace the built-in identity
-instructions = ""             # append your own rules
-file = ""                     # or point at a Markdown file
-```
-
-Loop behavior is not scriptable. Fork the crate.
-
-## Design principles
-
-- **Local by default.** No telemetry, no hosted state, no phone-home. The model can be remote; the harness is yours.
-- **Enforced, not prompted.** Guards are code paths because prompts are advice.
-- **Facts over guesses.** Probe the engine, measure the context, record the result.
-- **Plain text, no lock-in.** JSONL sessions, TOML config, Markdown skills, and ordinary executables.
-- **Extensible at the edges.** Profiles, skills, workflows, tools, and themes; the loop stays small.
-
-## Configuration
-
-Global config: `~/.config/localharness/config.toml`. A trusted project `.harness/` overrides it. Precedence: CLI flags > trusted project config > global config > built-in defaults.
-
-| Environment | Meaning |
-|---|---|
-| `LH_ENDPOINT`, `LH_MODEL` | Endpoint base URL and model id |
-| `LH_API_KEY` | Bearer token |
-| `LH_PROFILE`, `LH_MODEL_PROFILE` | Tool profile and model profile |
-| `LH_THEME` | Theme name |
-| `LH_NO_SESSION`, `LH_TRUST` | Disable persistence; trust project config |
-| `LH_AGENTS_MD` | Set to `0` to skip the AGENTS.md chain |
-| `LH_CONFIG_DIR`, `LH_DATA_DIR` | Override config and data roots |
-| `LH_SKIP_TOOL_PROBE` | Skip the one-shot tool-call conformance probe |
-
-`model_profile = "auto"` matches by model-name prefix; the `default` model profile is the fallback. `[model] context_window` is used only when the model profile does not set one. See [docs/configuration.md](docs/configuration.md) for every key and [docs/model-setup.md](docs/model-setup.md) for engine-specific tuning.
+The interface speaks in two voices. Skoll, the sun, is the model: its replies
+and thinking glow amber. Hati, the moon, is the harness: tool rows, gates, and
+turn summaries are silver-blue. The default theme is dusk; `/theme` previews the
+others live (`hati` for night, `skoll` for daylight terminals, `catppuccin-mocha`,
+`gruvbox-dark`, `high-contrast`, and more), and your own palettes are plain
+TOML. See [themes](docs/themes.md).
 
 ## Documentation
 
-| Guide | What it covers |
+| | |
 |---|---|
-| [Configuration](docs/configuration.md) | Every config key, precedence, verify steps, environment |
-| [Model setup](docs/model-setup.md) | llama.cpp, Ollama, vLLM, profiles, context accounting, `lh doctor` |
-| [Skills and workflows](docs/skills-workflows.md) | Skill format, references, bundled playbooks, tool allowlists |
-| [Security](docs/security.md) | Authorization, scope, evidence, findings, PoC replay, sandbox |
-| [Lifecycle hooks](docs/hooks.md) | `session_start` through `stop`, JSON protocol, fail-closed guards, `lh hooks test` |
-| [External tools](docs/external-tools.md) | Manifest format, protocol, schemas, scope gating |
-| [MCP servers](docs/mcp.md) | stdio and HTTP servers, tool naming, profiles, `lh mcp` |
-| [Editor integration](docs/acp.md) | `lh acp`, Zed setup, permissions, roots, stop reasons, limitations |
-| [Local HTTP API](docs/serve.md) | `lh serve`, endpoints, SSE events, token, permission modes, shutdown |
-| [Images](docs/images.md) | `@image` attachments, vision models, the describer fallback, EXIF and remote rules |
-| [Themes](docs/themes.md) | Semantic tokens, color modes, user themes |
-| [Packaging and releases](docs/packaging.md) | Release artifacts, installer, AUR, Nix, Homebrew, Docker, completions |
+| [Usage guide](docs/usage.md) | The TUI, keys, commands, sessions, headless mode, tools |
+| [Configuration](docs/configuration.md) | Every key, precedence, permissions, environment variables |
+| [Model setup](docs/model-setup.md) | llama.cpp, Ollama, vLLM, model profiles, `tot doctor` |
+| [Skills and workflows](docs/skills-workflows.md) | Skill format, bundled playbooks, workflow steps |
+| [MCP servers](docs/mcp.md) · [Hooks](docs/hooks.md) · [External tools](docs/external-tools.md) | Extending Totality |
+| [Editors (ACP)](docs/acp.md) · [HTTP API](docs/serve.md) | Running it from other programs |
+| [Security](docs/security.md) · [Images](docs/images.md) · [Themes](docs/themes.md) | Everything else |
 | [Architecture](ARCHITECTURE.md) | Implementation specification and design decisions |
 
-## Development
-
-```sh
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test
-cargo audit && cargo deny check   # advisories
-```
-
-No test requires a real model or network. [ARCHITECTURE.md](ARCHITECTURE.md) is the implementation specification.
+Upgrading from LocalHarness? The binary is now `tot`, environment variables use
+`TOT_` (the `LH_` names still work), and your existing config and sessions are
+picked up where they are.
 
 ## Contributing
 
-Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a PR. The short version: run the checks above, bring a test for anything that changes the loop, a gate, or the tool protocol, and settle the issue before writing the patch. Report vulnerabilities through [SECURITY.md](SECURITY.md), never in a public issue.
+Issues and pull requests are welcome; read [CONTRIBUTING.md](CONTRIBUTING.md)
+first. The checks are the usual three, and no test needs a model or the network:
+
+```sh
+cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
+```
+
+Report vulnerabilities through [SECURITY.md](SECURITY.md), never in a public
+issue.
 
 ## License
 
-MIT OR Apache-2.0. See [LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE).
+MIT OR Apache-2.0, at your option. See [LICENSE-MIT](LICENSE-MIT) and
+[LICENSE-APACHE](LICENSE-APACHE).
 
 <p align="center">
-  <sub>Local-first by default. Enforced by code. Shaped by you.</sub>
+  <sub>In the old story, two wolves chase the sun and the moon across the sky until they catch them. Totality is the moment they do.</sub>
 </p>

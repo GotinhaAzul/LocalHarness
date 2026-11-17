@@ -6,25 +6,25 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use localharness::Tool;
-use localharness::agent::{AgentEvent, Core, TurnStatus, run_turn};
-use localharness::config::{
-    Config, HookConfig, HookEvent, HookOnError, ProfileConfig, VerifyConfig, VerifyStep,
-};
-use localharness::context::TokenBudget;
-use localharness::paths::Paths;
-use localharness::policy::{AskAnswer, AskRequest, Asker, PermissionMode, Permissions, Policy};
-use localharness::provider::{
-    ChatMessage, ChatRequest, ErrorClass, Provider, ProviderError, StreamEvent, StreamItem, Usage,
-};
-use localharness::security::SecurityState;
-use localharness::session::{
-    CompactionData, CustomData, EntryKind, Session, SessionData, ToolCall, ToolResultData,
-};
-use localharness::tools::{BgRegistry, ReadTracker, SessionHandle, ToolRegistry};
 use serde_json::json;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
+use totality::Tool;
+use totality::agent::{AgentEvent, Core, TurnStatus, run_turn};
+use totality::config::{
+    Config, HookConfig, HookEvent, HookOnError, ProfileConfig, VerifyConfig, VerifyStep,
+};
+use totality::context::TokenBudget;
+use totality::paths::Paths;
+use totality::policy::{AskAnswer, AskRequest, Asker, PermissionMode, Permissions, Policy};
+use totality::provider::{
+    ChatMessage, ChatRequest, ErrorClass, Provider, ProviderError, StreamEvent, StreamItem, Usage,
+};
+use totality::security::SecurityState;
+use totality::session::{
+    CompactionData, CustomData, EntryKind, Session, SessionData, ToolCall, ToolResultData,
+};
+use totality::tools::{BgRegistry, ReadTracker, SessionHandle, ToolRegistry};
 
 enum Script {
     Events(Vec<StreamEvent>),
@@ -184,29 +184,27 @@ fn call_script(id: &str, name: &str, args: serde_json::Value) -> Script {
 }
 
 struct ScriptedReviewer {
-    decisions: Mutex<VecDeque<localharness::tools::hunk::HunkDecision>>,
-    requests: Mutex<Vec<localharness::tools::hunk::HunkRequest>>,
+    decisions: Mutex<VecDeque<totality::tools::hunk::HunkDecision>>,
+    requests: Mutex<Vec<totality::tools::hunk::HunkRequest>>,
 }
 
 #[async_trait]
-impl localharness::tools::hunk::HunkReviewer for ScriptedReviewer {
+impl totality::tools::hunk::HunkReviewer for ScriptedReviewer {
     async fn review(
         &self,
-        request: localharness::tools::hunk::HunkRequest,
-    ) -> localharness::tools::hunk::HunkDecision {
+        request: totality::tools::hunk::HunkRequest,
+    ) -> totality::tools::hunk::HunkDecision {
         let count = request.hunks.len();
         self.requests.lock().unwrap().push(request);
         self.decisions
             .lock()
             .unwrap()
             .pop_front()
-            .unwrap_or_else(|| localharness::tools::hunk::HunkDecision::accept_all(count))
+            .unwrap_or_else(|| totality::tools::hunk::HunkDecision::accept_all(count))
     }
 }
 
-fn scripted_reviewer(
-    decisions: Vec<localharness::tools::hunk::HunkDecision>,
-) -> Arc<ScriptedReviewer> {
+fn scripted_reviewer(decisions: Vec<totality::tools::hunk::HunkDecision>) -> Arc<ScriptedReviewer> {
     Arc::new(ScriptedReviewer {
         decisions: Mutex::new(decisions.into()),
         requests: Mutex::new(Vec::new()),
@@ -304,7 +302,7 @@ fn harness_with_extra(
     dir: &std::path::Path,
     scripts: Vec<Script>,
     config: Config,
-    extra: Vec<Arc<dyn localharness::Tool>>,
+    extra: Vec<Arc<dyn totality::Tool>>,
 ) -> Harness {
     harness_in_mode(dir, scripts, config, extra, PermissionMode::Yolo)
 }
@@ -315,7 +313,7 @@ fn harness_in_mode(
     dir: &std::path::Path,
     scripts: Vec<Script>,
     config: Config,
-    extra: Vec<Arc<dyn localharness::Tool>>,
+    extra: Vec<Arc<dyn totality::Tool>>,
     mode: PermissionMode,
 ) -> Harness {
     let provider = Arc::new(ScriptedProvider {
@@ -337,7 +335,7 @@ fn harness_in_mode(
 fn build_core(
     dir: &std::path::Path,
     config: Config,
-    extra: Vec<Arc<dyn localharness::Tool>>,
+    extra: Vec<Arc<dyn totality::Tool>>,
     provider: Arc<dyn Provider>,
 ) -> (Arc<Core>, SessionHandle) {
     build_core_in_mode(dir, config, extra, provider, PermissionMode::Yolo)
@@ -346,7 +344,7 @@ fn build_core(
 fn build_core_in_mode(
     dir: &std::path::Path,
     config: Config,
-    extra: Vec<Arc<dyn localharness::Tool>>,
+    extra: Vec<Arc<dyn totality::Tool>>,
     provider: Arc<dyn Provider>,
     mode: PermissionMode,
 ) -> (Arc<Core>, SessionHandle) {
@@ -384,14 +382,14 @@ fn build_core_in_mode(
     let (_, model_profile) = config.model_profile();
     let tool_specs = ToolRegistry::specs_with(&selected, model_profile.short_tool_schemas());
     let budget = TokenBudget::new(config.context_window(), config.model.max_output_tokens);
-    let tool_specs_json = localharness::provider::tools_json(&tool_specs);
-    let tool_specs_cost = localharness::context::ToolSpecCost::from_json(&tool_specs_json, &budget);
+    let tool_specs_json = totality::provider::tools_json(&tool_specs);
+    let tool_specs_cost = totality::context::ToolSpecCost::from_json(&tool_specs_json, &budget);
     let core = Core {
         budget,
-        static_prompt: localharness::context::StaticPrompt::default(),
+        static_prompt: totality::context::StaticPrompt::default(),
         tool_specs_cost,
         tokenize: false,
-        limits: localharness::agent::RunLimits::from(&config.budgets),
+        limits: totality::agent::RunLimits::from(&config.budgets),
         config,
         paths: paths.clone(),
         provider,
@@ -411,14 +409,14 @@ fn build_core_in_mode(
         model_profile,
         vision: Default::default(),
         tool_probe: None,
-        engine: localharness::provider::Engine::Generic,
+        engine: totality::provider::Engine::Generic,
         structured: None,
         cancel: CancellationToken::new(),
         tool_timeout: std::time::Duration::from_secs(10),
         path_jail: false,
         server_window: Default::default(),
         usage_check: Default::default(),
-        window_source: localharness::agent::WindowSource::Default,
+        window_source: totality::agent::WindowSource::Default,
         window_truth: None,
         window_notice: None,
         window_notice_sent: std::sync::Once::new(),
@@ -433,10 +431,7 @@ fn build_core_in_mode(
     (Arc::new(core), session)
 }
 
-async fn run(
-    harness: &Harness,
-    prompt: &str,
-) -> (localharness::agent::TurnOutcome, Vec<AgentEvent>) {
+async fn run(harness: &Harness, prompt: &str) -> (totality::agent::TurnOutcome, Vec<AgentEvent>) {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let outcome = run_turn(
         harness.core.clone(),
@@ -557,7 +552,7 @@ async fn bash_secrets_are_redacted_in_evidence_but_not_in_what_the_model_reads()
     let raw = format!("stdout:\n{KEY}\n");
     assert_eq!(
         evidence.sha256,
-        localharness::security::evidence::sha256_hex(raw.as_bytes()),
+        totality::security::evidence::sha256_hex(raw.as_bytes()),
         "the digest still describes raw output"
     );
     let (_, artifact) = engagement.evidence.read(&evidence.id).unwrap();
@@ -717,7 +712,7 @@ fn last_assistant(session: &SessionHandle) -> String {
         .unwrap_or_default()
 }
 
-fn assistants(session: &SessionHandle) -> Vec<localharness::session::AssistantData> {
+fn assistants(session: &SessionHandle) -> Vec<totality::session::AssistantData> {
     let session = session.lock().unwrap();
     session
         .branch_entries()
@@ -860,8 +855,8 @@ async fn a_missing_tool_result_fails_before_the_request() {
         .session
         .lock()
         .unwrap()
-        .append(EntryKind::Assistant(localharness::session::AssistantData {
-            tool_calls: Some(vec![localharness::session::ToolCall {
+        .append(EntryKind::Assistant(totality::session::AssistantData {
+            tool_calls: Some(vec![totality::session::ToolCall {
                 id: "call_0001".into(),
                 name: "read".into(),
                 arguments: json!({"path":"a.rs"}),
@@ -937,7 +932,7 @@ async fn native_tool_mode_leaves_text_alone() {
     Arc::get_mut(&mut harness.core)
         .unwrap()
         .model_profile
-        .tool_mode = localharness::config::ToolMode::Native;
+        .tool_mode = totality::config::ToolMode::Native;
     let (outcome, _) = run(&harness, "go").await;
     assert_eq!(outcome.status, TurnStatus::Done);
     assert!(tool_results(&harness.session).is_empty());
@@ -985,12 +980,9 @@ async fn structured_output_repairs_invalid_json_or_blocks_the_turn() {
         "required": ["answer"],
         "properties": {"answer": {"type": "string"}}
     });
-    let plan = localharness::provider::structured::plan(
-        localharness::provider::Engine::Vllm,
-        "reply",
-        &schema,
-    )
-    .expect("plan");
+    let plan =
+        totality::provider::structured::plan(totality::provider::Engine::Vllm, "reply", &schema)
+            .expect("plan");
 
     let dir = tempfile::tempdir().unwrap();
     let mut harness = harness_config(
@@ -1050,12 +1042,9 @@ async fn structured_output_lets_recovered_text_calls_execute() {
         "required": ["answer"],
         "properties": {"answer": {"type": "string"}}
     });
-    let plan = localharness::provider::structured::plan(
-        localharness::provider::Engine::Vllm,
-        "reply",
-        &schema,
-    )
-    .expect("plan");
+    let plan =
+        totality::provider::structured::plan(totality::provider::Engine::Vllm, "reply", &schema)
+            .expect("plan");
 
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("a.rs"), "fn main() {}\n").unwrap();
@@ -1250,7 +1239,7 @@ async fn a_turn_after_compaction_keeps_system_messages_leading() {
     assert!(
         matches!(&messages[0], ChatMessage::System { content }
             if content.contains("the compacted summary")
-                && !content.contains("[localharness] state")),
+                && !content.contains("[totality] state")),
         "leading system: {:?}",
         messages[0]
     );
@@ -1258,7 +1247,7 @@ async fn a_turn_after_compaction_keeps_system_messages_leading() {
     // the tail of the request.
     assert!(
         matches!(messages.last(), Some(ChatMessage::User { content, .. })
-            if content.starts_with("continue") && content.contains("[localharness] state")),
+            if content.starts_with("continue") && content.contains("[totality] state")),
         "last message: {:?}",
         messages.last()
     );
@@ -1767,7 +1756,7 @@ async fn productive_long_task_renews_a_checkpoint_and_finishes() {
     config.budgets.max_model_calls = 100;
     let mut core = Arc::try_unwrap(harness.core).unwrap_or_else(|_| panic!("sole owner"));
     core.config = config;
-    core.limits = localharness::agent::RunLimits::from(&core.config.budgets);
+    core.limits = totality::agent::RunLimits::from(&core.config.budgets);
     harness.core = Arc::new(core);
 
     let (outcome, events) = run(&harness, "read three files").await;
@@ -1804,7 +1793,7 @@ async fn long_task_without_progress_stops_at_the_checkpoint() {
     config.budgets.max_model_calls = 100;
     let mut core = Arc::try_unwrap(harness.core).unwrap_or_else(|_| panic!("sole owner"));
     core.config = config;
-    core.limits = localharness::agent::RunLimits::from(&core.config.budgets);
+    core.limits = totality::agent::RunLimits::from(&core.config.budgets);
     harness.core = Arc::new(core);
 
     let (outcome, _) = run(&harness, "loop on missing files").await;
@@ -1997,7 +1986,7 @@ async fn repeated_over_threshold_ends_with_budget_context_after_one_compaction()
     // The fixed system prompt alone stays above the threshold, so one
     // compaction cannot converge.
     core.system_prompt = "s".repeat(6000);
-    core.window_source = localharness::agent::WindowSource::Configured;
+    core.window_source = totality::agent::WindowSource::Configured;
     harness.core = Arc::new(core);
 
     let (outcome, events) = run(&harness, "go").await;
@@ -2171,7 +2160,7 @@ async fn mentioned_files_reach_the_model_and_count_as_read() {
         .messages
         .iter()
         .find_map(|message| match message {
-            localharness::provider::ChatMessage::User { content, .. } => Some(content.clone()),
+            totality::provider::ChatMessage::User { content, .. } => Some(content.clone()),
             _ => None,
         })
         .expect("user message");
@@ -2346,13 +2335,13 @@ async fn model_calls_an_mcp_tool_through_the_loop() {
     let mut config = base_config();
     config.mcp.insert(
         "fx".into(),
-        localharness::config::McpServerConfig {
+        totality::config::McpServerConfig {
             command: "python3".into(),
             args: vec![fixture.display().to_string()],
             ..Default::default()
         },
     );
-    let manager = localharness::mcp::McpManager::new();
+    let manager = totality::mcp::McpManager::new();
     let resolution = manager.resolve(&config, dir.path(), &[]).await;
     assert!(resolution.warnings.is_empty(), "{:?}", resolution.warnings);
     let harness = harness_with_extra(
@@ -2575,8 +2564,8 @@ async fn shell_profile_reads_edits_and_tests_with_bash_only() {
 
 #[tokio::test]
 async fn hash_edit_mode_wires_read_anchors_into_patch() {
-    use localharness::config::{EditMode, ModelProfile};
-    use localharness::tools::read::{line_hash, snapshot_hash};
+    use totality::config::{EditMode, ModelProfile};
+    use totality::tools::read::{line_hash, snapshot_hash};
 
     let dir = tempfile::tempdir().unwrap();
     let body = "alpha\nbeta\n";
@@ -2637,7 +2626,7 @@ async fn hash_edit_mode_wires_read_anchors_into_patch() {
 
 #[tokio::test]
 async fn two_file_edit_buffers_for_review_and_rejecting_one_hunk_keeps_that_file() {
-    use localharness::tools::hunk::{HunkChoice, HunkDecision};
+    use totality::tools::hunk::{HunkChoice, HunkDecision};
 
     let dir = tempfile::tempdir().unwrap();
     seed_files(dir.path());
@@ -2699,7 +2688,7 @@ async fn two_file_edit_buffers_for_review_and_rejecting_one_hunk_keeps_that_file
     }
 
     // Undo still works over the accepted hunk.
-    let undo = localharness::tools::undo::UndoTool
+    let undo = totality::tools::undo::UndoTool
         .call(&harness.core.tool_context(), json!({"path": "a.txt"}))
         .await;
     assert!(!undo.is_error, "{}", undo.content);
@@ -2708,7 +2697,7 @@ async fn two_file_edit_buffers_for_review_and_rejecting_one_hunk_keeps_that_file
 
 #[tokio::test]
 async fn rejecting_every_hunk_leaves_every_file_byte_identical() {
-    use localharness::tools::hunk::HunkDecision;
+    use totality::tools::hunk::HunkDecision;
 
     let dir = tempfile::tempdir().unwrap();
     seed_files(dir.path());
@@ -2741,7 +2730,7 @@ async fn review_off_writes_immediately_like_before_the_feature() {
     seed_files(dir.path());
     let reviewer = scripted_reviewer(Vec::new());
     let mut config = base_config();
-    config.review = localharness::config::ReviewMode::Off;
+    config.review = totality::config::ReviewMode::Off;
     config.profiles.get_mut("test").expect("test profile").tools =
         ["read", "edit"].map(str::to_string).to_vec();
     let harness = harness_config(dir.path(), two_file_edit_scripts(), config);
@@ -2782,13 +2771,13 @@ async fn headless_review_without_a_reviewer_auto_accepts() {
 
 #[tokio::test]
 async fn review_always_buffers_even_a_single_file_edit() {
-    use localharness::tools::hunk::HunkDecision;
+    use totality::tools::hunk::HunkDecision;
 
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("a.txt"), "one\n").unwrap();
     let reviewer = scripted_reviewer(vec![HunkDecision::reject_all(1)]);
     let mut config = base_config();
-    config.review = localharness::config::ReviewMode::Always;
+    config.review = totality::config::ReviewMode::Always;
     config.profiles.get_mut("test").expect("test profile").tools =
         ["read", "edit"].map(str::to_string).to_vec();
     let harness = harness_config(
@@ -2914,7 +2903,7 @@ async fn missing_hook_binary_is_a_visible_failure_never_an_approval() {
         "missing".into(),
         HookConfig {
             event: HookEvent::PreTool,
-            command: vec!["/definitely/not/localharness-hook".into()],
+            command: vec!["/definitely/not/totality-hook".into()],
             timeout_secs: 0,
             on_error: None,
         },
@@ -3218,8 +3207,8 @@ async fn malicious_readme_triggers_a_warning_and_an_approval_gate() {
         arguments: json!({"command": "cat ~/definitely-missing > provenance-ran.txt"}),
     };
     assert!(matches!(
-        localharness::provenance::check(&harness.core, &call, &call.arguments).await,
-        localharness::provenance::Gate::Deny { .. }
+        totality::provenance::check(&harness.core, &call, &call.arguments).await,
+        totality::provenance::Gate::Deny { .. }
     ));
     harness
         .core
@@ -3234,13 +3223,13 @@ async fn malicious_readme_triggers_a_warning_and_an_approval_gate() {
         arguments: json!({"path": "README.md"}),
     };
     assert_eq!(
-        localharness::provenance::check(&harness.core, &benign, &benign.arguments).await,
-        localharness::provenance::Gate::Allow,
+        totality::provenance::check(&harness.core, &benign, &benign.arguments).await,
+        totality::provenance::Gate::Allow,
         "a non-sensitive call does not consume the approval"
     );
     assert_eq!(
-        localharness::provenance::check(&harness.core, &call, &call.arguments).await,
-        localharness::provenance::Gate::Allow,
+        totality::provenance::check(&harness.core, &call, &call.arguments).await,
+        totality::provenance::Gate::Allow,
         "/approve permits exactly the next sensitive action"
     );
     {
@@ -3451,9 +3440,9 @@ fn rule(
     id: &str,
     tool: Option<&str>,
     command: Option<&str>,
-    action: localharness::policy::RuleAction,
-) -> localharness::policy::RuleConfig {
-    localharness::policy::RuleConfig {
+    action: totality::policy::RuleAction,
+) -> totality::policy::RuleConfig {
+    totality::policy::RuleConfig {
         id: Some(id.into()),
         tool: tool.map(str::to_string),
         path: None,
@@ -3465,7 +3454,7 @@ fn rule(
 
 fn workflow_config(tools: &[&str]) -> Config {
     let mut config = base_config();
-    let workflow = localharness::workflows::WorkflowSpec {
+    let workflow = totality::workflows::WorkflowSpec {
         name: "lists-tools".into(),
         description: None,
         profile: None,
@@ -3493,7 +3482,7 @@ fn plan_entries(session: &SessionHandle) -> Vec<serde_json::Map<String, serde_js
 
 #[tokio::test]
 async fn a_deny_rule_blocks_git_push_even_when_a_workflow_lists_bash() {
-    use localharness::policy::RuleAction;
+    use totality::policy::RuleAction;
     let dir = tempfile::tempdir().unwrap();
     let mut config = workflow_config(&["bash"]);
     config.permissions.rules = vec![rule(
@@ -3559,7 +3548,7 @@ async fn ask_prompts_once_per_exact_command_not_per_prefix() {
 
 #[tokio::test]
 async fn a_later_specific_allow_beats_an_earlier_broad_ask() {
-    use localharness::policy::RuleAction;
+    use totality::policy::RuleAction;
     let dir = tempfile::tempdir().unwrap();
     let mut config = workflow_config(&["bash"]);
     config.permissions.rules = vec![
@@ -3809,10 +3798,10 @@ async fn strip_reasoning_false_persists_and_replays_reasoning() {
     );
     // Ctrl+R replays reasoning from the session blocks.
     let session = harness.session.lock().unwrap();
-    let blocks = localharness::ui::render::blocks_from_session(&session);
+    let blocks = totality::ui::render::blocks_from_session(&session);
     assert!(blocks.iter().any(|block| matches!(
         &block.kind,
-        localharness::ui::render::BlockKind::Assistant { reasoning: Some(text), .. }
+        totality::ui::render::BlockKind::Assistant { reasoning: Some(text), .. }
             if text == "secret chain of thought"
     )));
 }
@@ -3821,7 +3810,7 @@ fn harness_profile_edit(
     dir: &std::path::Path,
     scripts: Vec<Script>,
     tools: &[&str],
-    edit: impl FnOnce(&mut localharness::config::ModelProfile),
+    edit: impl FnOnce(&mut totality::config::ModelProfile),
 ) -> Harness {
     let mut config = base_config();
     config.profiles.get_mut("test").expect("test profile").tools =
@@ -3839,7 +3828,7 @@ fn harness_profile_edit(
 async fn thinking_off_without_a_control_refuses_before_the_request() {
     let dir = tempfile::tempdir().unwrap();
     let harness = harness_profile_edit(dir.path(), vec![text_script("no")], &["read"], |p| {
-        p.thinking = localharness::config::ThinkingPolicy::Off;
+        p.thinking = totality::config::ThinkingPolicy::Off;
     });
     let (outcome, _) = run(&harness, "hi").await;
     assert_eq!(outcome.status, TurnStatus::Error);
@@ -3923,13 +3912,13 @@ async fn old_inline_reasoning_never_reaches_the_next_prompt() {
             ("q3", "dangling plan</think>third answer"),
         ] {
             session
-                .append(EntryKind::User(localharness::session::UserData {
+                .append(EntryKind::User(totality::session::UserData {
                     content: question.into(),
                     attachments: Vec::new(),
                 }))
                 .unwrap();
             session
-                .append(EntryKind::Assistant(localharness::session::AssistantData {
+                .append(EntryKind::Assistant(totality::session::AssistantData {
                     content: Some(answer.into()),
                     reasoning: None,
                     tool_calls: None,
@@ -4048,7 +4037,7 @@ mod engines {
     use axum::http::header;
     use axum::response::Response;
     use axum::routing::post;
-    use localharness::provider::OpenAiCompatProvider;
+    use totality::provider::OpenAiCompatProvider;
 
     #[derive(Clone, Default)]
     struct Fake {
@@ -4295,7 +4284,7 @@ mod engines {
 
 #[tokio::test]
 async fn a_policy_deny_is_final_before_any_pre_tool_hook_runs() {
-    use localharness::policy::RuleAction;
+    use totality::policy::RuleAction;
     let dir = tempfile::tempdir().unwrap();
     let mut config = base_config();
     config.profiles.get_mut("test").unwrap().tools = vec!["bash".into()];
@@ -4334,7 +4323,7 @@ async fn a_policy_deny_is_final_before_any_pre_tool_hook_runs() {
 
 #[tokio::test]
 async fn a_blocking_hook_beats_an_allow_rule_and_nobody_is_asked() {
-    use localharness::policy::RuleAction;
+    use totality::policy::RuleAction;
     let dir = tempfile::tempdir().unwrap();
     let mut config = base_config();
     config.profiles.get_mut("test").unwrap().tools = vec!["bash".into()];
@@ -4374,7 +4363,7 @@ async fn a_blocking_hook_beats_an_allow_rule_and_nobody_is_asked() {
 
 #[tokio::test]
 async fn a_provenance_warning_beats_an_allow_rule_and_a_gated_call_keeps_the_approval() {
-    use localharness::policy::RuleAction;
+    use totality::policy::RuleAction;
     let dir = tempfile::tempdir().unwrap();
     readme_injection(dir.path());
     let outside = tempfile::tempdir().unwrap();
@@ -4471,16 +4460,16 @@ async fn a_policy_denied_edit_is_refused_before_hunk_review() {
     seed_files(dir.path());
     let reviewer = scripted_reviewer(Vec::new());
     let mut config = base_config();
-    config.review = localharness::config::ReviewMode::Always;
+    config.review = totality::config::ReviewMode::Always;
     config.profiles.get_mut("test").expect("test profile").tools =
         ["read", "edit"].map(str::to_string).to_vec();
-    config.permissions.rules = vec![localharness::policy::RuleConfig {
+    config.permissions.rules = vec![totality::policy::RuleConfig {
         id: Some("keep-a".into()),
         tool: Some("edit".into()),
         path: Some("a.txt".into()),
         command: None,
         network: None,
-        action: localharness::policy::RuleAction::Deny,
+        action: totality::policy::RuleAction::Deny,
     }];
     let harness = harness_config(dir.path(), two_file_edit_scripts(), config);
     harness.core.set_reviewer(reviewer.clone());
@@ -4516,7 +4505,7 @@ async fn a_reviewed_edit_still_runs_post_tool_hooks() {
     std::fs::write(dir.path().join("a.txt"), "one\n").unwrap();
     let reviewer = scripted_reviewer(Vec::new());
     let mut config = base_config();
-    config.review = localharness::config::ReviewMode::Always;
+    config.review = totality::config::ReviewMode::Always;
     config.profiles.get_mut("test").expect("test profile").tools =
         ["read", "edit"].map(str::to_string).to_vec();
     config.hooks.entries.insert(
@@ -4562,10 +4551,10 @@ fn hash_patch_harness(
     dir: &std::path::Path,
     body: &str,
     text: &str,
-    review: localharness::config::ReviewMode,
+    review: totality::config::ReviewMode,
 ) -> Harness {
-    use localharness::config::{EditMode, ModelProfile};
-    use localharness::tools::read::{line_hash, snapshot_hash};
+    use totality::config::{EditMode, ModelProfile};
+    use totality::tools::read::{line_hash, snapshot_hash};
     std::fs::write(dir.join("a.txt"), body).unwrap();
     let mut config = base_config();
     config.review = review;
@@ -4599,13 +4588,13 @@ fn hash_patch_harness(
 
 #[tokio::test]
 async fn a_hash_patch_is_held_for_hunk_review() {
-    use localharness::tools::hunk::HunkDecision;
+    use totality::tools::hunk::HunkDecision;
     let dir = tempfile::tempdir().unwrap();
     let harness = hash_patch_harness(
         dir.path(),
         "alpha\nbeta\n",
         "BETA",
-        localharness::config::ReviewMode::Always,
+        totality::config::ReviewMode::Always,
     );
     let reviewer = scripted_reviewer(vec![HunkDecision::reject_all(1)]);
     harness.core.set_reviewer(reviewer.clone());
@@ -4623,14 +4612,14 @@ async fn a_hash_patch_is_held_for_hunk_review() {
 
 #[tokio::test]
 async fn a_hash_patch_cannot_write_a_redaction_placeholder() {
-    let placeholder = localharness::security::redact::Redactor::new(true)
+    let placeholder = totality::security::redact::Redactor::new(true)
         .redact_owned(&format!("aws_key = AKIA{}", "Q".repeat(16)))
         .trim_start_matches("aws_key = ")
         .to_string();
     assert!(placeholder.starts_with("[REDACTED:"), "{placeholder}");
     for review in [
-        localharness::config::ReviewMode::Off,
-        localharness::config::ReviewMode::Always,
+        totality::config::ReviewMode::Off,
+        totality::config::ReviewMode::Always,
     ] {
         let dir = tempfile::tempdir().unwrap();
         let harness = hash_patch_harness(
@@ -4669,18 +4658,18 @@ async fn a_path_deny_rule_matches_a_hash_patch_target() {
             dir.path(),
             "alpha\nbeta\n",
             "BETA",
-            localharness::config::ReviewMode::Off,
+            totality::config::ReviewMode::Off,
         );
         // Rebuild the permissions with a deny rule on the plain file name.
         let mut core = Arc::try_unwrap(harness.core).unwrap_or_else(|_| panic!("sole owner"));
         core.permissions = Arc::new(Permissions::new(
-            Policy::compile(&[localharness::policy::RuleConfig {
+            Policy::compile(&[totality::policy::RuleConfig {
                 id: Some("keep-a".into()),
                 tool: Some("patch".into()),
                 path: Some("a.txt".into()),
                 command: None,
                 network: None,
-                action: localharness::policy::RuleAction::Deny,
+                action: totality::policy::RuleAction::Deny,
             }])
             .unwrap(),
             PermissionMode::Yolo,
@@ -5065,7 +5054,7 @@ async fn auto_settle_runs_verify_and_review_without_extra_model_calls() {
         AgentEvent::ToolStarted { name, summary, .. } if name == "verify" && summary.contains("harness"))));
     // No orphan tool result: every result pairs with a model call.
     let session = harness.session.lock().unwrap();
-    assert!(localharness::context::validate_tool_pairs(&session).is_ok());
+    assert!(totality::context::validate_tool_pairs(&session).is_ok());
 }
 
 #[tokio::test]
@@ -5090,7 +5079,7 @@ async fn a_failing_harness_verify_continues_once_with_the_failure() {
     assert_eq!(harness.provider.requests.lock().unwrap().len(), 4);
     let nudges: Vec<String> = user_messages(&harness.session)
         .into_iter()
-        .filter(|m| m.starts_with("[localharness] settle checks"))
+        .filter(|m| m.starts_with("[totality] settle checks"))
         .collect();
     assert_eq!(nudges.len(), 1, "{nudges:?}");
     assert!(nudges[0].contains("verify FAILED"), "{}", nudges[0]);
@@ -5119,7 +5108,7 @@ async fn a_flagged_harness_review_reaches_the_model_with_the_verify_result() {
     assert_eq!(outcome.status, TurnStatus::Done, "{:?}", outcome.error);
     let nudge = user_messages(&harness.session)
         .into_iter()
-        .find(|m| m.starts_with("[localharness] settle checks"))
+        .find(|m| m.starts_with("[totality] settle checks"))
         .expect("continuation");
     assert!(nudge.contains("verify passed"), "{nudge}");
     assert!(nudge.contains("review flagged"), "{nudge}");
@@ -5204,7 +5193,7 @@ async fn hook_context_does_not_push_a_sized_read_into_the_blind_cut() {
 
 #[tokio::test]
 async fn a_denied_harness_verify_is_skipped_not_reported_as_a_failure() {
-    use localharness::policy::RuleAction;
+    use totality::policy::RuleAction;
     let dir = tempfile::tempdir().unwrap();
     let base = auto_settle_harness(dir.path(), Vec::new(), "false");
     let mut config = base.core.config.clone();

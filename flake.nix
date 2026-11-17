@@ -18,19 +18,19 @@
       packages = forAllSystems (
         pkgs:
         let
-          localharness = pkgs.rustPlatform.buildRustPackage {
-            pname = "localharness";
+          totality = pkgs.rustPlatform.buildRustPackage {
+            pname = "totality";
             version = cargoToml.package.version;
             src = ./.;
             cargoLock.lockFile = ./Cargo.lock;
             nativeBuildInputs = [ pkgs.installShellFiles ];
             postInstall = ''
-              installShellCompletion --cmd lh \
-                --bash <($out/bin/lh completions bash) \
-                --zsh <($out/bin/lh completions zsh) \
-                --fish <($out/bin/lh completions fish)
-              $out/bin/lh man > lh.1
-              installManPage lh.1
+              installShellCompletion --cmd tot \
+                --bash <($out/bin/tot completions bash) \
+                --zsh <($out/bin/tot completions zsh) \
+                --fish <($out/bin/tot completions fish)
+              $out/bin/tot man > tot.1
+              installManPage tot.1
             '';
             meta = with pkgs.lib; {
               description = cargoToml.package.description;
@@ -39,19 +39,19 @@
                 mit
                 asl20
               ];
-              mainProgram = "lh";
+              mainProgram = "tot";
               platforms = platforms.linux;
             };
           };
         in
         {
-          inherit localharness;
-          default = localharness;
+          inherit totality;
+          default = totality;
         }
       );
 
       overlays.default = final: _prev: {
-        localharness = self.packages.${final.stdenv.hostPlatform.system}.localharness;
+        totality = self.packages.${final.stdenv.hostPlatform.system}.totality;
       };
 
       devShells = forAllSystems (pkgs: {

@@ -86,7 +86,7 @@ impl OpenAiCompatProvider {
             Err(err) => {
                 let msg = if err.is_connect() {
                     format!(
-                        "cannot reach {}: {err}. Start the inference server or set LH_ENDPOINT.",
+                        "cannot reach {}: {err}. Start the inference server or set TOT_ENDPOINT.",
                         self.base_url
                     )
                 } else if err.is_timeout() {
@@ -535,7 +535,7 @@ fn classify_http(code: u16, body: &str, model: &str) -> Option<ProviderError> {
     let body_lower = body.to_ascii_lowercase();
     let message = match code {
         401 | 403 => format!(
-            "endpoint rejected credentials ({code}). Set model.api_key or LH_API_KEY, or run the server without auth."
+            "endpoint rejected credentials ({code}). Set model.api_key or TOT_API_KEY, or run the server without auth."
         ),
         404 => format!(
             "endpoint has no model {model:?} (404): {body}. List models with GET /v1/models or set --model."
@@ -607,7 +607,7 @@ fn merge_leading_system(messages: &[ChatMessage]) -> Vec<ChatMessage> {
 fn log_request_body(body: &Value, api_key: &str) {
     let redacted = logged_request_body(body, api_key);
     tracing::debug!(
-        target: "localharness::provider::request",
+        target: "totality::provider::request",
         body = %redacted,
         "chat request body"
     );

@@ -146,7 +146,7 @@ fn request(provider: &dyn Provider, url: &str) -> Result<reqwest::RequestBuilder
     request_with_timeout(provider, url, Duration::from_secs(10))
 }
 
-/// `GET` a JSON metadata endpoint. Shared with `lh doctor`.
+/// `GET` a JSON metadata endpoint. Shared with `tot doctor`.
 pub(crate) async fn get_json_with_timeout(
     provider: &dyn Provider,
     url: &str,

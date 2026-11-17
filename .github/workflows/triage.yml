@@ -33,7 +33,7 @@ jobs:
           operations-per-run: 40
           stale-issue-message: |
             This issue is waiting on information that has not arrived, so it is
-            now marked stale. Comment with the reproduction, the `lh --version`
+            now marked stale. Comment with the reproduction, the `tot --version`
             output, or the answer that was asked for and it returns to the queue.
           close-issue-message: |
             Closed for lack of a reproduction after 35 days. It is not a verdict

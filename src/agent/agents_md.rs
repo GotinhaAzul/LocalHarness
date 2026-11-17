@@ -10,7 +10,7 @@
 //! When the total cap is tight, the nearest files are kept whole and broader
 //! files are truncated or skipped, matching the nearest-wins convention.
 //! Symlinks must resolve inside the repository. Every decision is recorded in
-//! the manifest returned to callers and printed by `lh context --show`.
+//! the manifest returned to callers and printed by `tot context --show`.
 
 use std::fs;
 use std::io;
@@ -171,7 +171,7 @@ impl AgentsMd {
         }
     }
 
-    /// Stable, machine-readable manifest printed by `lh context --json`.
+    /// Stable, machine-readable manifest printed by `tot context --json`.
     pub fn manifest_json(&self) -> Value {
         let files: Vec<Value> = self
             .files
@@ -199,11 +199,11 @@ impl AgentsMd {
         })
     }
 
-    /// Human-readable manifest printed by `lh context --show`.
+    /// Human-readable manifest printed by `tot context --show`.
     pub fn manifest_text(&self) -> String {
         let mut out = String::new();
         if !self.enabled {
-            out.push_str("AGENTS.md context: disabled (--no-agents-md or LH_AGENTS_MD=0)\n");
+            out.push_str("AGENTS.md context: disabled (--no-agents-md or TOT_AGENTS_MD=0)\n");
             return out;
         }
         let loaded = self

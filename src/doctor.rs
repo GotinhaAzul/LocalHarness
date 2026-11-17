@@ -1,4 +1,4 @@
-//! `lh doctor`: a stable capability manifest for the configured engine.
+//! `tot doctor`: a stable capability manifest for the configured engine.
 //!
 //! The manifest is assembled from metadata endpoints only. It never sends a
 //! chat completion and never loads a model. Unknown engines fall back to
@@ -14,7 +14,7 @@ use crate::provider::probe::{self, LlamaProps, OllamaModel, ToolProbe, WindowTru
 use crate::provider::{Engine, Provider, SamplerSettings, endpoint_urls};
 
 /// Timeout for one metadata probe. Long enough for a local engine to answer,
-/// short enough that an unknown endpoint does not stall `lh doctor`.
+/// short enough that an unknown endpoint does not stall `tot doctor`.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// What the configured engine can do, as reported by its own metadata.
@@ -33,8 +33,8 @@ pub struct DoctorManifest {
     pub tool_dialect: String,
     pub tool_parser: Option<String>,
     /// Last forced-tool conformance probe for this model/build. `null` when
-    /// the TUI/headless runtime has not run one or `lh doctor` has no cached
-    /// result. `lh doctor` itself never sends a chat completion.
+    /// the TUI/headless runtime has not run one or `tot doctor` has no cached
+    /// result. `tot doctor` itself never sends a chat completion.
     #[serde(default)]
     pub tool_probe: Option<ToolProbe>,
     pub reasoning_field: Option<String>,
@@ -52,7 +52,7 @@ pub struct DoctorManifest {
     pub warnings: Vec<String>,
     pub fixes: Vec<String>,
     /// The last time the runtime found this endpoint's `usage.prompt_tokens`
-    /// wrong (against `/tokenize`, or implausibly small). `lh doctor` sends
+    /// wrong (against `/tokenize`, or implausibly small). `tot doctor` sends
     /// no chat completion, so it reports what a session observed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage_report: Option<String>,
@@ -65,7 +65,7 @@ pub struct DoctorManifest {
     pub verify: Option<VerifyStatus>,
 }
 
-/// Verify configuration as `lh doctor` reports it.
+/// Verify configuration as `tot doctor` reports it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VerifyStatus {
     pub configured: usize,
@@ -73,7 +73,7 @@ pub struct VerifyStatus {
     pub detected: Vec<String>,
 }
 
-/// Serialized tool-schema sizes for `lh doctor`.
+/// Serialized tool-schema sizes for `tot doctor`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SchemaSizes {
     pub full_chars: usize,
@@ -442,12 +442,12 @@ impl DoctorManifest {
         }
     }
 
-    /// Stable pretty JSON for `lh doctor --json`.
+    /// Stable pretty JSON for `tot doctor --json`.
     pub fn to_json_pretty(&self) -> String {
         serde_json::to_string_pretty(self).unwrap_or_else(|_| "{}".into())
     }
 
-    /// Human-readable form for `lh doctor`.
+    /// Human-readable form for `tot doctor`.
     pub fn to_text(&self) -> String {
         let mut out = String::new();
         out.push_str(&format!("engine: {}\n", self.engine));
@@ -491,7 +491,7 @@ impl DoctorManifest {
                 out.push_str("verify: not configured (nothing detected)\n");
             } else {
                 out.push_str(&format!(
-                    "verify: not configured; detected {} (save with `lh verify --init`)\n",
+                    "verify: not configured; detected {} (save with `tot verify --init`)\n",
                     verify.detected.join(", ")
                 ));
             }

@@ -1,6 +1,6 @@
 # MCP servers
 
-LocalHarness is a [Model Context Protocol](https://modelcontextprotocol.io)
+Totality is a [Model Context Protocol](https://modelcontextprotocol.io)
 client. Every tool an MCP server advertises becomes a harness tool with the
 same contract as the built-ins: prescriptive errors, capped output,
 cancellation, and evidence entries during an engagement.
@@ -18,7 +18,7 @@ The client negotiates protocol `2025-06-18` and accepts `2025-03-26` and
 
 ## Configure
 
-Add one `[mcp.<name>]` table per server to `~/.config/localharness/config.toml`.
+Add one `[mcp.<name>]` table per server to `~/.config/totality/config.toml`.
 Project config (`.harness/config.toml`) can declare servers too, but only with
 `--trust`, the same as every other project-local setting.
 
@@ -93,12 +93,12 @@ static-prompt warning at startup shows what the profile costs.
 ## Inspect and test
 
 ```sh
-lh mcp list                 # connect to every enabled server, list exposed tools
-lh mcp list --json          # the same as one JSON object
-lh mcp call time get_current_time '{"timezone": "UTC"}'
+tot mcp list                 # connect to every enabled server, list exposed tools
+tot mcp list --json          # the same as one JSON object
+tot mcp call time get_current_time '{"timezone": "UTC"}'
 ```
 
-`lh mcp list` exits with `1` when any server fails. `lh mcp call` runs one tool
+`tot mcp list` exits with `1` when any server fails. `tot mcp call` runs one tool
 directly without a model, which helps when debugging a server's configuration.
 
 In the TUI, `/mcp` shows each server's state: connected (with server version,
@@ -109,7 +109,7 @@ active profile. `/tools` lists the active tools, MCP tools included.
 
 - **Lifecycle.** Servers start when a profile that uses them loads. They stay
   running across `/profile`, `/model`, and `/theme` changes, are restarted when
-  their `[mcp.*]` table changes, and are stopped when `lh` exits. Each stdio
+  their `[mcp.*]` table changes, and are stopped when `tot` exits. Each stdio
   server runs in its own process group so launchers such as `npx` and `uvx` are
   cleaned up with it.
 - **Crashes.** A request in flight when the server exits fails with the last

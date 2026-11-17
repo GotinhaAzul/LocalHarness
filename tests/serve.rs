@@ -1,4 +1,4 @@
-//! `lh serve`: drive the HTTP API over loopback against a scripted endpoint.
+//! `tot serve`: drive the HTTP API over loopback against a scripted endpoint.
 //!
 //! Covers a streamed and cancelled turn, the bearer token (required, never
 //! printed or logged), the typed 409 for a concurrent turn, the loopback
@@ -175,23 +175,30 @@ fn env() -> Env {
     }
 }
 
-fn lh(env: &Env, endpoint: &str) -> tokio::process::Command {
-    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_lh"));
+fn tot(env: &Env, endpoint: &str) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_tot"));
     command
         .arg("--endpoint")
         .arg(endpoint)
         .arg("--model")
         .arg("test-model")
         .current_dir(&env.root)
-        .env("LH_CONFIG_DIR", &env.config_dir)
-        .env("LH_DATA_DIR", &env.data_dir)
-        .env("LH_SKIP_TOOL_PROBE", "1")
+        .env("TOT_CONFIG_DIR", &env.config_dir)
+        .env("TOT_DATA_DIR", &env.data_dir)
+        .env("TOT_SKIP_TOOL_PROBE", "1")
+        .env_remove("TOT_ENDPOINT")
         .env_remove("LH_ENDPOINT")
+        .env_remove("TOT_MODEL")
         .env_remove("LH_MODEL")
+        .env_remove("TOT_API_KEY")
         .env_remove("LH_API_KEY")
+        .env_remove("TOT_PROFILE")
         .env_remove("LH_PROFILE")
+        .env_remove("TOT_TRUST")
         .env_remove("LH_TRUST")
+        .env_remove("TOT_NO_SESSION")
         .env_remove("LH_NO_SESSION")
+        .env_remove("TOT_DEBUG_CONTENT")
         .env_remove("LH_DEBUG_CONTENT");
     command
 }
@@ -219,7 +226,7 @@ fn capture(pipe: impl tokio::io::AsyncRead + Unpin + Send + 'static, sink: Arc<M
 
 impl Server {
     async fn start(env: &Env, endpoint: &str, global: &[&str], serve: &[&str]) -> Self {
-        let mut command = lh(env, endpoint);
+        let mut command = tot(env, endpoint);
         command
             .args(global)
             .arg("serve")
@@ -228,7 +235,7 @@ impl Server {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        let mut child = command.spawn().expect("spawn lh serve");
+        let mut child = command.spawn().expect("spawn tot serve");
         let stdout = Arc::new(Mutex::new(String::new()));
         let stderr = Arc::new(Mutex::new(String::new()));
         capture(child.stdout.take().unwrap(), stdout.clone());
@@ -243,7 +250,12 @@ impl Server {
             }
         })
         .await
-        .unwrap_or_else(|_| panic!("lh serve did not start; stderr: {}", stderr.lock().unwrap()));
+        .unwrap_or_else(|_| {
+            panic!(
+                "tot serve did not start; stderr: {}",
+                stderr.lock().unwrap()
+            )
+        });
         let ready: Value = serde_json::from_str(&first).expect("first stdout line is JSON");
         let base = ready["listening"].as_str().unwrap().to_string();
         let token_file = PathBuf::from(ready["token_file"].as_str().unwrap());
@@ -344,7 +356,7 @@ impl Server {
         .unwrap();
         let status = tokio::time::timeout(TIMEOUT, self.child.wait())
             .await
-            .expect("lh serve did not stop on SIGTERM")
+            .expect("tot serve did not stop on SIGTERM")
             .unwrap();
         // Let the capture tasks drain the pipes.
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -629,7 +641,7 @@ async fn the_token_is_required_and_never_printed() {
     );
     let data = all_files_text(&env.data_dir);
     assert!(
-        data.contains("lh serve"),
+        data.contains("tot serve"),
         "the debug log should have been written"
     );
     for secret in [token.as_str(), wrong] {
@@ -702,7 +714,7 @@ async fn a_non_loopback_bind_requires_the_flag_and_warns() {
 
     let output = tokio::time::timeout(
         TIMEOUT,
-        lh(&env, &endpoint)
+        tot(&env, &endpoint)
             .args(["serve", "--bind", "0.0.0.0:0"])
             .output(),
     )
@@ -731,11 +743,11 @@ async fn a_non_loopback_bind_requires_the_flag_and_warns() {
 async fn sse_event_names_match_the_json_event_names() {
     let env = env();
 
-    // The same script through `lh --print --json` ...
+    // The same script through `tot --print --json` ...
     let (endpoint, _fake) = spawn_endpoint(vec![Script::Text("same answer".into())]).await;
     let output = tokio::time::timeout(
         TIMEOUT,
-        lh(&env, &endpoint)
+        tot(&env, &endpoint)
             .args(["--no-session", "--print", "hi", "--json"])
             .output(),
     )
@@ -812,7 +824,7 @@ async fn stopping_the_server_leaves_sessions_resumable() {
     // The normal session store resumes it.
     let output = tokio::time::timeout(
         TIMEOUT,
-        lh(&env, &endpoint)
+        tot(&env, &endpoint)
             .args(["--resume", &id, "--print", "what was the word?", "--json"])
             .output(),
     )

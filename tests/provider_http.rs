@@ -13,13 +13,13 @@ use axum::response::Response;
 use axum::routing::post;
 use bytes::Bytes;
 use futures_util::stream;
-use localharness::config::ModelConfig;
-use localharness::provider::{
+use serde_json::json;
+use tokio_util::sync::CancellationToken;
+use totality::config::ModelConfig;
+use totality::provider::{
     ChatMessage, ChatRequest, Completion, ErrorClass, OpenAiCompatProvider, StreamEvent, ToolCall,
     Usage, collect_stream, fold_stream,
 };
-use serde_json::json;
-use tokio_util::sync::CancellationToken;
 
 #[derive(Clone)]
 struct Script {
@@ -111,19 +111,19 @@ fn request() -> ChatRequest {
             content: "hi".into(),
             images: Vec::new(),
         }],
-        tools: vec![localharness::provider::ToolSpec {
+        tools: vec![totality::provider::ToolSpec {
             name: "read".into(),
             description: "read a file".into(),
             parameters: serde_json::json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}),
         }],
         tool_choice: Some("auto".into()),
         parallel_tool_calls: None,
-        samplers: localharness::provider::SamplerSettings {
+        samplers: totality::provider::SamplerSettings {
             temperature: Some(0.2),
             top_p: Some(0.95),
             ..Default::default()
         },
-        engine: localharness::provider::Engine::Generic,
+        engine: totality::provider::Engine::Generic,
         response_schema: None,
         max_tokens: 128,
         stop: vec![],
@@ -194,7 +194,7 @@ async fn streams_text_reasoning_tool_calls_and_usage() {
 }
 
 fn tool_deltas(
-    events: Vec<Result<StreamEvent, localharness::provider::ProviderError>>,
+    events: Vec<Result<StreamEvent, totality::provider::ProviderError>>,
 ) -> Vec<(usize, Option<String>, Option<String>, String)> {
     events
         .into_iter()
@@ -504,7 +504,7 @@ async fn malformed_sse_is_a_parse_error() {
 
 #[tokio::test]
 async fn sampler_fields_are_lowered_per_engine_and_unsupported_ones_are_omitted() {
-    use localharness::provider::{Engine, SamplerField, SamplerSettings};
+    use totality::provider::{Engine, SamplerField, SamplerSettings};
 
     async fn sent_body(engine: Engine) -> serde_json::Value {
         let (base, state) = spawn().await;
@@ -567,7 +567,7 @@ async fn sampler_fields_are_lowered_per_engine_and_unsupported_ones_are_omitted(
 #[tokio::test]
 async fn tool_conformance_probe_classifies_every_outcome_against_fixture_servers() {
     use axum::routing::get;
-    use localharness::provider::probe::{
+    use totality::provider::probe::{
         ToolProbeOutcome, probe_tool_conformance, tool_probe_metadata,
     };
 
@@ -575,7 +575,7 @@ async fn tool_conformance_probe_classifies_every_outcome_against_fixture_servers
         props: Option<&'static str>,
         status: u16,
         body: &'static str,
-    ) -> (localharness::provider::probe::ToolProbe, serde_json::Value) {
+    ) -> (totality::provider::probe::ToolProbe, serde_json::Value) {
         let state = FakeState::default();
         let chat_state = state.clone();
         let mut app = Router::new().route(
@@ -662,8 +662,8 @@ async fn tool_conformance_probe_classifies_every_outcome_against_fixture_servers
 
 #[tokio::test]
 async fn structured_schema_uses_each_engine_dialect_and_never_sends_strict_with_tools() {
-    use localharness::provider::StructuredMode;
-    use localharness::provider::structured::plan;
+    use totality::provider::StructuredMode;
+    use totality::provider::structured::plan;
 
     let schema = serde_json::json!({
         "type": "object",
@@ -673,7 +673,7 @@ async fn structured_schema_uses_each_engine_dialect_and_never_sends_strict_with_
     });
 
     async fn chat_body(
-        engine: localharness::provider::Engine,
+        engine: totality::provider::Engine,
         schema: &serde_json::Value,
     ) -> serde_json::Value {
         let (base, state) = spawn().await;
@@ -694,18 +694,18 @@ async fn structured_schema_uses_each_engine_dialect_and_never_sends_strict_with_
     }
 
     // llama.cpp gets the GBNF grammar.
-    let llama = chat_body(localharness::provider::Engine::LlamaCpp, &schema).await;
+    let llama = chat_body(totality::provider::Engine::LlamaCpp, &schema).await;
     let grammar = llama["grammar"].as_str().expect("grammar");
     assert!(grammar.contains("root ::="), "{grammar}");
     assert!(grammar.contains("\"answer\""), "{grammar}");
 
     // vLLM gets structured_outputs, not response_format.
-    let vllm = chat_body(localharness::provider::Engine::Vllm, &schema).await;
+    let vllm = chat_body(totality::provider::Engine::Vllm, &schema).await;
     assert_eq!(vllm["structured_outputs"]["json"]["type"], "object");
     assert!(vllm.get("response_format").is_none());
 
     // SGLang gets its response_format dialect.
-    let sglang = chat_body(localharness::provider::Engine::Sglang, &schema).await;
+    let sglang = chat_body(totality::provider::Engine::Sglang, &schema).await;
     assert_eq!(sglang["response_format"]["type"], "json_schema");
     assert_eq!(
         sglang["response_format"]["json_schema"]["schema"]["type"],
@@ -714,19 +714,19 @@ async fn structured_schema_uses_each_engine_dialect_and_never_sends_strict_with_
 
     // MLX has no grammar backend: the request carries no strict field and the
     // plan is a visible repair fallback.
-    let mlx = chat_body(localharness::provider::Engine::Mlx, &schema).await;
+    let mlx = chat_body(totality::provider::Engine::Mlx, &schema).await;
     assert!(mlx.get("grammar").is_none());
     assert!(mlx.get("response_format").is_none());
     assert!(mlx.get("structured_outputs").is_none());
-    let mlx_plan = plan(localharness::provider::Engine::Mlx, "reply", &schema).unwrap();
+    let mlx_plan = plan(totality::provider::Engine::Mlx, "reply", &schema).unwrap();
     assert_eq!(mlx_plan.mode, StructuredMode::Repair);
     assert!(mlx_plan.notice().unwrap().contains("repair"));
 
     // A strict schema plus tools on llama.cpp is refused before the request.
     let mut req = request();
-    req.engine = localharness::provider::Engine::LlamaCpp;
+    req.engine = totality::provider::Engine::LlamaCpp;
     req.response_schema =
-        Some(plan(localharness::provider::Engine::LlamaCpp, "reply", &schema).unwrap());
+        Some(plan(totality::provider::Engine::LlamaCpp, "reply", &schema).unwrap());
     let events = collect_stream(
         &provider("http://127.0.0.1:9"),
         req,
@@ -743,9 +743,8 @@ async fn structured_schema_uses_each_engine_dialect_and_never_sends_strict_with_
 
     // The same combination is allowed on vLLM.
     let mut req = request();
-    req.engine = localharness::provider::Engine::Vllm;
-    req.response_schema =
-        Some(plan(localharness::provider::Engine::Vllm, "reply", &schema).unwrap());
+    req.engine = totality::provider::Engine::Vllm;
+    req.response_schema = Some(plan(totality::provider::Engine::Vllm, "reply", &schema).unwrap());
     let (base, state) = spawn().await;
     state.script.lock().unwrap().push_back(Script {
         status: 200,
@@ -761,7 +760,7 @@ async fn structured_schema_uses_each_engine_dialect_and_never_sends_strict_with_
 
 #[tokio::test]
 async fn koboldcpp_grammar_endpoint_supplies_the_request_grammar() {
-    use localharness::provider::structured::{kobold_grammar, plan};
+    use totality::provider::structured::{kobold_grammar, plan};
 
     let state = FakeState::default();
     let chat_state = state.clone();
@@ -800,13 +799,13 @@ async fn koboldcpp_grammar_endpoint_supplies_the_request_grammar() {
         .expect("converted grammar");
     assert_eq!(grammar, "root ::= \"from-kobold\"");
     let mut structured =
-        plan(localharness::provider::Engine::KoboldCpp, "reply", &schema).expect("plan");
+        plan(totality::provider::Engine::KoboldCpp, "reply", &schema).expect("plan");
     structured.grammar = Some(grammar);
 
     let mut req = request();
     req.tools.clear();
     req.tool_choice = None;
-    req.engine = localharness::provider::Engine::KoboldCpp;
+    req.engine = totality::provider::Engine::KoboldCpp;
     req.response_schema = Some(structured);
     let events = collect_stream(&provider(&base), req, CancellationToken::new()).await;
     assert!(events.iter().all(|event| event.is_ok()));
@@ -828,13 +827,13 @@ async fn auth_failure_is_prescriptive() {
         .find_map(|event| event.err())
         .expect("an error");
     assert_eq!(error.class, ErrorClass::Auth);
-    assert!(error.message.contains("LH_API_KEY"));
+    assert!(error.message.contains("TOT_API_KEY"));
 }
 
 #[tokio::test]
 async fn models_probe_lists_ids() {
     let (base, _state) = spawn().await;
-    let models = localharness::provider::probe::list_models(&provider(&base))
+    let models = totality::provider::probe::list_models(&provider(&base))
         .await
         .unwrap();
     assert_eq!(models, ["test-model"]);
@@ -1052,10 +1051,7 @@ fn non_streamed_fixture() -> String {
     .to_string()
 }
 
-async fn fold(
-    body: &str,
-    chunked: bool,
-) -> Result<Completion, localharness::provider::ProviderError> {
+async fn fold(body: &str, chunked: bool) -> Result<Completion, totality::provider::ProviderError> {
     let (base, state) = spawn().await;
     state.script.lock().unwrap().push_back(Script {
         status: 200,
@@ -1080,12 +1076,12 @@ async fn every_engine_fixture_folds_into_the_same_completion() {
         content: "Reading both.".into(),
         reasoning: "plan".into(),
         calls: vec![
-            localharness::provider::AssembledCall {
+            totality::provider::AssembledCall {
                 engine_id: None,
                 name: "read".into(),
                 arguments: READ_ARGS.into(),
             },
-            localharness::provider::AssembledCall {
+            totality::provider::AssembledCall {
                 engine_id: None,
                 name: "write".into(),
                 arguments: WRITE_ARGS.into(),

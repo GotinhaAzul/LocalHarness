@@ -908,7 +908,7 @@ mod tests {
             mtime: std::time::SystemTime::UNIX_EPOCH,
             len: 0,
         };
-        let path = std::path::Path::new("/localharness/coverage-test");
+        let path = std::path::Path::new("/totality/coverage-test");
         tracker.record_range(path, stamp, 400, 1, 150);
         tracker.record_range(path, stamp, 400, 300, 400);
         assert_eq!(

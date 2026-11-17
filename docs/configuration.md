@@ -7,21 +7,21 @@ defaults. Environment variables fill the gaps.
 
 | Purpose | Default |
 |---|---|
-| Global config | `~/.config/localharness/config.toml` |
-| Profiles | `~/.config/localharness/profiles/` |
-| Skills | `~/.config/localharness/skills/<name>/SKILL.md` |
-| Skills lockfile | `~/.config/localharness/skills.lock` |
-| Skills trash | `~/.config/localharness/skills-trash/` |
-| Workflows | `~/.config/localharness/workflows/` |
-| External tools | `~/.config/localharness/tools/*.toml` |
+| Global config | `~/.config/totality/config.toml` |
+| Profiles | `~/.config/totality/profiles/` |
+| Skills | `~/.config/totality/skills/<name>/SKILL.md` |
+| Skills lockfile | `~/.config/totality/skills.lock` |
+| Skills trash | `~/.config/totality/skills-trash/` |
+| Workflows | `~/.config/totality/workflows/` |
+| External tools | `~/.config/totality/tools/*.toml` |
 | MCP servers | `[mcp.<name>]` tables in `config.toml` ([docs/mcp.md](mcp.md)) |
-| Themes | `~/.config/localharness/themes/*.toml` |
-| Data | `~/.local/share/localharness/` |
-| Sessions | `~/.local/share/localharness/sessions/<project-id>/` |
-| Engagements | `~/.local/share/localharness/engagements/<name>/` |
+| Themes | `~/.config/totality/themes/*.toml` |
+| Data | `~/.local/share/totality/` |
+| Sessions | `~/.local/share/totality/sessions/<project-id>/` |
+| Engagements | `~/.local/share/totality/engagements/<name>/` |
 | Project config | `<cwd>/.harness/` (requires `--trust`) |
 
-`LH_CONFIG_DIR` and `LH_DATA_DIR` override the roots.
+`TOT_CONFIG_DIR` and `TOT_DATA_DIR` override the roots.
 
 ## Example
 
@@ -167,7 +167,7 @@ extra_body = { chat_template_kwargs = { enable_thinking = true } }
 ```
 
 `default_profile` picks the profile used at startup; `--profile` and
-`LH_PROFILE` still override it. The built-in default is `coding`.
+`TOT_PROFILE` still override it. The built-in default is `coding`.
 
 `model_profile = "auto"` matches by model-name prefix declared in `match`; the
 `default` model profile is the fallback. `[model] context_window` is used only
@@ -206,7 +206,7 @@ bundled preset for the same model.
 The harness sends only fields the detected engine accepts, under the name that
 engine uses: `repeat_penalty` for llama.cpp/Ollama/LM Studio/KoboldCpp and
 `repetition_penalty` for vLLM/SGLang/TabbyAPI. DRY and XTC go only to llama.cpp
-and KoboldCpp; `min_p` is omitted for Ollama and the generic profile. `lh doctor`
+and KoboldCpp; `min_p` is omitted for Ollama and the generic profile. `tot doctor`
 warns about every omitted field and names it. Pin `[model] engine` when a
 gateway hides the real server, otherwise detection is best-effort.
 `extra_body` still merges last, so an engine-only sampler can be passed there.
@@ -214,7 +214,7 @@ gateway hides the real server, otherwise detection is best-effort.
 The streaming repetition guard remains the last line of defense, not the first.
 
 `--debug` records the exact request body in the diagnostic log
-(`localharness::provider::request`), with the configured bearer token redacted.
+(`totality::provider::request`), with the configured bearer token redacted.
 
 ### Structured output
 
@@ -454,7 +454,7 @@ dispatch with `plan_mode` and the approve command. A plan-mode turn cannot end
 without a `todo` plan; the plan is stored as a `plan` session entry and shown
 by `/plan`. `/plan approve` restores the previous mode and exactly the
 previous tool set and records the approval; `/plan exit` does the same and
-records the plan as discarded. `lh --plan --print "..."` runs one plan-mode
+records the plan as discarded. `tot --plan --print "..."` runs one plan-mode
 turn, prints the plan, and exits 0.
 
 ## Lifecycle hooks
@@ -468,7 +468,7 @@ elsewhere. A missing binary, non-zero exit, timeout, or malformed JSON is
 visible in the transcript and recorded in the session; it never looks like
 approval. Hook output cannot change tools, scope, the endpoint, or the
 permission mode. See [hooks.md](hooks.md) for the payload, output schema, exit
-codes, and `lh hooks test <name>`.
+codes, and `tot hooks test <name>`.
 
 ## LSP gate
 
@@ -503,9 +503,9 @@ the gates, tool selection, scope, or the endpoint; those remain in code.
 repository root to the working directory, nearest last, each under a
 source-path header. Each file is capped at 12 KiB and the chain at 32 KiB;
 truncation is deterministic and reported as a warning. A symlink that resolves
-outside the repository is refused. `lh context --show` prints the manifest
-(path, bytes, SHA-256, loaded/skipped/truncated) and `lh context --json` emits
-it as JSON. `--no-agents-md` or `LH_AGENTS_MD=0` disables loading for one run.
+outside the repository is refused. `tot context --show` prints the manifest
+(path, bytes, SHA-256, loaded/skipped/truncated) and `tot context --json` emits
+it as JSON. `--no-agents-md` or `TOT_AGENTS_MD=0` disables loading for one run.
 The files remain untrusted, advisory instructions.
 
 The TUI does not require `[model]` to be resolved at startup. If the endpoint is
@@ -565,21 +565,21 @@ Steps run sequentially without a shell and stop at the first failure.
 
 | Variable | Meaning |
 |---|---|
-| `LH_ENDPOINT` | Endpoint base URL |
-| `LH_MODEL` | Model id |
-| `LH_API_KEY` | Bearer token |
-| `LH_PROFILE` | Tool profile |
-| `LH_MODEL_PROFILE` | Force a model profile |
-| `LH_THEME` | Theme name |
-| `LH_NO_SESSION` | Disable persistence |
-| `LH_TRUST` | Trust project config |
-| `LH_AGENTS_MD` | Set to `0` to skip the AGENTS.md chain |
-| `LH_CONFIG_DIR`, `LH_DATA_DIR` | Override roots |
-| `LH_HOME` | Home used for `~/.claude/skills` and `~/.agents/skills` discovery |
-| `LH_SKIP_TOOL_PROBE` | Skip the one-shot tool-call conformance probe |
+| `TOT_ENDPOINT` | Endpoint base URL |
+| `TOT_MODEL` | Model id |
+| `TOT_API_KEY` | Bearer token |
+| `TOT_PROFILE` | Tool profile |
+| `TOT_MODEL_PROFILE` | Force a model profile |
+| `TOT_THEME` | Theme name |
+| `TOT_NO_SESSION` | Disable persistence |
+| `TOT_TRUST` | Trust project config |
+| `TOT_AGENTS_MD` | Set to `0` to skip the AGENTS.md chain |
+| `TOT_CONFIG_DIR`, `TOT_DATA_DIR` | Override roots |
+| `TOT_HOME` | Home used for `~/.claude/skills` and `~/.agents/skills` discovery |
+| `TOT_SKIP_TOOL_PROBE` | Skip the one-shot tool-call conformance probe |
 | `NO_COLOR` | Disable color |
-| `LH_DEBUG_CONTENT` | Allow content in debug logs (warns) |
-| `LH_BWRAP` | Override the bubblewrap executable used by `--sandbox` |
+| `TOT_DEBUG_CONTENT` | Allow content in debug logs (warns) |
+| `TOT_BWRAP` | Override the bubblewrap executable used by `--sandbox` |
 
 ## Flags
 
@@ -591,10 +591,10 @@ Steps run sequentially without a shell and stop at the first failure.
 `--keep-exif`, `--debug`, `--mode <ask|accept-edits|plan|dont-ask>`, `--yolo`,
 `--plan`.
 
-`lh doctor [--json] [--fix]` prints the engine capability manifest without
+`tot doctor [--json] [--fix]` prints the engine capability manifest without
 sending a chat completion. See [model-setup.md](model-setup.md).
 
-`lh context --show` prints the AGENTS.md chain and its manifest without
+`tot context --show` prints the AGENTS.md chain and its manifest without
 opening a session or contacting a model; `--json` emits one stable object.
 With no AGENTS.md files in the chain, it reports an empty chain. With
-`--no-agents-md` or `LH_AGENTS_MD=0`, it reports that loading is disabled.
+`--no-agents-md` or `TOT_AGENTS_MD=0`, it reports that loading is disabled.

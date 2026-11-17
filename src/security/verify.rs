@@ -764,7 +764,7 @@ async fn execute_shell(
             cmd.env(key, value);
         }
     }
-    cmd.env("LH_POC", "1");
+    cmd.env("TOT_POC", "1");
     {
         use std::os::unix::process::CommandExt;
         cmd.as_std_mut().process_group(0);

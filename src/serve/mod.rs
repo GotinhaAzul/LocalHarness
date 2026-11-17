@@ -1,4 +1,4 @@
-//! `lh serve`: a local HTTP API for scripts, cron jobs, CI, and small UIs.
+//! `tot serve`: a local HTTP API for scripts, cron jobs, CI, and small UIs.
 //!
 //! Endpoints (all under `/v1`, all require `Authorization: Bearer <token>`):
 //!
@@ -45,7 +45,7 @@ use crate::paths::Paths;
 
 pub use api::PermissionMode;
 
-/// Options from `lh serve`.
+/// Options from `tot serve`.
 #[derive(Debug, Clone)]
 pub struct ServeOptions {
     pub bind: String,
@@ -83,11 +83,11 @@ pub fn check_bind(address: SocketAddr, allow_non_loopback: bool) -> Result<Optio
     }
     if !allow_non_loopback {
         bail!(
-            "refusing to bind {address}: it is not a loopback address. `lh serve` exposes a session that can edit files and run commands; bind 127.0.0.1, or pass --allow-non-loopback if you understand that anyone who can reach this address and read the token can drive the harness"
+            "refusing to bind {address}: it is not a loopback address. `tot serve` exposes a session that can edit files and run commands; bind 127.0.0.1, or pass --allow-non-loopback if you understand that anyone who can reach this address and read the token can drive the harness"
         );
     }
     Ok(Some(format!(
-        "warning: lh serve is listening on non-loopback address {address}. Anyone who can reach it and obtain the token can drive the harness; the traffic is plain HTTP, so the token crosses the network unencrypted. Prefer 127.0.0.1 and an SSH tunnel."
+        "warning: tot serve is listening on non-loopback address {address}. Anyone who can reach it and obtain the token can drive the harness; the traffic is plain HTTP, so the token crosses the network unencrypted. Prefer 127.0.0.1 and an SSH tunnel."
     )))
 }
 
@@ -149,7 +149,7 @@ pub async fn run(config: Config, paths: Paths, options: ServeOptions) -> Result<
     let local = listener.local_addr()?;
     if let Some(warning) = &warning {
         eprintln!("{warning}");
-        tracing::warn!(%local, "lh serve bound a non-loopback address");
+        tracing::warn!(%local, "tot serve bound a non-loopback address");
     }
 
     let token = generate_token()?;
@@ -185,10 +185,10 @@ pub async fn run(config: Config, paths: Paths, options: ServeOptions) -> Result<
         })
     );
     eprintln!(
-        "lh serve listening on http://{local}\ntoken file: {}\nsend `Authorization: Bearer $(cat <token file>)`; Ctrl+C stops the server",
+        "tot serve listening on http://{local}\ntoken file: {}\nsend `Authorization: Bearer $(cat <token file>)`; Ctrl+C stops the server",
         token_file.display()
     );
-    tracing::info!(%local, "lh serve started");
+    tracing::info!(%local, "tot serve started");
 
     let mut connections = JoinSet::new();
     let stop = stop_signal();
@@ -227,7 +227,7 @@ pub async fn run(config: Config, paths: Paths, options: ServeOptions) -> Result<
         }
     }
 
-    eprintln!("lh serve stopping: cancelling running turns");
+    eprintln!("tot serve stopping: cancelling running turns");
     drop(listener);
     // Refuse new work, cancel running turns, and wait until each has written
     // its cancellation (and published `done`); then end SSE streams and ask
@@ -240,7 +240,7 @@ pub async fn run(config: Config, paths: Paths, options: ServeOptions) -> Result<
     .await;
     connections.abort_all();
     let _ = std::fs::remove_file(&token_file);
-    eprintln!("lh serve stopped; sessions are resumable with `lh --resume <id>`");
+    eprintln!("tot serve stopped; sessions are resumable with `tot --resume <id>`");
     Ok(0)
 }
 

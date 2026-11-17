@@ -1,4 +1,4 @@
-# LocalHarness — Architecture and Implementation Specification
+# Totality — Architecture and Implementation Specification
 
 Status: implementation-ready specification, v1.0
 Target: Linux first, Rust, local models in the 27B dense to 35B MoE class
@@ -8,7 +8,7 @@ Audience: the implementer and contributors; no prior Pi context required
 
 ## 0. What this is
 
-LocalHarness is a standalone, local-first agent harness for coding and security
+Totality is a standalone, local-first agent harness for coding and security
 work. It talks to any local inference engine that exposes an OpenAI-compatible
 chat-completions endpoint. It owns its own agent loop, tools, context
 management, session tree, and TUI. It does not depend on Pi, Node, or any
@@ -221,7 +221,7 @@ Per-model samplers (`temperature`, `top_p`, `min_p`, `repeat_penalty`,
 `dry_multiplier`, `dry_base`, `xtc_probability`, `seed`) override the global
 `[model]` fields one by one. They are lowered to the engine's own key names
 (`repeat_penalty` vs `repetition_penalty`); fields the engine does not accept
-are omitted, never sent as unknown keys, and `lh doctor` warns about each
+are omitted, never sent as unknown keys, and `tot doctor` warns about each
 omission. Bundled presets: `qwen-coding`, `gemma-chat`, `glm-agent`.
 
 ### 2.5 Errors and timeouts
@@ -240,7 +240,7 @@ omission. Bundled presets: `qwen-coding`, `gemma-chat`, `glm-agent`.
   backoff, and the final error says "gave up after N attempts". A call that
   ran out the whole-request timeout is not retried. When a reply failed after
   streaming text, a `discard` event (also in `--json` and SSE) tells
-  frontends to drop that text; piped `lh -p` output holds each call's text
+  frontends to drop that text; piped `tot -p` output holds each call's text
   until the call completes. `retries = 0` restores the old behavior.
 - Error classes: `connection`, `auth`, `model_not_found`, `context_too_small`,
   `bad_request`, `rate_limited`, `server`, `cancelled`, `parse`.
@@ -353,7 +353,7 @@ observable.
 | Read-before-edit | `edit`/`patch` on an existing file require a prior `read` with a matching stat stamp (`mtime`, size). `write` also requires full-line coverage of the existing file, or an explicit `overwrite: true`; a result capped by the result or batch limit marks coverage incomplete. A changed file requires a re-read. Creation is allowed. A successful `edit`/`patch`/`write` re-stamps only the file it wrote, so consecutive edits need no re-read while any outside change still does. |
 | Scope gate | Security-sensitive commands are checked against the user-set engagement scope. No scope blocks with `SEC_SCOPE` and the `/sec scope add` call. Best-effort, not a sandbox. |
 | Sandbox | When `--sandbox` is set, `bash` and `bg` run in a bubblewrap namespace (or the Landlock fallback): read-only root, hidden `$HOME`, private `/tmp`, no network, and `.git` read-only in `workspace-write`. Startup fails closed when no backend exists; a per-command wrap failure returns `SANDBOX_UNAVAILABLE`. Commands never fall back to an unsandboxed run. |
-| Loop guard | Signature is tool name plus canonical arguments. Four identical calls in a row, or an exact 2-8 call cycle repeated four times, blocks the call and ends the turn with a recovery instruction and the `stalled` status (exit code 2 from `lh -p`, never a successful workflow step). A file change or a passing verification clears the history, so long multi-step work does not trip it. No automatic session replacement in v1. |
+| Loop guard | Signature is tool name plus canonical arguments. Four identical calls in a row, or an exact 2-8 call cycle repeated four times, blocks the call and ends the turn with a recovery instruction and the `stalled` status (exit code 2 from `tot -p`, never a successful workflow step). A file change or a passing verification clears the history, so long multi-step work does not trip it. No automatic session replacement in v1. |
 | Interactive command guard | Blocks `vim`, `less`, `top`, `htop`, `watch`, `nano`, `ssh` without a command, and similar TTY-only invocations. |
 | Budget checkpoint | Tool calls, model calls, and wall clock are checked at 120 calls, 40 model calls, and 30 minutes. A checkpoint that finds a new result, a file change, or a passing verify within the last `stall_calls` calls renews the allowance and the turn continues. A checkpoint with no recent progress ends the turn and reports why. |
 | Stall | Twelve consecutive calls with no new result fingerprint, no file change, and no successful verify. Ends the turn with the last known state. |
@@ -410,7 +410,7 @@ itself is unchanged.
 
 Local servers often lack a reasoning or tool parser, and small models loop.
 `agent/output.rs` repairs what can be repaired deterministically; anything
-else becomes a harness message (`[localharness] <kind>: ...`) and the loop
+else becomes a harness message (`[totality] <kind>: ...`) and the loop
 continues. Nudges are capped at three per turn.
 
 | Symptom | Handling |
@@ -420,7 +420,7 @@ continues. Nudges are capped at three per turn.
 | Exact repetition | The stream is checked as it grows; a tail of one unit repeated at least 5 times and 600 bytes stops generation, keeps one copy, and nudges. Repeated loops end the turn as `stalled`. |
 | `finish_reason = length` | A cut tool call (arguments not valid JSON) does not run; the model is told to send smaller calls. Cut prose is continued. A reply that spent the budget thinking is told to act. |
 | Empty reply | One nudge to call a tool or answer. |
-| Silent prompt truncation | The engine's `truncated` flag and context-shift count are proof and end the turn. Arithmetic signals need a second witness: `prompt_tokens + cached_tokens` covering the prompt means an uncached-only report; `/tokenize` decides between a cut prompt (it exceeds the window) and a wrong report (it fits); a count under 512 tokens is a broken usage field; impossible characters per token with a plausible count is a confirmed cut; a plain shortfall must repeat on the next call. A wrong report keeps the reply, warns once, stops calibrating from usage on that endpoint, and is recorded for `lh doctor`, which reports it without sending a chat completion. |
+| Silent prompt truncation | The engine's `truncated` flag and context-shift count are proof and end the turn. Arithmetic signals need a second witness: `prompt_tokens + cached_tokens` covering the prompt means an uncached-only report; `/tokenize` decides between a cut prompt (it exceeds the window) and a wrong report (it fits); a count under 512 tokens is a broken usage field; impossible characters per token with a plausible count is a confirmed cut; a plain shortfall must repeat on the next call. A wrong report keeps the reply, warns once, stops calibrating from usage on that endpoint, and is recorded for `tot doctor`, which reports it without sending a chat completion. |
 
 ---
 
@@ -493,7 +493,7 @@ No model call. The summary is built from session entries.
 Sections, omitted when empty:
 
 ```
-[localharness] deterministic compaction
+[totality] deterministic compaction
 
 ## Active thread T{n} - {title}
 objective: ...
@@ -556,7 +556,7 @@ without it before reporting `budget_context`. Compactions after a provider
 context error, `/compact`, and `thread split` keep nothing.
 
 Messages the harness writes in the user role (gate continuations, recovery
-nudges) start with `[localharness]` and are never taken as the last
+nudges) start with `[totality]` and are never taken as the last
 instruction or the objective.
 
 ### 4.5 Threads
@@ -699,7 +699,7 @@ deletes entries.
 
 ### 5.5 Rewind
 
-`/rewind [turns] [force]` and `lh --rewind <session>:<entry>` move the active
+`/rewind [turns] [force]` and `tot --rewind <session>:<entry>` move the active
 leaf to an earlier entry **and** put the working tree back to the state it had
 at that entry. `/rewind` defaults to one turn: the entry before the last user
 message, so the last turn's edits are reverted and its conversation is
@@ -722,7 +722,7 @@ The plan is built from the active branch's `fs-change` entries, the same data
   `after_sha256`. A mismatch means the file changed outside the harness; the
   rewind writes nothing, moves no leaf, and names every conflicting file.
   `force` backs those files up next to the originals as
-  `<name>.lh-rewind-<nanos>.bak` before restoring them.
+  `<name>.tot-rewind-<nanos>.bak` before restoring them.
 - After the files, the leaf moves with a `checkout` marker (`reason =
   "rewind"`) and a `rewind` custom entry records the target, restored and
   deleted paths, backups, and the reverted `fs-change` seqs. The abandoned
@@ -736,7 +736,7 @@ only the marker and the `rewind` entry are appended.
 ### 5.6 Storage
 
 ```
-~/.local/share/localharness/
+~/.local/share/totality/
   sessions/
     <project-id>/
       <session-id>.jsonl
@@ -771,8 +771,8 @@ only the marker and the `rewind` entry are appended.
 
 ### 5.7 Resume and switching
 
-- `lh --continue` loads the most recent session for the project.
-- `lh --resume <session-id>` loads a specific session.
+- `tot --continue` loads the most recent session for the project.
+- `tot --resume <session-id>` loads a specific session.
 - `/sessions` lists sessions with first-user-message previews and lets the user
   switch. Switching replaces the in-memory app state; it does not merge.
 - On resume, show the active branch, model, endpoint, and profile. If the
@@ -827,9 +827,9 @@ the profile's `tools` names it or `--tools +fetch` adds it.
 `short_tool_schemas` accepts `true`, `false`, or `"auto"`. `"auto"` sends the
 short form when the system prompt plus the full schemas would exceed 20% of the
 usable prompt; the choice is made once per session and model so the prefix
-stays byte-stable. The default stays the full form, because the `lh eval`
+stays byte-stable. The default stays the full form, because the `tot eval`
 tool-call and edit suites have not been run against real models for the short
-form. `lh doctor` prints both sizes.
+form. `tot doctor` prints both sizes.
 
 ### 6.2 Tool contracts
 
@@ -889,11 +889,11 @@ form. `lh doctor` prints both sizes.
   verification is configured.
 - `verify` runs configured steps sequentially without a shell, caps combined
   output at 1 MiB, and returns a compact pass/fail summary. It records
-  `verify-result`. With no steps configured, `lh verify [--init]` shows or
+  `verify-result`. With no steps configured, `tot verify [--init]` shows or
   saves the steps detected from manifest files, and `/verify [accept]` does
   the same in the TUI; nothing from the repository runs before the user
   accepts. Accepted steps live in `verify-steps.json` in the user data
-  directory, keyed by project, so they load without `--trust`. `lh doctor`
+  directory, keyed by project, so they load without `--trust`. `tot doctor`
   reports what is configured or detected.
 - `fetch` GETs one public http(s) URL and returns readable text: HTML is
   converted (scripts, navigation, and page chrome dropped; code blocks
@@ -1131,7 +1131,7 @@ scope, policy, or the endpoint. Anything else is changed by forking the crate.
 
 ### 7.1 Profiles
 
-TOML files in `~/.config/localharness/profiles/` or `.harness/profiles/`
+TOML files in `~/.config/totality/profiles/` or `.harness/profiles/`
 (project profiles require `--trust`). A profile selects packs/tools, a model
 profile, budgets, prompt additions, and UI defaults.
 
@@ -1152,15 +1152,15 @@ allowed-tools: read grep bash
 ... instructions ...
 ```
 
-- Global native skills live in `~/.config/localharness/skills/<name>/SKILL.md`.
+- Global native skills live in `~/.config/totality/skills/<name>/SKILL.md`.
 - Standard roots also load: `~/.claude/skills`, `~/.agents/skills`,
   `.claude/skills`, `.agents/skills`.
 - Project skills live in `.harness/skills/`, `.claude/skills/`, or
   `.agents/skills/` and require trust.
 - Precedence, lowest first: bundled, `~/.claude/skills`, `~/.agents/skills`,
-  `~/.config/localharness/skills`, project `.claude/skills`, project
+  `~/.config/totality/skills`, project `.claude/skills`, project
   `.agents/skills`, `.harness/skills`. Native beats standard at the same level;
-  every collision is recorded as a shadow. `lh skill lint --all` fails a
+  every collision is recorded as a shadow. `tot skill lint --all` fails a
   duplicate unless the winner sets `shadow: true`.
 - `name` is 1-64 lowercase letters, digits, or hyphens; `description` is at most
   1,024 characters. Discovery reads only name, description, and `when`; the
@@ -1174,16 +1174,16 @@ allowed-tools: read grep bash
   `~/.claude` and `~/.agents` skills sort behind bundled, native, and project
   skills. `[skills] index = "full" | "names" | "off"` chooses how much the
   prompt carries. Full text loads on `/skill <name>`, when the `skill` tool
-  loads it, or when a workflow names it. `lh context` reports the index size
+  loads it, or when a workflow names it. `tot context` reports the index size
   and names the skills whose entry was clipped.
 - Skills are instructions, not executable code. A script shipped in a skill
   directory is never run automatically; `bash`/`bg` targeting one requires
   per-execution approval with the command shown.
-- `lh skill add|update|remove|list` installs into the global native directory
+- `tot skill add|update|remove|list` installs into the global native directory
   with `skills.lock` (source, requested and resolved ref, per-file SHA-256,
   install time). Replaced and removed copies move to `skills-trash/`; nothing is
   deleted. `--frozen` fails on digest drift.
-- `lh skill lint [name|--all]` and `lh skill eval --fixtures <dir>` share the
+- `tot skill lint [name|--all]` and `tot skill eval --fixtures <dir>` share the
   loader's validator. Lint errors: bad name, long description, body over 500
   lines, missing/unreadable/oversize reference, grant-shaped frontmatter, and
   duplicate names. Warnings: body over 300 lines, more than ten references,
@@ -1231,7 +1231,7 @@ run = "approval"
 message = "Push the branch?"
 ```
 
-- `lh workflow run <name>` executes steps in order in one session; `/workflow`
+- `tot workflow run <name>` executes steps in order in one session; `/workflow`
   refuses step workflows because the TUI owns one turn at a time.
 - Conditions read only `changed_files`, `open_tasks`, `last_exit`,
   `steps_completed`, and `last_verify`, through `<fact> <op> <value>` clauses
@@ -1253,10 +1253,10 @@ message = "Push the branch?"
   and reopens the recorded session. `--no-session` keeps the journal in memory.
 - A step cannot select tools, skills, or a profile. The engine evaluates no
   code, and the turn inside a step still goes through every gate.
-- `lh workflow run` loads the workflow's named skills into the first prompt
+- `tot workflow run` loads the workflow's named skills into the first prompt
   step after validating them.
 
-`lh workflow list` prints bundled, global, and trusted project workflows.
+`tot workflow list` prints bundled, global, and trusted project workflows.
 
 ### 7.4 External tools
 
@@ -1293,7 +1293,7 @@ SEMGREP_SEND_METRICS = "off"
 ### 7.5 Themes
 
 Theme files are TOML with semantic tokens. Users can add themes to
-`~/.config/localharness/themes/`. See section 9.
+`~/.config/totality/themes/`. See section 9.
 
 ### 7.6 Rust library
 
@@ -1324,7 +1324,7 @@ Feature flags: `coding`, `security`, `lsp`. The binary is a thin wrapper.
   asked. Hooks cannot enable a denied tool or change scope, the tool list, the
   endpoint, or the permission mode. `stop` runs when
   the turn loop ends and is advisory because the turn has already stopped.
-- `lh hooks list` and `lh hooks test <name>` exercise hooks without a model
+- `tot hooks list` and `tot hooks test <name>` exercise hooks without a model
   turn. See `docs/hooks.md`.
 
 ### 7.8 Explicitly not extensible at runtime
@@ -1456,7 +1456,7 @@ input characters. Missing input and unreadable files return prescriptive errors.
 
 ### 8.9 Trust model
 
-- Global config (`~/.config/localharness/`), `~/.claude/skills/`, and
+- Global config (`~/.config/totality/`), `~/.claude/skills/`, and
   `~/.agents/skills/` are trusted because the user wrote them.
 - Project `.harness/` config, profiles, skills, workflows, tools, and verify
   steps, plus project `.claude/skills/` and `.agents/skills/`, are ignored
@@ -1466,9 +1466,9 @@ input characters. Missing input and unreadable files return prescriptive errors.
   the git repository root and the working directory, nearest last, each under a
   source-path header. The chain is capped at 32 KiB total and 12 KiB per file
   with deterministic truncation and a warning. Symlinks that resolve outside
-  the repository are refused. `lh context --show` prints path, bytes, SHA-256,
+  the repository are refused. `tot context --show` prints path, bytes, SHA-256,
   and loaded/skipped/truncated for each file; `--no-agents-md` and
-  `LH_AGENTS_MD=0` disable the chain. It cannot change scope, tools, gates, or
+  `TOT_AGENTS_MD=0` disable the chain. It cannot change scope, tools, gates, or
   the endpoint.
 - A trusted project still cannot grant security scope.
 - Model input from repository files and tool output is delimited and labeled as
@@ -1505,9 +1505,9 @@ input characters. Missing input and unreadable files return prescriptive errors.
   delete or disable an engagement file the user explicitly created; findings
   are separate, user-owned data.
 - Diagnostic logs are metadata only: timings, tool names, token counts, error
-  codes. Prompts and tool output are not logged unless `LH_DEBUG_CONTENT=1` is
+  codes. Prompts and tool output are not logged unless `TOT_DEBUG_CONTENT=1` is
   set, which prints a warning.
-- API keys are read from config or `LH_API_KEY`, never logged, and redacted in
+- API keys are read from config or `TOT_API_KEY`, never logged, and redacted in
   error messages.
 - Artifact retention defaults to 30 days; `--keep-artifacts` and
   `--clean-artifacts` control it.
@@ -1532,7 +1532,7 @@ input characters. Missing input and unreadable files return prescriptive errors.
   `workspace-write`) and a `sandbox_explicit` flag. `--sandbox[=MODE]` selects
   a mode; `--no-sandbox` maps to `off`. Neither value is read from TOML.
 - `src/sandbox.rs` owns the engine. `Sandbox::new` resolves the workspace and
-  picks a backend: bubblewrap when `bwrap` (or `LH_BWRAP`) is executable,
+  picks a backend: bubblewrap when `bwrap` (or `TOT_BWRAP`) is executable,
   otherwise Landlock. If neither is usable the constructor returns a
   fail-closed error, and `detect` exposes the same check to the CLI.
 - Bubblewrap wraps `bash -lc` with `--unshare-all`, `--cap-drop ALL`, a
@@ -1620,7 +1620,7 @@ given, or a frontend approver attached) is resolved by
 ### 9.1 Layout
 
 ```
-+ LocalHarness  ~/src/app (main*)  full  qwen3.5-35b-a3b  12.4k/64k [###---] 19%  24 tok/s +
++ Totality  ~/src/app (main*)  full  qwen3.5-35b-a3b  12.4k/64k [###---] 19%  24 tok/s +
 |                                                                                        |
 |  You  20:14                                                                            |
 |  Fix the parser bug                                                                    |
@@ -1795,7 +1795,7 @@ cursor = "#c0caf5"
 
 ### 9.7 Headless mode
 
-`lh --print "<prompt>"` runs one turn without the TUI, streams to stdout, and
+`tot --print "<prompt>"` runs one turn without the TUI, streams to stdout, and
 exits with the turn status. `--json` emits newline-delimited events for
 scripting; `usage` events include `prompt_tokens`, `cached_tokens`, and
 `cache_percent`. The same core and session code is used. This is not a second
@@ -1804,11 +1804,11 @@ with `DENIED`; pass `--mode accept-edits`, add allow rules, or `--yolo`.
 `--plan --print` runs one plan-mode turn, prints the stored plan (a `plan`
 event with `--json`), and exits 0 without touching the workspace. The event
 schema (`type` names and fields) lives in `src/events.rs`, an exhaustive match
-on `AgentEvent` that `lh serve` shares.
+on `AgentEvent` that `tot serve` shares.
 
 ### 9.8 Agent Client Protocol
 
-`lh acp` serves ACP v1 over stdio: newline-delimited JSON-RPC 2.0 on stdin and
+`tot acp` serves ACP v1 over stdio: newline-delimited JSON-RPC 2.0 on stdin and
 stdout, with logs kept in the log file. It exposes `initialize`, `session/new`,
 `session/load`, `session/prompt`, and `session/cancel`, streams
 `session/update`, and sends `session/request_permission` before every
@@ -1829,7 +1829,7 @@ non-read-only tool call.
   `cancelled`, budget/context → `max_tokens`, stalled → `max_turn_requests`,
   blocked → `refusal`. A turn error is a JSON-RPC error (`-32000`) so a
   transient endpoint failure does not make the client drop the conversation;
-  the exact status and code ride in the error data and `_meta.localharness`.
+  the exact status and code ride in the error data and `_meta.totality`.
 - Agent text is passed through `sanitize::display` before it reaches the
   client. Streamed deltas are buffered across chunk boundaries so an escape
   sequence cannot be split into visible payload, and tool titles, arguments,
@@ -1838,11 +1838,11 @@ non-read-only tool call.
   `session/cancel` and permission replies from other sessions.
 - `tests/acp.rs` drives the binary over stdio against a scripted endpoint.
 - Session hosting (runtime per root, root trust policy, one turn per session,
-  the turn driver) lives in `src/host.rs` and is shared with `lh serve`.
+  the turn driver) lives in `src/host.rs` and is shared with `tot serve`.
 
 ### 9.9 Local HTTP API
 
-`lh serve` exposes hosted sessions over HTTP/1.1 on loopback (`docs/serve.md`):
+`tot serve` exposes hosted sessions over HTTP/1.1 on loopback (`docs/serve.md`):
 `POST /v1/sessions`, `POST /v1/sessions/{id}/turns`,
 `GET /v1/sessions/{id}/events` (SSE), `POST /v1/sessions/{id}/cancel`,
 `GET /v1/sessions`, and `GET /v1/health`.
@@ -1880,17 +1880,17 @@ non-read-only tool call.
 
 | Purpose | Path |
 |---|---|
-| Global config | `~/.config/localharness/config.toml` |
-| Global profiles | `~/.config/localharness/profiles/` |
-| Global skills | `~/.config/localharness/skills/` |
-| Skills lockfile | `~/.config/localharness/skills.lock` |
-| Skills trash | `~/.config/localharness/skills-trash/` |
-| Global workflows | `~/.config/localharness/workflows/` |
-| Global tools | `~/.config/localharness/tools/` |
-| Themes | `~/.config/localharness/themes/` |
-| Data | `~/.local/share/localharness/` |
-| Sessions | `~/.local/share/localharness/sessions/` |
-| Engagements | `~/.local/share/localharness/engagements/` |
+| Global config | `~/.config/totality/config.toml` |
+| Global profiles | `~/.config/totality/profiles/` |
+| Global skills | `~/.config/totality/skills/` |
+| Skills lockfile | `~/.config/totality/skills.lock` |
+| Skills trash | `~/.config/totality/skills-trash/` |
+| Global workflows | `~/.config/totality/workflows/` |
+| Global tools | `~/.config/totality/tools/` |
+| Themes | `~/.config/totality/themes/` |
+| Data | `~/.local/share/totality/` |
+| Sessions | `~/.local/share/totality/sessions/` |
+| Engagements | `~/.local/share/totality/engagements/` |
 | Project config | `<cwd>/.harness/` |
 
 ### 10.2 Precedence
@@ -1904,19 +1904,19 @@ Model resolution is layered:
   stop sequences, and `extra_body`.
 - An explicit `[model] context_window` is used only when the model profile does
   not set one.
-- `--model`, `--endpoint`, and `LH_MODEL`/`LH_ENDPOINT` choose the endpoint and
+- `--model`, `--endpoint`, and `TOT_MODEL`/`TOT_ENDPOINT` choose the endpoint and
   model name; they do not change the model profile unless `--model-profile` is
   passed. `/login` writes `endpoint`, `model`, and `api_key` to the global
   config; a trusted project config still overrides them on the next start.
 
-Environment variables: `LH_ENDPOINT`, `LH_MODEL`, `LH_API_KEY`, `LH_PROFILE`,
-`LH_MODEL_PROFILE`, `LH_THEME`, `LH_NO_SESSION`, `LH_TRUST`, `LH_HOME`
+Environment variables: `TOT_ENDPOINT`, `TOT_MODEL`, `TOT_API_KEY`, `TOT_PROFILE`,
+`TOT_MODEL_PROFILE`, `TOT_THEME`, `TOT_NO_SESSION`, `TOT_TRUST`, `TOT_HOME`
 (the home used for standard skill roots).
 
 ### 10.3 Example config
 
 ```toml
-default_profile = "coding"      # overridden by --profile / LH_PROFILE
+default_profile = "coding"      # overridden by --profile / TOT_PROFILE
 
 [model]
 endpoint = "http://127.0.0.1:8080"
@@ -1980,14 +1980,14 @@ strip_reasoning = true
 ```
 
 `verify.toml` is a project file and needs `--trust`. Steps accepted through
-`lh verify --init` or `/verify accept` are stored per project in
+`tot verify --init` or `/verify accept` are stored per project in
 `verify-steps.json` in the user data directory, so they load without trust.
 
 `AGENTS.md` files between the repository root and the working directory are
 read as untrusted project instructions, nearest last. They are data, not
-executable, and cannot change scope, tools, gates, or the endpoint. `lh context
+executable, and cannot change scope, tools, gates, or the endpoint. `tot context
 --show` reports the chain and its hashes; `[prompt] agents_md = false`,
-`--no-agents-md`, and `LH_AGENTS_MD=0` disable loading.
+`--no-agents-md`, and `TOT_AGENTS_MD=0` disable loading.
 
 ### 10.5 Permissions and secrets
 
@@ -2083,12 +2083,12 @@ src/
     tui/support.rs        endpoint probing, themes, workflows, sessions
     tui/tests.rs          TUI tests, including the screen-drift check
   events.rs               --json / SSE event schema (one exhaustive match)
-  host.rs                 session hosting shared by ACP and lh serve
+  host.rs                 session hosting shared by ACP and tot serve
   acp/
     mod.rs                JSON-RPC loop, capabilities, reverse requests
     session.rs            roots, turns, updates, permission callback
   serve/
-    mod.rs                lh serve: bind policy, token file, accept loop, shutdown
+    mod.rs                tot serve: bind policy, token file, accept loop, shutdown
     api.rs                routes, auth, SSE event log, HTTP permission modes
   skills/                 bundled skills (embedded) plus discovery, validation,
                           install/lockfile, lint, and eval
@@ -2117,7 +2117,7 @@ Dependencies, with reasons:
 - `nix`, `fs2`: process groups and signals, and the advisory session lock.
 - `tracing`, `tracing-subscriber`: diagnostics, written to a log file, never
   telemetry.
-- `hyper`, `hyper-util`, `http-body-util`: the `lh serve` HTTP/1 server; all
+- `hyper`, `hyper-util`, `http-body-util`: the `tot serve` HTTP/1 server; all
   three were already in the lock graph through `reqwest` (only hyper's
   `server` feature is new).
 - `subtle`: constant-time token comparison; already in the graph through
@@ -2230,7 +2230,7 @@ Build:
 - `--print` headless mode.
 - Unit and TUI tests for the above.
 
-Acceptance: a user can point `lh` at a local endpoint, chat, switch themes, see
+Acceptance: a user can point `tot` at a local endpoint, chat, switch themes, see
 the context meter and git branch, open `/tree`, checkout an earlier entry, send
 a new message, and resume the session.
 
@@ -2304,7 +2304,7 @@ a new message, and resume the session.
 These do not block implementation; defaults are specified.
 
 - **Community model matrix.** No models are pinned. The project ships model
-  profiles and a `lh probe` diagnostic. Contributors add profiles as they test
+  profiles and a `tot probe` diagnostic. Contributors add profiles as they test
   engines and models.
 - **Constrained decoding.** Native JSON-schema/GBNF support varies by engine.
   `tool_mode = auto` tries native and falls back to repair. The fallback is

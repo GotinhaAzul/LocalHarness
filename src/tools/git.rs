@@ -290,10 +290,7 @@ pub fn content_tree(cwd: &Path) -> Option<String> {
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_nanos());
-    let index = std::path::PathBuf::from(format!(
-        "{real}.localharness-{}-{nonce}",
-        std::process::id()
-    ));
+    let index = std::path::PathBuf::from(format!("{real}.totality-{}-{nonce}", std::process::id()));
     // Starting from the real index reuses its stat cache; a missing one (a
     // repository without commits) just means a slower first add.
     let _ = std::fs::copy(&real, &index);
@@ -1396,7 +1393,7 @@ fn branch(ctx: &ToolContext, args: &Value) -> ToolResult {
                         ),
                     );
                 }
-                let note = format!("localharness: before switching to {name}");
+                let note = format!("totality: before switching to {name}");
                 let run = git(&ctx.cwd, &["stash", "push", "-m", &note]);
                 if !run.ok {
                     return ToolResult::err("GIT_FAILED", run.error());

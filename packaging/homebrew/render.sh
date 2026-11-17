@@ -1,5 +1,5 @@
 #!/bin/sh
-# Render packaging/homebrew/localharness.rb.in with real release checksums.
+# Render packaging/homebrew/totality.rb.in with real release checksums.
 # The release workflow uses this and attaches the result; a tap maintainer can
 # run it by hand after downloading SHA256SUMS.
 #
@@ -19,7 +19,7 @@ version="${1#v}"
 sums="$2"
 source_sha="$3"
 here="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
-template="${here}/localharness.rb.in"
+template="${here}/totality.rb.in"
 
 [ -f "$sums" ] || {
     printf 'error: %s does not exist\n' "$sums" >&2
@@ -39,8 +39,8 @@ checksum() {
     ' "$sums"
 }
 
-x86_64="$(checksum "lh-v${version}-x86_64-unknown-linux-musl.tar.gz")"
-aarch64="$(checksum "lh-v${version}-aarch64-unknown-linux-musl.tar.gz")"
+x86_64="$(checksum "tot-v${version}-x86_64-unknown-linux-musl.tar.gz")"
+aarch64="$(checksum "tot-v${version}-aarch64-unknown-linux-musl.tar.gz")"
 
 for value in "$x86_64" "$aarch64" "$source_sha"; do
     case "$value" in

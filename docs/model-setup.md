@@ -1,6 +1,6 @@
 # Model setup
 
-LocalHarness speaks the OpenAI chat-completions API. It does not download
+Totality speaks the OpenAI chat-completions API. It does not download
 models or start servers.
 
 ## Login and model selection
@@ -25,8 +25,8 @@ switch lasts for the session; `/login` saves a default. If the endpoint cannot
 list models, `/model` prints the error instead.
 
 If the endpoint does not implement `/v1/models`, set the connection manually in
-`~/.config/localharness/config.toml`, `--endpoint`/`--model`, or `LH_ENDPOINT`/
-`LH_MODEL`.
+`~/.config/totality/config.toml`, `--endpoint`/`--model`, or `TOT_ENDPOINT`/
+`TOT_MODEL`.
 
 ## llama.cpp
 
@@ -48,7 +48,7 @@ the model profile's `context_window`, or the provider rejects long prompts.
 ```sh
 ollama serve
 ollama pull qwen3
-lh --endpoint http://127.0.0.1:11434 --model qwen3
+tot --endpoint http://127.0.0.1:11434 --model qwen3
 ```
 
 `GET /api/show` supplies the model context length. Tool calling needs a recent
@@ -70,7 +70,7 @@ or `PARAMETER num_ctx 32768` in a Modelfile.
 
 ```sh
 vllm serve <model> --enable-auto-tool-choice --tool-call-parser <parser>
-lh --endpoint http://127.0.0.1:8000 --model <model>
+tot --endpoint http://127.0.0.1:8000 --model <model>
 ```
 
 Without both flags the server rejects tool definitions; the harness reports the
@@ -174,7 +174,7 @@ tool_mode = "repair"        # native | repair | auto
   applies one from the model name, `/model <name> <preset>` pins one for the
   session, and `--model-profile <name>` selects one at startup. Only fields
   the engine accepts are sent: `min_p` is omitted for Ollama, DRY/XTC only go
-  to llama.cpp and KoboldCpp, and `lh doctor` warns about each omitted field.
+  to llama.cpp and KoboldCpp, and `tot doctor` warns about each omitted field.
   Set `[model] engine` when a gateway hides the real server.
 - `extra_body` merges server-specific fields into every request, for example
   `chat_template_kwargs`.
@@ -216,7 +216,7 @@ returned as the final answer.
 
 A strict response format is refused together with `tools[]` on engines that do
 not support both (llama.cpp, Ollama, LM Studio, TabbyAPI, MLX, generic). Remove
-the tools for that run or remove the schema. `lh doctor` reports the detected
+the tools for that run or remove the schema. `tot doctor` reports the detected
 `structured_output` dialect (`json_schema`, `grammar`, `none`, or `unknown`).
 
 ## Context and token accounting
@@ -281,11 +281,11 @@ low cache share between compactions means something else is evicting the
 cache: another client on the same llama.cpp slot, or too few `--parallel`
 slots.
 
-## Checking the engine: `lh doctor`
+## Checking the engine: `tot doctor`
 
-`lh doctor` fingerprints the configured engine from metadata endpoints only.
+`tot doctor` fingerprints the configured engine from metadata endpoints only.
 It never sends a chat completion and never loads a model. It prints the
-manifest below; `lh doctor --json` prints the same manifest as stable, pretty
+manifest below; `tot doctor --json` prints the same manifest as stable, pretty
 JSON. Fix lines name the exact server flag to change.
 
 Probes are tried in this order and stop at the first match:
@@ -309,16 +309,16 @@ Selecting a model (or switching models) sends one tiny, forced tool call with a
 one-field schema and classifies the result as `native_ok`, `prose_fallback`,
 `rejected_400`, `tools_dropped`, or `empty_call`. A known-good result is cached
 per `(API base, model, build)` and skipped next time; a failed classification is
-retried on the next start because server flags change. `lh doctor` only reads
+retried on the next start because server flags change. `tot doctor` only reads
 the cached result and never sends a chat completion itself.
 
 Anything other than `native_ok` switches the effective mode to `repair` and
 records a warning; the system prompt then names the `<tool_call>` JSON block
 the repair layer executes. A server that rejects tool definitions
 (`rejected_400`) also stops receiving them, so the next request is not rejected
-the same way. The chosen mode appears as `tool_probe` in `lh doctor`, as a
+the same way. The chosen mode appears as `tool_probe` in `tot doctor`, as a
 `tool-probe` custom entry in the session, and as `tools:native`/`tools:repair`
-in the TUI header. Set `LH_SKIP_TOOL_PROBE=1` to skip the probe (diagnostics and
+in the TUI header. Set `TOT_SKIP_TOOL_PROBE=1` to skip the probe (diagnostics and
 scripted tests).
 
 ### Manifest fields
@@ -341,7 +341,7 @@ scripted tests).
 | `probes_ok` | Metadata probes that answered. |
 | `probes_failed` | Metadata probes that failed or did not identify an engine. |
 | `warnings` | Context mismatch, Ollama default, unknown tool support, unrecognized engine. |
-| `fixes` | Exact commands or config changes; `lh doctor --fix` prints them after the manifest. When the configured window is larger than the server's effective window, the first line names the flag that raises the server limit. |
+| `fixes` | Exact commands or config changes; `tot doctor --fix` prints them after the manifest. When the configured window is larger than the server's effective window, the first line names the flag that raises the server limit. |
 
 ### `--json` schema
 
@@ -421,4 +421,4 @@ the server reported nothing; the harness falls back to the configured
 - **"repetition guard"**: the model fell into an exact loop and was stopped
   early. Apply a sampler preset (`qwen-coding`, `gemma-chat`, `glm-agent`),
   lower `temperature`, or set `min_p`/`repeat_penalty`/DRY values in the model
-  profile. `lh doctor` reports fields the engine omits.
+  profile. `tot doctor` reports fields the engine omits.

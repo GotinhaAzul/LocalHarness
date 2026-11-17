@@ -44,7 +44,7 @@ pub struct PromptPrefix {
 /// deterministic, so the same profile and model produce the same hash.
 pub fn prompt_prefix(system: &str, tools_json: &str) -> PromptPrefix {
     let mut hasher = Sha256::new();
-    hasher.update(b"localharness-prompt-prefix-v1\0");
+    hasher.update(b"totality-prompt-prefix-v1\0");
     hasher.update(system.as_bytes());
     hasher.update(b"\0tools\0");
     hasher.update(tools_json.as_bytes());
@@ -275,7 +275,7 @@ fn fold_system_messages(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
 
 /// User turn placed after the system message when the conversation would
 /// otherwise open with an assistant or tool message.
-pub const COMPACTED_CONTINUE: &str = "[localharness] Earlier context was compacted into the system message above. Continue the task from there and from the messages that follow.";
+pub const COMPACTED_CONTINUE: &str = "[totality] Earlier context was compacted into the system message above. Continue the task from there and from the messages that follow.";
 
 /// Open the conversation with a user turn. A compaction in the middle of a
 /// long agentic turn keeps a tail that starts at an assistant entry (or no
@@ -545,7 +545,7 @@ pub fn state_block(
     findings: Option<&FindingSummary>,
     used_percent: f32,
 ) -> String {
-    let mut out = String::from("[localharness] state\n");
+    let mut out = String::from("[totality] state\n");
     let mut changed: Vec<String> = Vec::new();
     let mut verify: Option<(bool, usize)> = None;
     for entry in session.branch_entries() {
@@ -904,7 +904,7 @@ mod tests {
             .unwrap();
         session
             .append(EntryKind::Compaction(CompactionData {
-                summary: "[localharness] summary".into(),
+                summary: "[totality] summary".into(),
                 tokens_before: 100,
                 reason: "auto".into(),
                 thread_id: None,
@@ -920,7 +920,7 @@ mod tests {
         let budget = TokenBudget::new(32768, 4096);
         let assembled = assemble("system", &session, Some("STATE"), &budget);
         // The state block rides on the last message, not the system head.
-        assert_leading_system(&assembled.messages, "system\n\n[localharness] summary");
+        assert_leading_system(&assembled.messages, "system\n\n[totality] summary");
         assert_eq!(assembled.messages.len(), 2); // system, user
         assert!(matches!(
             &assembled.messages[1],
@@ -934,7 +934,7 @@ mod tests {
         let mut session = session(dir.path());
         session
             .append(EntryKind::Compaction(CompactionData {
-                summary: "[localharness] summary".into(),
+                summary: "[totality] summary".into(),
                 tokens_before: 100,
                 reason: "auto".into(),
                 thread_id: None,
@@ -971,7 +971,7 @@ mod tests {
             .unwrap();
         session
             .append(EntryKind::Compaction(CompactionData {
-                summary: "[localharness] summary".into(),
+                summary: "[totality] summary".into(),
                 tokens_before: 100,
                 reason: "auto".into(),
                 thread_id: None,
@@ -1012,7 +1012,7 @@ mod tests {
             .unwrap();
         let budget = TokenBudget::new(32768, 4096);
         let assembled = assemble("system", &session, Some("STATE"), &budget);
-        assert_leading_system(&assembled.messages, "system\n\n[localharness] summary");
+        assert_leading_system(&assembled.messages, "system\n\n[totality] summary");
         assert!(matches!(
             assembled.messages.last(),
             Some(ChatMessage::User { content, .. }) if content == "next\n\nSTATE"
@@ -1111,7 +1111,7 @@ mod tests {
         let assistants = agentic_turn(&mut session, 6);
         session
             .append(EntryKind::Compaction(CompactionData {
-                summary: "[localharness] summary".into(),
+                summary: "[totality] summary".into(),
                 tokens_before: 100,
                 reason: "auto".into(),
                 thread_id: None,
@@ -1153,7 +1153,7 @@ mod tests {
         agentic_turn(&mut session, 3);
         session
             .append(EntryKind::Compaction(CompactionData {
-                summary: "[localharness] summary".into(),
+                summary: "[totality] summary".into(),
                 tokens_before: 100,
                 reason: "thread_split".into(),
                 thread_id: None,

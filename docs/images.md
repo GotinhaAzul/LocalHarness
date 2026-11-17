@@ -1,7 +1,7 @@
 # Images
 
 Screenshots carry layout and colour that words lose: "this button is
-misaligned", "match this design", "the error is in this dialog". LocalHarness
+misaligned", "match this design", "the error is in this dialog". Totality
 accepts PNG, JPEG, and WebP images in two ways:
 
 - **`@shot.png` in a prompt** attaches the image to your message.
@@ -20,7 +20,7 @@ private-network endpoints by default.
 | Text only, no `[vision] model` | The image is refused with a message naming both fixes. |
 
 A model has vision input when its model profile says `vision = true`. When the
-profile does not say, LocalHarness asks the server: llama.cpp reports
+profile does not say, Totality asks the server: llama.cpp reports
 `modalities.vision` in `/props` when it was started with a vision projector
 (`--mmproj`). Gateways that do not expose `/props` need the profile setting.
 

@@ -25,7 +25,7 @@ pub struct Config {
     pub lsp: LspConfig,
     /// Commit and pull-request approval for the `git` and `pr` tools.
     pub git: GitConfig,
-    /// Profile used when neither `--profile` nor `LH_PROFILE` is set.
+    /// Profile used when neither `--profile` nor `TOT_PROFILE` is set.
     pub default_profile: String,
     #[serde(rename = "profile")]
     pub profiles: BTreeMap<String, ProfileConfig>,
@@ -373,47 +373,47 @@ impl Config {
         Ok(cfg)
     }
 
-    /// Environment overrides. `LH_ENDPOINT`, `LH_MODEL`, `LH_API_KEY`,
-    /// `LH_PROFILE`, `LH_MODEL_PROFILE`, `LH_THEME`, and `LH_AGENTS_MD` are
+    /// Environment overrides. `TOT_ENDPOINT`, `TOT_MODEL`, `TOT_API_KEY`,
+    /// `TOT_PROFILE`, `TOT_MODEL_PROFILE`, `TOT_THEME`, and `TOT_AGENTS_MD` are
     /// read.
     pub fn apply_env(&mut self) {
-        if let Ok(v) = std::env::var("LH_ENDPOINT")
+        if let Ok(v) = crate::paths::env_var("ENDPOINT")
             && !v.trim().is_empty()
         {
             self.model.endpoint = v;
         }
-        if let Ok(v) = std::env::var("LH_MODEL") {
+        if let Ok(v) = crate::paths::env_var("MODEL") {
             self.model.model = v;
         }
-        if let Ok(v) = std::env::var("LH_API_KEY") {
+        if let Ok(v) = crate::paths::env_var("API_KEY") {
             self.model.api_key = v;
         }
-        if let Ok(v) = std::env::var("LH_PROFILE")
+        if let Ok(v) = crate::paths::env_var("PROFILE")
             && !v.trim().is_empty()
         {
             self.profile_name = v;
         }
-        if let Ok(v) = std::env::var("LH_MODEL_PROFILE")
+        if let Ok(v) = crate::paths::env_var("MODEL_PROFILE")
             && !v.trim().is_empty()
         {
             self.model_profile_override = Some(v);
         }
-        if let Ok(v) = std::env::var("LH_THEME")
+        if let Ok(v) = crate::paths::env_var("THEME")
             && !v.trim().is_empty()
         {
             self.ui.theme = v;
         }
-        if let Ok(value) = std::env::var("LH_AGENTS_MD") {
+        if let Ok(value) = crate::paths::env_var("AGENTS_MD") {
             match value.trim().to_ascii_lowercase().as_str() {
                 "0" | "false" | "off" | "no" => self.prompt.agents_md = false,
                 "1" | "true" | "on" | "yes" => self.prompt.agents_md = true,
                 _ => {}
             }
         }
-        if std::env::var("LH_NO_SESSION").is_ok() {
+        if crate::paths::env_var("NO_SESSION").is_ok() {
             self.session.no_session = true;
         }
-        if std::env::var("LH_TRUST").is_ok() {
+        if crate::paths::env_var("TRUST").is_ok() {
             self.trust = true;
         }
     }
@@ -446,7 +446,7 @@ impl Config {
         Ok(())
     }
 
-    /// The active profile name: CLI/`LH_PROFILE`, then `default_profile`, then
+    /// The active profile name: CLI/`TOT_PROFILE`, then `default_profile`, then
     /// the built-in `coding`.
     pub fn profile_name(&self) -> &str {
         if !self.profile_name.is_empty() {
@@ -635,7 +635,7 @@ pub struct ModelConfig {
     pub start_command: String,
     /// `None` means "not explicitly configured".
     pub context_window: Option<u32>,
-    /// Engine fingerprint: `auto` (empty) or a name from `lh doctor`
+    /// Engine fingerprint: `auto` (empty) or a name from `tot doctor`
     /// (`llama.cpp`, `vllm`, `sglang`, `ollama`, `lmstudio`, `koboldcpp`,
     /// `tabbyapi`, `mlx`, `generic`). Pinning it skips the metadata probes and
     /// decides sampler and structured-output wire formats behind a gateway.
@@ -1057,7 +1057,7 @@ pub struct PromptConfig {
     /// Extra instructions file, resolved like a profile prompt.
     pub file: PathBuf,
     /// Load the hierarchical `AGENTS.md` chain into the system prompt.
-    /// `--no-agents-md` and `LH_AGENTS_MD=0` disable it.
+    /// `--no-agents-md` and `TOT_AGENTS_MD=0` disable it.
     pub agents_md: bool,
 }
 
@@ -1259,7 +1259,7 @@ pub struct ModelProfile {
     pub extra_body: Option<toml::Value>,
     /// Sampler values for this model. Each `Some` value overrides the global
     /// `[model]` field; fields unsupported by the detected engine are omitted
-    /// and reported by `lh doctor`.
+    /// and reported by `tot doctor`.
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
     pub min_p: Option<f32>,

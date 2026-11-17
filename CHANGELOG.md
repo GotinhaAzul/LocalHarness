@@ -104,6 +104,13 @@ release may change defaults when the change is called out below.
 
 ### Changed
 
+- **Renamed to Totality.** The binary is `tot` (installers also add a
+  `totality` link), the crate is `totality`, and environment variables use
+  the `TOT_` prefix. The `LH_` names still work. Config and data move to
+  `~/.config/totality` and `~/.local/share/totality`; the old `localharness`
+  directories are used until the new ones exist, so sessions and settings
+  carry over. Older sessions' harness messages are still recognized. The
+  installer still installs pre-0.3 releases (`lh`) when pinned.
 - **Default theme:** `default` is now the warm dusk palette (`totality`); the
   previous default is available as `classic`.
 - Tool rows label calls by their main argument (`Read src/cli.rs · first 130

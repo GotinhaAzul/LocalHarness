@@ -1,4 +1,4 @@
-//! Secret redaction for what LocalHarness writes to disk or sends off the
+//! Secret redaction for what Totality writes to disk or sends off the
 //! machine on the user's behalf.
 //!
 //! Session files, archived artifacts, evidence, findings evidence, exported
@@ -515,7 +515,7 @@ mod tests {
     const GCP_KEY: &str = "AIza0123456789abcdefghijklmnopqrstuvwxy";
 
     fn redactor() -> Redactor {
-        Redactor::with_env_values(&[("LH_TEST_TOKEN", "env-secret-value-123")])
+        Redactor::with_env_values(&[("TOT_TEST_TOKEN", "env-secret-value-123")])
     }
 
     #[test]
@@ -726,7 +726,7 @@ mod tests {
 
     #[test]
     fn short_values_do_not_leak_a_prefix() {
-        let redactor = Redactor::with_env_values(&[("LH_PASSWORD", "abcdefgh")]);
+        let redactor = Redactor::with_env_values(&[("TOT_PASSWORD", "abcdefgh")]);
         let redacted = redactor.redact_owned("abcdefgh");
         assert!(redacted.starts_with("[REDACTED:env:..."), "{redacted}");
     }

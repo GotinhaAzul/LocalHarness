@@ -17,7 +17,16 @@ pub const TAIL_MAX_PERCENT: usize = 20;
 /// Prefix of every message the harness writes into the user role (gate
 /// continuations, output-recovery nudges). Such a message is never the
 /// user's instruction.
-pub const HARNESS_PREFIX: &str = "[localharness]";
+pub const HARNESS_PREFIX: &str = "[totality]";
+/// The prefix harness messages carried before 0.3, still found in older
+/// sessions.
+pub const LEGACY_HARNESS_PREFIX: &str = "[localharness]";
+
+/// Whether a user-role message was written by the harness, not the user.
+pub fn is_harness_message(content: &str) -> bool {
+    let content = content.trim_start();
+    content.starts_with(HARNESS_PREFIX) || content.starts_with(LEGACY_HARNESS_PREFIX)
+}
 
 /// Window-derived summary limits: a third of the usable prompt characters,
 /// clamped, plus the hard 40% ceiling.
@@ -196,7 +205,7 @@ pub fn build_summary_keeping(
                    instruction_chars: usize,
                    minimal: bool| {
         let mut out = String::new();
-        out.push_str("[localharness] deterministic compaction\n\n");
+        out.push_str("[totality] deterministic compaction\n\n");
         out.push_str(&format!("## Active thread T1 - {title}\n"));
         if !objective.is_empty() {
             out.push_str(&format!("objective: {objective}\n"));
@@ -413,9 +422,7 @@ fn verify_status(branch: &[&Entry]) -> Option<(bool, usize)> {
 /// nudges are stored in the user role but are not instructions.
 fn user_instructions<'a>(branch: &'a [&'a Entry]) -> impl DoubleEndedIterator<Item = &'a str> {
     branch.iter().filter_map(|entry| match &entry.kind {
-        EntryKind::User(user) if !user.content.trim_start().starts_with(HARNESS_PREFIX) => {
-            Some(user.content.as_str())
-        }
+        EntryKind::User(user) if !is_harness_message(&user.content) => Some(user.content.as_str()),
         _ => None,
     })
 }
@@ -682,7 +689,7 @@ mod tests {
         step(&mut session, "call_1", "cargo test", "ok");
         user(
             &mut session,
-            "[localharness] verify gate: files changed after the last passing verification.",
+            "[totality] verify gate: files changed after the last passing verification.",
         );
         let summary = build_summary(&session, None, 4000);
         assert!(

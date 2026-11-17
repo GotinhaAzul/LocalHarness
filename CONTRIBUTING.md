@@ -1,6 +1,6 @@
 # Contributing
 
-The backlog is public and mostly claimed: [issue #45](https://github.com/GotinhaAzul/LocalHarness/issues/45)
+The backlog is public and mostly claimed: [issue #45](https://github.com/GotinhaAzul/Totality/issues/45)
 maps it, and most issues name the area and the intended shape of the fix. Read
 it before starting something new.
 
@@ -8,8 +8,8 @@ it before starting something new.
 
 ## Before you write code
 
-1. Search [issues](https://github.com/GotinhaAzul/LocalHarness/issues) and
-   [discussions](https://github.com/GotinhaAzul/LocalHarness/discussions). If the
+1. Search [issues](https://github.com/GotinhaAzul/Totality/issues) and
+   [discussions](https://github.com/GotinhaAzul/Totality/discussions). If the
    item exists, say so on it and ask whether it is taken.
 2. For anything larger than a typo, open an issue or comment on the existing one
    and get a yes before the PR. An unsolicited 2,000-line PR against a moving
@@ -24,10 +24,10 @@ Rust 1.88 or newer. Linux x86_64 or aarch64; the harness is not supported on
 macOS or Windows.
 
 ```sh
-git clone https://github.com/GotinhaAzul/LocalHarness
-cd LocalHarness
+git clone https://github.com/GotinhaAzul/Totality
+cd Totality
 cargo build --release
-./target/release/lh --help
+./target/release/tot --help
 ```
 
 Build what the users install:
@@ -36,7 +36,7 @@ Build what the users install:
 cargo install --path . --locked
 ```
 
-The binary is `lh`; the crate is `localharness`. You do not need a model server
+The binary is `tot`; the crate is `totality`. You do not need a model server
 to develop or to run the test suite.
 
 ## Checks

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Minimal MCP stdio server for LocalHarness integration tests.
+"""Minimal MCP stdio server for Totality integration tests.
 
 Tools: echo, fail (isError result), slow (sleeps), crash (exits), env (reads
 MCP_TEST_VALUE). tools/list is split over two pages to exercise cursors. A

@@ -1,16 +1,16 @@
 [package]
-name = "localharness"
+name = "totality"
 version = "0.2.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 description = "Local-first agent harness for coding and security work"
-repository = "https://github.com/GotinhaAzul/LocalHarness"
+repository = "https://github.com/GotinhaAzul/Totality"
 keywords = ["agent", "llm", "tui", "security"]
 categories = ["command-line-utilities", "development-tools"]
 
 [[bin]]
-name = "lh"
+name = "tot"
 path = "src/main.rs"
 
 [dependencies]
@@ -45,7 +45,7 @@ fs2 = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
-# `lh serve`: HTTP/1 server pieces already in the lock graph through reqwest.
+# `tot serve`: HTTP/1 server pieces already in the lock graph through reqwest.
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"

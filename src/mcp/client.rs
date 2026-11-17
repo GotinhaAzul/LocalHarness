@@ -129,7 +129,7 @@ impl McpClient {
                     "protocolVersion": PROTOCOL_VERSION,
                     "capabilities": {},
                     "clientInfo": {
-                        "name": "localharness",
+                        "name": "totality",
                         "version": env!("CARGO_PKG_VERSION"),
                     },
                 }),

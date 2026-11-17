@@ -886,7 +886,7 @@ async fn run_loop(
                 match verdict {
                     TruncationVerdict::Confirmed(signal) => Some(signal),
                     TruncationVerdict::UsageUnreliable(message) => {
-                        // `lh doctor` reports what the session observed.
+                        // `tot doctor` reports what the session observed.
                         let key =
                             crate::provider::probe::tool_probe_key(core.provider.as_ref(), None);
                         if let Err(error) = crate::doctor::store_usage_mismatch(
@@ -1061,7 +1061,7 @@ async fn run_loop(
                 if !facts.todo_plan_present && gate_tools.todo {
                     if progress.can_continue_settle() {
                         progress.settle_continuations += 1;
-                        let message = "[localharness] plan mode: record your proposal now with the todo tool, action \"plan\", one task per step you propose. Nothing may change until the user runs /plan approve.";
+                        let message = "[totality] plan mode: record your proposal now with the todo tool, action \"plan\", one task per step you propose. Nothing may change until the user runs /plan approve.";
                         if let Err(err) = append_user(&core.session, message) {
                             return TurnOutcome::error("session_write", err.to_string());
                         }
@@ -1222,7 +1222,7 @@ async fn run_loop(
         }
         if invalid_tool_calls >= 2 && !one_call_reminded {
             one_call_reminded = true;
-            let reminder = "[localharness] one_call: one JSON object, one tool per assistant message. Extra calls were rejected and did not run; send a single tool call now.";
+            let reminder = "[totality] one_call: one JSON object, one tool per assistant message. Extra calls were rejected and did not run; send a single tool call now.";
             if let Err(err) = append_user(&core.session, reminder) {
                 return TurnOutcome::error("session_write", err.to_string());
             }
@@ -1236,7 +1236,7 @@ async fn run_loop(
                 message: message.clone(),
             });
             // A run the loop guard stopped did not finish its task. Reporting
-            // it as done would exit 0 from `lh -p` and mark a workflow step
+            // it as done would exit 0 from `tot -p` and mark a workflow step
             // succeeded; it is the same outcome as the stall guard.
             return TurnOutcome::ok(TurnStatus::Stalled);
         }
@@ -1546,7 +1546,7 @@ fn judge_truncation(
     if reported < MIN_PLAUSIBLE_TRUNCATED_PROMPT {
         check.unreliable = true;
         return TruncationVerdict::UsageUnreliable(format!(
-            "the server reported {reported} prompt tokens for a prompt the harness estimates at {estimated_tokens}. No engine truncates to that, so the usage report is unreliable; the reply was kept and usage is no longer used to calibrate the estimate on this endpoint. `lh doctor` compares the report with the tokenizer."
+            "the server reported {reported} prompt tokens for a prompt the harness estimates at {estimated_tokens}. No engine truncates to that, so the usage report is unreliable; the reply was kept and usage is no longer used to calibrate the estimate on this endpoint. `tot doctor` compares the report with the tokenizer."
         ));
     }
     if signal.kind == SignalKind::Ratio {
@@ -1557,7 +1557,7 @@ fn judge_truncation(
         return TruncationVerdict::Confirmed(signal);
     }
     TruncationVerdict::Suspected(format!(
-        "the server counted {reported} prompt tokens for a prompt the harness estimates at {estimated_tokens}. Either the server truncated the prompt (raise the engine context) or its usage report is unreliable; run `lh doctor` to compare it with the tokenizer. The turn continues; a second shortfall in a row ends it."
+        "the server counted {reported} prompt tokens for a prompt the harness estimates at {estimated_tokens}. Either the server truncated the prompt (raise the engine context) or its usage report is unreliable; run `tot doctor` to compare it with the tokenizer. The turn continues; a second shortfall in a row ends it."
     ))
 }
 
@@ -1673,7 +1673,7 @@ fn recover_output(
         assistant.tool_calls = None;
         out.degenerate = true;
         out.notice = Some("repetition guard: the model started looping; generation stopped".into());
-        out.nudge = Some("[localharness] repetition guard: your output began repeating itself and was stopped. Do not restate it. Take one concrete next step: a single tool call, or a short final answer.".into());
+        out.nudge = Some("[totality] repetition guard: your output began repeating itself and was stopped. Do not restate it. Take one concrete next step: a single tool call, or a short final answer.".into());
         return out;
     }
 
@@ -1726,7 +1726,7 @@ fn recover_output(
                 schema.name
             ));
             out.nudge = Some(format!(
-                "[localharness] structured output rejected: {error}. Reply with exactly one JSON document that matches the schema {}. No prose and no Markdown fence.",
+                "[totality] structured output rejected: {error}. Reply with exactly one JSON document that matches the schema {}. No prose and no Markdown fence.",
                 serde_json::to_string(&schema.schema).unwrap_or_default()
             ));
             return out;
@@ -1744,9 +1744,9 @@ fn recover_output(
         let limit = format!(" ({} tokens)", core.config.model.max_output_tokens);
         if calls.is_empty() {
             out.nudge = Some(if content_empty {
-                "[localharness] output limit: you used the whole output budget thinking. Stop deliberating and act now: make one tool call or give a concise answer.".to_string()
+                "[totality] output limit: you used the whole output budget thinking. Stop deliberating and act now: make one tool call or give a concise answer.".to_string()
             } else {
-                "[localharness] output limit: your response was cut off by the output token limit. Continue exactly where it stopped, without repeating what you already wrote.".to_string()
+                "[totality] output limit: your response was cut off by the output token limit. Continue exactly where it stopped, without repeating what you already wrote.".to_string()
             });
         }
         if out.nudge.is_some() {
@@ -1755,7 +1755,7 @@ fn recover_output(
             ));
         }
     } else if calls.is_empty() && content_empty {
-        out.nudge = Some("[localharness] empty response: you returned no text and no tool call (reasoning alone is not an answer). Make the next tool call, or give your final answer outside the reasoning block.".into());
+        out.nudge = Some("[totality] empty response: you returned no text and no tool call (reasoning alone is not an answer). Make the next tool call, or give your final answer outside the reasoning block.".into());
     }
     out
 }
@@ -2268,7 +2268,7 @@ async fn auto_settle(
         parts.insert(0, clean.join(", "));
     }
     Some(format!(
-        "[localharness] settle checks: {}\n\nFix what failed, then finish; the checks run again when you do.",
+        "[totality] settle checks: {}\n\nFix what failed, then finish; the checks run again when you do.",
         parts.join("\n\n")
     ))
 }
@@ -2418,7 +2418,7 @@ async fn run_settle_check(
         name: name.to_string(),
         is_error: result.is_error,
         duration_ms: started.elapsed().as_millis() as u64,
-        preview: preview(tool_body(&result.content), 300),
+        preview: preview_block(tool_body(&result.content)),
         artifact: capped.artifact,
     });
     Some(SettleCheck { result, executed })
@@ -3269,7 +3269,7 @@ async fn execute_batch(
             name: call.name.clone(),
             is_error: tool_result.is_error,
             duration_ms,
-            preview: preview(tool_body(&tool_result.content), 300),
+            preview: preview_block(tool_body(&tool_result.content)),
             artifact: capped.artifact,
         });
 
@@ -3631,7 +3631,7 @@ async fn finish_review(
             name: call.call.name.clone(),
             is_error: tool_result.is_error,
             duration_ms: call.started.elapsed().as_millis() as u64,
-            preview: preview(tool_body(&tool_result.content), 300),
+            preview: preview_block(tool_body(&tool_result.content)),
             artifact: capped.artifact,
         });
     }
@@ -3675,7 +3675,9 @@ fn summarize_args(args: &Value) -> String {
             None => preview(name, 80),
         };
     }
-    for key in ["path", "command", "pattern", "action", "artifact", "text"] {
+    for key in [
+        "path", "command", "pattern", "action", "step", "artifact", "text",
+    ] {
         if let Some(value) = args.get(key).and_then(|v| v.as_str()) {
             return preview(value, 80);
         }
@@ -3690,6 +3692,26 @@ fn tool_body(content: &str) -> &str {
     } else {
         content
     }
+}
+
+/// A tool result's preview for the UI: line breaks kept (a diff or test
+/// output is unreadable flattened), at most 40 lines and 2000 characters.
+fn preview_block(text: &str) -> String {
+    let mut out = String::new();
+    for (index, line) in text.lines().enumerate() {
+        if index == 40 {
+            out.push('…');
+            break;
+        }
+        if index > 0 {
+            out.push('\n');
+        }
+        out.push_str(line.trim_end());
+    }
+    if out.chars().count() > 2000 {
+        out = out.chars().take(1999).collect::<String>() + "…";
+    }
+    out
 }
 
 fn preview(text: &str, max: usize) -> String {
@@ -4102,7 +4124,7 @@ fn record_evidence(
     let mut state = core
         .security
         .lock()
-        .map_err(|_| "security state is poisoned; restart lh".to_string())?;
+        .map_err(|_| "security state is poisoned; restart tot".to_string())?;
     let scope = state.scope.clone();
     let Some(engagement) = state.engagement.as_mut() else {
         return Ok(());

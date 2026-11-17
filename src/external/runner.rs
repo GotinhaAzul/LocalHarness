@@ -358,7 +358,7 @@ mod tests {
     async fn missing_program_is_a_spawn_error() {
         let error = run(
             call(
-                "/nonexistent/localharness-test-binary",
+                "/nonexistent/totality-test-binary",
                 vec![],
                 Duration::from_secs(5),
             ),

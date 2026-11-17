@@ -117,6 +117,15 @@ impl TurnFacts {
     pub fn multi_step(&self) -> bool {
         self.mutations >= 2 || self.files.len() >= 2
     }
+
+    /// The settle-time todo gate: multi-step work without a plan. Work whose
+    /// every change already passed verification is finished, so asking for a
+    /// plan after the fact would only reopen it.
+    pub fn needs_plan(&self) -> bool {
+        self.multi_step()
+            && !self.todo_plan_present
+            && !(self.last_verify_passed == Some(true) && !self.unverified_mutations)
+    }
 }
 
 /// Facts for the current turn, using the last user entry as the boundary.
@@ -276,7 +285,7 @@ pub fn auto_checks(facts: &TurnFacts, progress: &RunProgress, tools: GateTools) 
         verify: false,
         review: false,
     };
-    if tools.todo && facts.multi_step() && !facts.todo_plan_present {
+    if tools.todo && facts.needs_plan() {
         return none;
     }
     let verify = tools.verify
@@ -291,13 +300,13 @@ pub fn auto_checks(facts: &TurnFacts, progress: &RunProgress, tools: GateTools) 
 
 /// Decide whether the turn settles or continues with a gate instruction.
 pub fn settle(facts: &TurnFacts, progress: &mut RunProgress, tools: GateTools) -> SettleDecision {
-    if tools.todo && facts.multi_step() && !facts.todo_plan_present {
+    if tools.todo && facts.needs_plan() {
         if progress.can_continue_settle() {
             progress.settle_continuations += 1;
             return SettleDecision::Continue {
                 kind: SettleKind::Todo,
                 message: format!(
-                    "[localharness] todo gate: this run changed {} file(s) across {} mutation(s) but has no plan. Call the todo tool with action \"plan\" and the remaining tasks before continuing. Do not make more edits until the plan exists.",
+                    "[totality] todo gate: this run changed {} file(s) across {} mutation(s) but has no plan. Call the todo tool with action \"plan\" and the remaining tasks before continuing. Do not make more edits until the plan exists.",
                     facts.files.len(),
                     facts.mutations
                 ),
@@ -320,7 +329,7 @@ pub fn settle(facts: &TurnFacts, progress: &mut RunProgress, tools: GateTools) -
             progress.settle_continuations += 1;
             return SettleDecision::Continue {
                 kind: SettleKind::Verify,
-                message: "[localharness] verify gate: files changed after the last passing verification. Run the verify tool now and fix any failure before settling.".into(),
+                message: "[totality] verify gate: files changed after the last passing verification. Run the verify tool now and fix any failure before settling.".into(),
             };
         }
         tracing::warn!(
@@ -332,7 +341,7 @@ pub fn settle(facts: &TurnFacts, progress: &mut RunProgress, tools: GateTools) -
         progress.review_nudged = true;
         return SettleDecision::Continue {
             kind: SettleKind::Review,
-            message: "[localharness] review nudge: changes are in the working tree. Call the review tool once, address any real risk it reports, then finish.".into(),
+            message: "[totality] review nudge: changes are in the working tree. Call the review tool once, address any real risk it reports, then finish.".into(),
         };
     }
 
@@ -372,7 +381,7 @@ pub fn todo_gate_notice(
     if plan_present || !(mutations >= 2 || files >= 2) {
         return None;
     }
-    Some("[localharness] the next edit needs a plan: call todo action=\"plan\" first.")
+    Some("[totality] the next edit needs a plan: call todo action=\"plan\" first.")
 }
 
 #[cfg(test)]
@@ -380,6 +389,26 @@ mod tests {
     use super::*;
     use crate::config::BudgetConfig;
     use crate::session::*;
+
+    #[test]
+    fn verified_work_is_not_reopened_for_a_plan() {
+        let mut facts = TurnFacts {
+            mutations: 2,
+            files: vec!["src/lib.rs".into()],
+            verify_configured: true,
+            ..TurnFacts::default()
+        };
+        // Unverified multi-step work still needs a plan.
+        facts.unverified_mutations = true;
+        assert!(facts.needs_plan());
+        // A failing verification does too.
+        facts.unverified_mutations = false;
+        facts.last_verify_passed = Some(false);
+        assert!(facts.needs_plan());
+        // Every change verified and passing: done, no plan demanded.
+        facts.last_verify_passed = Some(true);
+        assert!(!facts.needs_plan());
+    }
 
     #[test]
     fn loop_guard_trips_on_fourth_consecutive_repeat() {

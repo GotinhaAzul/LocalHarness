@@ -165,9 +165,9 @@ fn acquire(lock: &File, path: &Path, lock_path: &Path) -> Result<(), StoreError>
             }
             let holder = holder.trim().to_string();
             let holder = if holder.is_empty() {
-                "another localharness process".to_string()
+                "another totality process".to_string()
             } else {
-                format!("localharness ({holder})")
+                format!("totality ({holder})")
             };
             Err(StoreError::Busy {
                 path: path.to_path_buf(),

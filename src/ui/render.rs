@@ -614,6 +614,25 @@ pub fn blocks_from_session_after(session: &Session, floor_seq: u64) -> Vec<Block
             continue;
         }
         match &entry.kind {
+            // A gate or guard instruction is the harness speaking, not the
+            // user: it shows as a harness note inside the running turn.
+            EntryKind::User(data) if crate::context::compact::is_harness_message(&data.content) => {
+                let text = data.content.trim_start();
+                let text = text
+                    .strip_prefix(crate::context::compact::HARNESS_PREFIX)
+                    .or_else(|| text.strip_prefix(crate::context::compact::LEGACY_HARNESS_PREFIX))
+                    .unwrap_or(text)
+                    .trim();
+                let (title, body) = text.split_once(": ").unwrap_or(("harness", text));
+                blocks.push(Block {
+                    kind: BlockKind::Note {
+                        title: title.to_string(),
+                        body: body.to_string(),
+                        is_error: false,
+                    },
+                    ts: Some(entry.ts),
+                });
+            }
             EntryKind::User(data) => {
                 if let Some(done) = recap.take() {
                     done.push_into(&mut blocks);
@@ -1145,10 +1164,11 @@ fn render_block(
             body,
             is_error,
         } => {
+            // Notes are the harness speaking: Hati's color.
             let (glyph, role) = if *is_error {
                 ("✗ ", Role::Error)
             } else {
-                ("• ", Role::Accent)
+                ("◑ ", Role::Moon)
             };
             let mut content = vec![Line::styled(title.clone(), theme.bold(role))];
             content.extend(plain_lines(body, inner, theme.style(Role::Fg)));
@@ -2311,6 +2331,49 @@ mod tests {
         );
         let expanded = joined(&render_block(&block, 80, &theme, opts));
         assert!(expanded.contains("· [out-1]"), "{expanded}");
+    }
+
+    #[test]
+    fn harness_instructions_replay_as_notes_not_user_turns() {
+        use crate::session::entry::{EntryKind, UserData};
+        let dir = tempfile::tempdir().unwrap();
+        let mut paths = crate::paths::Paths::discover(dir.path()).unwrap();
+        paths.data_dir = dir.path().join("data");
+        paths.config_dir = dir.path().join("config");
+        let header = crate::session::entry::SessionData {
+            cwd: "/tmp".into(),
+            endpoint: "http://127.0.0.1:8080".into(),
+            model: "test".into(),
+            profile: "coding".into(),
+            app: crate::session::APP_VERSION.into(),
+            redact: true,
+            context: None,
+            permissions: None,
+        };
+        let mut session = crate::session::Session::create(&paths, header, true).unwrap();
+        for content in [
+            "fix it",
+            "[totality] verify gate: files changed after the last passing verification.",
+            "[localharness] review nudge: changes are in the working tree.",
+        ] {
+            session
+                .append(EntryKind::User(UserData {
+                    attachments: Vec::new(),
+                    content: content.into(),
+                }))
+                .unwrap();
+        }
+        let blocks = blocks_from_session(&session);
+        let users = blocks
+            .iter()
+            .filter(|block| matches!(block.kind, BlockKind::User(_)))
+            .count();
+        assert_eq!(users, 1);
+        let theme = Theme::bundled("default");
+        let text = joined(&blocks_to_lines(&blocks, 80, &theme, false));
+        assert!(text.contains("◑ verify gate"), "{text}");
+        assert!(text.contains("◑ review nudge"), "{text}");
+        assert!(!text.contains("[totality]"), "{text}");
     }
 
     #[test]

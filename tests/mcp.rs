@@ -1,5 +1,5 @@
 //! MCP client end to end: a real stdio server process (Python fixture), a
-//! Streamable HTTP server (axum), profile selection, and the `lh mcp` CLI.
+//! Streamable HTTP server (axum), profile selection, and the `tot mcp` CLI.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -10,11 +10,11 @@ use axum::Router;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
-use localharness::config::{Config, McpServerConfig};
-use localharness::mcp::{McpClient, McpError, McpManager};
-use localharness::{Paths, ToolRegistry};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
+use totality::config::{Config, McpServerConfig};
+use totality::mcp::{McpClient, McpError, McpManager};
+use totality::{Paths, ToolRegistry};
 
 fn fixture() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mcp_stdio_server.py")
@@ -279,14 +279,15 @@ async fn streamable_http_session_headers_json_and_sse() {
     let (url, fake) = http_server().await;
     let dir = tempfile::tempdir().unwrap();
     // SAFETY: tests in this binary do not read this variable concurrently.
-    unsafe { std::env::set_var("LH_TEST_MCP_TOKEN", "s3cret") };
+    unsafe { std::env::set_var("TOT_TEST_MCP_TOKEN", "s3cret") };
     let mut config = McpServerConfig {
         url,
         ..Default::default()
     };
-    config
-        .headers
-        .insert("Authorization".into(), "Bearer ${LH_TEST_MCP_TOKEN}".into());
+    config.headers.insert(
+        "Authorization".into(),
+        "Bearer ${TOT_TEST_MCP_TOKEN}".into(),
+    );
     let client = McpClient::new("docs", config, dir.path());
 
     let info = client.connect().await.expect("handshake");
@@ -434,7 +435,7 @@ async fn servers_attach_to_profiles_and_failures_are_warnings() {
     );
 
     // Unset `profiles`: every profile gets the server's tools.
-    let (tools, warnings) = localharness::app::select_tools(&registry, &config, &paths, &manager)
+    let (tools, warnings) = totality::app::select_tools(&registry, &config, &paths, &manager)
         .await
         .unwrap();
     let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
@@ -469,7 +470,7 @@ async fn servers_attach_to_profiles_and_failures_are_warnings() {
     // `profiles = []`: only attached when the profile names it.
     config.mcp.get_mut("fx").unwrap().profiles = Some(vec![]);
     config.mcp.get_mut("broken").unwrap().enabled = false;
-    let (tools, _) = localharness::app::select_tools(&registry, &config, &paths, &manager)
+    let (tools, _) = totality::app::select_tools(&registry, &config, &paths, &manager)
         .await
         .unwrap();
     assert!(!tools.iter().any(|t| t.name().starts_with("fx__")));
@@ -480,7 +481,7 @@ async fn servers_attach_to_profiles_and_failures_are_warnings() {
         .unwrap()
         .tools
         .push("fx__echo".into());
-    let (tools, _) = localharness::app::select_tools(&registry, &config, &paths, &manager)
+    let (tools, _) = totality::app::select_tools(&registry, &config, &paths, &manager)
         .await
         .unwrap();
     let mcp_tools: Vec<&str> = tools
@@ -496,7 +497,7 @@ async fn servers_attach_to_profiles_and_failures_are_warnings() {
         .unwrap()
         .tools
         .push("mcp:fx".into());
-    let (tools, _) = localharness::app::select_tools(&registry, &config, &paths, &manager)
+    let (tools, _) = totality::app::select_tools(&registry, &config, &paths, &manager)
         .await
         .unwrap();
     assert_eq!(
@@ -513,7 +514,7 @@ async fn servers_attach_to_profiles_and_failures_are_warnings() {
         .unwrap()
         .tools
         .push("mcp:nosuch".into());
-    let error = localharness::app::select_tools(&registry, &config, &paths, &manager)
+    let error = totality::app::select_tools(&registry, &config, &paths, &manager)
         .await
         .err()
         .unwrap()
@@ -549,14 +550,14 @@ fn config_rejects_ambiguous_servers() {
 #[test]
 fn cli_refuses_a_disabled_server_before_connecting() {
     let home = tempfile::tempdir().unwrap();
-    let config_dir = home.path().join("config/localharness");
+    let config_dir = home.path().join("config/totality");
     std::fs::create_dir_all(&config_dir).unwrap();
     std::fs::write(
         config_dir.join("config.toml"),
         "[mcp.off]\ncommand = \"/nonexistent/mcp-server\"\nenabled = false\n",
     )
     .unwrap();
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_lh"))
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_tot"))
         .args(["mcp", "call", "off", "echo", "{}"])
         .env("XDG_CONFIG_HOME", home.path().join("config"))
         .env("XDG_DATA_HOME", home.path().join("data"))
@@ -579,7 +580,7 @@ fn cli_lists_and_calls_tools() {
         return;
     }
     let home = tempfile::tempdir().unwrap();
-    let config_dir = home.path().join("config/localharness");
+    let config_dir = home.path().join("config/totality");
     std::fs::create_dir_all(&config_dir).unwrap();
     std::fs::write(
         config_dir.join("config.toml"),
@@ -590,7 +591,7 @@ fn cli_lists_and_calls_tools() {
     )
     .unwrap();
     let run = |args: &[&str]| {
-        std::process::Command::new(env!("CARGO_BIN_EXE_lh"))
+        std::process::Command::new(env!("CARGO_BIN_EXE_tot"))
             .args(args)
             .env("XDG_CONFIG_HOME", home.path().join("config"))
             .env("XDG_DATA_HOME", home.path().join("data"))

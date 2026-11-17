@@ -226,7 +226,7 @@ impl LspService {
             .unwrap_or_else(|| "workspace".to_string());
         let initialize = json!({
             "processId": Value::Null,
-            "clientInfo": {"name": "localharness", "version": env!("CARGO_PKG_VERSION")},
+            "clientInfo": {"name": "totality", "version": env!("CARGO_PKG_VERSION")},
             "rootUri": file_url(root),
             "workspaceFolders": [{"uri": file_url(root), "name": folder_name}],
             "capabilities": {
@@ -2083,7 +2083,7 @@ while true; do
     *'"method":"textDocument/didOpen"'*|*'"method":"textDocument/didChange"'*)
       uri=""
       [[ "$body" =~ \"uri\":\"([^\"]+)\" ]] && uri="${BASH_REMATCH[1]}"
-      if [[ "$body" == *LH_BAD* ]]; then
+      if [[ "$body" == *TOT_BAD* ]]; then
         send "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":\"$uri\",\"diagnostics\":[{\"range\":{\"start\":{\"line\":0,\"character\":0}},\"severity\":1,\"code\":\"E0308\",\"message\":\"mismatched types\"}]}}"
       else
         send "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":\"$uri\",\"diagnostics\":[]}}"
@@ -2151,7 +2151,7 @@ done
         let result = crate::tools::edit::EditTool
             .call(
                 &ctx,
-                json!({"path": "src/lib.rs", "old": "1", "new": "LH_BAD"}),
+                json!({"path": "src/lib.rs", "old": "1", "new": "TOT_BAD"}),
             )
             .await;
         assert!(!result.is_error, "{}", result.content);
@@ -2166,7 +2166,7 @@ done
             result.content
         );
         assert!(
-            std::fs::read_to_string(&file).unwrap().contains("LH_BAD"),
+            std::fs::read_to_string(&file).unwrap().contains("TOT_BAD"),
             "warn must keep the change"
         );
     }
@@ -2191,7 +2191,7 @@ done
         let result = crate::tools::edit::EditTool
             .call(
                 &ctx,
-                json!({"path": "src/lib.rs", "old": "1", "new": "LH_BAD"}),
+                json!({"path": "src/lib.rs", "old": "1", "new": "TOT_BAD"}),
             )
             .await;
         assert!(result.is_error, "{}", result.content);
@@ -2243,7 +2243,7 @@ done
         let result = crate::tools::edit::EditTool
             .call(
                 &ctx,
-                json!({"path": "app.py", "old": "1", "new": "\"LH_BAD\""}),
+                json!({"path": "app.py", "old": "1", "new": "\"TOT_BAD\""}),
             )
             .await;
         assert!(result.is_error, "{}", result.content);
@@ -2285,7 +2285,7 @@ done
                         "op": "PUT",
                         "line": 1,
                         "hash": line_hash("pub fn value() -> u32 { 1 }"),
-                        "text": "pub fn value() -> u32 { LH_BAD }"
+                        "text": "pub fn value() -> u32 { TOT_BAD }"
                     }]
                 }),
             )
@@ -2342,7 +2342,7 @@ done
         rust_project(dir.path());
         std::fs::write(
             dir.path().join("src/lib.rs"),
-            "pub fn value() -> u32 { LH_BAD }\n",
+            "pub fn value() -> u32 { TOT_BAD }\n",
         )
         .expect("source");
         let mut ctx = crate::tools::write::test_context(dir.path());
@@ -2385,7 +2385,7 @@ done
         let result = crate::tools::write::WriteTool
             .call(
                 &ctx,
-                json!({"path": "src/cold.rs", "content": "pub fn bad() -> u32 { LH_BAD }\n"}),
+                json!({"path": "src/cold.rs", "content": "pub fn bad() -> u32 { TOT_BAD }\n"}),
             )
             .await;
         assert!(!result.is_error, "{}", result.content);
@@ -2412,14 +2412,14 @@ done
         let result = crate::tools::edit::EditTool
             .call(
                 &ctx,
-                json!({"path": "loose.rs", "old": "1", "new": "LH_BAD"}),
+                json!({"path": "loose.rs", "old": "1", "new": "TOT_BAD"}),
             )
             .await;
         assert!(!result.is_error, "{}", result.content);
         assert!(
             std::fs::read_to_string(loose.path().join("loose.rs"))
                 .unwrap()
-                .contains("LH_BAD")
+                .contains("TOT_BAD")
         );
     }
 

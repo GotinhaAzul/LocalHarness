@@ -49,14 +49,14 @@ Lowest to highest:
 | Bundled | compiled into the binary | always |
 | Claude global | `~/.claude/skills/<name>/SKILL.md` | user-owned |
 | Agents global | `~/.agents/skills/<name>/SKILL.md` | user-owned |
-| Native global | `~/.config/localharness/skills/<name>/SKILL.md` | user-owned |
+| Native global | `~/.config/totality/skills/<name>/SKILL.md` | user-owned |
 | Claude project | `.claude/skills/<name>/SKILL.md` | `--trust` |
 | Agents project | `.agents/skills/<name>/SKILL.md` | `--trust` |
 | Native project | `.harness/skills/<name>/SKILL.md` | `--trust` |
 
 Native directories beat the ecosystem directories at the same level, and a
 project skill beats a global one. Resolution is deterministic; every collision
-is recorded as a shadow and `lh skill lint --all` reports it. An intentional
+is recorded as a shadow and `tot skill lint --all` reports it. An intentional
 override sets `shadow: true` in the winning skill's frontmatter, which turns the
 duplicate-name error into an explicit warning. Project `.claude/skills` and
 `.agents/skills` are untrusted repository content and load only with `--trust`,
@@ -123,10 +123,10 @@ an approval channel (ACP) asks; one without it refuses with
 ### Linting and trigger eval
 
 ```sh
-lh skill lint rust-review            # one skill
-lh skill lint                        # global and trusted project skills
-lh skill lint --all                  # bundled, global, and trusted project
-lh skill lint --all --json
+tot skill lint rust-review            # one skill
+tot skill lint                        # global and trusted project skills
+tot skill lint --all                  # bundled, global, and trusted project
+tot skill lint --all --json
 ```
 
 The linter and the loader share one validator. Errors: a name outside the spec,
@@ -136,11 +136,11 @@ frontmatter field that claims a grant, and a duplicate name without
 `shadow: true`. Warnings: a body over 300 lines, more than ten references, a
 missing description, an absolute home path, a secret-shaped string, and a name
 that does not match its directory. Exit status is 1 when there is any error;
-CI runs `lh skill lint --all` on the bundled skills with no model.
+CI runs `tot skill lint --all` on the bundled skills with no model.
 
 ```sh
-lh skill eval --fixtures ./skill-fixtures
-lh skill eval --fixtures ./skill-fixtures --json
+tot skill eval --fixtures ./skill-fixtures
+tot skill eval --fixtures ./skill-fixtures --json
 ```
 
 A fixture is one `.toml` (or `.json`) file:
@@ -165,14 +165,14 @@ exits 1.
 ### Installing skills
 
 ```sh
-lh skill add ./skills/deploy                  # local directory
-lh skill add https://example.com/skills.git#main
-lh skill update                               # every locked skill
-lh skill update deploy --force                # discard local edits, keep a backup
-lh skill update --frozen                      # verify pins, change nothing
-lh skill remove deploy
-lh skill list --json
-lh skill list --frozen
+tot skill add ./skills/deploy                  # local directory
+tot skill add https://example.com/skills.git#main
+tot skill update                               # every locked skill
+tot skill update deploy --force                # discard local edits, keep a backup
+tot skill update --frozen                      # verify pins, change nothing
+tot skill remove deploy
+tot skill list --json
+tot skill list --frozen
 ```
 
 `add` accepts a local directory or a git URL with an optional `#ref` (branch,
@@ -181,8 +181,8 @@ The skill is validated before install: frontmatter, body, references, and size.
 The description and file list are printed, and bundled scripts are copied but
 never executed.
 
-Installed copies live in `~/.config/localharness/skills/<name>/`.
-`~/.config/localharness/skills.lock` records the source, requested ref, resolved
+Installed copies live in `~/.config/totality/skills/<name>/`.
+`~/.config/totality/skills.lock` records the source, requested ref, resolved
 commit, install time, and a SHA-256 for every installed file:
 
 ```toml
@@ -209,9 +209,9 @@ the CI/reproducible-setup mode.
 `update` re-reads the source (the git ref resolves again) and refuses when the
 installed copy has local edits, naming the changed files. `--force` replaces it
 anyway. `add --force`, `update --force`, and `remove` move the old copy to
-`~/.config/localharness/skills-trash/<timestamp>-<name>/` and never delete it.
+`~/.config/totality/skills-trash/<timestamp>-<name>/` and never delete it.
 Removing the last copy leaves the session able to start; the name is simply
-missing from `/skill` and `lh skill list`.
+missing from `/skill` and `tot skill list`.
 
 ### Bundled coding skill pack
 
@@ -253,7 +253,7 @@ tools = ["read", "grep", "glob", "bash", "bg", "finding", "iocs"]
 
 Paths:
 
-- Global: `~/.config/localharness/workflows/<name>.toml`
+- Global: `~/.config/totality/workflows/<name>.toml`
 - Project: `.harness/workflows/<name>.toml` (requires trust)
 - Bundled: compiled into the binary
 
@@ -303,7 +303,7 @@ and leave the session unchanged.
 
 ### Deterministic steps
 
-A workflow can also declare steps. `lh workflow run <name>` executes them in
+A workflow can also declare steps. `tot workflow run <name>` executes them in
 order; `/workflow` refuses a step workflow and points at the command, because
 the TUI owns one turn at a time.
 
@@ -341,11 +341,11 @@ evaluator. An approval step takes a `message` only; `prompt`, `require`, and
 
 A workflow's `tools` list narrows the tool set; it never widens the
 permission policy. `[permissions]` deny rules and plan mode still apply to
-every listed tool, and `lh workflow run` cannot answer a permission prompt, so
+every listed tool, and `tot workflow run` cannot answer a permission prompt, so
 calls that would ask are denied unless the run passes `--mode accept-edits`,
 has matching allow rules, or uses `--yolo`.
 
-`lh workflow run` loads and validates the workflow's `skills` and prepends
+`tot workflow run` loads and validates the workflow's `skills` and prepends
 their instructions to the first prompt step. The TUI does the same by adding
 labeled user entries when it starts the workflow.
 
@@ -393,7 +393,7 @@ symlinks.
 `0600` permissions in a `0700` directory. Every step transition is written
 atomically. Each record carries a hash of the step definition: a step whose
 prompt, condition, requirement, retry, or artifacts changed is rerun instead of
-being skipped by id. `lh workflow run <name> --resume` skips unchanged steps
+being skipped by id. `tot workflow run <name> --resume` skips unchanged steps
 already completed or skipped and starts at the first step that is pending or
 failed; it also reopens the recorded session so the model keeps its context.
 If that session file is gone, the run warns and starts a new session. `--json`
@@ -427,7 +427,7 @@ src/workflows/bundled/prompts/security-red.md
 
 The TOML files are ordinary installable workflows: `prompt` is a path relative
 to the TOML, and copying the TOML plus its prompt directory into
-`~/.config/localharness/workflows/` (or `.harness/workflows/`) installs it.
+`~/.config/totality/workflows/` (or `.harness/workflows/`) installs it.
 Editing the installed copy does not change the compiled-in workflow unless you
 rebuild with an updated source file. Workflow tests check that every TOML
 parses, every prompt exists and is nonempty, and every skill and tool name
