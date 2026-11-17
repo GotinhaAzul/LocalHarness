@@ -24,7 +24,11 @@
 </p>
 
 <p align="center">
-  <img src="docs/assets/demo.gif" alt="Totality fixing a failing test: it reads the file, edits it, and the verify gate passes" width="900">
+  <img src="docs/assets/demo-short.gif" alt="Totality in a terminal: a local model edits a file and the verify gate passes" width="900">
+</p>
+
+<p align="center">
+  <a href="docs/assets/demo.mp4">Watch the full 60-second demo</a>
 </p>
 
 ---
