@@ -44,6 +44,7 @@ impl App {
             "commit" => self.command_commit(rest).await,
             "pr" => self.command_pr(rest).await,
             "plan" => self.command_plan(rest).await,
+            "permissions" => self.command_permissions(rest).await,
             "tools" => self.command_tools(),
             "mcp" => self.command_mcp(),
             "skill" => self.command_skill(rest),
@@ -508,6 +509,112 @@ impl App {
             }
         }
         self.set_notice(notice, Role::Success);
+    }
+
+    /// `/permissions`: pick or set what runs without asking. Levels are
+    /// `normal`, `accept-edits`, `deny-all`, and `yolo`; plan mode keeps its
+    /// own command.
+    pub(super) async fn command_permissions(&mut self, rest: &str) {
+        use crate::policy::PermissionMode;
+
+        let argument = rest.trim();
+        if argument.is_empty() {
+            let Some(core) = self.core().cloned() else {
+                return;
+            };
+            let current = core.permissions.mode();
+            let items = PermissionMode::LEVELS
+                .iter()
+                .map(|mode| PickItem::run("permissions", mode.label(), mode.description()))
+                .collect();
+            let picker = PickerModal::new(
+                "permissions",
+                "Permissions · what runs without asking",
+                items,
+                current.label(),
+            );
+            self.open_picker(picker, "no permission levels");
+            return;
+        }
+        let Some(mode) = PermissionMode::parse(argument) else {
+            self.set_notice(
+                "permissions: normal, accept-edits, deny-all, or yolo",
+                Role::Error,
+            );
+            return;
+        };
+        if mode == PermissionMode::Plan {
+            self.set_notice("plan mode has its own command: /plan", Role::Muted);
+            return;
+        }
+        let already = self
+            .core()
+            .is_some_and(|core| core.permissions.mode() == mode);
+        if mode == PermissionMode::Yolo && !already {
+            self.pending_mode_confirm = Some(PermissionMode::Yolo);
+            self.set_notice(
+                "yolo allows every call without asking (deny rules still apply): press y to confirm, any other key cancels",
+                Role::Warning,
+            );
+            return;
+        }
+        self.set_permission_mode(mode).await;
+    }
+
+    /// Switch the session's permission level. The config file is never
+    /// touched, and `yolo` is recorded in the session like `--yolo`.
+    pub(super) async fn set_permission_mode(&mut self, mode: crate::policy::PermissionMode) {
+        let Some(core) = self.core().cloned() else {
+            return;
+        };
+        let permissions = core.permissions.clone();
+        let previous = permissions.mode();
+        if previous == mode {
+            self.set_notice(
+                format!("permissions: {} (unchanged)", mode.label()),
+                Role::Muted,
+            );
+            return;
+        }
+        let left_plan = previous == crate::policy::PermissionMode::Plan;
+        let plan_fallback = if left_plan {
+            permissions.leave_plan()
+        } else {
+            None
+        };
+        permissions.set_mode(mode);
+        if left_plan {
+            // Plan mode filtered the tool set at rebuild; bring it back.
+            if let Err(error) = self.rebuild_core_with(self.config.clone()).await {
+                permissions.set_mode(plan_fallback.unwrap_or_default());
+                permissions.enter_plan();
+                self.set_notice(format!("/permissions failed: {error}"), Role::Error);
+                return;
+            }
+        }
+        if let Ok(mut session) = core.session.lock() {
+            let entry = crate::session::CustomData::new("permission-mode")
+                .with("mode", mode.label())
+                .with("source", "/permissions");
+            if let Err(error) = session.append(EntryKind::Custom(entry)) {
+                tracing::warn!(%error, "cannot record the permission-mode change");
+            }
+        }
+        if mode == crate::policy::PermissionMode::Yolo {
+            self.transcript.push_note(
+                "session warning",
+                "yolo: every tool call runs without asking; only deny rules still apply",
+                false,
+            );
+        }
+        self.set_notice(
+            format!("permissions: {} — {}", mode.label(), mode.description()),
+            if mode == crate::policy::PermissionMode::Yolo {
+                Role::Warning
+            } else {
+                Role::Success
+            },
+        );
     }
 
     pub(super) async fn rebuild_core_with(&mut self, config: Config) -> Result<()> {

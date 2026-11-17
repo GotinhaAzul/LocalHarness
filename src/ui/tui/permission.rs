@@ -114,20 +114,46 @@ impl App {
         true
     }
 
+    /// Keys while a `yolo` switch waits for confirmation: `y` enables it,
+    /// any other key cancels so a stray keystroke cannot remove approvals.
+    pub(super) async fn handle_mode_confirm(&mut self, key: &KeyEvent) -> bool {
+        let Some(mode) = self.pending_mode_confirm.take() else {
+            return false;
+        };
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => self.set_permission_mode(mode).await,
+            _ => self.set_notice("yolo not enabled; permissions unchanged", Role::Muted),
+        }
+        true
+    }
+
     /// Footer status: an open question first, then a non-default mode.
     pub(super) fn permission_status(&self) -> Option<(String, Role)> {
         if self.pending_ask.is_some() {
             return Some(("permission: y allow · n deny".into(), Role::Warning));
         }
+        if self.pending_mode_confirm.is_some() {
+            return Some((
+                "yolo: press y to confirm · any key cancels".into(),
+                Role::Warning,
+            ));
+        }
         let mode = self.core()?.permissions.mode();
         match mode {
+            // `normal` is the default, so it adds nothing to the footer.
             PermissionMode::Ask => None,
             PermissionMode::Plan => Some((
                 "plan mode · /plan approve to apply · /plan exit to discard".into(),
                 Role::Warning,
             )),
+            PermissionMode::AcceptEdits => {
+                Some(("accept-edits: edits run, commands ask".into(), Role::Muted))
+            }
+            PermissionMode::DenyAll => Some((
+                "deny-all: anything that would ask is denied".into(),
+                Role::Warning,
+            )),
             PermissionMode::Yolo => Some(("yolo: no approvals".into(), Role::Error)),
-            other => Some((format!("mode: {}", other.label()), Role::Muted)),
         }
     }
 }

@@ -138,7 +138,7 @@ pub struct SessionData {
 /// The permission policy a session started under.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionPermissions {
-    /// `ask`, `accept-edits`, `plan`, `dont-ask`, or `yolo`.
+    /// `normal`, `accept-edits`, `plan`, `deny-all`, or `yolo`.
     pub mode: String,
     /// First 16 hex digits of SHA-256 over the rules as JSON.
     pub rules_hash: String,

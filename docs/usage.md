@@ -137,25 +137,26 @@ The terminal interface is the default. It speaks in two voices: the model in Sko
 | `Tab` / `Shift+Tab` | complete commands, arguments, and paths; move back through choices |
 | Review: `a` / `r` / `e` | accept, reject, or edit the selected hunk (`A`/`R` all, `Enter` apply, `Esc` reject all) |
 
-Tab completes the token at the cursor: commands, arguments (themes, profiles, skills, workflows, session ids, models, `/login` endpoints, `/help` topics, `/sec` subcommands), and file paths. Ambiguous matches first extend to their shared prefix, then open a picker. Every command that chooses from a list — `/model`, `/profile`, `/theme` (with live preview), `/skill`, `/workflow`, `/sec`, `/resume` — opens a filterable menu when run without an argument: type to filter, arrows to move, Enter to pick. Model and profile switches load in the background, so the TUI stays responsive while the server swaps models.
+Tab completes the token at the cursor: commands, arguments (themes, profiles, skills, workflows, session ids, models, `/login` endpoints, `/help` topics, `/sec` subcommands), and file paths. Ambiguous matches first extend to their shared prefix, then open a picker. Every command that chooses from a list — `/model`, `/profile`, `/theme` (with live preview), `/permissions`, `/skill`, `/workflow`, `/sec`, `/resume` — opens a filterable menu when run without an argument: type to filter, arrows to move, Enter to pick. Model and profile switches load in the background, so the TUI stays responsive while the server swaps models.
 
 Write `@path` in a prompt to attach a file: `fix the panic in @src/parser.rs`. Typing `@` opens a live picker over the project's files (gitignored files excluded): it matches names fuzzily, shows each file's folder, and ranks paths under a typed directory first; Tab or Enter inserts the path. The file is read through the same path as the `read` tool and appended to your message, so the model can edit it without another read. Up to eight files per prompt, within a quarter of the usable context. `@shot.png` attaches a screenshot: a model with vision input sees the image, and a text-only model can get a description from a local vision model; the `read` tool opens images too. Images are checked by content, stripped of EXIF, and sent only to local endpoints unless you opt in. See [images.md](images.md).
 
-Slash commands: `/help /quit /login /model /profile /theme /tree /rewind /fork /new /resume /sessions /compact /tools /mcp /skill /workflow /sec /trust /commit /pr /plan /export /clear /debug`.
+Slash commands: `/help /quit /login /model /profile /theme /tree /rewind /fork /new /resume /sessions /compact /tools /mcp /skill /workflow /sec /trust /commit /pr /plan /permissions /export /clear /debug`.
 
-Every tool call passes a permission policy first. The default mode `ask` runs read-only calls and asks before edits and commands, showing the exact command or path and a diff; `y` approves exactly that call for the session. `/plan` switches to plan mode: mutating tools are removed and refused at dispatch until `/plan approve`. Modes, rules, and `--yolo` are in [configuration.md](configuration.md#permissions).
+Every tool call passes a permission policy first. The default level `normal` runs read-only calls and asks before edits and commands, showing the exact command or path and a diff; `y` approves exactly that call for the session. `/permissions` opens a picker with one line per level — `normal`, `accept-edits` (edits run, commands ask), `deny-all` (anything that would ask is denied), and `yolo` (no approvals; deny rules still apply) — and `/permissions <level>` sets one directly. The footer spells out a non-default level (`deny-all: anything that would ask is denied`), `yolo` needs a one-key confirmation and is never written to the config, and `/plan` keeps its own command: mutating tools are removed and refused at dispatch until `/plan approve`. Modes, rules, and `--yolo` are in [configuration.md](configuration.md#permissions).
 
 ### Headless
 
 ```sh
 tot --mode accept-edits --print "Fix the failing parser test"
+tot --mode deny-all --print "Summarize this repo"   # never prompts; would-ask calls are denied
 tot --print "Summarize this repo" --json
 tot --plan --print "Plan the parser refactor"   # read-only; prints the plan
 tot --continue                  # most recent session
 tot --resume 20261107-201500-1234
 ```
 
-`--print` streams text to stdout, diagnostics to stderr, and exits with the turn status: `0` done, `1` error/blocked, `2` budget/stalled, `130` cancelled. `--json` emits newline-delimited events for scripts and CI. A headless run cannot answer a permission prompt, so calls that would ask are denied: pass `--mode accept-edits`, add allow rules, or use `--yolo` (explicit, recorded in the session).
+`--print` streams text to stdout, diagnostics to stderr, and exits with the turn status: `0` done, `1` error/blocked, `2` budget/stalled, `130` cancelled. `--json` emits newline-delimited events for scripts and CI. A headless run cannot answer a permission prompt, so calls that would ask are denied: pass `--mode accept-edits` or `--mode deny-all`, add allow rules, or use `--yolo` (explicit, recorded in the session).
 
 ### Local HTTP API
 

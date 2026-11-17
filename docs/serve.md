@@ -90,7 +90,7 @@ capped at 1 MiB.
   `tot serve` was started in. File tools are jailed to it, as in ACP. Project
   trust (`--trust`) and `verify.toml` apply only when `cwd` is the server's own
   directory. Another root never inherits that trust.
-- `permission_mode`: see [Permissions](#permissions). Defaults to `ask`.
+- `permission_mode`: see [Permissions](#permissions). Defaults to `normal`.
 - `resume`: a stored session id under that root. The session store reopens
   it, the same way `tot --resume` does. A session already live in this server
   returns `409 session_already_loaded`.
@@ -158,16 +158,16 @@ matches. A deny rule always wins. The mode never widens a harness gate
 
 | `permission_mode` | Runs | Denied |
 | --- | --- | --- |
-| `ask` (default) | built-in read-only tools (`read`, `grep`, `glob`, `repo_map`, `recall`, `review`, `lsp`, `skill`, `todo`, `thread`), plus any call an allow rule names | everything else |
+| `normal` (default; alias `ask`) | built-in read-only tools (`read`, `grep`, `glob`, `repo_map`, `recall`, `review`, `lsp`, `skill`, `todo`, `thread`), plus any call an allow rule names | everything else |
 | `accept-edits` | the above plus `write`, `edit`, `patch`, `undo` | `bash`, `bg`, `verify`, `test`, MCP and external tools |
-| `dont-ask` | same as `ask` over HTTP | same as `ask` |
+| `deny-all` (alias `dont-ask`) | same as `normal` over HTTP | same as `normal` |
 | `yolo` | every call the harness gates allow; needs `tot serve --allow-yolo` | nothing beyond the gates |
 
 A denied call does not run. The model receives a `DENIED` tool result that
 names the mode, rule, or next action, and the turn continues. MCP and external
 tools always count as needing approval, even when their manifest claims to be
 read-only. Add an allow rule under `[permissions]` to run a specific command or
-path in `ask` or `dont-ask` mode.
+path in `normal` or `deny-all` mode.
 
 **Why not an approval endpoint?** `tot serve` is built for unattended callers.
 A round trip that parks a turn until a second client approves it would need its

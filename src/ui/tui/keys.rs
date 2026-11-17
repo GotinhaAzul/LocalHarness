@@ -63,6 +63,10 @@ impl App {
             return;
         }
 
+        if self.handle_mode_confirm(&key).await {
+            return;
+        }
+
         if self.handle_permission_key(&key) {
             return;
         }

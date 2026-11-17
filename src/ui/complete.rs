@@ -160,6 +160,7 @@ pub fn takes_args(command: &str) -> bool {
             | "commit"
             | "pr"
             | "plan"
+            | "permissions"
             | "export"
     )
 }
@@ -466,6 +467,12 @@ fn complete_argument(
             Candidate::new("approve", "leave plan mode and restore the previous tools"),
             Candidate::new("exit", "leave plan mode and discard the plan"),
         ],
+        ("permissions", []) => vec![
+            Candidate::new("normal", "read-only runs; edits and commands ask"),
+            Candidate::new("accept-edits", "edits run, commands ask"),
+            Candidate::new("deny-all", "anything that would ask is denied"),
+            Candidate::new("yolo", "no approvals; deny rules still apply"),
+        ],
         ("pr", []) => vec![
             Candidate::new("confirm", "carry out the pending pull request action"),
             Candidate::new("cancel", "drop the pending pull request action"),
@@ -626,6 +633,7 @@ mod tests {
         ("trust", "show trust state"),
         ("sec", "security"),
         ("export", "export"),
+        ("permissions", "permission levels"),
     ];
 
     fn sources(cwd: &Path) -> Sources {
@@ -686,6 +694,15 @@ mod tests {
 
         let completion = complete("/resume 2026", COMMANDS, &src, false).unwrap();
         assert_eq!(completion.candidates[0].description, "fix the parser");
+
+        // `/permissions` completes its four levels.
+        let completion = complete("/permissions d", COMMANDS, &src, false).unwrap();
+        assert_eq!(values(&completion), vec!["deny-all"]);
+        let completion = complete("/permissions ", COMMANDS, &src, false).unwrap();
+        assert_eq!(
+            values(&completion),
+            vec!["normal", "accept-edits", "deny-all", "yolo"]
+        );
     }
 
     #[test]

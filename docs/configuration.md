@@ -93,7 +93,7 @@ pr = "ask"                      # ask: /pr confirm approves drafts and comments
 subject_max = 72                # longest accepted commit subject
 
 [permissions]
-mode = "ask"                    # ask | accept-edits | plan | dont-ask (yolo: --yolo only)
+mode = "normal"                 # normal | accept-edits | plan | deny-all (yolo: --yolo only)
 
 [[permissions.rules]]           # ordered; see "Permissions" below
 id = "no-push"
@@ -383,13 +383,13 @@ hash patches pass through the LSP gate below.
 ## Git approval
 
 The `git` tool's `commit` and the `pr` tool's `draft` and `comment` change
-history or publish. With the default `ask`, the tool records a preview in the
+history or publish. With the default `normal`, the tool records a preview in the
 session and stops; the user reviews it in the TUI and approves with
 `/commit confirm` or `/pr confirm` (`/commit edit <message>` replaces the
 message; `\n` starts a new line; `cancel` drops either). A commit is made only
 while the staged diff still matches the preview. `allow` runs the action at
 once and suits unattended runs; headless `--print` has no way to approve, so
-`ask` leaves the preview unapplied there.
+`normal` leaves the preview unapplied there.
 
 ## Permissions
 
@@ -405,14 +405,26 @@ bookkeeping (`todo`, `thread`, `finding`) always run.
 
 | Mode | File edits (`write`, `edit`, `patch`, `undo`) | Commands, network, MCP/external tools |
 |---|---|---|
-| `ask` (default) | ask | ask |
+| `normal` (default; alias `ask`) | ask | ask |
 | `accept-edits` | run | ask |
 | `plan` | refused (`plan_mode`) | refused unless read-only |
-| `dont-ask` | denied | denied |
+| `deny-all` (alias `dont-ask`) | denied | denied |
 | `yolo` | run | run |
 
-`yolo` is never the default and cannot be set in a config file; only `--yolo`
-selects it, and the session records it. Deny rules still apply in every mode.
+`ask` and `dont-ask` are the old spellings of `normal` and `deny-all`; they
+still load from a config file and still work on `--mode`, but new files should
+use the new names.
+
+In the TUI, `/permissions` opens a picker over the four levels (`normal`,
+`accept-edits`, `deny-all`, `yolo`) with the current one marked, and
+`/permissions <level>` sets one directly. The change lasts for the session and
+never edits the config file. `yolo` asks for a one-key confirmation, and the
+session records it just like `--yolo`. Plan mode keeps its own command,
+`/plan`.
+
+`yolo` is never the default and cannot be set in a config file; `--yolo` or
+`/permissions yolo` selects it for one session, and the session records it.
+Deny rules still apply in every mode.
 
 **Rules** are an ordered list. Every field a rule sets must match:
 
@@ -588,7 +600,7 @@ Steps run sequentially without a shell and stop at the first failure.
 `--no-redact`, `--no-agents-md`, `--continue`, `--resume`, `--path-jail`,
 `--sandbox [read-only|workspace-write]`, `--no-sandbox`, `--engagement`,
 `--no-color`, `--keep-artifacts`, `--clean-artifacts`, `--allow-remote-images`,
-`--keep-exif`, `--debug`, `--mode <ask|accept-edits|plan|dont-ask>`, `--yolo`,
+`--keep-exif`, `--debug`, `--mode <normal|accept-edits|plan|deny-all>`, `--yolo`,
 `--plan`.
 
 `tot doctor [--json] [--fix]` prints the engine capability manifest without

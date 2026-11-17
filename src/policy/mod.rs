@@ -24,42 +24,84 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 /// How calls that no rule matches are decided.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "kebab-case")]
+///
+/// The names are the ones users see: `normal`, `accept-edits`, `plan`,
+/// `deny-all`, and `yolo`. Older spellings (`ask`, `dont-ask`) still parse so
+/// existing config files keep working.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PermissionMode {
     /// Read-only calls run; edits, commands, and network calls ask.
     #[default]
     Ask,
-    /// Like `ask`, but file edits (write, edit, patch, undo) run unasked.
+    /// Like `normal`, but file edits (write, edit, patch, undo) run unasked.
     AcceptEdits,
     /// Investigate and propose only: every mutating call is refused.
     Plan,
-    /// Never ask: a call that would ask is denied instead.
-    DontAsk,
+    /// Deny anything that would ask; never prompt.
+    DenyAll,
     /// Run everything a deny rule does not block. Only `--yolo` selects it.
     Yolo,
 }
 
 impl PermissionMode {
+    /// The levels `/permissions` offers, in order. Plan keeps its own command.
+    pub const LEVELS: [PermissionMode; 4] = [
+        PermissionMode::Ask,
+        PermissionMode::AcceptEdits,
+        PermissionMode::DenyAll,
+        PermissionMode::Yolo,
+    ];
+
+    /// The user-facing name, also the canonical config and CLI spelling.
     pub fn label(self) -> &'static str {
         match self {
-            PermissionMode::Ask => "ask",
+            PermissionMode::Ask => "normal",
             PermissionMode::AcceptEdits => "accept-edits",
             PermissionMode::Plan => "plan",
-            PermissionMode::DontAsk => "dont-ask",
+            PermissionMode::DenyAll => "deny-all",
             PermissionMode::Yolo => "yolo",
         }
     }
 
+    /// One line for pickers and the footer: what this level actually does.
+    pub fn description(self) -> &'static str {
+        match self {
+            PermissionMode::Ask => "read-only runs; edits and commands ask",
+            PermissionMode::AcceptEdits => "edits run, commands ask",
+            PermissionMode::Plan => "investigate and propose, change nothing",
+            PermissionMode::DenyAll => "anything that would ask is denied",
+            PermissionMode::Yolo => "no approvals; deny rules still apply",
+        }
+    }
+
+    /// Parse a name or an older alias. `dont-ask` and `ask` are deprecated
+    /// spellings of `deny-all` and `normal`.
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
-            "ask" | "default" => Some(PermissionMode::Ask),
+            "normal" | "ask" | "default" => Some(PermissionMode::Ask),
             "accept-edits" | "acceptedits" => Some(PermissionMode::AcceptEdits),
             "plan" => Some(PermissionMode::Plan),
-            "dont-ask" | "dontask" => Some(PermissionMode::DontAsk),
+            "deny-all" | "denyall" | "dont-ask" | "dontask" => Some(PermissionMode::DenyAll),
             "yolo" => Some(PermissionMode::Yolo),
             _ => None,
         }
+    }
+}
+
+impl Serialize for PermissionMode {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.label())
+    }
+}
+
+impl<'de> Deserialize<'de> for PermissionMode {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        PermissionMode::parse(&raw).ok_or_else(|| {
+            serde::de::Error::custom(format!(
+                "unknown permission mode {raw:?}; use normal, accept-edits, plan, or deny-all"
+            ))
+        })
     }
 }
 
@@ -475,10 +517,10 @@ impl Policy {
             },
             RuleAction::Ask => match mode {
                 PermissionMode::Yolo => Decision::Allow,
-                PermissionMode::DontAsk => Decision::Deny {
+                PermissionMode::DenyAll => Decision::Deny {
                     code: "DENIED".into(),
                     message: format!(
-                        "{} ({}) needs approval{} and the dont-ask mode never asks. The call did not run; try a read-only approach or tell the user which allow rule it needs.",
+                        "{} ({}) needs approval{} and the deny-all mode never asks. The call did not run; try a read-only approach or tell the user which allow rule it needs.",
                         call.tool,
                         call.subject(),
                         rule.as_deref()
@@ -818,6 +860,50 @@ mod tests {
     }
 
     #[test]
+    fn mode_names_parse_with_deprecated_aliases() {
+        for (raw, mode) in [
+            ("normal", PermissionMode::Ask),
+            ("ask", PermissionMode::Ask),
+            ("default", PermissionMode::Ask),
+            ("accept-edits", PermissionMode::AcceptEdits),
+            ("acceptedits", PermissionMode::AcceptEdits),
+            ("plan", PermissionMode::Plan),
+            ("deny-all", PermissionMode::DenyAll),
+            ("denyall", PermissionMode::DenyAll),
+            ("dont-ask", PermissionMode::DenyAll),
+            ("dontask", PermissionMode::DenyAll),
+            ("YOLO", PermissionMode::Yolo),
+        ] {
+            assert_eq!(PermissionMode::parse(raw), Some(mode), "{raw}");
+        }
+        assert_eq!(PermissionMode::parse("bypass"), None);
+    }
+
+    #[test]
+    fn config_names_are_canonical_and_old_names_still_load() {
+        for mode in [
+            PermissionMode::Ask,
+            PermissionMode::AcceptEdits,
+            PermissionMode::Plan,
+            PermissionMode::DenyAll,
+            PermissionMode::Yolo,
+        ] {
+            assert_eq!(PermissionMode::parse(mode.label()), Some(mode));
+            let config = PermissionsConfig {
+                mode,
+                rules: Vec::new(),
+            };
+            let text = toml::to_string(&config).unwrap();
+            let back: PermissionsConfig = toml::from_str(&text).unwrap();
+            assert_eq!(back.mode, mode, "{text}");
+        }
+        let old: PermissionsConfig = toml::from_str("mode = \"dont-ask\"").unwrap();
+        assert_eq!(old.mode, PermissionMode::DenyAll);
+        let bare: PermissionsConfig = toml::from_str("mode = \"ask\"").unwrap();
+        assert_eq!(bare.mode, PermissionMode::Ask);
+    }
+
+    #[test]
     fn modes_set_the_default_for_unmatched_calls() {
         let policy = Policy::default();
         let write = CallFacts::new("write", false, &json!({"path": "a.txt"}), Path::new("/w"));
@@ -836,13 +922,13 @@ mod tests {
             Decision::Ask(_)
         ));
         assert!(matches!(
-            policy.decide(PermissionMode::DontAsk, &write),
+            policy.decide(PermissionMode::DenyAll, &write),
             Decision::Deny { .. }
         ));
         assert_eq!(policy.decide(PermissionMode::Yolo, &write), Decision::Allow);
         for mode in [
             PermissionMode::Ask,
-            PermissionMode::DontAsk,
+            PermissionMode::DenyAll,
             PermissionMode::Plan,
         ] {
             assert_eq!(policy.decide(mode, &read), Decision::Allow);

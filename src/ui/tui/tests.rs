@@ -1237,6 +1237,105 @@ async fn plan_approve_restores_exactly_the_prior_tool_set() {
 }
 
 #[tokio::test]
+async fn permissions_command_sets_levels_and_yolo_needs_a_key() {
+    use crate::policy::PermissionMode;
+
+    let (_dir, mut app) = test_app().await;
+    let mode = |app: &App| app.core().unwrap().permissions.mode();
+    assert_eq!(mode(&app), PermissionMode::Ask);
+
+    app.run_command("/permissions deny-all").await;
+    assert_eq!(mode(&app), PermissionMode::DenyAll);
+    assert!(
+        app.footer()
+            .status
+            .contains("deny-all: anything that would ask is denied"),
+        "{}",
+        app.footer().status
+    );
+
+    app.run_command("/permissions accept-edits").await;
+    assert_eq!(mode(&app), PermissionMode::AcceptEdits);
+    assert_eq!(
+        app.core().unwrap().config.permissions.mode,
+        PermissionMode::Ask,
+        "a TUI switch never edits the config"
+    );
+
+    // The deprecated spelling still works.
+    app.run_command("/permissions dont-ask").await;
+    assert_eq!(mode(&app), PermissionMode::DenyAll);
+
+    app.run_command("/permissions normal").await;
+    assert_eq!(mode(&app), PermissionMode::Ask);
+
+    // Yolo asks for one key; anything else leaves the level alone.
+    app.run_command("/permissions yolo").await;
+    assert_eq!(mode(&app), PermissionMode::Ask);
+    assert!(app.footer().status.contains("press y to confirm"));
+    app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE))
+        .await;
+    assert_eq!(mode(&app), PermissionMode::Ask);
+
+    app.run_command("/permissions yolo").await;
+    app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+        .await;
+    assert_eq!(mode(&app), PermissionMode::Yolo);
+    assert!(app.footer().status.contains("yolo: no approvals"));
+    // Session-only: the config (and so the config file) keeps the default.
+    assert_eq!(
+        app.core().unwrap().config.permissions.mode,
+        PermissionMode::Ask
+    );
+
+    // A direct set while a turn is idle never touches the input prompt.
+    assert!(app.input.text().is_empty());
+}
+
+#[tokio::test]
+async fn permissions_command_leaves_plan_and_restores_the_tools() {
+    use crate::policy::PermissionMode;
+
+    let (_dir, mut app) = test_app().await;
+    let before = tool_names(&app);
+    app.run_command("/plan").await;
+    assert!(!tool_names(&app).contains(&"write"));
+
+    app.run_command("/permissions deny-all").await;
+    assert_eq!(
+        app.core().unwrap().permissions.mode(),
+        PermissionMode::DenyAll
+    );
+    assert_eq!(tool_names(&app), before);
+    assert!(
+        app.footer()
+            .status
+            .contains("deny-all: anything that would ask is denied"),
+        "{}",
+        app.footer().status
+    );
+}
+
+#[tokio::test]
+async fn permissions_command_opens_a_picker_with_the_four_levels() {
+    let (_dir, mut app) = test_app().await;
+    app.run_command("/permissions").await;
+    let Some(ModalData::Picker(picker)) = &app.modal else {
+        panic!("expected the permissions picker");
+    };
+    assert_eq!(picker.command, "permissions");
+    assert_eq!(picker.current, "normal");
+    let labels: Vec<&str> = picker
+        .items
+        .iter()
+        .map(|item| item.label.as_str())
+        .collect();
+    assert_eq!(labels, vec!["normal", "accept-edits", "deny-all", "yolo"]);
+    assert!(picker.items.iter().all(|item| !item.description.is_empty()));
+    assert!(picker.items[3].description.contains("deny rules"));
+}
+
+#[tokio::test]
 async fn a_permission_prompt_shows_the_exact_command_and_answers_with_y_or_n() {
     let (_dir, mut app) = test_app().await;
     let ask = |subject: &str| {
