@@ -5,9 +5,10 @@
 //! installs that mode on the session's permission engine before the runtime
 //! is built. The engine is the single pre-dispatch decision point
 //! (`authorize::decide()`): config `[permissions]` rules decide first, and an
-//! `ask` that nobody can answer is denied. Modes reuse the engine names (`ask`
-//! default, `accept-edits`, `dont-ask`, `yolo`); `yolo` must be enabled by the
-//! operator with `tot serve --allow-yolo`, never by a request alone.
+//! `ask` that nobody can answer is denied. Modes reuse the engine names
+//! (`normal` default, `accept-edits`, `deny-all`, `yolo`); `yolo` must be
+//! enabled by the operator with `tot serve --allow-yolo`, never by a request
+//! alone.
 
 use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
@@ -44,10 +45,10 @@ pub enum PermissionMode {
     /// Read-only built-in tools run; everything else is denied because an
     /// HTTP turn cannot ask.
     Ask,
-    /// Like `ask`, plus file edits (`write`, `edit`, `patch`, `undo`).
+    /// Like `normal`, plus file edits (`write`, `edit`, `patch`, `undo`).
     AcceptEdits,
-    /// Never asks: a call that would ask is denied instead.
-    DontAsk,
+    /// Deny anything that would ask; never prompt.
+    DenyAll,
     /// Every call the harness gates allow. Requires `--allow-yolo`.
     Yolo,
 }
@@ -55,9 +56,9 @@ pub enum PermissionMode {
 impl PermissionMode {
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
-            "ask" | "default" => Some(Self::Ask),
+            "normal" | "ask" | "default" => Some(Self::Ask),
             "accept-edits" | "acceptedits" => Some(Self::AcceptEdits),
-            "dont-ask" | "dontask" => Some(Self::DontAsk),
+            "deny-all" | "denyall" | "dont-ask" | "dontask" => Some(Self::DenyAll),
             "yolo" => Some(Self::Yolo),
             _ => None,
         }
@@ -65,9 +66,9 @@ impl PermissionMode {
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Ask => "ask",
+            Self::Ask => "normal",
             Self::AcceptEdits => "accept-edits",
-            Self::DontAsk => "dont-ask",
+            Self::DenyAll => "deny-all",
             Self::Yolo => "yolo",
         }
     }
@@ -78,7 +79,7 @@ impl PermissionMode {
         match self {
             Self::Ask => crate::policy::PermissionMode::Ask,
             Self::AcceptEdits => crate::policy::PermissionMode::AcceptEdits,
-            Self::DontAsk => crate::policy::PermissionMode::DontAsk,
+            Self::DenyAll => crate::policy::PermissionMode::DenyAll,
             Self::Yolo => crate::policy::PermissionMode::Yolo,
         }
     }
@@ -479,7 +480,7 @@ async fn create_session(state: &Arc<State>, body: Value) -> Response<Body> {
             Some(mode) => mode,
             None => {
                 return bad_request(format!(
-                    "unknown permission_mode {raw:?}; use ask, accept-edits, dont-ask, or yolo"
+                    "unknown permission_mode {raw:?}; use normal, accept-edits, deny-all, or yolo"
                 ));
             }
         },
@@ -763,7 +764,7 @@ mod tests {
             PermissionMode::AcceptEdits.policy(),
             PolicyMode::AcceptEdits
         );
-        assert_eq!(PermissionMode::DontAsk.policy(), PolicyMode::DontAsk);
+        assert_eq!(PermissionMode::DenyAll.policy(), PolicyMode::DenyAll);
         assert_eq!(PermissionMode::Yolo.policy(), PolicyMode::Yolo);
     }
 
@@ -812,7 +813,7 @@ mod tests {
         for (raw, mode) in [
             ("ask", PermissionMode::Ask),
             ("accept-edits", PermissionMode::AcceptEdits),
-            ("dont-ask", PermissionMode::DontAsk),
+            ("deny-all", PermissionMode::DenyAll),
             ("YOLO", PermissionMode::Yolo),
         ] {
             assert_eq!(PermissionMode::parse(raw), Some(mode));

@@ -9,6 +9,14 @@ release may change defaults when the change is called out below.
 
 ### Added
 
+- `/permissions` gathers the permission levels in one TUI command. With no
+  argument it opens the filterable picker over `normal`, `accept-edits`,
+  `deny-all`, and `yolo`, marking the current level and describing each one;
+  `/permissions <level>` sets one directly, and Tab completes the names. The
+  footer spells out a non-default level (`yolo: no approvals`,
+  `deny-all: anything that would ask is denied`). `yolo` needs a one-key
+  confirmation, lasts only for the session, never edits the config, and is
+  recorded in the session like `--yolo`. `/plan` is unchanged.
 - A welcome screen with Skoll and Hati, two pixel-art wolves closing in on an
   eclipse, drawn with half blocks (the eclipse alone on narrow terminals,
   outlines only with `NO_COLOR`).
@@ -104,6 +112,11 @@ release may change defaults when the change is called out below.
 
 ### Changed
 
+- Permission levels are named for what they do: `dont-ask` is now `deny-all`
+  and `ask` is now `normal`, in the TUI, the docs, and `--mode`. `dont-ask`
+  and `ask` are still accepted as deprecated aliases in config files and on
+  `--mode`, so existing setups keep working, and `--mode` also takes the new
+  names. `yolo` stays reachable only via `--yolo` or `/permissions yolo`.
 - **Renamed to Totality.** The binary is `tot` (installers also add a
   `totality` link), the crate is `totality`, and environment variables use
   the `TOT_` prefix. The `LH_` names still work. Config and data move to

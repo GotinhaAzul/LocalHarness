@@ -500,7 +500,7 @@ async fn a_script_creates_a_session_streams_a_turn_and_cancels_it() {
     let id = server.create(json!({})).await;
     let (_, list) = server.get("/v1/sessions").await;
     assert_eq!(list["sessions"][0]["id"], id.as_str());
-    assert_eq!(list["sessions"][0]["permission_mode"], "ask");
+    assert_eq!(list["sessions"][0]["permission_mode"], "normal");
 
     // A streamed turn.
     let frames = server.turn(&id, "say hello").await;

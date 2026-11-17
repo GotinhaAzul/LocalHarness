@@ -37,8 +37,8 @@ harness itself in a container.
 ## Permissions
 
 A policy engine runs before every tool call (see
-[configuration.md](configuration.md#permissions)). Modes (`ask`,
-`accept-edits`, `plan`, `dont-ask`, `yolo`) and ordered allow/ask/deny rules on
+[configuration.md](configuration.md#permissions)). Modes (`normal`,
+`accept-edits`, `plan`, `deny-all`, `yolo`) and ordered allow/ask/deny rules on
 tool, path, command, and network decide whether a call runs, asks the user
 with the exact command or path, or returns `DENIED` with the rule id. A `deny`
 cannot be undone by a later, less specific `allow`, and it applies in every

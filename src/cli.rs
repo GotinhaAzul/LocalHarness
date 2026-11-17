@@ -148,8 +148,9 @@ pub struct Cli {
     #[arg(long, global = true, conflicts_with = "sandbox")]
     pub no_sandbox: bool,
 
-    /// Permission mode for unmatched calls: ask, accept-edits, plan, or
-    /// dont-ask. Overrides `[permissions] mode`; rules still apply.
+    /// Permission mode for unmatched calls: normal, accept-edits, plan, or
+    /// deny-all. `ask` and `dont-ask` are accepted as deprecated aliases.
+    /// Overrides `[permissions] mode`; rules still apply.
     #[arg(long, global = true, value_name = "MODE", conflicts_with_all = ["yolo", "plan"])]
     pub mode: Option<String>,
 
@@ -440,7 +441,9 @@ pub async fn run(cli: Cli) -> Result<i32> {
             }
             Some(mode) => mode,
             None => {
-                bail!("unknown permission mode {mode:?}; use ask, accept-edits, plan, or dont-ask")
+                bail!(
+                    "unknown permission mode {mode:?}; use normal, accept-edits, plan, or deny-all"
+                )
             }
         };
     }
