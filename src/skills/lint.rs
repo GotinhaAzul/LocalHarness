@@ -1,4 +1,4 @@
-//! `lh skill lint`: one report over the same validator discovery and install
+//! `tot skill lint`: one report over the same validator discovery and install
 //! use.
 
 use std::path::PathBuf;

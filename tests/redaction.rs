@@ -240,9 +240,9 @@ fn env() -> Env {
     }
 }
 
-/// Run `lh` with a persistent session (no `--no-session`).
-async fn run_lh(env: &Env, base: &str, extra: &[&str]) -> std::process::Output {
-    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_lh"));
+/// Run `tot` with a persistent session (no `--no-session`).
+async fn run_tot(env: &Env, base: &str, extra: &[&str]) -> std::process::Output {
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_tot"));
     command
         .arg("--endpoint")
         .arg(base)
@@ -254,18 +254,23 @@ async fn run_lh(env: &Env, base: &str, extra: &[&str]) -> std::process::Output {
         .arg("--yolo")
         .args(extra)
         .current_dir(&env.cwd)
-        .env("LH_CONFIG_DIR", &env.config_dir)
-        .env("LH_DATA_DIR", &env.data_dir)
-        .env("LH_SKIP_TOOL_PROBE", "1")
+        .env("TOT_CONFIG_DIR", &env.config_dir)
+        .env("TOT_DATA_DIR", &env.data_dir)
+        .env("TOT_SKIP_TOOL_PROBE", "1")
+        .env_remove("TOT_ENDPOINT")
         .env_remove("LH_ENDPOINT")
+        .env_remove("TOT_MODEL")
         .env_remove("LH_MODEL")
+        .env_remove("TOT_API_KEY")
         .env_remove("LH_API_KEY")
+        .env_remove("TOT_PROFILE")
         .env_remove("LH_PROFILE")
+        .env_remove("TOT_TRUST")
         .env_remove("LH_TRUST");
     let output = tokio::time::timeout(std::time::Duration::from_secs(30), command.output())
         .await
-        .expect("lh timed out")
-        .expect("cannot run lh");
+        .expect("tot timed out")
+        .expect("cannot run tot");
     assert_eq!(
         output.status.code(),
         Some(0),
@@ -313,7 +318,7 @@ async fn write_back_turn(env: &Env) -> (Fake, String, String) {
     )
     .unwrap();
     let (base, fake) = spawn(Script::ReadThenWriteBack).await;
-    run_lh(env, &base, &["--print", "fix task storage"]).await;
+    run_tot(env, &base, &["--print", "fix task storage"]).await;
     (fake, aws, password)
 }
 
@@ -372,7 +377,7 @@ async fn a_resumed_placeholder_is_annotated_and_never_written() {
     let (_fake, aws, _password) = write_back_turn(&env).await;
 
     let (base, fake) = spawn(Script::CopyPlaceholder).await;
-    run_lh(&env, &base, &["--continue", "--print", "copy the env file"]).await;
+    run_tot(&env, &base, &["--continue", "--print", "copy the env file"]).await;
     let bodies = fake.bodies.lock().unwrap().clone();
 
     // The replayed result is the saved, redacted form, with a note saying

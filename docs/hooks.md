@@ -23,7 +23,7 @@ command = ["/home/me/bin/format"]
 
 [hooks.notify]
 event = "stop"
-command = ["notify-send", "LocalHarness", "turn finished"]
+command = ["notify-send", "Totality", "turn finished"]
 ```
 
 `command` is a program plus arguments. It is spawned directly. There is no
@@ -135,12 +135,12 @@ show hook failures as `notice` events; `--json` also shows them in the session.
 ## Test a hook
 
 ```sh
-lh hooks list
-lh hooks test guard
-lh hooks test guard --json
+tot hooks list
+tot hooks test guard
+tot hooks test guard --json
 ```
 
-`lh hooks test <name>` runs exactly one configured hook with a representative
+`tot hooks test <name>` runs exactly one configured hook with a representative
 payload for its event and prints the outcome. It does not call a model and does
 not write a session. Exit status is 0 when the hook allowed or succeeded, 1
 when it blocked or failed.

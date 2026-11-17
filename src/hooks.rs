@@ -34,7 +34,7 @@ pub struct HookIdentity {
 }
 
 /// Everything a hook invocation needs. Built from `Core` by the agent loop and
-/// from config by `lh hooks test`.
+/// from config by `tot hooks test`.
 pub struct HookEnv<'a> {
     pub config: &'a HooksConfig,
     pub cwd: &'a Path,
@@ -215,7 +215,7 @@ pub fn record_contexts(env: &HookEnv<'_>, event: HookEvent, outcome: &Outcome) {
     env.record_contexts(event, outcome);
 }
 
-/// Run exactly one named hook (used by `lh hooks test`). No session record.
+/// Run exactly one named hook (used by `tot hooks test`). No session record.
 pub async fn test_named(env: &HookEnv<'_>, name: &str) -> Result<(Invocation, Outcome), String> {
     let hook = env
         .config
@@ -259,7 +259,7 @@ pub async fn test_named(env: &HookEnv<'_>, name: &str) -> Result<(Invocation, Ou
     Ok((run.invocation, outcome))
 }
 
-/// A representative payload for `lh hooks test <name>`.
+/// A representative payload for `tot hooks test <name>`.
 pub fn sample_payload(event: HookEvent) -> Value {
     match event {
         HookEvent::SessionStart => json!({}),

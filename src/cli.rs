@@ -18,7 +18,7 @@ use crate::ui::{self, UiOptions};
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "lh",
+    name = "tot",
     version,
     about = "Local-first agent harness for coding and security work"
 )]
@@ -265,7 +265,7 @@ pub enum SkillCommand {
     },
     /// Move an installed skill to the trash directory and drop its lock entry.
     Remove {
-        /// Skill name as shown by `lh skill list`.
+        /// Skill name as shown by `tot skill list`.
         name: String,
     },
     /// List installed skills with source, pinned ref, and digest.
@@ -372,7 +372,7 @@ pub async fn run(cli: Cli) -> Result<i32> {
     let cwd = std::env::current_dir().context("cannot read the current directory")?;
     let mut paths = Paths::discover(&cwd)?;
 
-    let trust = cli.trust || std::env::var("LH_TRUST").is_ok();
+    let trust = cli.trust || crate::paths::env_var("TRUST").is_ok();
     let project_config = if trust {
         Some(paths.project_dir().join("config.toml"))
     } else {
@@ -385,7 +385,7 @@ pub async fn run(cli: Cli) -> Result<i32> {
             config.verify = crate::config::VerifyConfig::load(&verify_path)?;
         }
     }
-    // Steps the user accepted for this project (`lh verify --init`, the TUI
+    // Steps the user accepted for this project (`tot verify --init`, the TUI
     // offer). They live in the user's data directory, not the repository.
     if config.verify.steps.is_empty()
         && let Some(steps) = crate::verify_setup::accepted_steps(&paths)
@@ -498,7 +498,7 @@ pub async fn run(cli: Cli) -> Result<i32> {
     if matches!(&cli.command, Some(Command::Acp)) {
         if cli.print.is_some() || cli.json || cli.continue_last || cli.resume.is_some() {
             bail!(
-                "`lh acp` is a stdio server; --print, --json, --continue, and --resume do not apply"
+                "`tot acp` is a stdio server; --print, --json, --continue, and --resume do not apply"
             );
         }
         let options = crate::acp::AcpOptions {
@@ -519,7 +519,7 @@ pub async fn run(cli: Cli) -> Result<i32> {
     {
         if cli.print.is_some() || cli.json || cli.continue_last || cli.resume.is_some() {
             bail!(
-                "`lh serve` is a server; --print, --json, --continue, and --resume do not apply (resume over HTTP with {{\"resume\": \"<id>\"}})"
+                "`tot serve` is a server; --print, --json, --continue, and --resume do not apply (resume over HTTP with {{\"resume\": \"<id>\"}})"
             );
         }
         let options = crate::serve::ServeOptions {
@@ -576,7 +576,7 @@ pub async fn run(cli: Cli) -> Result<i32> {
                     Some(candidate)
                 } else {
                     bail!(
-                        "no session {id_or_path:?} in {}; run `lh --continue` for the latest session",
+                        "no session {id_or_path:?} in {}; run `tot --continue` for the latest session",
                         paths.project_sessions_dir().display()
                     );
                 }
@@ -600,7 +600,7 @@ pub async fn run(cli: Cli) -> Result<i32> {
 
     if cli.print.is_some() && !runtime.core.logged_in() {
         bail!(
-            "no model is selected. Start the inference server and run `/login` in the TUI, or pass --model (or set LH_MODEL)."
+            "no model is selected. Start the inference server and run `/login` in the TUI, or pass --model (or set TOT_MODEL)."
         );
     }
 
@@ -628,7 +628,7 @@ pub async fn run(cli: Cli) -> Result<i32> {
                 "[notice] {}",
                 crate::verify_setup::unconfigured_notice(
                     &detected,
-                    "Save them with `lh verify --init`."
+                    "Save them with `tot verify --init`."
                 )
             );
         } else if !detected.steps.is_empty()
@@ -663,7 +663,7 @@ pub async fn run(cli: Cli) -> Result<i32> {
     outcome
 }
 
-/// `lh verify [--init]`: show the verify steps, or detect and save them.
+/// `tot verify [--init]`: show the verify steps, or detect and save them.
 fn run_verify(config: &Config, paths: &Paths, init: bool) -> Result<i32> {
     if !config.verify.steps.is_empty() && !init {
         println!("verify: {} step(s) configured", config.verify.steps.len());
@@ -678,7 +678,7 @@ fn run_verify(config: &Config, paths: &Paths, init: bool) -> Result<i32> {
             "{}",
             crate::verify_setup::unconfigured_notice(
                 &detected,
-                "Save them with `lh verify --init`."
+                "Save them with `tot verify --init`."
             )
         );
         return Ok(0);
@@ -704,17 +704,17 @@ fn run_verify(config: &Config, paths: &Paths, init: bool) -> Result<i32> {
     Ok(0)
 }
 
-/// `lh completions <shell>`: write a completion script for packaging.
+/// `tot completions <shell>`: write a completion script for packaging.
 fn run_completions(shell: clap_complete::Shell) -> Result<i32> {
     let mut out = std::io::stdout();
-    clap_complete::generate(shell, &mut Cli::command(), "lh", &mut out);
+    clap_complete::generate(shell, &mut Cli::command(), "tot", &mut out);
     out.flush().context("cannot write shell completions")?;
     Ok(0)
 }
 
-/// `lh man`: write the roff man page used by release tarballs and packages.
+/// `tot man`: write the roff man page used by release tarballs and packages.
 fn run_man_page() -> Result<i32> {
-    let command = Cli::command().name("lh");
+    let command = Cli::command().name("tot");
     let man = clap_mangen::Man::new(command);
     let mut out = std::io::stdout();
     man.render(&mut out).context("cannot write the man page")?;
@@ -722,7 +722,7 @@ fn run_man_page() -> Result<i32> {
     Ok(0)
 }
 
-/// `lh context`: print the AGENTS.md chain and its manifest. This reads local
+/// `tot context`: print the AGENTS.md chain and its manifest. This reads local
 /// files only; it does not open a session, start a turn, or contact a model.
 fn run_context(config: &Config, paths: &Paths, json: bool) -> Result<i32> {
     let agents = crate::agent::agents_md::AgentsMd::load(&paths.cwd, config.prompt.agents_md);
@@ -773,7 +773,7 @@ fn diagnostic_engine(configured: &str, detected: &str) -> crate::provider::Engin
         .unwrap_or(crate::provider::Engine::Generic)
 }
 
-/// `lh doctor`: fingerprint the engine and print a capability manifest. Only
+/// `tot doctor`: fingerprint the engine and print a capability manifest. Only
 /// metadata probes are used; no chat completion and no model load.
 async fn run_doctor(config: &Config, paths: &Paths, json: bool, fix: bool) -> Result<i32> {
     let mut model = config.model.model.trim().to_string();
@@ -797,7 +797,7 @@ async fn run_doctor(config: &Config, paths: &Paths, json: bool, fix: bool) -> Re
     let mut manifest = crate::doctor::DoctorManifest::probe(&provider, configured).await;
     let engine = diagnostic_engine(&config.model.engine, &manifest.engine);
     manifest.warn_unsupported_samplers(&profile_name, engine, &samplers);
-    // `lh doctor` never sends a chat completion. Show the last conformance
+    // `tot doctor` never sends a chat completion. Show the last conformance
     // result the runtime stored for this model/build, if any.
     let probe_path = paths.data_dir.join("tool-probe-cache.json");
     let probe_key = crate::provider::probe::tool_probe_key(&provider, manifest.build.as_deref());
@@ -855,7 +855,7 @@ async fn run_doctor(config: &Config, paths: &Paths, json: bool, fix: bool) -> Re
     Ok(0)
 }
 
-/// `lh mcp`: connect to configured servers without starting a model turn.
+/// `tot mcp`: connect to configured servers without starting a model turn.
 async fn run_mcp(config: &Config, paths: &Paths, action: &McpCommand) -> Result<i32> {
     match action {
         McpCommand::List { json } => {
@@ -992,7 +992,7 @@ async fn run_mcp(config: &Config, paths: &Paths, action: &McpCommand) -> Result<
     }
 }
 
-/// `lh skill`: the package manager, linter, and trigger eval.
+/// `tot skill`: the package manager, linter, and trigger eval.
 fn run_skill_command(paths: &Paths, trust: bool, action: &SkillCommand) -> Result<i32> {
     use crate::skills::{eval, lint, manager};
 
@@ -1116,7 +1116,7 @@ fn run_skill_command(paths: &Paths, trust: bool, action: &SkillCommand) -> Resul
                 );
             } else if rows.is_empty() {
                 println!(
-                    "no skills installed; `lh skill add <dir|git-url#ref>` installs one into {}",
+                    "no skills installed; `tot skill add <dir|git-url#ref>` installs one into {}",
                     paths.skills_dir().display()
                 );
             } else {
@@ -1276,7 +1276,7 @@ fn run_skill_command(paths: &Paths, trust: bool, action: &SkillCommand) -> Resul
     }
 }
 
-/// `lh hooks`: list or exercise configured lifecycle hooks without a turn.
+/// `tot hooks`: list or exercise configured lifecycle hooks without a turn.
 async fn run_hooks(config: &Config, paths: &Paths, action: &HooksCommand) -> Result<i32> {
     match action {
         HooksCommand::List { json } => {
@@ -1328,7 +1328,7 @@ async fn run_hooks(config: &Config, paths: &Paths, action: &HooksCommand) -> Res
         HooksCommand::Test { name, json } => {
             if !config.hooks.entries.contains_key(name) {
                 bail!(
-                    "no hook named {name:?} in {}; run `lh hooks list` to see configured hooks and docs/hooks.md for the format",
+                    "no hook named {name:?} in {}; run `tot hooks list` to see configured hooks and docs/hooks.md for the format",
                     paths.config_file().display()
                 );
             }
@@ -1389,7 +1389,7 @@ async fn run_hooks(config: &Config, paths: &Paths, action: &HooksCommand) -> Res
     }
 }
 
-/// `lh workflow`: list playbooks or run one through the deterministic engine.
+/// `tot workflow`: list playbooks or run one through the deterministic engine.
 async fn run_workflow_command(
     config: &Config,
     paths: &Paths,
@@ -1468,7 +1468,7 @@ async fn run_workflow_command(
                 crate::workflows::resolve(paths, config.trust, name).map_err(anyhow::Error::msg)?;
             if spec.steps.is_empty() {
                 // A prompt-only playbook is one prompt step. This keeps the
-                // bundled workflows and `lh workflow run coding` honest.
+                // bundled workflows and `tot workflow run coding` honest.
                 spec.steps.push(crate::workflows::engine::StepSpec {
                     id: "workflow".into(),
                     run: crate::workflows::engine::StepRun::Prompt,
@@ -1565,7 +1565,7 @@ async fn run_workflow_command(
             });
             if needs_model && !runtime.core.logged_in() {
                 bail!(
-                    "no model is selected. Start the inference server and pass --model (or set LH_MODEL), or run `/login` in the TUI."
+                    "no model is selected. Start the inference server and pass --model (or set TOT_MODEL), or run `/login` in the TUI."
                 );
             }
             let (session_id, session_file) = match runtime.core.session.lock() {
@@ -1669,11 +1669,11 @@ fn print_workflow_event(event: &crate::workflows::engine::Event, json: bool) {
     }
 }
 
-/// `lh --rewind <session>:<entry>`: restore harness-written files and move the
+/// `tot --rewind <session>:<entry>`: restore harness-written files and move the
 /// conversation leaf, without starting a model turn.
 fn run_rewind(paths: &Paths, spec: &str, force: bool) -> Result<i32> {
     let (session_part, entry) = spec.rsplit_once(':').ok_or_else(|| {
-        anyhow::anyhow!("--rewind expects <session>:<entry>, for example `lh --rewind last:e12`")
+        anyhow::anyhow!("--rewind expects <session>:<entry>, for example `tot --rewind last:e12`")
     })?;
     let entry = entry.trim();
     if entry.is_empty() {
@@ -1697,7 +1697,7 @@ fn run_rewind(paths: &Paths, spec: &str, force: bool) -> Result<i32> {
                     candidate
                 } else {
                     bail!(
-                        "no session {value:?} in {}; use `lh --rewind last:{entry}` for the latest",
+                        "no session {value:?} in {}; use `tot --rewind last:{entry}` for the latest",
                         paths.project_sessions_dir().display()
                     );
                 }
@@ -1785,7 +1785,7 @@ async fn run_headless(runtime: crate::app::Runtime, prompt: String, json: bool) 
     })
 }
 
-/// Plain `lh -p` answer text. On a terminal it streams. Piped, it is held
+/// Plain `tot -p` answer text. On a terminal it streams. Piped, it is held
 /// until the model call finishes, so a reply that fails partway and is
 /// retried does not leave its partial text in front of the real answer.
 struct HeadlessText {
@@ -1907,18 +1907,18 @@ fn render_event(
 
 fn init_logging(paths: &Paths, debug: bool) {
     use tracing_subscriber::filter::EnvFilter;
-    if std::env::var_os("LH_DEBUG_CONTENT").is_some() {
+    if crate::paths::env_os("DEBUG_CONTENT").is_some() {
         eprintln!(
-            "warning: LH_DEBUG_CONTENT is set. Prompts and tool output may appear in diagnostic logs; unset it unless debugging."
+            "warning: TOT_DEBUG_CONTENT is set. Prompts and tool output may appear in diagnostic logs; unset it unless debugging."
         );
     }
     let filter = if debug {
-        EnvFilter::new("localharness=debug,warn")
+        EnvFilter::new("totality=debug,warn")
     } else {
-        EnvFilter::new("localharness=warn,error")
+        EnvFilter::new("totality=warn,error")
     };
     let _ = std::fs::create_dir_all(&paths.data_dir);
-    let file_appender = tracing_appender::rolling::never(&paths.data_dir, "localharness.log");
+    let file_appender = tracing_appender::rolling::never(&paths.data_dir, "totality.log");
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
     let subscriber = tracing_subscriber::fmt()
         .with_env_filter(filter)
@@ -1963,9 +1963,9 @@ mod tests {
 
     #[test]
     fn no_redact_is_an_explicit_global_flag() {
-        let cli = Cli::try_parse_from(["lh", "--no-redact"]).unwrap();
+        let cli = Cli::try_parse_from(["tot", "--no-redact"]).unwrap();
         assert!(cli.no_redact);
-        assert!(!Cli::try_parse_from(["lh"]).unwrap().no_redact);
+        assert!(!Cli::try_parse_from(["tot"]).unwrap().no_redact);
     }
 
     #[test]
@@ -1979,17 +1979,17 @@ mod tests {
 
     #[test]
     fn rewind_takes_a_session_and_entry_and_force_needs_it() {
-        let cli = Cli::try_parse_from(["lh", "--rewind", "last:e12"]).unwrap();
+        let cli = Cli::try_parse_from(["tot", "--rewind", "last:e12"]).unwrap();
         assert_eq!(cli.rewind.as_deref(), Some("last:e12"));
         assert!(!cli.force);
-        let cli = Cli::try_parse_from(["lh", "--rewind", "abc:e3", "--force"]).unwrap();
+        let cli = Cli::try_parse_from(["tot", "--rewind", "abc:e3", "--force"]).unwrap();
         assert!(cli.force);
         assert!(
-            Cli::try_parse_from(["lh", "--force"]).is_err(),
+            Cli::try_parse_from(["tot", "--force"]).is_err(),
             "--force only means something with --rewind"
         );
         assert!(
-            Cli::try_parse_from(["lh", "--rewind", "last:e3", "--print", "hi"]).is_err(),
+            Cli::try_parse_from(["tot", "--rewind", "last:e3", "--print", "hi"]).is_err(),
             "--rewind and --print are separate modes"
         );
     }

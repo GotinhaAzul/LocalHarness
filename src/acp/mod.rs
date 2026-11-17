@@ -1,6 +1,6 @@
 //! Agent Client Protocol v1 over stdio.
 //!
-//! Editors (Zed, Neovim, Emacs) launch `lh acp` and speak newline-delimited
+//! Editors (Zed, Neovim, Emacs) launch `tot acp` and speak newline-delimited
 //! JSON-RPC 2.0. This server exposes `initialize`, `session/new`,
 //! `session/load`, `session/prompt`, and `session/cancel`, streams
 //! `session/update`, and asks the client for permission before every
@@ -45,7 +45,7 @@ pub struct AcpOptions {
 }
 
 pub(crate) struct Server {
-    /// Config, paths, and session options shared with `lh serve`.
+    /// Config, paths, and session options shared with `tot serve`.
     host: Host,
     options: AcpOptions,
     out: UnboundedSender<String>,
@@ -89,7 +89,7 @@ impl Server {
     }
 
     pub(crate) fn next_request_id(&self) -> String {
-        format!("lh-{}", self.next_request.fetch_add(1, Ordering::SeqCst))
+        format!("tot-{}", self.next_request.fetch_add(1, Ordering::SeqCst))
     }
 
     pub(crate) fn session(&self, id: &str) -> Option<Arc<AcpSession>> {
@@ -271,7 +271,7 @@ impl Server {
                 }
                 ("session/cancel", None) => self.cancel(params),
                 ("authenticate", Some(id)) => {
-                    // LocalHarness has no auth methods; the endpoint is already
+                    // Totality has no auth methods; the endpoint is already
                     // configured by the user who launched the process.
                     self.response(id, json!({}));
                 }
@@ -423,8 +423,8 @@ fn initialize_result(params: &Value, load_session: bool) -> Value {
             "sessionCapabilities": {},
         },
         "agentInfo": {
-            "name": "localharness",
-            "title": "LocalHarness",
+            "name": "totality",
+            "title": "Totality",
             "version": env!("CARGO_PKG_VERSION"),
         },
         "authMethods": [],
@@ -467,7 +467,7 @@ mod tests {
             initialize_result(&json!({"protocolVersion": 1}), false)["agentCapabilities"]["loadSession"],
             false
         );
-        assert_eq!(result["agentInfo"]["name"], "localharness");
+        assert_eq!(result["agentInfo"]["name"], "totality");
 
         let future = initialize_result(&json!({"protocolVersion": 7}), true);
         assert_eq!(future["protocolVersion"], 1);
@@ -479,7 +479,7 @@ mod tests {
     fn ids_keep_numbers_and_strings_apart() {
         assert_eq!(id_key(&json!(1)), "n:1");
         assert_eq!(id_key(&json!("1")), "1");
-        assert_eq!(id_key(&json!("lh-7")), "lh-7");
+        assert_eq!(id_key(&json!("tot-7")), "tot-7");
         assert!(valid_session_id("abc-123_x"));
         assert!(!valid_session_id("../etc/passwd"));
         assert!(!valid_session_id(""));

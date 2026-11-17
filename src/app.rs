@@ -175,7 +175,7 @@ pub async fn create_runtime(
         bail!("--no-session cannot be combined with --continue or --resume");
     }
 
-    if let Ok(endpoint) = std::env::var("LH_ENDPOINT")
+    if let Ok(endpoint) = crate::paths::env_var("ENDPOINT")
         && !endpoint.trim().is_empty()
     {
         config.model.endpoint = endpoint;
@@ -1169,7 +1169,7 @@ async fn resolve_tool_probe(
     profile: &mut crate::config::ModelProfile,
     tool_specs: &mut Vec<crate::provider::ToolSpec>,
 ) -> Option<probe::ToolProbe> {
-    if std::env::var_os("LH_SKIP_TOOL_PROBE").is_some() {
+    if crate::paths::env_os("SKIP_TOOL_PROBE").is_some() {
         return None;
     }
     if provider.model().trim().is_empty() {

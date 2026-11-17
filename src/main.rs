@@ -1,6 +1,6 @@
 use clap::Parser;
 
-use localharness::cli::{Cli, run};
+use totality::cli::{Cli, run};
 
 #[tokio::main]
 async fn main() {

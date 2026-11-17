@@ -103,7 +103,7 @@ impl SkillOrigin {
             SkillOrigin::Bundled => "bundled",
             SkillOrigin::GlobalClaude => "~/.claude/skills",
             SkillOrigin::GlobalAgents => "~/.agents/skills",
-            SkillOrigin::GlobalNative => "~/.config/localharness/skills",
+            SkillOrigin::GlobalNative => "~/.config/totality/skills",
             SkillOrigin::ProjectClaude => ".claude/skills",
             SkillOrigin::ProjectAgents => ".agents/skills",
             SkillOrigin::ProjectNative => ".harness/skills",
@@ -399,7 +399,7 @@ impl SkillIndex {
     }
 
     /// Names of the skills whose index entry the per-entry cap cuts, for
-    /// `lh context`.
+    /// `tot context`.
     pub fn clipped_names(&self) -> Vec<String> {
         self.skills
             .iter()
@@ -515,7 +515,7 @@ fn index_entry_uncapped(skill: &Skill) -> String {
 }
 
 /// True when the description and trigger hint are too long for the index and
-/// the model would see a cut entry. `lh skill lint` reports these so an author
+/// the model would see a cut entry. `tot skill lint` reports these so an author
 /// can shorten the text instead of losing the trigger words.
 pub fn clipped_in_index(skill: &Skill) -> bool {
     index_entry_uncapped(skill).chars().count() > INDEX_ENTRY_CAP

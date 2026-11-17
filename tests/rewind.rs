@@ -2,18 +2,18 @@
 
 use std::sync::{Arc, Mutex};
 
-use localharness::config::VerifyConfig;
-use localharness::paths::Paths;
-use localharness::security::SecurityState;
-use localharness::session::rewind;
-use localharness::session::{AssistantData, EntryKind, Session, SessionData, UserData};
-use localharness::tools::edit::EditTool;
-use localharness::tools::read::ReadTool;
-use localharness::tools::undo::fs_change_entry;
-use localharness::tools::write::WriteTool;
-use localharness::tools::{BgRegistry, ReadTracker, SessionHandle, Tool, ToolContext};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
+use totality::config::VerifyConfig;
+use totality::paths::Paths;
+use totality::security::SecurityState;
+use totality::session::rewind;
+use totality::session::{AssistantData, EntryKind, Session, SessionData, UserData};
+use totality::tools::edit::EditTool;
+use totality::tools::read::ReadTool;
+use totality::tools::undo::fs_change_entry;
+use totality::tools::write::WriteTool;
+use totality::tools::{BgRegistry, ReadTracker, SessionHandle, Tool, ToolContext};
 
 struct Fixture {
     _dir: tempfile::TempDir,
@@ -27,8 +27,8 @@ impl Fixture {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().canonicalize().unwrap();
         let paths = Paths {
-            config_dir: cwd.join(".lh-config"),
-            data_dir: cwd.join(".lh-data"),
+            config_dir: cwd.join(".tot-config"),
+            data_dir: cwd.join(".tot-data"),
             cwd: cwd.clone(),
             project_id: "test".into(),
             sessions_dir_override: None,
@@ -61,11 +61,11 @@ impl Fixture {
             bg: Arc::new(Mutex::new(BgRegistry::default())),
             security: Arc::new(Mutex::new(SecurityState::default())),
             paths,
-            lsp: Arc::new(localharness::tools::lsp::LspService::new()),
+            lsp: Arc::new(totality::tools::lsp::LspService::new()),
             sandbox: None,
             vision: Default::default(),
             caps: Default::default(),
-            edit_mode: localharness::config::EditMode::Text,
+            edit_mode: totality::config::EditMode::Text,
         };
         Fixture {
             _dir: dir,
@@ -106,7 +106,7 @@ impl Fixture {
                     attachments: Vec::new(),
                     content: text.into(),
                 }),
-                Some(localharness::provenance::CONTINUATION.to_string()),
+                Some(totality::provenance::CONTINUATION.to_string()),
             )
             .unwrap()
             .id
@@ -217,7 +217,7 @@ async fn rewinding_two_turns_restores_conversation_and_files() {
         !session.tree.children(&first_user).is_empty(),
         "the abandoned turn keeps its children"
     );
-    let rows = localharness::ui::tree::TreeView::new(&session).rows;
+    let rows = totality::ui::tree::TreeView::new(&session).rows;
     assert!(
         rows.iter().any(|row| row.id == first_assistant),
         "the abandoned branch stays visible in /tree: {rows:?}"
@@ -327,7 +327,7 @@ fn synthetic_continuation_prompts_are_not_rewind_turns() {
     let fixture = Fixture::new();
     let real = fixture.user("real request");
     fixture.assistant();
-    fixture.continuation("[localharness] review nudge: call the review tool");
+    fixture.continuation("[totality] review nudge: call the review tool");
     fixture.assistant();
 
     let session = fixture.lock();

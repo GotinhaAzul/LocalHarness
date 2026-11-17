@@ -28,7 +28,10 @@ use crate::security::redact::{Redactor, contains_placeholder};
 
 /// Appended to a replayed tool result whose saved form contains redaction
 /// placeholders, so the model does not mistake them for file content.
-pub const RESUMED_PLACEHOLDER_NOTE: &str = "\n[localharness] This result was restored from a saved session. [REDACTED:...] markers were substituted when it was saved and are not file content; re-read a file before editing it.";
+/// The same note as written before 0.3.
+pub const LEGACY_RESUMED_PLACEHOLDER_NOTE: &str = "\n[localharness] This result was restored from a saved session. [REDACTED:...] markers were substituted when it was saved and are not file content; re-read a file before editing it.";
+
+pub const RESUMED_PLACEHOLDER_NOTE: &str = "\n[totality] This result was restored from a saved session. [REDACTED:...] markers were substituted when it was saved and are not file content; re-read a file before editing it.";
 
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -231,6 +234,7 @@ impl Session {
             if let EntryKind::ToolResult(data) = &mut entry.kind
                 && contains_placeholder(&data.content)
                 && !data.content.ends_with(RESUMED_PLACEHOLDER_NOTE)
+                && !data.content.ends_with(LEGACY_RESUMED_PLACEHOLDER_NOTE)
             {
                 data.content.push_str(RESUMED_PLACEHOLDER_NOTE);
             }
@@ -399,7 +403,7 @@ impl Session {
     /// Markdown export of the active branch.
     pub fn export_markdown(&self) -> String {
         let mut out = String::new();
-        out.push_str(&format!("# LocalHarness session {}\n\n", self.id));
+        out.push_str(&format!("# Totality session {}\n\n", self.id));
         if let Some(header) = self.header() {
             out.push_str(&format!(
                 "- cwd: `{}`\n- endpoint: `{}`\n- model: `{}`\n- profile: `{}`\n\n",

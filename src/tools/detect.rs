@@ -115,7 +115,7 @@ impl DetectTool {
         let mut state = match ctx.security.lock() {
             Ok(state) => state,
             Err(_) => {
-                return ToolResult::err("SECURITY_IO", "security state is poisoned; restart lh");
+                return ToolResult::err("SECURITY_IO", "security state is poisoned; restart tot");
             }
         };
         let engagement = match state.ensure_engagement(&ctx.paths) {

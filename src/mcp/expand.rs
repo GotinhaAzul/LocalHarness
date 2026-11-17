@@ -29,7 +29,7 @@ fn expand_with(text: &str, lookup: impl Fn(&str) -> Option<String>) -> Result<St
         let name = &captures[1];
         out.push_str(&text[last..whole.start()]);
         let value = lookup(name).ok_or_else(|| {
-            format!("environment variable {name} is not set; export it before starting lh")
+            format!("environment variable {name} is not set; export it before starting tot")
         })?;
         out.push_str(&value);
         last = whole.end();

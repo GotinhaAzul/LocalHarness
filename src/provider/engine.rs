@@ -78,7 +78,7 @@ impl Engine {
     }
 
     /// Fingerprint the engine from metadata endpoints. Order matches
-    /// `lh doctor`; detection stops at the first engine that answers. Every
+    /// `tot doctor`; detection stops at the first engine that answers. Every
     /// probe is best-effort and bounded by [`DETECT_TIMEOUT`].
     pub async fn detect(provider: &dyn Provider) -> Self {
         let model = provider.model().trim().to_string();
@@ -163,7 +163,7 @@ impl Engine {
     }
 
     /// Fields the engine maps with a known wire name. `None` means the field
-    /// is not sent (and `lh doctor` warns). `repeat_penalty` is renamed per
+    /// is not sent (and `tot doctor` warns). `repeat_penalty` is renamed per
     /// engine; vLLM and SGLang call it `repetition_penalty`.
     pub fn sampler_key(self, field: super::sampler::SamplerField) -> Option<&'static str> {
         use super::sampler::SamplerField as F;
@@ -248,7 +248,7 @@ impl Engine {
     }
 }
 
-/// Structured-output capability recorded in the `lh doctor` manifest.
+/// Structured-output capability recorded in the `tot doctor` manifest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StructuredOutput {
     /// JSON Schema (`response_format` / `structured_outputs`).

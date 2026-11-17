@@ -1,6 +1,6 @@
 # Security policy
 
-LocalHarness runs shell commands, edits files, and holds model credentials on
+Totality runs shell commands, edits files, and holds model credentials on
 your machine, and it is used on security engagements. It is held to the same bar
 as the tools it drives.
 
@@ -15,7 +15,7 @@ advisory is published.
 
 A useful report has:
 
-- the version (`lh --version`) and platform, plus the commit if you built from source;
+- the version (`tot --version`) and platform, plus the commit if you built from source;
 - a minimal reproduction — config, command, and the input that triggers it;
 - the impact you can demonstrate, and the boundary you believe is crossed.
 
@@ -59,7 +59,7 @@ Classes that break a boundary the harness claims to enforce:
 - Bugs in your inference engine, model weights, GPU driver, or OS.
 - Reports that require the user to trust an untrusted manifest with `--trust`.
   Trust is an explicit, recorded decision.
-- Use of LocalHarness against systems you are not authorized to test.
+- Use of Totality against systems you are not authorized to test.
 - Automated scanner output with no demonstrated impact.
 
 ## Supported versions

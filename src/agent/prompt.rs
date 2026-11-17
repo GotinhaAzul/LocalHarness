@@ -45,7 +45,7 @@ pub(crate) fn build_system_prompt_with_agents(
     let mut out = String::new();
     let identity = config.prompt.identity.trim();
     if identity.is_empty() {
-        out.push_str("You are LocalHarness, a local-first agent harness. You act on the user's machine through tools.\n\n");
+        out.push_str("You are Totality, a local-first agent harness. You act on the user's machine through tools.\n\n");
     } else {
         out.push_str(identity);
         out.push_str("\n\n");
@@ -360,6 +360,6 @@ mod tests {
         assert!(prompt.starts_with("You are Acme Agent."));
         assert!(prompt.contains("## Custom instructions"));
         assert!(prompt.contains("Prefer small reviews."));
-        assert!(!prompt.contains("You are LocalHarness"));
+        assert!(!prompt.contains("You are Totality"));
     }
 }

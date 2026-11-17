@@ -293,7 +293,7 @@ pub(crate) fn atomic_restore(path: &Path, bytes: &[u8], mode: u32) -> std::io::R
         .unwrap_or(0);
     let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
     let temp = dir.join(format!(
-        ".{name}.lh-tmp-{}-{nanos}-{seq}",
+        ".{name}.tot-tmp-{}-{nanos}-{seq}",
         std::process::id()
     ));
 
@@ -355,8 +355,8 @@ pub(crate) fn test_context(dir: &Path) -> ToolContext {
 
     let cwd = dir.canonicalize().expect("canonical temp dir");
     let paths = Paths {
-        config_dir: cwd.join(".lh-config"),
-        data_dir: cwd.join(".lh-data"),
+        config_dir: cwd.join(".tot-config"),
+        data_dir: cwd.join(".tot-data"),
         cwd: cwd.clone(),
         project_id: "test".into(),
         sessions_dir_override: None,

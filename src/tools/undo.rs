@@ -343,7 +343,7 @@ mod tests {
         let original = format!("DB_PASSWORD={password}\nname = Column(Text)\n");
         std::fs::write(dir.path().join("settings.py"), &original).unwrap();
         let mut ctx = test_context(dir.path());
-        let root = dir.path().join(".lh-artifacts");
+        let root = dir.path().join(".tot-artifacts");
         ctx.artifacts = std::sync::Arc::new(
             crate::session::ArtifactStore::new("s", Some(root.clone())).unwrap(),
         );

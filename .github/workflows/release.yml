@@ -40,14 +40,14 @@ jobs:
         run: |
           set -eu
           mkdir -p dist/completions dist/man
-          ./target/release/lh completions bash > dist/completions/lh.bash
-          ./target/release/lh completions zsh > dist/completions/lh.zsh
-          ./target/release/lh completions fish > dist/completions/lh.fish
-          ./target/release/lh man > dist/man/lh.1
-          test -s dist/completions/lh.bash
-          test -s dist/completions/lh.zsh
-          test -s dist/completions/lh.fish
-          test -s dist/man/lh.1
+          ./target/release/tot completions bash > dist/completions/tot.bash
+          ./target/release/tot completions zsh > dist/completions/tot.zsh
+          ./target/release/tot completions fish > dist/completions/tot.fish
+          ./target/release/tot man > dist/man/tot.1
+          test -s dist/completions/tot.bash
+          test -s dist/completions/tot.zsh
+          test -s dist/completions/tot.fish
+          test -s dist/man/tot.1
       - uses: actions/upload-artifact@v4
         with:
           name: cli-assets
@@ -83,19 +83,19 @@ jobs:
         run: |
           set -eu
           version="${GITHUB_REF_NAME#v}"
-          binary="target/${{ matrix.target }}/release/lh"
+          binary="target/${{ matrix.target }}/release/tot"
           test -x "$binary"
-          install -Dm755 "$binary" dist/lh
+          install -Dm755 "$binary" dist/tot
           cp README.md LICENSE-MIT LICENSE-APACHE THIRD_PARTY_NOTICES.md dist/
-          artifact="lh-v${version}-${{ matrix.target }}.tar.gz"
+          artifact="tot-v${version}-${{ matrix.target }}.tar.gz"
           tar -czf "$artifact" -C dist .
           sha256sum "$artifact" > "${artifact}.sha256"
       - uses: actions/upload-artifact@v4
         with:
           name: release-${{ matrix.target }}
           path: |
-            lh-v*.tar.gz
-            lh-v*.tar.gz.sha256
+            tot-v*.tar.gz
+            tot-v*.tar.gz.sha256
 
   publish:
     name: publish release
@@ -112,7 +112,7 @@ jobs:
           set -eu
           version="${GITHUB_REF_NAME#v}"
           mkdir -p release
-          find downloaded -name 'lh-v*.tar.gz' -exec cp {} release/ \;
+          find downloaded -name 'tot-v*.tar.gz' -exec cp {} release/ \;
           (cd release && sha256sum -- *.tar.gz > SHA256SUMS)
           cp install.sh release/install.sh
 
@@ -123,8 +123,8 @@ jobs:
           source_sha="$(sha256sum source.tar.gz | awk '{print $1}')"
           rm -f source.tar.gz
 
-          x86_64_sha="$(awk -v artifact="lh-v${version}-x86_64-unknown-linux-musl.tar.gz" '$2 == artifact { print $1 }' release/SHA256SUMS)"
-          aarch64_sha="$(awk -v artifact="lh-v${version}-aarch64-unknown-linux-musl.tar.gz" '$2 == artifact { print $1 }' release/SHA256SUMS)"
+          x86_64_sha="$(awk -v artifact="tot-v${version}-x86_64-unknown-linux-musl.tar.gz" '$2 == artifact { print $1 }' release/SHA256SUMS)"
+          aarch64_sha="$(awk -v artifact="tot-v${version}-aarch64-unknown-linux-musl.tar.gz" '$2 == artifact { print $1 }' release/SHA256SUMS)"
           test -n "$x86_64_sha"
           test -n "$aarch64_sha"
 
@@ -132,19 +132,19 @@ jobs:
             -e "s/^pkgver=.*/pkgver=${version}/" \
             -e "s/^sha256sums_x86_64=('SKIP')/sha256sums_x86_64=('${x86_64_sha}')/" \
             -e "s/^sha256sums_aarch64=('SKIP')/sha256sums_aarch64=('${aarch64_sha}')/" \
-            packaging/aur/localharness-bin/PKGBUILD > release/PKGBUILD-localharness-bin
+            packaging/aur/totality-bin/PKGBUILD > release/PKGBUILD-totality-bin
 
           sed \
             -e "s/^pkgver=.*/pkgver=${version}/" \
             -e "s/^sha256sums=('SKIP')/sha256sums=('${source_sha}')/" \
-            packaging/aur/localharness/PKGBUILD > release/PKGBUILD-localharness
+            packaging/aur/totality/PKGBUILD > release/PKGBUILD-totality
 
-          sh packaging/homebrew/render.sh "$version" release/SHA256SUMS "$source_sha" > release/localharness.rb
+          sh packaging/homebrew/render.sh "$version" release/SHA256SUMS "$source_sha" > release/totality.rb
 
           test -s release/SHA256SUMS
-          test -s release/localharness.rb
-          test -s release/PKGBUILD-localharness-bin
-          test -s release/PKGBUILD-localharness
+          test -s release/totality.rb
+          test -s release/PKGBUILD-totality-bin
+          test -s release/PKGBUILD-totality
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
@@ -165,7 +165,7 @@ jobs:
         run: |
           set -eu
           mkdir -p dist
-          find downloaded -name 'lh-v*.tar.gz' -exec cp {} dist/ \;
+          find downloaded -name 'tot-v*.tar.gz' -exec cp {} dist/ \;
           (cd dist && sha256sum -- *.tar.gz > SHA256SUMS)
       - name: Install in clean Debian without Rust or curl
         run: |
@@ -173,32 +173,32 @@ jobs:
           docker run --rm \
             -v "$PWD/dist:/dist:ro" \
             -v "$PWD/install.sh:/install.sh:ro" \
-            -e "LH_VERSION=${GITHUB_REF_NAME#v}" \
-            -e LH_INSTALL_SOURCE_DIR=/dist \
-            -e LH_INSTALL_DIR=/lh/bin \
-            -e XDG_DATA_HOME=/lh/share \
+            -e "TOT_VERSION=${GITHUB_REF_NAME#v}" \
+            -e TOT_INSTALL_SOURCE_DIR=/dist \
+            -e TOT_INSTALL_DIR=/tot/bin \
+            -e XDG_DATA_HOME=/tot/share \
             debian:bookworm-slim \
-            sh -c 'command -v cargo >/dev/null && exit 1 || true; sh /install.sh; /lh/bin/lh --version; /lh/bin/lh man | head -n 1; test -s /lh/share/man/man1/lh.1'
+            sh -c 'command -v cargo >/dev/null && exit 1 || true; sh /install.sh; /tot/bin/tot --version; /tot/bin/tot man | head -n 1; test -s /tot/share/man/man1/tot.1'
       - name: Refuse a tampered artifact
         run: |
           set -eu
           docker run --rm \
             -v "$PWD/dist:/dist:ro" \
             -v "$PWD/install.sh:/install.sh:ro" \
-            -e "LH_VERSION=${GITHUB_REF_NAME#v}" \
-            -e LH_INSTALL_SOURCE_DIR=/dist \
-            -e LH_INSTALL_DIR=/lh/bin \
+            -e "TOT_VERSION=${GITHUB_REF_NAME#v}" \
+            -e TOT_INSTALL_SOURCE_DIR=/dist \
+            -e TOT_INSTALL_DIR=/tot/bin \
             debian:bookworm-slim \
             sh -c '
               set -eu
               cp -r /dist /tmp/dist
-              printf tampered >> /tmp/dist/lh-v*-x86_64-unknown-linux-musl.tar.gz
-              if LH_INSTALL_SOURCE_DIR=/tmp/dist sh /install.sh 2>/tmp/install.err; then
+              printf tampered >> /tmp/dist/tot-v*-x86_64-unknown-linux-musl.tar.gz
+              if TOT_INSTALL_SOURCE_DIR=/tmp/dist sh /install.sh 2>/tmp/install.err; then
                 echo "installer accepted a tampered artifact" >&2
                 exit 1
               fi
               grep -q "checksum mismatch" /tmp/install.err
-              test ! -e /lh/bin/lh
+              test ! -e /tot/bin/tot
             '
 
   docker:
@@ -209,14 +209,14 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Build the image
-        run: docker build -f packaging/docker/Dockerfile -t localharness:ci .
+        run: docker build -f packaging/docker/Dockerfile -t totality:ci .
       - name: Run as non-root in distroless
         run: |
           set -eu
-          user="$(docker image inspect --format '{{.Config.User}}' localharness:ci)"
+          user="$(docker image inspect --format '{{.Config.User}}' totality:ci)"
           test "$user" = "nonroot:nonroot"
-          docker run --rm localharness:ci --version
-          if docker run --rm --entrypoint sh localharness:ci -c true 2>/dev/null; then
+          docker run --rm totality:ci --version
+          if docker run --rm --entrypoint sh totality:ci -c true 2>/dev/null; then
             echo "image unexpectedly contains a shell" >&2
             exit 1
           fi

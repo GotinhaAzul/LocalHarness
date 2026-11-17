@@ -63,7 +63,7 @@ use terminal::*;
 
 pub const COMMANDS: &[(&str, &str)] = &[
     ("help", "list commands and key bindings"),
-    ("quit", "exit LocalHarness"),
+    ("quit", "exit Totality"),
     ("model", "pick a model from the endpoint or gateway"),
     ("login", "configure the endpoint, model, and API key"),
     ("profile", "pick the tool profile"),

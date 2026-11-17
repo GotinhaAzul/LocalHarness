@@ -80,7 +80,7 @@ impl LockFile {
             .with_context(|| format!("{} is not a valid skills lockfile", path.display()))?;
         if lock.version > LOCK_VERSION {
             bail!(
-                "{} was written by a newer LocalHarness (lockfile version {}); upgrade `lh`",
+                "{} was written by a newer Totality (lockfile version {}); upgrade `tot`",
                 path.display(),
                 lock.version
             );
@@ -198,7 +198,7 @@ pub fn add(paths: &Paths, raw_source: &str, force: bool) -> Result<InstallReport
         && !force
     {
         bail!(
-            "skill `{}` is already installed at {}; run `lh skill update {}` or `lh skill add {} --force` (the old copy is moved to {})",
+            "skill `{}` is already installed at {}; run `tot skill update {}` or `tot skill add {} --force` (the old copy is moved to {})",
             skill.name,
             target.display(),
             skill.name,
@@ -236,7 +236,7 @@ pub fn update(
             && lock.get(name).is_none()
         {
             bail!(
-                "no lockfile entry for `{name}`; run `lh skill list` or install it with `lh skill add`"
+                "no lockfile entry for `{name}`; run `tot skill list` or install it with `tot skill add`"
             );
         }
         let drift = verify_lock(paths, &lock, name);
@@ -254,17 +254,17 @@ pub fn update(
                 let installed = paths.skills_dir().join(name).is_dir();
                 if installed {
                     bail!(
-                        "skill `{name}` was installed by hand and has no lockfile source; run `lh skill add <source>` to record one, or remove it first"
+                        "skill `{name}` was installed by hand and has no lockfile source; run `tot skill add <source>` to record one, or remove it first"
                     );
                 }
-                bail!("skill `{name}` is not installed; `lh skill list` shows installed skills");
+                bail!("skill `{name}` is not installed; `tot skill list` shows installed skills");
             };
             vec![entry]
         }
         None => {
             if lock.skills.is_empty() {
                 bail!(
-                    "no skills are locked in {}; install one with `lh skill add <dir|git-url#ref>`",
+                    "no skills are locked in {}; install one with `tot skill add <dir|git-url#ref>`",
                     paths.skills_lock_file().display()
                 );
             }
@@ -369,7 +369,7 @@ pub fn remove(paths: &Paths, name: &str) -> Result<RemoveReport> {
     };
     if trash.is_none() && !lock_removed {
         bail!(
-            "skill `{name}` is not installed in {}; `lh skill list` shows installed skills",
+            "skill `{name}` is not installed in {}; `tot skill list` shows installed skills",
             paths.skills_dir().display()
         );
     }
@@ -509,7 +509,7 @@ pub fn format_drift(drift: &[Drift]) -> String {
         }
     }
     out.push_str(
-        "\n`--frozen` never rewrites skills.lock. Restore the copy with `lh skill update` (without --frozen) or fix the install.",
+        "\n`--frozen` never rewrites skills.lock. Restore the copy with `tot skill update` (without --frozen) or fix the install.",
     );
     out
 }
@@ -541,7 +541,7 @@ fn parse_source(paths: &Paths, raw: &str) -> Result<SourceSpec> {
     }
     let direct = expand_path(paths, raw);
     if direct.exists() {
-        // A later `lh skill update` runs from wherever the user is, so a
+        // A later `tot skill update` runs from wherever the user is, so a
         // relative install source must be recorded as the resolved path.
         let resolved = direct.canonicalize().unwrap_or_else(|_| direct.clone());
         let resolved = resolved.to_string_lossy().into_owned();
@@ -852,7 +852,7 @@ fn materialize(
         .ok_or_else(|| anyhow::anyhow!("invalid skill name {:?}", skill.name))?;
     if target.exists() && !updating && !force {
         bail!(
-            "skill `{}` is already installed; run `lh skill update {}` or add --force",
+            "skill `{}` is already installed; run `tot skill update {}` or add --force",
             skill.name,
             skill.name
         );

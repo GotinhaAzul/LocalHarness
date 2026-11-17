@@ -17,7 +17,7 @@ impl AttackPathTool {
             Err(_) => {
                 return Err(ToolResult::err(
                     "SECURITY_IO",
-                    "security state is poisoned; restart lh",
+                    "security state is poisoned; restart tot",
                 ));
             }
         };

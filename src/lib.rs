@@ -1,4 +1,4 @@
-//! LocalHarness: a local-first agent harness for coding and security work.
+//! Totality: a local-first agent harness for coding and security work.
 //!
 //! The library exposes the harness core for embedding and forking. The binary
 //! in `main.rs` is a thin wrapper.

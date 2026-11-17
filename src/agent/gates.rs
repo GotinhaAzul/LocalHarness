@@ -297,7 +297,7 @@ pub fn settle(facts: &TurnFacts, progress: &mut RunProgress, tools: GateTools) -
             return SettleDecision::Continue {
                 kind: SettleKind::Todo,
                 message: format!(
-                    "[localharness] todo gate: this run changed {} file(s) across {} mutation(s) but has no plan. Call the todo tool with action \"plan\" and the remaining tasks before continuing. Do not make more edits until the plan exists.",
+                    "[totality] todo gate: this run changed {} file(s) across {} mutation(s) but has no plan. Call the todo tool with action \"plan\" and the remaining tasks before continuing. Do not make more edits until the plan exists.",
                     facts.files.len(),
                     facts.mutations
                 ),
@@ -320,7 +320,7 @@ pub fn settle(facts: &TurnFacts, progress: &mut RunProgress, tools: GateTools) -
             progress.settle_continuations += 1;
             return SettleDecision::Continue {
                 kind: SettleKind::Verify,
-                message: "[localharness] verify gate: files changed after the last passing verification. Run the verify tool now and fix any failure before settling.".into(),
+                message: "[totality] verify gate: files changed after the last passing verification. Run the verify tool now and fix any failure before settling.".into(),
             };
         }
         tracing::warn!(
@@ -332,7 +332,7 @@ pub fn settle(facts: &TurnFacts, progress: &mut RunProgress, tools: GateTools) -
         progress.review_nudged = true;
         return SettleDecision::Continue {
             kind: SettleKind::Review,
-            message: "[localharness] review nudge: changes are in the working tree. Call the review tool once, address any real risk it reports, then finish.".into(),
+            message: "[totality] review nudge: changes are in the working tree. Call the review tool once, address any real risk it reports, then finish.".into(),
         };
     }
 
@@ -372,7 +372,7 @@ pub fn todo_gate_notice(
     if plan_present || !(mutations >= 2 || files >= 2) {
         return None;
     }
-    Some("[localharness] the next edit needs a plan: call todo action=\"plan\" first.")
+    Some("[totality] the next edit needs a plan: call todo action=\"plan\" first.")
 }
 
 #[cfg(test)]

@@ -73,7 +73,7 @@ impl Server {
                 "client-supplied MCP servers are not connected in this version; configure them in the harness config"
             );
         }
-        Ok(json!({"sessionId": id, "_meta": {"localharness": meta}}))
+        Ok(json!({"sessionId": id, "_meta": {"totality": meta}}))
     }
 
     pub(crate) async fn load_session(self: &Arc<Self>, params: Value) -> Result<Value, RpcError> {
@@ -137,7 +137,7 @@ impl Server {
 
         self.replay(&session);
         Ok(json!({
-            "_meta": {"localharness": {"sessionId": loaded_id, "trusted": trusted}}
+            "_meta": {"totality": {"sessionId": loaded_id, "trusted": trusted}}
         }))
     }
 
@@ -341,7 +341,7 @@ impl Server {
             request_id,
             json!({
                 "stopReason": stop_reason,
-                "_meta": {"localharness": meta},
+                "_meta": {"totality": meta},
             }),
         );
     }

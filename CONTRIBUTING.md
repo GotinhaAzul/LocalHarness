@@ -25,9 +25,9 @@ macOS or Windows.
 
 ```sh
 git clone https://github.com/GotinhaAzul/LocalHarness
-cd LocalHarness
+cd Totality
 cargo build --release
-./target/release/lh --help
+./target/release/tot --help
 ```
 
 Build what the users install:
@@ -36,7 +36,7 @@ Build what the users install:
 cargo install --path . --locked
 ```
 
-The binary is `lh`; the crate is `localharness`. You do not need a model server
+The binary is `tot`; the crate is `totality`. You do not need a model server
 to develop or to run the test suite.
 
 ## Checks

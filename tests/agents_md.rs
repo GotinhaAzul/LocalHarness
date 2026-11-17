@@ -1,6 +1,6 @@
 //! End-to-end coverage for the hierarchical AGENTS.md loader: repository-root
 //! discovery, source order, caps, symlink confinement, and the
-//! `lh context --show` manifest.
+//! `tot context --show` manifest.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -46,21 +46,26 @@ fn init_git(root: &Path) {
 }
 
 fn run(env: &Env, cwd: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_lh"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_tot"));
     command
         .args(args)
         .current_dir(cwd)
-        .env("LH_CONFIG_DIR", &env.config_dir)
-        .env("LH_DATA_DIR", &env.data_dir)
+        .env("TOT_CONFIG_DIR", &env.config_dir)
+        .env("TOT_DATA_DIR", &env.data_dir)
+        .env_remove("TOT_AGENTS_MD")
         .env_remove("LH_AGENTS_MD")
+        .env_remove("TOT_ENDPOINT")
         .env_remove("LH_ENDPOINT")
+        .env_remove("TOT_MODEL")
         .env_remove("LH_MODEL")
+        .env_remove("TOT_PROFILE")
         .env_remove("LH_PROFILE")
+        .env_remove("TOT_TRUST")
         .env_remove("LH_TRUST");
     for (key, value) in extra_env {
         command.env(key, value);
     }
-    command.output().expect("run lh")
+    command.output().expect("run tot")
 }
 
 fn stdout(output: &Output) -> String {
@@ -105,7 +110,7 @@ fn context_show_lists_the_monorepo_chain_in_order_with_hashes() {
     assert!(text.contains(&sha256(b"leaf rule\n")), "{text}");
     assert!(
         !env.data_dir.join("sessions").exists(),
-        "lh context must not open a session"
+        "tot context must not open a session"
     );
 
     let output = run(
@@ -136,7 +141,7 @@ fn context_show_lists_the_monorepo_chain_in_order_with_hashes() {
 
 #[test]
 fn context_show_truncates_at_the_total_cap_deterministically_with_a_warning() {
-    use localharness::agent::agents_md::{PER_FILE_CAP_BYTES, TOTAL_CAP_BYTES};
+    use totality::agent::agents_md::{PER_FILE_CAP_BYTES, TOTAL_CAP_BYTES};
 
     let env = env();
     init_git(&env.repo);
@@ -234,7 +239,7 @@ fn no_agents_md_flag_env_and_config_disable_loading() {
         &env,
         &env.repo,
         &["context", "--show"],
-        &[("LH_AGENTS_MD", "0")],
+        &[("TOT_AGENTS_MD", "0")],
     );
     assert_eq!(from_env.status.code(), Some(0), "{}", stderr(&from_env));
     assert!(

@@ -1,4 +1,4 @@
-//! `/rewind` and `lh --rewind`: move the active leaf to an earlier entry and
+//! `/rewind` and `tot --rewind`: move the active leaf to an earlier entry and
 //! restore every file the harness wrote after it to the snapshot that entry
 //! implies.
 //!
@@ -487,5 +487,5 @@ fn backup_path(path: &Path) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_nanos())
         .unwrap_or(0);
-    path.with_file_name(format!("{name}.lh-rewind-{nanos}.bak"))
+    path.with_file_name(format!("{name}.tot-rewind-{nanos}.bak"))
 }

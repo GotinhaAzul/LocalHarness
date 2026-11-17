@@ -1,6 +1,6 @@
 # Third-party notices
 
-LocalHarness includes material adapted from third-party open-source projects.
+Totality includes material adapted from third-party open-source projects.
 The original copyright and license terms apply to that material.
 
 ## 0
@@ -18,7 +18,7 @@ project by 0 Labs.
 The upstream material is licensed under the MIT License and the Apache License,
 Version 2.0. Copies of those license texts are included in this repository as
 `LICENSE-MIT` and `LICENSE-APACHE`. Nothing in this notice grants rights to the
-`0` name or marks; LocalHarness uses no `0` trademarks.
+`0` name or marks; Totality uses no `0` trademarks.
 
 Adapted source documents (upstream paths relative to
 `packages/core/src/agent/skills/`):

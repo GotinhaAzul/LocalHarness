@@ -4,19 +4,17 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use localharness::agent::prompt::{
-    SESSION_FACTS_HEADING, build_system_prompt, stable_prefix_chars,
-};
-use localharness::config::{Config, ProfileConfig};
-use localharness::context::{
+use totality::agent::prompt::{SESSION_FACTS_HEADING, build_system_prompt, stable_prefix_chars};
+use totality::config::{Config, ProfileConfig};
+use totality::context::{
     AssembledContext, JSON_CHARS_PER_TOKEN, TokenBudget, ToolSpecCost, assemble,
     common_prefix_chars, prompt_prefix,
 };
-use localharness::paths::Paths;
-use localharness::provider::{ChatMessage, ToolSpec, tools_json, tools_payload};
-use localharness::session::{EntryKind, Session, SessionData, UserData};
-use localharness::skills::SkillIndex;
-use localharness::tools::{Tool, ToolRegistry};
+use totality::paths::Paths;
+use totality::provider::{ChatMessage, ToolSpec, tools_json, tools_payload};
+use totality::session::{EntryKind, Session, SessionData, UserData};
+use totality::skills::SkillIndex;
+use totality::tools::{Tool, ToolRegistry};
 
 fn paths(dir: &Path) -> Paths {
     let mut paths = Paths::discover(dir).unwrap();
@@ -305,7 +303,7 @@ fn same_branch_assembles_a_byte_identical_prefix_and_hash() {
     // keeps nearly the whole prefix.
     let stable = stable_prefix_chars(&prompt);
     assert!(stable > 0);
-    assert!(prompt[..stable].starts_with("You are LocalHarness"));
+    assert!(prompt[..stable].starts_with("You are Totality"));
     assert!(prompt[..stable].contains("## Operating rules"));
     assert!(!prompt[..stable].contains("Working directory:"));
     assert!(prompt[stable..].starts_with(SESSION_FACTS_HEADING));
@@ -363,7 +361,7 @@ fn leading_system(assembled: &AssembledContext) -> &str {
 }
 
 fn tool_step(session: &mut Session, n: usize) {
-    use localharness::session::{AssistantData, ToolCall, ToolResultData};
+    use totality::session::{AssistantData, ToolCall, ToolResultData};
     session
         .append(EntryKind::Assistant(AssistantData {
             content: Some(format!("step {n}")),
@@ -387,7 +385,7 @@ fn tool_step(session: &mut Session, n: usize) {
 }
 
 fn hook_context(session: &mut Session, event: &str, text: &str) {
-    use localharness::session::CustomData;
+    use totality::session::CustomData;
     session
         .append(EntryKind::Custom(
             CustomData::new("hook-context")
@@ -400,12 +398,12 @@ fn hook_context(session: &mut Session, event: &str, text: &str) {
 
 #[test]
 fn state_block_after_compaction_leaves_the_head_byte_identical() {
-    use localharness::session::CompactionData;
+    use totality::session::CompactionData;
     let dir = tempfile::tempdir().unwrap();
     let mut session = session(dir.path());
     session
         .append(EntryKind::Compaction(CompactionData {
-            summary: "[localharness] summary of earlier work".into(),
+            summary: "[totality] summary of earlier work".into(),
             tokens_before: 9000,
             reason: "auto".into(),
             thread_id: None,
@@ -424,7 +422,7 @@ fn state_block_after_compaction_leaves_the_head_byte_identical() {
     let first = assemble(
         "system",
         &session,
-        Some("[localharness] state\nverify: not run\ncontext: under 50% of usable prompt"),
+        Some("[totality] state\nverify: not run\ncontext: under 50% of usable prompt"),
         &budget,
     );
     tool_step(&mut session, 2);
@@ -433,12 +431,12 @@ fn state_block_after_compaction_leaves_the_head_byte_identical() {
         "system",
         &session,
         Some(
-            "[localharness] state\nchanged: f1.rs\nverify: failed\ncontext: over 50% of usable prompt",
+            "[totality] state\nchanged: f1.rs\nverify: failed\ncontext: over 50% of usable prompt",
         ),
         &budget,
     );
     assert_eq!(leading_system(&first), leading_system(&second));
-    assert!(!leading_system(&second).contains("[localharness] state"));
+    assert!(!leading_system(&second).contains("[totality] state"));
     // Everything the first request sent before its last message is reused.
     let reused = bytes_before_last(&first);
     assert!(message_bytes(&second).starts_with(&reused));
@@ -513,7 +511,7 @@ fn auto_tool_schemas_go_short_on_a_small_window_and_full_on_a_large_one() {
     let mut specs = ToolRegistry::specs_with(&tools, false);
     let before = static_tokens(&specs, &small);
     let choice =
-        localharness::tools::choose_schemas(&tools, &mut specs, &prompt, &small).expect("a choice");
+        totality::tools::choose_schemas(&tools, &mut specs, &prompt, &small).expect("a choice");
     assert!(choice.short, "{choice:?}");
     assert_eq!(
         tools_json(&specs),
@@ -527,13 +525,13 @@ fn auto_tool_schemas_go_short_on_a_small_window_and_full_on_a_large_one() {
     );
     // Decided once: the same inputs give byte-identical schemas.
     let mut again = ToolRegistry::specs_with(&tools, false);
-    localharness::tools::choose_schemas(&tools, &mut again, &prompt, &small);
+    totality::tools::choose_schemas(&tools, &mut again, &prompt, &small);
     assert_eq!(tools_json(&again), tools_json(&specs));
 
     let large = TokenBudget::new(131_072, 8192);
     let mut specs = ToolRegistry::specs_with(&tools, false);
     let choice =
-        localharness::tools::choose_schemas(&tools, &mut specs, &prompt, &large).expect("a choice");
+        totality::tools::choose_schemas(&tools, &mut specs, &prompt, &large).expect("a choice");
     assert!(!choice.short, "{choice:?}");
     assert_eq!(
         tools_json(&specs),

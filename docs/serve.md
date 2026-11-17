@@ -1,16 +1,16 @@
-# Local HTTP API (`lh serve`)
+# Local HTTP API (`tot serve`)
 
-`lh serve` runs a small HTTP server on your machine so scripts, cron jobs, CI
-steps, dashboards, and phone shortcuts can drive LocalHarness sessions without
-spawning `lh --print` for every prompt or reimplementing process management.
+`tot serve` runs a small HTTP server on your machine so scripts, cron jobs, CI
+steps, dashboards, and phone shortcuts can drive Totality sessions without
+spawning `tot --print` for every prompt or reimplementing process management.
 
-It is the same harness as the TUI, `--print`, and `lh acp`. Every session uses
+It is the same harness as the TUI, `--print`, and `tot acp`. Every session uses
 the same session store, config, path jail, scope gate, sandbox, and agent loop.
 The only new thing is the transport.
 
 ```sh
-lh --endpoint http://127.0.0.1:8080 --model qwen3 serve
-# {"listening":"http://127.0.0.1:43817","token_file":"/home/me/.local/share/localharness/serve/token-43817"}
+tot --endpoint http://127.0.0.1:8080 --model qwen3 serve
+# {"listening":"http://127.0.0.1:43817","token_file":"/home/me/.local/share/totality/serve/token-43817"}
 ```
 
 stdout carries exactly one JSON line with the address and the **path** of the
@@ -21,7 +21,7 @@ printed or logged.
 
 ```sh
 BASE=http://127.0.0.1:43817
-TOKEN=$(cat ~/.local/share/localharness/serve/token-43817)
+TOKEN=$(cat ~/.local/share/totality/serve/token-43817)
 auth=(-H "Authorization: Bearer $TOKEN")
 
 # 1. Create a session rooted at the server's working directory.
@@ -87,12 +87,12 @@ capped at 1 MiB.
 ### Creating a session
 
 - `cwd`: an absolute, existing directory. It defaults to the directory
-  `lh serve` was started in. File tools are jailed to it, as in ACP. Project
+  `tot serve` was started in. File tools are jailed to it, as in ACP. Project
   trust (`--trust`) and `verify.toml` apply only when `cwd` is the server's own
   directory. Another root never inherits that trust.
 - `permission_mode`: see [Permissions](#permissions). Defaults to `ask`.
 - `resume`: a stored session id under that root. The session store reopens
-  it, the same way `lh --resume` does. A session already live in this server
+  it, the same way `tot --resume` does. A session already live in this server
   returns `409 session_already_loaded`.
 
 A server with no model selected answers `503 no_model` instead of creating a
@@ -124,7 +124,7 @@ data: {"type":"text","text":"Hello"}
 ```
 
 - **The names are the `--json` names.** `event:` is the same string as the
-  `"type"` field of `lh --print --json`, and `data:` is the same JSON object.
+  `"type"` field of `tot --print --json`, and `data:` is the same JSON object.
   Both frontends render through one function (`src/events.rs`), so they cannot
   drift. The names are `started`, `state`, `text`, `reasoning`,
   `tool_started`, `tool_finished`, `usage`, `context`, `window_detected`,
@@ -161,7 +161,7 @@ matches. A deny rule always wins. The mode never widens a harness gate
 | `ask` (default) | built-in read-only tools (`read`, `grep`, `glob`, `repo_map`, `recall`, `review`, `lsp`, `skill`, `todo`, `thread`), plus any call an allow rule names | everything else |
 | `accept-edits` | the above plus `write`, `edit`, `patch`, `undo` | `bash`, `bg`, `verify`, `test`, MCP and external tools |
 | `dont-ask` | same as `ask` over HTTP | same as `ask` |
-| `yolo` | every call the harness gates allow; needs `lh serve --allow-yolo` | nothing beyond the gates |
+| `yolo` | every call the harness gates allow; needs `tot serve --allow-yolo` | nothing beyond the gates |
 
 A denied call does not run. The model receives a `DENIED` tool result that
 names the mode, rule, or next action, and the turn continues. MCP and external
@@ -169,7 +169,7 @@ tools always count as needing approval, even when their manifest claims to be
 read-only. Add an allow rule under `[permissions]` to run a specific command or
 path in `ask` or `dont-ask` mode.
 
-**Why not an approval endpoint?** `lh serve` is built for unattended callers.
+**Why not an approval endpoint?** `tot serve` is built for unattended callers.
 A round trip that parks a turn until a second client approves it would need its
 own event type outside the `--json` schema, and a timeout policy. Picking the
 mode at creation is explicit, auditable in the session list, and safe by
@@ -208,9 +208,9 @@ server then closes the remaining connections, stops MCP servers, and removes
 the token file. Sessions stay in the normal session store:
 
 ```sh
-lh --resume <id>                       # TUI
-lh --resume <id> --print "continue"    # headless
-curl … -X POST $BASE/v1/sessions -d '{"resume":"<id>"}'   # a new lh serve
+tot --resume <id>                       # TUI
+tot --resume <id> --print "continue"    # headless
+curl … -X POST $BASE/v1/sessions -d '{"resume":"<id>"}'   # a new tot serve
 ```
 
 With `--no-session`, nothing is persisted, ids look like `http-1`, and

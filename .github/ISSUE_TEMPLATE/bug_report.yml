@@ -26,8 +26,8 @@ body:
     id: version
     attributes:
       label: Version
-      description: Output of `lh --version`. Add the commit if you built from source.
-      placeholder: "lh 0.2.0 (339650a)"
+      description: Output of `tot --version`. Add the commit if you built from source.
+      placeholder: "tot 0.2.0 (339650a)"
     validations:
       required: true
 
@@ -73,7 +73,7 @@ body:
       label: Steps to reproduce
       description: Smallest sequence that shows it. Include the flags, the profile, and any `.harness/` config that matters.
       placeholder: |
-        1. `lh --profile security --sandbox`
+        1. `tot --profile security --sandbox`
         2. ask for ...
         3. the tool call ...
     validations:
@@ -98,15 +98,15 @@ body:
   - type: textarea
     id: doctor
     attributes:
-      label: "`lh doctor` output"
-      description: Paste `lh doctor` (or `lh doctor --json`) when the engine, the context window, or tool calling is involved.
+      label: "`tot doctor` output"
+      description: Paste `tot doctor` (or `tot doctor --json`) when the engine, the context window, or tool calling is involved.
       render: text
 
   - type: textarea
     id: logs
     attributes:
       label: Logs
-      description: Relevant output from `lh --debug`. Trim to the failing turn.
+      description: Relevant output from `tot --debug`. Trim to the failing turn.
       render: text
 
   - type: textarea

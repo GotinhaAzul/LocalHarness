@@ -1,5 +1,5 @@
 //! Project detection: the runner detection shared with the `test` tool, and
-//! the manifest-only verify step candidates that `verify`, `lh doctor` and the
+//! the manifest-only verify step candidates that `verify`, `tot doctor` and the
 //! startup prompt propose.
 //!
 //! Nothing here executes a command. Detection reads manifest and config files

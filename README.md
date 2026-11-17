@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="docs/assets/demo.gif" alt="LocalHarness TUI: a failing test, the model reading the file, editing it, and the verify gate passing" width="960">
+  <img src="docs/assets/demo.gif" alt="Totality TUI: a failing test, the model reading the file, editing it, and the verify gate passing" width="960">
 </p>
 
-<h1 align="center">LocalHarness</h1>
+<h1 align="center">Totality</h1>
 
 <p align="center">
   <strong>A local-first coding agent that enforces the loop.</strong><br>
@@ -24,15 +24,15 @@
 
 ---
 
-**LocalHarness owns the agent loop, the tools, the context budget, the session tree, and the interface.** Point it at any engine that speaks the OpenAI chat-completions API — llama.cpp, Ollama, vLLM, LM Studio, LiteLLM — and get the same enforced behavior. It does not ship a model, phone home, or require a Node runtime.
+**Totality owns the agent loop, the tools, the context budget, the session tree, and the interface.** Point it at any engine that speaks the OpenAI chat-completions API — llama.cpp, Ollama, vLLM, LM Studio, LiteLLM — and get the same enforced behavior. It does not ship a model, phone home, or require a Node runtime.
 
 Built for people running local or self-hosted models who want an agent they can inspect, script, and shape. The product stance is simple: **anything the model is unreliable at is enforced by code, not requested by prompt.** The harness supplies facts, measures progress, and stops loops. The model does the work.
 
 ## The harness is the difference
 
-Most coding agents are a prompt, a tool loop, and a lot of trust. LocalHarness moves the trust into code.
+Most coding agents are a prompt, a tool loop, and a lot of trust. Totality moves the trust into code.
 
-| The failure mode | What LocalHarness does instead |
+| The failure mode | What Totality does instead |
 |---|---|
 | An edit before the file was read | `edit`, `write`, and `patch` refuse until the file has been read in this session. |
 | “I ran the tests” | `verify` executes the configured steps and records the result before the turn can settle. |
@@ -55,22 +55,22 @@ and installs into `~/.local/bin`:
 curl -fsSLO https://github.com/GotinhaAzul/LocalHarness/releases/latest/download/install.sh
 less install.sh          # read it before running
 sh install.sh
-lh --version
+tot --version
 ```
 
 Download and read `install.sh` instead of piping it into a shell. It detects the
 architecture, downloads the matching static binary, verifies it against the
 release `SHA256SUMS`, and refuses to install anything on a checksum mismatch.
-Set `LH_VERSION=0.2.0` to pin a release and `LH_INSTALL_DIR` to change the
-prefix. Bash, zsh, and fish completions and the `lh.1` man page are installed
+Set `TOT_VERSION=0.2.0` to pin a release and `TOT_INSTALL_DIR` to change the
+prefix. Bash, zsh, and fish completions and the `tot.1` man page are installed
 under `$XDG_DATA_HOME` (default `~/.local/share`).
 
 | Channel | Install |
 |---|---|
-| AUR (binary) | `localharness-bin` recipe in `packaging/aur/` (publish pending) |
-| AUR (source) | `localharness` recipe in `packaging/aur/` (publish pending) |
+| AUR (binary) | `totality-bin` recipe in `packaging/aur/` (publish pending) |
+| AUR (source) | `totality` recipe in `packaging/aur/` (publish pending) |
 | Nix | `nix profile install github:GotinhaAzul/LocalHarness` |
-| Docker | `docker build -f packaging/docker/Dockerfile -t localharness .` then `docker run --rm -it -v "$PWD:/workspace" localharness` |
+| Docker | `docker build -f packaging/docker/Dockerfile -t totality .` then `docker run --rm -it -v "$PWD:/workspace" totality` |
 | Homebrew | Best-effort formula in `packaging/homebrew/`; not in a tap yet |
 
 The Docker image is distroless, runs as a non-root user, and has no shell or
@@ -81,40 +81,40 @@ From source (Rust 1.88 or newer, Linux x86_64 or aarch64):
 
 ```sh
 git clone https://github.com/GotinhaAzul/LocalHarness
-cd LocalHarness
+cd Totality
 cargo install --path . --locked
-lh --version
+tot --version
 ```
 
 Or build in place:
 
 ```sh
 cargo build --release
-./target/release/lh --help
+./target/release/tot --help
 ```
 
 Dependencies are pinned in `Cargo.lock`.
 
 ## Quick start
 
-Start any OpenAI-compatible server, then run `lh`. If the endpoint exposes exactly one model, it is selected automatically.
+Start any OpenAI-compatible server, then run `tot`. If the endpoint exposes exactly one model, it is selected automatically.
 
 ```sh
 # llama.cpp (tool calling requires --jinja)
 llama-server -m Qwen3.5-35B-A3B-Q4_K_M.gguf --ctx-size 65536 --jinja --port 8080
-lh
+tot
 
 # Ollama
 ollama serve
 ollama pull qwen3
-lh --endpoint http://127.0.0.1:11434 --model qwen3
+tot --endpoint http://127.0.0.1:11434 --model qwen3
 
 # vLLM
 vllm serve Qwen/Qwen3-35B-A3B --enable-auto-tool-choice --tool-call-parser hermes
-lh --endpoint http://127.0.0.1:8000 --model Qwen/Qwen3-35B-A3B
+tot --endpoint http://127.0.0.1:8000 --model Qwen/Qwen3-35B-A3B
 ```
 
-`lh` also starts with no reachable endpoint or model. The TUI opens with `not logged in` and turns stay disabled until you sign in:
+`tot` also starts with no reachable endpoint or model. The TUI opens with `not logged in` and turns stay disabled until you sign in:
 
 ```text
 /login http://127.0.0.1:8080             auto-select the endpoint's only model
@@ -124,13 +124,13 @@ lh --endpoint http://127.0.0.1:8000 --model Qwen/Qwen3-35B-A3B
 
 `/login` validates `GET /v1/models` and saves `endpoint`, `model`, and `api_key` to the global config with `0600` permissions. `/model` opens a filterable picker over every model the endpoint exposes, including gateways such as LiteLLM or OpenRouter. Headless `--print` requires a selected model.
 
-Point at another endpoint with `--endpoint` or `LH_ENDPOINT` (default `http://127.0.0.1:8080`). Both `http://host:8080` and `http://host:8080/v1` work, so you can paste the base URL an engine prints. A non-local endpoint is allowed but warned about; see [docs/model-setup.md](docs/model-setup.md) for a tailnet example.
+Point at another endpoint with `--endpoint` or `TOT_ENDPOINT` (default `http://127.0.0.1:8080`). Both `http://host:8080` and `http://host:8080/v1` work, so you can paste the base URL an engine prints. A non-local endpoint is allowed but warned about; see [docs/model-setup.md](docs/model-setup.md) for a tailnet example.
 
 Facts come from optional endpoints (`/v1/models`, `/props`, `/tokenize`, `/api/show`). Missing probes only degrade estimates; they never fail a turn. The harness does not launch servers on its own, but `[model] start_command` can start one once when the endpoint is unreachable.
 
 ## 01 · The loop is enforced, not requested
 
-A model can forget to read a file, claim a test passed, or repeat the same failing call until the context is gone. LocalHarness makes those states visible and stoppable.
+A model can forget to read a file, claim a test passed, or repeat the same failing call until the context is gone. Totality makes those states visible and stoppable.
 
 ```text
 [tool] edit src/parser.rs
@@ -172,7 +172,7 @@ Tool results are capped, archived, and retrievable. The model never has to guess
 
 ## 03 · Sessions are a tree, not a log
 
-One append-only JSONL file per session tree under `~/.local/share/localharness/sessions/<project-id>/`. Branches, checkouts, and forks are non-destructive.
+One append-only JSONL file per session tree under `~/.local/share/totality/sessions/<project-id>/`. Branches, checkouts, and forks are non-destructive.
 
 ```text
 /tree       show branches and switch
@@ -187,17 +187,17 @@ One append-only JSONL file per session tree under `~/.local/share/localharness/s
 `/rewind [turns]` restores every file the harness wrote after the target to its
 snapshot there, then moves the leaf; the old branch stays in `/tree`. An edit
 made outside the harness refuses the rewind and is named; `/rewind 1 force`
-backs such files up before restoring them. `lh --rewind <session>:<entry>`
+backs such files up before restoring them. `tot --rewind <session>:<entry>`
 does the same headlessly.
 
 ```sh
-lh --rewind last:e42          # latest session, before entry e42
-lh --rewind 20261107-…:e9 --force
+tot --rewind last:e42          # latest session, before entry e42
+tot --rewind 20261107-…:e9 --force
 ```
 
 Compaction is deterministic, not model-written. Tool output is archived with an id, and `recall` reads an exact range. The request prefix is cache-stable: tool order and schema key order do not drift, volatile session facts sit at the end of the system block, and a compaction logs how much of the prefix the engine can keep. `--no-session` writes nothing: no session file, no artifacts. Session files, artifacts, evidence, and reports are redacted on disk by default; `--no-redact` is the explicit opt-out and is recorded in the session header. Redaction applies only to what is written to disk: in a live session the model sees the real tool output, so it has no placeholder to copy into a file. A resumed session replays the saved, redacted form with a note, and `write`/`edit`/`patch`/`undo` refuse content that adds a `[REDACTED:...]` placeholder the file does not already hold.
 
-`AGENTS.md` is read hierarchically: the chain from the git repository root to the working directory, nearest last, each with a source-path header. Files are capped at 12 KiB each and 32 KiB total, with deterministic truncation and a warning; a symlink that resolves outside the repository is refused. `lh context --show` prints the manifest (path, bytes, SHA-256, loaded/skipped/truncated), and `lh context --json` emits the same data for scripts. `--no-agents-md` or `LH_AGENTS_MD=0` skips the chain. The files are advisory: they cannot add a tool, relax a gate, or change the profile.
+`AGENTS.md` is read hierarchically: the chain from the git repository root to the working directory, nearest last, each with a source-path header. Files are capped at 12 KiB each and 32 KiB total, with deterministic truncation and a warning; a symlink that resolves outside the repository is refused. `tot context --show` prints the manifest (path, bytes, SHA-256, loaded/skipped/truncated), and `tot context --json` emits the same data for scripts. `--no-agents-md` or `TOT_AGENTS_MD=0` skips the chain. The files are advisory: they cannot add a tool, relax a gate, or change the profile.
 
 ## 04 · One binary, two front ends
 
@@ -231,21 +231,21 @@ Every tool call passes a permission policy first. The default mode `ask` runs re
 ### Headless
 
 ```sh
-lh --mode accept-edits --print "Fix the failing parser test"
-lh --print "Summarize this repo" --json
-lh --plan --print "Plan the parser refactor"   # read-only; prints the plan
-lh --continue                  # most recent session
-lh --resume 20261107-201500-1234
+tot --mode accept-edits --print "Fix the failing parser test"
+tot --print "Summarize this repo" --json
+tot --plan --print "Plan the parser refactor"   # read-only; prints the plan
+tot --continue                  # most recent session
+tot --resume 20261107-201500-1234
 ```
 
 `--print` streams text to stdout, diagnostics to stderr, and exits with the turn status: `0` done, `1` error/blocked, `2` budget/stalled, `130` cancelled. `--json` emits newline-delimited events for scripts and CI. A headless run cannot answer a permission prompt, so calls that would ask are denied: pass `--mode accept-edits`, add allow rules, or use `--yolo` (explicit, recorded in the session).
 
 ### Local HTTP API
 
-`lh serve` exposes sessions, turns, a Server-Sent Events stream, and cancel on loopback, for cron jobs, CI, dashboards, and scripts:
+`tot serve` exposes sessions, turns, a Server-Sent Events stream, and cancel on loopback, for cron jobs, CI, dashboards, and scripts:
 
 ```sh
-lh serve                       # prints {"listening":"http://127.0.0.1:PORT","token_file":"…"}
+tot serve                       # prints {"listening":"http://127.0.0.1:PORT","token_file":"…"}
 curl -H "Authorization: Bearer $(cat <token_file>)" -X POST http://127.0.0.1:PORT/v1/sessions -d '{}'
 ```
 
@@ -253,14 +253,14 @@ The bearer token is written to a `0600` file. Only its path is printed. SSE even
 
 ### Editors
 
-`lh acp` speaks the Agent Client Protocol v1 over stdio, so Zed (and other ACP editors) can host a LocalHarness thread:
+`tot acp` speaks the Agent Client Protocol v1 over stdio, so Zed (and other ACP editors) can host a Totality thread:
 
 ```json
 {
   "agent_servers": {
-    "localharness": {
+    "totality": {
       "type": "custom",
-      "command": "lh",
+      "command": "tot",
       "args": ["--endpoint", "http://127.0.0.1:8080", "--model", "qwen3", "acp"],
       "env": {}
     }
@@ -292,11 +292,11 @@ Everything at the edge is configurable; the loop itself stays small and auditabl
 
 - **Profiles** select packs and tools. Built-ins are `coding` (default), `full`, `security`, `minimal`, `strict` (six tools, one call per message for weak models), and experimental `shell` (bash only); add your own in `profiles/*.toml` or `.harness/profiles/`.
 - **Prompt** customization lives in `[prompt]`: replace the one-line identity, append inline instructions, point at a Markdown file, or disable the hierarchical `AGENTS.md` chain with `agents_md = false`. Per-profile prompts still apply on top.
-- **Skills** are Markdown instructions in the Agent Skills format (`SKILL.md`). The model loads a matching skill with the `skill` tool, or you load one with `/skill <name>`. Bundled security skills advertise only when the security pack is active and remain loadable by name; eight bundled coding skills advertise with the coding pack. `.claude/skills`, `.agents/skills`, and `~/.claude/skills` load alongside the native directories, with native precedence. Install and pin a library with `lh skill add|update|remove|list`, validate it with `lh skill lint`, and test its triggers with `lh skill eval --fixtures`.
-- **Workflows** are playbooks plus a profile and tool allowlist. Optional `[[step]]` tables add conditions, bounded retries, approval gates, declared artifacts, and resume; `lh workflow run <name>` executes them. The bundled set covers coding, review, general assistance, and security.
+- **Skills** are Markdown instructions in the Agent Skills format (`SKILL.md`). The model loads a matching skill with the `skill` tool, or you load one with `/skill <name>`. Bundled security skills advertise only when the security pack is active and remain loadable by name; eight bundled coding skills advertise with the coding pack. `.claude/skills`, `.agents/skills`, and `~/.claude/skills` load alongside the native directories, with native precedence. Install and pin a library with `tot skill add|update|remove|list`, validate it with `tot skill lint`, and test its triggers with `tot skill eval --fixtures`.
+- **Workflows** are playbooks plus a profile and tool allowlist. Optional `[[step]]` tables add conditions, bounded retries, approval gates, declared artifacts, and resume; `tot workflow run <name>` executes them. The bundled set covers coding, review, general assistance, and security.
 - **External tools** are any executable speaking one JSON object in, one JSON object out. No plugin ABI, no second runtime.
-- **Lifecycle hooks** run your command at `session_start`, `user_prompt`, `pre_tool`, `post_tool`, `pre_compact`, and `stop`. They can add context or block; a missing hook is visible and `pre_tool` fails closed. `lh hooks test <name>` exercises one.
-- **MCP servers** plug in over stdio or Streamable HTTP with one `[mcp.<name>]` table. Their tools join the profile as `<server>__<tool>`; `lh mcp list` and `/mcp` show what connected.
+- **Lifecycle hooks** run your command at `session_start`, `user_prompt`, `pre_tool`, `post_tool`, `pre_compact`, and `stop`. They can add context or block; a missing hook is visible and `pre_tool` fails closed. `tot hooks test <name>` exercises one.
+- **MCP servers** plug in over stdio or Streamable HTTP with one `[mcp.<name>]` table. Their tools join the profile as `<server>__<tool>`; `tot mcp list` and `/mcp` show what connected.
 - **Themes** are TOML files of semantic color tokens. `default` is bundled with four alternatives; `omarchy` is an alias for existing configs.
 
 ```toml
@@ -323,18 +323,18 @@ Loop behavior is not scriptable. Fork the crate.
 
 ## Configuration
 
-Global config: `~/.config/localharness/config.toml`. A trusted project `.harness/` overrides it. Precedence: CLI flags > trusted project config > global config > built-in defaults.
+Global config: `~/.config/totality/config.toml`. A trusted project `.harness/` overrides it. Precedence: CLI flags > trusted project config > global config > built-in defaults.
 
 | Environment | Meaning |
 |---|---|
-| `LH_ENDPOINT`, `LH_MODEL` | Endpoint base URL and model id |
-| `LH_API_KEY` | Bearer token |
-| `LH_PROFILE`, `LH_MODEL_PROFILE` | Tool profile and model profile |
-| `LH_THEME` | Theme name |
-| `LH_NO_SESSION`, `LH_TRUST` | Disable persistence; trust project config |
-| `LH_AGENTS_MD` | Set to `0` to skip the AGENTS.md chain |
-| `LH_CONFIG_DIR`, `LH_DATA_DIR` | Override config and data roots |
-| `LH_SKIP_TOOL_PROBE` | Skip the one-shot tool-call conformance probe |
+| `TOT_ENDPOINT`, `TOT_MODEL` | Endpoint base URL and model id |
+| `TOT_API_KEY` | Bearer token |
+| `TOT_PROFILE`, `TOT_MODEL_PROFILE` | Tool profile and model profile |
+| `TOT_THEME` | Theme name |
+| `TOT_NO_SESSION`, `TOT_TRUST` | Disable persistence; trust project config |
+| `TOT_AGENTS_MD` | Set to `0` to skip the AGENTS.md chain |
+| `TOT_CONFIG_DIR`, `TOT_DATA_DIR` | Override config and data roots |
+| `TOT_SKIP_TOOL_PROBE` | Skip the one-shot tool-call conformance probe |
 
 `model_profile = "auto"` matches by model-name prefix; the `default` model profile is the fallback. `[model] context_window` is used only when the model profile does not set one. See [docs/configuration.md](docs/configuration.md) for every key and [docs/model-setup.md](docs/model-setup.md) for engine-specific tuning.
 
@@ -343,14 +343,14 @@ Global config: `~/.config/localharness/config.toml`. A trusted project `.harness
 | Guide | What it covers |
 |---|---|
 | [Configuration](docs/configuration.md) | Every config key, precedence, verify steps, environment |
-| [Model setup](docs/model-setup.md) | llama.cpp, Ollama, vLLM, profiles, context accounting, `lh doctor` |
+| [Model setup](docs/model-setup.md) | llama.cpp, Ollama, vLLM, profiles, context accounting, `tot doctor` |
 | [Skills and workflows](docs/skills-workflows.md) | Skill format, references, bundled playbooks, tool allowlists |
 | [Security](docs/security.md) | Authorization, scope, evidence, findings, PoC replay, sandbox |
-| [Lifecycle hooks](docs/hooks.md) | `session_start` through `stop`, JSON protocol, fail-closed guards, `lh hooks test` |
+| [Lifecycle hooks](docs/hooks.md) | `session_start` through `stop`, JSON protocol, fail-closed guards, `tot hooks test` |
 | [External tools](docs/external-tools.md) | Manifest format, protocol, schemas, scope gating |
-| [MCP servers](docs/mcp.md) | stdio and HTTP servers, tool naming, profiles, `lh mcp` |
-| [Editor integration](docs/acp.md) | `lh acp`, Zed setup, permissions, roots, stop reasons, limitations |
-| [Local HTTP API](docs/serve.md) | `lh serve`, endpoints, SSE events, token, permission modes, shutdown |
+| [MCP servers](docs/mcp.md) | stdio and HTTP servers, tool naming, profiles, `tot mcp` |
+| [Editor integration](docs/acp.md) | `tot acp`, Zed setup, permissions, roots, stop reasons, limitations |
+| [Local HTTP API](docs/serve.md) | `tot serve`, endpoints, SSE events, token, permission modes, shutdown |
 | [Images](docs/images.md) | `@image` attachments, vision models, the describer fallback, EXIF and remote rules |
 | [Themes](docs/themes.md) | Semantic tokens, color modes, user themes |
 | [Packaging and releases](docs/packaging.md) | Release artifacts, installer, AUR, Nix, Homebrew, Docker, completions |

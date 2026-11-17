@@ -1,7 +1,7 @@
 //! The installer's offline happy path and checksum-mismatch refusal.
 //!
 //! Each test builds a fake release tarball, points `install.sh` at the local
-//! directory through `LH_INSTALL_SOURCE_DIR`, and never touches the network or
+//! directory through `TOT_INSTALL_SOURCE_DIR`, and never touches the network or
 //! the real `~/.local/bin`.
 
 use std::fs;
@@ -12,7 +12,7 @@ use std::process::{Command, Output};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
-const VERSION: &str = "0.1.0-test";
+const VERSION: &str = "0.3.0-test";
 
 fn target() -> &'static str {
     match std::env::consts::ARCH {
@@ -32,7 +32,7 @@ fn sha256(bytes: &[u8]) -> String {
     out
 }
 
-/// Build the same tarball layout the release workflow publishes: `lh`,
+/// Build the same tarball layout the release workflow publishes: `tot`,
 /// `completions/`, and `man/` at the archive root.
 fn make_dist(root: &Path, version: &str, valid_checksum: bool) -> PathBuf {
     fs::create_dir_all(root).unwrap();
@@ -40,19 +40,19 @@ fn make_dist(root: &Path, version: &str, valid_checksum: bool) -> PathBuf {
     fs::create_dir_all(stage.join("completions")).unwrap();
     fs::create_dir_all(stage.join("man")).unwrap();
 
-    let binary = stage.join("lh");
+    let binary = stage.join("tot");
     fs::write(
         &binary,
-        "#!/bin/sh\nif [ \"${1:-}\" = \"--version\" ]; then\n  printf 'lh 0.1.0-test\\n'\n  exit 0\nfi\nprintf 'fake lh\\n'\n",
+        "#!/bin/sh\nif [ \"${1:-}\" = \"--version\" ]; then\n  printf 'tot 0.3.0-test\\n'\n  exit 0\nfi\nprintf 'fake tot\\n'\n",
     )
     .unwrap();
     fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
-    fs::write(stage.join("completions/lh.bash"), "# bash completion\n").unwrap();
-    fs::write(stage.join("completions/lh.zsh"), "# zsh completion\n").unwrap();
-    fs::write(stage.join("completions/lh.fish"), "# fish completion\n").unwrap();
-    fs::write(stage.join("man/lh.1"), ".TH lh 1\n").unwrap();
+    fs::write(stage.join("completions/tot.bash"), "# bash completion\n").unwrap();
+    fs::write(stage.join("completions/tot.zsh"), "# zsh completion\n").unwrap();
+    fs::write(stage.join("completions/tot.fish"), "# fish completion\n").unwrap();
+    fs::write(stage.join("man/tot.1"), ".TH tot 1\n").unwrap();
 
-    let artifact_name = format!("lh-v{version}-{}.tar.gz", target());
+    let artifact_name = format!("tot-v{version}-{}.tar.gz", target());
     let artifact = root.join(&artifact_name);
     let status = Command::new("tar")
         .arg("-czf")
@@ -84,13 +84,16 @@ fn run_installer(root: &TempDir, dist: &Path, prefix: &Path) -> Output {
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("install.sh");
     Command::new("sh")
         .arg(script)
-        .env("LH_VERSION", VERSION)
-        .env("LH_INSTALL_SOURCE_DIR", dist)
-        .env("LH_INSTALL_DIR", prefix)
+        .env("TOT_VERSION", VERSION)
+        .env("TOT_INSTALL_SOURCE_DIR", dist)
+        .env("TOT_INSTALL_DIR", prefix)
         .env("HOME", &home)
         .env("XDG_DATA_HOME", root.path().join("xdg"))
+        .env_remove("TOT_TARGET")
         .env_remove("LH_TARGET")
+        .env_remove("TOT_NO_EXTRAS")
         .env_remove("LH_NO_EXTRAS")
+        .env_remove("TOT_INSTALL_BASE_URL")
         .env_remove("LH_INSTALL_BASE_URL")
         .output()
         .expect("sh must be available to run install.sh")
@@ -111,12 +114,14 @@ fn installer_installs_a_verified_binary_and_extras() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let installed = prefix.join("lh");
+    let installed = prefix.join("tot");
     assert!(
         installed.is_file(),
         "installer did not write {}",
         installed.display()
     );
+    let alias = prefix.join("totality");
+    assert_eq!(fs::read_link(&alias).unwrap(), Path::new("tot"));
     let mode = fs::metadata(&installed).unwrap().permissions().mode();
     assert_eq!(mode & 0o777, 0o755, "installed binary is not executable");
 
@@ -128,10 +133,10 @@ fn installer_installs_a_verified_binary_and_extras() {
     );
 
     let data = root.path().join("xdg");
-    assert!(data.join("bash-completion/completions/lh").is_file());
-    assert!(data.join("zsh/site-functions/_lh").is_file());
-    assert!(data.join("fish/vendor_completions.d/lh.fish").is_file());
-    assert!(data.join("man/man1/lh.1").is_file());
+    assert!(data.join("bash-completion/completions/tot").is_file());
+    assert!(data.join("zsh/site-functions/_tot").is_file());
+    assert!(data.join("fish/vendor_completions.d/tot.fish").is_file());
+    assert!(data.join("man/man1/tot.1").is_file());
 }
 
 #[test]
@@ -141,7 +146,7 @@ fn installer_refuses_a_checksum_mismatch_and_installs_nothing() {
     make_dist(&dist, VERSION, false);
     let prefix = root.path().join("bin");
     fs::create_dir_all(&prefix).unwrap();
-    let untouched = prefix.join("lh");
+    let untouched = prefix.join("tot");
     fs::write(&untouched, "previous install\n").unwrap();
 
     let output = run_installer(&root, &dist, &prefix);

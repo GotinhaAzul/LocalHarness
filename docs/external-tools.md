@@ -5,7 +5,7 @@ response. No plugin ABI.
 
 ## Manifest
 
-Global manifests live in `~/.config/localharness/tools/*.toml` and are trusted.
+Global manifests live in `~/.config/totality/tools/*.toml` and are trusted.
 Project manifests live in `.harness/tools/` and require `--trust`.
 
 ```toml

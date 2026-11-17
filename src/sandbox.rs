@@ -341,10 +341,10 @@ fn resolve_workspace(mode: SandboxMode, workspace: &Path) -> Result<PathBuf, Str
     Ok(resolved)
 }
 
-/// Locate the bubblewrap executable. `LH_BWRAP` overrides the name/path; tests
+/// Locate the bubblewrap executable. `TOT_BWRAP` overrides the name/path; tests
 /// point it at a missing file to exercise the fail-closed path.
 fn bwrap_path() -> Option<PathBuf> {
-    let name = std::env::var_os("LH_BWRAP").unwrap_or_else(|| OsString::from("bwrap"));
+    let name = crate::paths::env_os("BWRAP").unwrap_or_else(|| OsString::from("bwrap"));
     let path = PathBuf::from(name.clone());
     if path.components().count() > 1 {
         return is_executable(&path).then_some(path);
@@ -690,7 +690,7 @@ fn seccomp_filter() -> Result<std::os::fd::OwnedFd, String> {
 
     // SAFETY: `memfd_create` returns a new owned fd. The filter bytes are read
     // from a live `sock_filter` slice.
-    let fd = unsafe { libc::memfd_create(c"lh-seccomp".as_ptr(), MFD_CLOEXEC) };
+    let fd = unsafe { libc::memfd_create(c"tot-seccomp".as_ptr(), MFD_CLOEXEC) };
     if fd < 0 {
         return Err(format!(
             "could not create a seccomp filter: {}; rerun with --no-sandbox to run unsandboxed",

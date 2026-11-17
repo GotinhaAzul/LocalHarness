@@ -270,7 +270,7 @@ impl McpManager {
         resolution
     }
 
-    /// Connect every enabled server regardless of profile; used by `lh mcp`.
+    /// Connect every enabled server regardless of profile; used by `tot mcp`.
     pub async fn probe_all(
         config: &Config,
         project_dir: &Path,
@@ -328,7 +328,7 @@ fn startup_error(name: &str, error: &McpError) -> String {
         McpError::Timeout(_) => {
             format!("raise startup_timeout_secs in [mcp.{name}] if the server is slow to start")
         }
-        _ => format!("run `lh mcp list` to diagnose, or set enabled = false in [mcp.{name}]"),
+        _ => format!("run `tot mcp list` to diagnose, or set enabled = false in [mcp.{name}]"),
     };
     format!("MCP server `{name}` is unavailable: {error}; {hint}")
 }
@@ -450,7 +450,7 @@ impl McpTool {
             McpError::Closed(message) | McpError::Other(message) => ToolResult::err(
                 "MCP_UNAVAILABLE",
                 format!(
-                    "{message}; the tool cannot run until MCP server `{server}` is reachable. Continue without it or ask the user to check `lh mcp list`"
+                    "{message}; the tool cannot run until MCP server `{server}` is reachable. Continue without it or ask the user to check `tot mcp list`"
                 ),
             ),
         }

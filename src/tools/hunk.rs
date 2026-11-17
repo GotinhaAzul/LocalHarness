@@ -627,7 +627,7 @@ mod tests {
         std::fs::write(&good, "old\n").unwrap();
         // `/proc` rejects a new directory for every user, so the second
         // write fails deterministically without depending on permissions.
-        let bad = Path::new("/proc/localharness-rewind-test/child.txt").to_path_buf();
+        let bad = Path::new("/proc/totality-rewind-test/child.txt").to_path_buf();
         let set = HunkSet::new(
             vec![
                 proposal(&good, Some("old\n"), "new\n"),
@@ -678,7 +678,7 @@ mod tests {
         let good = dir.path().join("fixture.txt");
         let original = format!("expected = {}\n", placeholder());
         std::fs::write(&good, &original).unwrap();
-        let bad = Path::new("/proc/localharness-rewind-test/child.txt").to_path_buf();
+        let bad = Path::new("/proc/totality-rewind-test/child.txt").to_path_buf();
         let set = HunkSet::new(
             vec![
                 proposal(&good, Some(&original), "expected = 1\n"),

@@ -254,23 +254,23 @@ fn env() -> Env {
     }
 }
 
-async fn run_lh(env: &Env, base: &str, extra: &[&str]) -> std::process::Output {
-    run_lh_with_session(env, base, extra, false).await
+async fn run_tot(env: &Env, base: &str, extra: &[&str]) -> std::process::Output {
+    run_tot_with_session(env, base, extra, false).await
 }
 
-/// Like [`run_lh`], but persists the session and artifacts so a test can
+/// Like [`run_tot`], but persists the session and artifacts so a test can
 /// inspect what reached disk.
-async fn run_lh_persistent(env: &Env, base: &str, extra: &[&str]) -> std::process::Output {
-    run_lh_with_session(env, base, extra, true).await
+async fn run_tot_persistent(env: &Env, base: &str, extra: &[&str]) -> std::process::Output {
+    run_tot_with_session(env, base, extra, true).await
 }
 
-async fn run_lh_with_session(
+async fn run_tot_with_session(
     env: &Env,
     base: &str,
     extra: &[&str],
     persist: bool,
 ) -> std::process::Output {
-    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_lh"));
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_tot"));
     command
         .arg("--endpoint")
         .arg(base)
@@ -278,14 +278,19 @@ async fn run_lh_with_session(
         .arg("test-model")
         .current_dir(&env.cwd)
         .env("HOME", &env.home)
-        .env("LH_HOME", &env.home)
-        .env("LH_CONFIG_DIR", &env.config_dir)
-        .env("LH_DATA_DIR", &env.data_dir)
-        .env("LH_SKIP_TOOL_PROBE", "1")
+        .env("TOT_HOME", &env.home)
+        .env("TOT_CONFIG_DIR", &env.config_dir)
+        .env("TOT_DATA_DIR", &env.data_dir)
+        .env("TOT_SKIP_TOOL_PROBE", "1")
+        .env_remove("TOT_ENDPOINT")
         .env_remove("LH_ENDPOINT")
+        .env_remove("TOT_MODEL")
         .env_remove("LH_MODEL")
+        .env_remove("TOT_API_KEY")
         .env_remove("LH_API_KEY")
+        .env_remove("TOT_PROFILE")
         .env_remove("LH_PROFILE")
+        .env_remove("TOT_TRUST")
         .env_remove("LH_TRUST");
     if !persist {
         command.arg("--no-session");
@@ -293,12 +298,12 @@ async fn run_lh_with_session(
     command.args(extra);
     tokio::time::timeout(std::time::Duration::from_secs(30), command.output())
         .await
-        .expect("lh timed out")
-        .expect("cannot run lh")
+        .expect("tot timed out")
+        .expect("cannot run tot")
 }
 
 async fn run_lh_no_model(env: &Env, base: &str, extra: &[&str]) -> std::process::Output {
-    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_lh"));
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_tot"));
     command
         .arg("--endpoint")
         .arg(base)
@@ -306,26 +311,31 @@ async fn run_lh_no_model(env: &Env, base: &str, extra: &[&str]) -> std::process:
         .args(extra)
         .current_dir(&env.cwd)
         .env("HOME", &env.home)
-        .env("LH_HOME", &env.home)
-        .env("LH_CONFIG_DIR", &env.config_dir)
-        .env("LH_DATA_DIR", &env.data_dir)
-        .env("LH_SKIP_TOOL_PROBE", "1")
+        .env("TOT_HOME", &env.home)
+        .env("TOT_CONFIG_DIR", &env.config_dir)
+        .env("TOT_DATA_DIR", &env.data_dir)
+        .env("TOT_SKIP_TOOL_PROBE", "1")
+        .env_remove("TOT_ENDPOINT")
         .env_remove("LH_ENDPOINT")
+        .env_remove("TOT_MODEL")
         .env_remove("LH_MODEL")
+        .env_remove("TOT_API_KEY")
         .env_remove("LH_API_KEY")
+        .env_remove("TOT_PROFILE")
         .env_remove("LH_PROFILE")
+        .env_remove("TOT_TRUST")
         .env_remove("LH_TRUST");
     tokio::time::timeout(std::time::Duration::from_secs(30), command.output())
         .await
-        .expect("lh timed out")
-        .expect("cannot run lh")
+        .expect("tot timed out")
+        .expect("cannot run tot")
 }
 
 #[tokio::test]
 async fn print_streams_text_and_exits_zero() {
     let (base, fake) = spawn().await;
     let env = env();
-    let output = run_lh(&env, &base, &["--print", "say hello"]).await;
+    let output = run_tot(&env, &base, &["--print", "say hello"]).await;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
@@ -338,7 +348,7 @@ async fn print_streams_text_and_exits_zero() {
 async fn print_json_emits_done_event() {
     let (base, _fake) = spawn().await;
     let env = env();
-    let output = run_lh(&env, &base, &["--print", "say hello", "--json"]).await;
+    let output = run_tot(&env, &base, &["--print", "say hello", "--json"]).await;
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_eq!(output.status.code(), Some(0));
     assert!(
@@ -386,7 +396,7 @@ async fn endpoint_down_is_prescriptive() {
         "[model]\nretry_backoff_ms = 10\n",
     )
     .unwrap();
-    let output = run_lh(&env, &base, &["--print", "hi"]).await;
+    let output = run_tot(&env, &base, &["--print", "hi"]).await;
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_ne!(output.status.code(), Some(0));
     assert!(
@@ -427,7 +437,7 @@ async fn print_refuses_when_the_static_prompt_cannot_fit() {
     )
     .unwrap();
 
-    let output = run_lh(&env, &base, &["--print", "hi", "--profile", "full"]).await;
+    let output = run_tot(&env, &base, &["--print", "hi", "--profile", "full"]).await;
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(
         output.status.code(),
@@ -457,7 +467,7 @@ async fn print_keeps_the_reply_when_the_usage_report_is_implausible() {
     )
     .unwrap();
 
-    let output = run_lh(&env, &base, &["--print", "hi", "--json"]).await;
+    let output = run_tot(&env, &base, &["--print", "hi", "--json"]).await;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(
@@ -490,7 +500,7 @@ async fn print_starts_with_minimal_on_a_small_window() {
     )
     .unwrap();
 
-    let output = run_lh(&env, &base, &["--print", "hi", "--profile", "minimal"]).await;
+    let output = run_tot(&env, &base, &["--print", "hi", "--profile", "minimal"]).await;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
@@ -511,7 +521,7 @@ async fn print_refuses_a_prompt_the_tokenizer_says_is_too_large() {
     // Enough user text to cross the compaction threshold even with the
     // compact default prompt, so the exact-tokenizer guard is exercised.
     let prompt = format!("hi {}", "context ".repeat(1500));
-    let output = run_lh(
+    let output = run_tot(
         &env,
         &base,
         &["--print", prompt.as_str(), "--profile", "minimal"],
@@ -538,7 +548,7 @@ async fn print_warns_and_clamps_a_profile_above_the_server_window() {
     )
     .unwrap();
 
-    let output = run_lh(&env, &base, &["--print", "hi", "--profile", "minimal"]).await;
+    let output = run_tot(&env, &base, &["--print", "hi", "--profile", "minimal"]).await;
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
     assert!(
@@ -555,7 +565,7 @@ async fn print_warns_and_clamps_a_profile_above_the_server_window() {
 async fn doctor_reports_generic_and_failed_probes() {
     let (base, _fake) = spawn().await;
     let env = env();
-    let output = run_lh(&env, &base, &["doctor", "--json"]).await;
+    let output = run_tot(&env, &base, &["doctor", "--json"]).await;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
@@ -638,7 +648,7 @@ async fn print_calls_repo_map_and_prompt_contains_the_map() {
     std::fs::create_dir_all(env.cwd.join("src")).unwrap();
     std::fs::write(env.cwd.join("src/main.rs"), "fn main() {}\n").unwrap();
 
-    let output = run_lh(&env, &base, &["--print", "map it"]).await;
+    let output = run_tot(&env, &base, &["--print", "map it"]).await;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
@@ -698,7 +708,7 @@ async fn print_loads_agents_md_from_root_to_leaf_and_keeps_it_advisory() {
     .unwrap();
     env.cwd = repo.join("pkg/leaf");
 
-    let output = run_lh(&env, &base, &["--print", "hi", "--profile", "readonly"]).await;
+    let output = run_tot(&env, &base, &["--print", "hi", "--profile", "readonly"]).await;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(
@@ -799,7 +809,7 @@ async fn print_executes_a_tool_call_and_writes_a_file() {
     let (base, fake) = spawn_tool_server().await;
     let env = env();
     // Headless runs cannot ask, so file edits need an explicit mode.
-    let output = run_lh(
+    let output = run_tot(
         &env,
         &base,
         &["--mode", "accept-edits", "--print", "create made.txt"],
@@ -957,7 +967,7 @@ fn workspace_files(env: &Env) -> Vec<String> {
 async fn print_denies_an_edit_it_cannot_ask_about_and_still_answers() {
     let (base, _) = spawn_tool_server().await;
     let env = env();
-    let output = run_lh(&env, &base, &["--print", "create made.txt"]).await;
+    let output = run_tot(&env, &base, &["--print", "create made.txt"]).await;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
@@ -975,7 +985,7 @@ async fn the_session_header_records_the_mode_and_rule_hash() {
         "[permissions]\nmode = \"accept-edits\"\n\n[[permissions.rules]]\nid = \"no-push\"\ntool = \"bash\"\ncommand = 'git\\s+push'\naction = \"deny\"\n",
     )
     .unwrap();
-    let output = run_lh_persistent(&env, &base, &["--print", "hi"]).await;
+    let output = run_tot_persistent(&env, &base, &["--print", "hi"]).await;
     assert_eq!(
         output.status.code(),
         Some(0),
@@ -1003,14 +1013,14 @@ async fn yolo_is_explicit_and_logged_in_the_session() {
         "[permissions]\nmode = \"yolo\"\n",
     )
     .unwrap();
-    let refused = run_lh(&env, &base, &["--print", "hi"]).await;
+    let refused = run_tot(&env, &base, &["--print", "hi"]).await;
     assert_ne!(refused.status.code(), Some(0));
     assert!(String::from_utf8_lossy(&refused.stderr).contains("--yolo"));
-    let refused = run_lh(&env, &base, &["--mode", "yolo", "--print", "hi"]).await;
+    let refused = run_tot(&env, &base, &["--mode", "yolo", "--print", "hi"]).await;
     assert_ne!(refused.status.code(), Some(0));
 
     std::fs::remove_file(env.config_dir.join("config.toml")).unwrap();
-    let output = run_lh_persistent(&env, &base, &["--yolo", "--print", "hi"]).await;
+    let output = run_tot_persistent(&env, &base, &["--yolo", "--print", "hi"]).await;
     assert_eq!(output.status.code(), Some(0));
     let lines = session_lines(&env);
     assert_eq!(lines[0]["data"]["permissions"]["mode"], "yolo");
@@ -1042,7 +1052,7 @@ async fn print_plan_runs_one_read_only_turn_and_prints_the_plan() {
         text_frames("That is the plan."),
     ])
     .await;
-    let output = run_lh(&env, &base, &["--plan", "--print", "change a.txt"]).await;
+    let output = run_tot(&env, &base, &["--plan", "--print", "change a.txt"]).await;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
@@ -1160,7 +1170,7 @@ async fn print_persists_only_redacted_secrets_in_session_and_artifacts() {
     let (base, fake) = spawn_secret_server(&key).await;
     let env = env();
     // The scripted `bash` call needs approval, which headless cannot give.
-    let output = run_lh_persistent(&env, &base, &["--yolo", "--print", "echo the token"]).await;
+    let output = run_tot_persistent(&env, &base, &["--yolo", "--print", "echo the token"]).await;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(
@@ -1199,7 +1209,7 @@ async fn no_redact_keeps_raw_output_and_is_recorded_in_the_header() {
     let key = fake_aws_key();
     let (base, _fake) = spawn_secret_server(&key).await;
     let env = env();
-    let output = run_lh_persistent(
+    let output = run_tot_persistent(
         &env,
         &base,
         &["--yolo", "--no-redact", "--print", "echo the token"],
@@ -1240,7 +1250,7 @@ async fn print_in_an_unconfigured_project_names_the_detected_steps_and_runs_none
     let env = env();
     std::fs::write(env.cwd.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
     // A marker a detected step would create if anything ran it.
-    let output = run_lh(&env, &base, &["--print", "hi"]).await;
+    let output = run_tot(&env, &base, &["--print", "hi"]).await;
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
     let notices = stderr
@@ -1249,7 +1259,7 @@ async fn print_in_an_unconfigured_project_names_the_detected_steps_and_runs_none
         .count();
     assert_eq!(notices, 1, "stderr: {stderr}");
     assert!(stderr.contains("cargo check --all-targets"), "{stderr}");
-    assert!(stderr.contains("lh verify --init"), "{stderr}");
+    assert!(stderr.contains("tot verify --init"), "{stderr}");
     assert!(!env.cwd.join("target").exists(), "no detected step may run");
 }
 
@@ -1258,20 +1268,20 @@ async fn verify_init_saves_the_detected_steps_for_later_runs() {
     let (base, _fake) = spawn().await;
     let env = env();
     std::fs::write(env.cwd.join("go.mod"), "module example.com/x\n").unwrap();
-    let output = run_lh(&env, &base, &["verify"]).await;
+    let output = run_tot(&env, &base, &["verify"]).await;
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("verify: not configured"), "{stdout}");
 
-    let output = run_lh(&env, &base, &["verify", "--init"]).await;
+    let output = run_tot(&env, &base, &["verify", "--init"]).await;
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_eq!(output.status.code(), Some(0), "{stdout}");
     assert!(stdout.contains("go vet ./..."), "{stdout}");
 
     // Later runs load them without --trust; the notice is gone.
-    let output = run_lh(&env, &base, &["verify"]).await;
+    let output = run_tot(&env, &base, &["verify"]).await;
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("verify: 2 step(s) configured"), "{stdout}");
-    let output = run_lh(&env, &base, &["--print", "hi"]).await;
+    let output = run_tot(&env, &base, &["--print", "hi"]).await;
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!stderr.contains("verify: not configured"), "{stderr}");
 }

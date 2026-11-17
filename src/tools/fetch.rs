@@ -97,7 +97,7 @@ async fn run(
             .timeout(TIMEOUT)
             .connect_timeout(CONNECT_TIMEOUT)
             .resolve_to_addrs(&host, &addrs)
-            .user_agent(concat!("localharness-fetch/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!("totality-fetch/", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(|err| {
                 ToolResult::err("FETCH_FAILED", format!("cannot build the client: {err}"))

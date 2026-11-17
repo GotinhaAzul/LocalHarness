@@ -1,4 +1,4 @@
-//! ACP v1 conformance: drive `lh acp` over stdio against a scripted endpoint.
+//! ACP v1 conformance: drive `tot acp` over stdio against a scripted endpoint.
 //!
 //! Covers initialization, a streamed turn, cancellation, root enforcement, a
 //! denied permission with no side effect, and the typed terminal refusal.
@@ -201,7 +201,7 @@ impl Client {
     async fn spawn_with(base: &str, root: &std::path::Path, extra: &[&str]) -> Self {
         let config_dir = root.parent().unwrap().join("config");
         let data_dir = root.parent().unwrap().join("data");
-        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_lh"));
+        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_tot"));
         command
             .arg("--endpoint")
             .arg(base)
@@ -210,21 +210,28 @@ impl Client {
             .args(extra)
             .arg("acp")
             .current_dir(root)
-            .env("LH_CONFIG_DIR", &config_dir)
-            .env("LH_DATA_DIR", &data_dir)
-            .env("LH_SKIP_TOOL_PROBE", "1")
+            .env("TOT_CONFIG_DIR", &config_dir)
+            .env("TOT_DATA_DIR", &data_dir)
+            .env("TOT_SKIP_TOOL_PROBE", "1")
+            .env_remove("TOT_ENDPOINT")
             .env_remove("LH_ENDPOINT")
+            .env_remove("TOT_MODEL")
             .env_remove("LH_MODEL")
+            .env_remove("TOT_API_KEY")
             .env_remove("LH_API_KEY")
+            .env_remove("TOT_PROFILE")
             .env_remove("LH_PROFILE")
+            .env_remove("TOT_TRUST")
             .env_remove("LH_TRUST")
+            .env_remove("TOT_NO_SESSION")
             .env_remove("LH_NO_SESSION")
+            .env_remove("TOT_DEBUG_CONTENT")
             .env_remove("LH_DEBUG_CONTENT")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        let mut child = command.spawn().expect("spawn lh acp");
+        let mut child = command.spawn().expect("spawn tot acp");
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
         let stderr = Arc::new(Mutex::new(String::new()));
@@ -386,7 +393,7 @@ async fn initialize_and_new_session_negotiate_capabilities() {
         response["result"]["agentCapabilities"]["promptCapabilities"]["image"],
         false
     );
-    assert_eq!(response["result"]["agentInfo"]["name"], "localharness");
+    assert_eq!(response["result"]["agentInfo"]["name"], "totality");
 
     let session_id = client.new_session(2, &root).await;
     assert!(!session_id.is_empty());
@@ -505,7 +512,7 @@ async fn a_foreign_root_is_untrusted_even_when_launched_with_trust() {
         )
         .await;
     assert_eq!(
-        response["result"]["_meta"]["localharness"]["trusted"], true,
+        response["result"]["_meta"]["totality"]["trusted"], true,
         "{response}"
     );
 
@@ -518,7 +525,7 @@ async fn a_foreign_root_is_untrusted_even_when_launched_with_trust() {
         )
         .await;
     assert_eq!(
-        response["result"]["_meta"]["localharness"]["trusted"], false,
+        response["result"]["_meta"]["totality"]["trusted"], false,
         "a root outside the process working directory must not inherit trust: {response}"
     );
 }
@@ -528,7 +535,7 @@ async fn absolute_paths_and_symlinks_cannot_escape_the_root() {
     let (base, _fake) = spawn_endpoint(vec![
         Script::Tool {
             name: "write".into(),
-            args: json!({"path": "/etc/localharness-acp-escape", "content": "nope"}),
+            args: json!({"path": "/etc/totality-acp-escape", "content": "nope"}),
         },
         Script::Text("one".into()),
         Script::Tool {
@@ -568,7 +575,7 @@ async fn absolute_paths_and_symlinks_cannot_escape_the_root() {
             .await;
         assert_eq!(response["result"]["stopReason"], "end_turn", "{response}");
     }
-    assert!(!std::path::Path::new("/etc/localharness-acp-escape").exists());
+    assert!(!std::path::Path::new("/etc/totality-acp-escape").exists());
     assert!(!outside.join("escaped.txt").exists());
     assert_eq!(
         client.permissions.load(std::sync::atomic::Ordering::SeqCst),

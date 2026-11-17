@@ -670,7 +670,7 @@ fn lock_security(ctx: &ToolContext) -> Result<MutexGuard<'_, SecurityState>, Too
     ctx.security.lock().map_err(|_| {
         ToolResult::err(
             "SECURITY_IO",
-            "security state is poisoned; restart lh so the findings ledger is reloaded",
+            "security state is poisoned; restart tot so the findings ledger is reloaded",
         )
     })
 }

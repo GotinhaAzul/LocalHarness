@@ -7,7 +7,7 @@
 //! (`authorize::decide()`): config `[permissions]` rules decide first, and an
 //! `ask` that nobody can answer is denied. Modes reuse the engine names (`ask`
 //! default, `accept-edits`, `dont-ask`, `yolo`); `yolo` must be enabled by the
-//! operator with `lh serve --allow-yolo`, never by a request alone.
+//! operator with `tot serve --allow-yolo`, never by a request alone.
 
 use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
@@ -325,25 +325,25 @@ pub async fn handle(state: Arc<State>, request: Request<Incoming>) -> Response<B
         return error(
             StatusCode::FORBIDDEN,
             "cross_origin_refused",
-            "requests from a browser origin are refused; lh serve is for local scripts and has no CORS support",
+            "requests from a browser origin are refused; tot serve is for local scripts and has no CORS support",
         );
     }
     if !state.authorized(&request) {
         let mut response = error(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
-            "missing or invalid bearer token; send `Authorization: Bearer <token>` with the token from the file `lh serve` printed at startup",
+            "missing or invalid bearer token; send `Authorization: Bearer <token>` with the token from the file `tot serve` printed at startup",
         );
         response.headers_mut().insert(
             header::WWW_AUTHENTICATE,
-            HeaderValue::from_static("Bearer realm=\"lh serve\""),
+            HeaderValue::from_static("Bearer realm=\"tot serve\""),
         );
         return response;
     }
 
     let path = request.uri().path().to_string();
     let segments: Vec<&str> = path.trim_matches('/').split('/').collect();
-    tracing::debug!(method = %request.method(), path = %path, "lh serve request");
+    tracing::debug!(method = %request.method(), path = %path, "tot serve request");
     match (request.method().clone(), segments.as_slice()) {
         (Method::GET, ["v1", "health"]) => json_response(
             StatusCode::OK,
@@ -489,7 +489,7 @@ async fn create_session(state: &Arc<State>, body: Value) -> Response<Body> {
         return error(
             StatusCode::FORBIDDEN,
             "mode_not_permitted",
-            "permission_mode \"yolo\" needs the operator to start the server with `lh serve --allow-yolo`",
+            "permission_mode \"yolo\" needs the operator to start the server with `tot serve --allow-yolo`",
         );
     }
     let resume = match body.get("resume") {
@@ -564,7 +564,7 @@ async fn create_session(state: &Arc<State>, body: Value) -> Response<Body> {
         return error(
             StatusCode::SERVICE_UNAVAILABLE,
             "no_model",
-            "no model is selected. Start the inference server and restart `lh serve` with --model (or set LH_MODEL)",
+            "no model is selected. Start the inference server and restart `tot serve` with --model (or set TOT_MODEL)",
         );
     }
     let id = if state.host.no_session {

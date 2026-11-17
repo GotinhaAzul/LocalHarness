@@ -109,22 +109,27 @@ fn write_workflow(env: &Env, name: &str, body: &str) {
 }
 
 async fn run(env: &Env, args: &[&str], stdin: &str) -> std::process::Output {
-    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_lh"));
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_tot"));
     command
         .args(args)
         .current_dir(&env.cwd)
-        .env("LH_CONFIG_DIR", &env.config_dir)
-        .env("LH_DATA_DIR", &env.data_dir)
-        .env("LH_SKIP_TOOL_PROBE", "1")
+        .env("TOT_CONFIG_DIR", &env.config_dir)
+        .env("TOT_DATA_DIR", &env.data_dir)
+        .env("TOT_SKIP_TOOL_PROBE", "1")
+        .env_remove("TOT_ENDPOINT")
         .env_remove("LH_ENDPOINT")
+        .env_remove("TOT_MODEL")
         .env_remove("LH_MODEL")
+        .env_remove("TOT_API_KEY")
         .env_remove("LH_API_KEY")
+        .env_remove("TOT_PROFILE")
         .env_remove("LH_PROFILE")
+        .env_remove("TOT_TRUST")
         .env_remove("LH_TRUST")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = command.spawn().expect("spawn lh");
+    let mut child = command.spawn().expect("spawn tot");
     child
         .stdin
         .take()
@@ -134,8 +139,8 @@ async fn run(env: &Env, args: &[&str], stdin: &str) -> std::process::Output {
         .unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(30), child.wait_with_output())
         .await
-        .expect("lh timed out")
-        .expect("lh run")
+        .expect("tot timed out")
+        .expect("tot run")
 }
 
 fn journal(env: &Env, name: &str) -> Option<Value> {
@@ -335,12 +340,12 @@ async fn no_session_writes_no_journal() {
 #[test]
 fn workflow_list_names_the_bundled_set() {
     let env = env();
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_lh"))
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_tot"))
         .args(["workflow", "list"])
         .current_dir(&env.cwd)
-        .env("LH_CONFIG_DIR", &env.config_dir)
-        .env("LH_DATA_DIR", &env.data_dir)
-        .env("LH_SKIP_TOOL_PROBE", "1")
+        .env("TOT_CONFIG_DIR", &env.config_dir)
+        .env("TOT_DATA_DIR", &env.data_dir)
+        .env("TOT_SKIP_TOOL_PROBE", "1")
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);

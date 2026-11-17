@@ -134,7 +134,8 @@ mod tests {
         std::fs::write(dir.path().join("go.mod"), "module example.com/x\n").unwrap();
         let paths = paths(dir.path());
         assert!(accepted_steps(&paths).is_none());
-        let notice = unconfigured_notice(&detect_verify_steps(&paths.cwd), "Run lh verify --init.");
+        let notice =
+            unconfigured_notice(&detect_verify_steps(&paths.cwd), "Run tot verify --init.");
         assert!(notice.contains("go vet ./..."), "{notice}");
         assert!(notice.contains("Nothing was run"), "{notice}");
         // Still nothing saved after the notice.

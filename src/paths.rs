@@ -20,20 +20,53 @@ pub struct Paths {
     pub home_dir: Option<PathBuf>,
 }
 
+/// The product's directory under `base`, or the pre-0.3 one while only that
+/// exists.
+fn named_dir(base: PathBuf) -> PathBuf {
+    let current = base.join(APP_DIR);
+    let legacy = base.join(LEGACY_APP_DIR);
+    if !current.exists() && legacy.is_dir() {
+        legacy
+    } else {
+        current
+    }
+}
+
+/// Directory name under the XDG config and data roots.
+pub const APP_DIR: &str = "totality";
+/// The name used before 0.3.
+pub const LEGACY_APP_DIR: &str = "localharness";
+
+/// Read the environment variable `TOT_<name>`, falling back to the pre-0.3
+/// `LH_<name>` so existing shells and scripts keep working.
+pub fn env_os(name: &str) -> Option<std::ffi::OsString> {
+    std::env::var_os(format!("TOT_{name}")).or_else(|| std::env::var_os(format!("LH_{name}")))
+}
+
+/// [`env_os`] as a `String`, with [`std::env::var`]'s error for a missing or
+/// non-Unicode value.
+pub fn env_var(name: &str) -> Result<String, std::env::VarError> {
+    match std::env::var(format!("TOT_{name}")) {
+        Err(std::env::VarError::NotPresent) => std::env::var(format!("LH_{name}")),
+        other => other,
+    }
+}
+
 impl Paths {
-    /// Discover paths for `cwd`, honoring `LH_CONFIG_DIR`/`LH_DATA_DIR`.
+    /// Discover paths for `cwd`, honoring `TOT_CONFIG_DIR`/`TOT_DATA_DIR`.
+    /// Before 0.3 the directories were named `localharness`; they are used
+    /// while the new ones do not exist yet, so an upgrade keeps its config
+    /// and sessions.
     pub fn discover(cwd: &Path) -> Result<Self> {
-        let config_dir = match std::env::var_os("LH_CONFIG_DIR") {
+        let config_dir = match env_os("CONFIG_DIR") {
             Some(dir) => PathBuf::from(dir),
-            None => dirs::config_dir()
-                .context("no config directory; set LH_CONFIG_DIR")?
-                .join("localharness"),
+            None => {
+                named_dir(dirs::config_dir().context("no config directory; set TOT_CONFIG_DIR")?)
+            }
         };
-        let data_dir = match std::env::var_os("LH_DATA_DIR") {
+        let data_dir = match env_os("DATA_DIR") {
             Some(dir) => PathBuf::from(dir),
-            None => dirs::data_dir()
-                .context("no data directory; set LH_DATA_DIR")?
-                .join("localharness"),
+            None => named_dir(dirs::data_dir().context("no data directory; set TOT_DATA_DIR")?),
         };
         let cwd = cwd
             .canonicalize()
@@ -44,9 +77,7 @@ impl Paths {
             project_id: project_id(&cwd),
             cwd,
             sessions_dir_override: None,
-            home_dir: std::env::var_os("LH_HOME")
-                .map(PathBuf::from)
-                .or_else(dirs::home_dir),
+            home_dir: env_os("HOME").map(PathBuf::from).or_else(dirs::home_dir),
         })
     }
 
@@ -120,7 +151,7 @@ impl Paths {
     }
 
     pub fn log_file(&self) -> PathBuf {
-        self.data_dir.join("localharness.log")
+        self.data_dir.join("totality.log")
     }
 
     /// Create the directories the harness writes to, with `0700` permissions.
@@ -179,6 +210,30 @@ mod tests {
         assert_eq!(
             id.len(),
             8 + 1 + 6 + 1 + std::process::id().to_string().len()
+        );
+    }
+}
+
+#[cfg(test)]
+mod rename_tests {
+    use super::*;
+
+    #[test]
+    fn the_legacy_directory_is_used_only_while_the_new_one_is_missing() {
+        let base = tempfile::tempdir().unwrap();
+        assert_eq!(
+            named_dir(base.path().to_path_buf()),
+            base.path().join(APP_DIR)
+        );
+        std::fs::create_dir(base.path().join(LEGACY_APP_DIR)).unwrap();
+        assert_eq!(
+            named_dir(base.path().to_path_buf()),
+            base.path().join(LEGACY_APP_DIR)
+        );
+        std::fs::create_dir(base.path().join(APP_DIR)).unwrap();
+        assert_eq!(
+            named_dir(base.path().to_path_buf()),
+            base.path().join(APP_DIR)
         );
     }
 }

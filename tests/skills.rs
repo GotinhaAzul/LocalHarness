@@ -134,29 +134,34 @@ fn apply_env(command: &mut tokio::process::Command, env: &Env) {
     command
         .current_dir(&env.cwd)
         .env("HOME", &env.home)
-        .env("LH_HOME", &env.home)
-        .env("LH_CONFIG_DIR", &env.config)
-        .env("LH_DATA_DIR", &env.data)
-        .env("LH_SKIP_TOOL_PROBE", "1")
+        .env("TOT_HOME", &env.home)
+        .env("TOT_CONFIG_DIR", &env.config)
+        .env("TOT_DATA_DIR", &env.data)
+        .env("TOT_SKIP_TOOL_PROBE", "1")
+        .env_remove("TOT_ENDPOINT")
         .env_remove("LH_ENDPOINT")
+        .env_remove("TOT_MODEL")
         .env_remove("LH_MODEL")
+        .env_remove("TOT_API_KEY")
         .env_remove("LH_API_KEY")
+        .env_remove("TOT_PROFILE")
         .env_remove("LH_PROFILE")
+        .env_remove("TOT_TRUST")
         .env_remove("LH_TRUST");
 }
 
 async fn run(env: &Env, args: &[&str]) -> std::process::Output {
-    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_lh"));
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_tot"));
     command.args(args);
     apply_env(&mut command, env);
     tokio::time::timeout(std::time::Duration::from_secs(30), command.output())
         .await
-        .expect("lh timed out")
-        .expect("cannot run lh")
+        .expect("tot timed out")
+        .expect("cannot run tot")
 }
 
 async fn run_print(env: &Env, base: &str, args: &[&str]) -> std::process::Output {
-    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_lh"));
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_tot"));
     command
         .arg("--endpoint")
         .arg(base)
@@ -167,8 +172,8 @@ async fn run_print(env: &Env, base: &str, args: &[&str]) -> std::process::Output
     apply_env(&mut command, env);
     tokio::time::timeout(std::time::Duration::from_secs(30), command.output())
         .await
-        .expect("lh timed out")
-        .expect("cannot run lh")
+        .expect("tot timed out")
+        .expect("cannot run tot")
 }
 
 fn write_skill(root: &Path, name: &str, description: &str, body: &str) {
@@ -298,7 +303,7 @@ async fn a_hundred_skills_are_capped_and_stay_loadable_by_name() {
         .find(|line| line.starts_with("- more (load with the skill tool by name):"))
         .unwrap_or_else(|| panic!("no names line:\n{system}"));
     assert!(
-        tail.chars().count() <= localharness::skills::INDEX_NAMES_CAP,
+        tail.chars().count() <= totality::skills::INDEX_NAMES_CAP,
         "{tail}"
     );
     let (mut shown, mut omitted) = (0usize, 0usize);
@@ -421,10 +426,7 @@ async fn native_and_standard_skills_resolve_deterministically_and_record_the_sha
     assert_eq!(duplicates[0]["code"], "skill_duplicate_name");
     let message = duplicates[0]["message"].as_str().unwrap();
     assert!(message.contains(".claude/skills"), "{message}");
-    assert!(
-        message.contains("~/.config/localharness/skills"),
-        "{message}"
-    );
+    assert!(message.contains("~/.config/totality/skills"), "{message}");
 }
 
 #[tokio::test]
@@ -848,7 +850,7 @@ async fn lint_all_checks_bundled_global_and_trusted_project_skills() {
         .filter_map(|skill| skill["origin"].as_str())
         .collect();
     assert!(origins.contains(&"bundled"));
-    assert!(origins.contains(&"~/.config/localharness/skills"));
+    assert!(origins.contains(&"~/.config/totality/skills"));
     assert!(origins.contains(&".harness/skills"));
 }
 

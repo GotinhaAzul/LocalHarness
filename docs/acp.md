@@ -1,12 +1,12 @@
 # Editor integration (ACP)
 
-`lh acp` serves the [Agent Client Protocol v1](https://agentclientprotocol.com)
-on stdio, so an editor can host a LocalHarness thread instead of a terminal.
+`tot acp` serves the [Agent Client Protocol v1](https://agentclientprotocol.com)
+on stdio, so an editor can host a Totality thread instead of a terminal.
 Zed, Neovim, and Emacs clients that speak ACP can drive it.
 
 The process speaks only newline-delimited JSON-RPC on stdout. Diagnostics go to
-the log file (`$LH_DATA_DIR/localharness.log` or
-`~/.local/share/localharness/localharness.log`), never to the protocol stream.
+the log file (`$TOT_DATA_DIR/totality.log` or
+`~/.local/share/totality/totality.log`), never to the protocol stream.
 
 ## Zed
 
@@ -16,9 +16,9 @@ Agents** → **Add Custom Agent**):
 ```json
 {
   "agent_servers": {
-    "localharness": {
+    "totality": {
       "type": "custom",
-      "command": "lh",
+      "command": "tot",
       "args": ["acp"],
       "env": {}
     }
@@ -26,15 +26,15 @@ Agents** → **Add Custom Agent**):
 }
 ```
 
-`lh` must be on the `PATH` Zed sees. Pass the endpoint and model as ACP does not
+`tot` must be on the `PATH` Zed sees. Pass the endpoint and model as ACP does not
 carry a model picker yet:
 
 ```json
 {
   "agent_servers": {
-    "localharness": {
+    "totality": {
       "type": "custom",
-      "command": "lh",
+      "command": "tot",
       "args": [
         "--endpoint", "http://127.0.0.1:8080",
         "--model", "Qwen3.5-35B-A3B-Q4_K_M",
@@ -46,7 +46,7 @@ carry a model picker yet:
 }
 ```
 
-The same flags work from `LH_ENDPOINT` and `LH_MODEL`, or from the global config
+The same flags work from `TOT_ENDPOINT` and `TOT_MODEL`, or from the global config
 written by `/login` in the TUI. Start a thread from the Agent Panel after saving
 the settings; Zed detects the file without a restart.
 
@@ -79,7 +79,7 @@ Stop reasons match the CLI's turn status:
 
 An errored turn is a protocol error rather than `refusal`, so a transient
 endpoint failure does not tell the client to drop the conversation. The exact
-harness status and error code ride in `_meta.localharness` (or the error
+harness status and error code ride in `_meta.totality` (or the error
 `data`).
 
 ## Roots
@@ -95,7 +95,7 @@ supports one root per session. Start a second session for the second root.
 Project trust and `verify` steps belong to the process working directory. When
 a session declares a different root, that session runs untrusted and with no
 verify steps, so a client cannot extend the launched project's trust to an
-arbitrary directory. Launch `lh acp` in the project root (or pass
+arbitrary directory. Launch `tot acp` in the project root (or pass
 `--endpoint`/`--model` explicitly) for project config and verify behavior.
 
 ## Permissions
@@ -140,7 +140,7 @@ rather than a silent success:
 
 Client-supplied `mcpServers` are not connected. Configure MCP servers in the
 harness config (`[mcp.<name>]`) instead; `session/new` reports the ignored count
-in `_meta.localharness` rather than claiming they are available.
+in `_meta.totality` rather than claiming they are available.
 
 ## Conformance
 

@@ -7,7 +7,7 @@
 //!
 //! Engines disagree about names and support. Only fields the selected engine
 //! accepts are written into the request body; anything else is omitted and
-//! reported by `lh doctor` instead of being sent as an unknown key.
+//! reported by `tot doctor` instead of being sent as an unknown key.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};

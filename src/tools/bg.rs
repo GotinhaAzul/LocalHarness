@@ -573,7 +573,7 @@ fn log_dir(ctx: &ToolContext) -> std::io::Result<PathBuf> {
     let directory = match ctx.artifacts.root() {
         Some(root) => root.to_path_buf(),
         None => {
-            std::env::temp_dir().join(format!("lh-bg-{}", sanitize(ctx.artifacts.session_id())))
+            std::env::temp_dir().join(format!("tot-bg-{}", sanitize(ctx.artifacts.session_id())))
         }
     };
     std::fs::create_dir_all(&directory)?;

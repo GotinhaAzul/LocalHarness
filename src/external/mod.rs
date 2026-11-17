@@ -130,7 +130,7 @@ impl ExternalTool {
             let mut argv = Vec::with_capacity(substituted.len() + 3);
             argv.push("-c".to_string());
             argv.push(format!("{} \"$@\"", self.manifest.command));
-            argv.push("localharness-external".to_string());
+            argv.push("totality-external".to_string());
             argv.extend(substituted);
             ("/bin/sh".to_string(), argv)
         } else {

@@ -1,5 +1,5 @@
-//! Hosting harness sessions for a long-lived frontend: `lh acp` (stdio) and
-//! `lh serve` (local HTTP).
+//! Hosting harness sessions for a long-lived frontend: `tot acp` (stdio) and
+//! `tot serve` (local HTTP).
 //!
 //! Both frontends own many sessions at once, each with its own `Core`, and
 //! drive turns from requests. This module holds what they share so there is
@@ -86,7 +86,7 @@ impl Host {
     }
 
     /// [`Host::open`] with the session's permission mode pinned before the
-    /// runtime is built. `lh serve` selects the mode per HTTP session; setting
+    /// runtime is built. `tot serve` selects the mode per HTTP session; setting
     /// it here makes the policy engine the only pre-dispatch decision point,
     /// so `[permissions]` allow and deny rules apply over HTTP too.
     pub async fn open_in_mode(
