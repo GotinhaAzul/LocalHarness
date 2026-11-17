@@ -2418,7 +2418,7 @@ async fn run_settle_check(
         name: name.to_string(),
         is_error: result.is_error,
         duration_ms: started.elapsed().as_millis() as u64,
-        preview: preview(tool_body(&result.content), 300),
+        preview: preview_block(tool_body(&result.content)),
         artifact: capped.artifact,
     });
     Some(SettleCheck { result, executed })
@@ -3269,7 +3269,7 @@ async fn execute_batch(
             name: call.name.clone(),
             is_error: tool_result.is_error,
             duration_ms,
-            preview: preview(tool_body(&tool_result.content), 300),
+            preview: preview_block(tool_body(&tool_result.content)),
             artifact: capped.artifact,
         });
 
@@ -3631,7 +3631,7 @@ async fn finish_review(
             name: call.call.name.clone(),
             is_error: tool_result.is_error,
             duration_ms: call.started.elapsed().as_millis() as u64,
-            preview: preview(tool_body(&tool_result.content), 300),
+            preview: preview_block(tool_body(&tool_result.content)),
             artifact: capped.artifact,
         });
     }
@@ -3675,7 +3675,9 @@ fn summarize_args(args: &Value) -> String {
             None => preview(name, 80),
         };
     }
-    for key in ["path", "command", "pattern", "action", "artifact", "text"] {
+    for key in [
+        "path", "command", "pattern", "action", "step", "artifact", "text",
+    ] {
         if let Some(value) = args.get(key).and_then(|v| v.as_str()) {
             return preview(value, 80);
         }
@@ -3690,6 +3692,26 @@ fn tool_body(content: &str) -> &str {
     } else {
         content
     }
+}
+
+/// A tool result's preview for the UI: line breaks kept (a diff or test
+/// output is unreadable flattened), at most 40 lines and 2000 characters.
+fn preview_block(text: &str) -> String {
+    let mut out = String::new();
+    for (index, line) in text.lines().enumerate() {
+        if index == 40 {
+            out.push('…');
+            break;
+        }
+        if index > 0 {
+            out.push('\n');
+        }
+        out.push_str(line.trim_end());
+    }
+    if out.chars().count() > 2000 {
+        out = out.chars().take(1999).collect::<String>() + "…";
+    }
+    out
 }
 
 fn preview(text: &str, max: usize) -> String {
