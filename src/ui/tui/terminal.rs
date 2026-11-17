@@ -1,6 +1,8 @@
 //! Terminal setup and restore: raw mode, the alternate screen, and a panic
 //! hook that always gives the user their shell back.
 
+use std::io::Write as _;
+
 use super::*;
 
 /// Room for a full repaint of a large terminal, so a frame leaves in one
@@ -35,6 +37,10 @@ pub(super) fn restore_terminal() {
             LeaveAlternateScreen,
             DisableBracketedPaste
         );
+        // Give the shell its title back (xterm title stack; ignored where
+        // unsupported).
+        let _ = out.write_all(b"\x1b[23;0t");
+        let _ = out.flush();
     }
 }
 
@@ -67,6 +73,9 @@ impl TerminalGuard {
             let _ = disable_raw_mode();
             return Err(error).context("cannot enter the alternate screen");
         }
+        // Save the shell's title so leaving restores it.
+        let _ = out.write_all(b"\x1b[22;0t");
+        let _ = out.flush();
         TERMINAL_ACTIVE.store(true, Ordering::SeqCst);
         Ok(TerminalGuard)
     }

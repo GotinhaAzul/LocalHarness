@@ -403,6 +403,7 @@ async fn tab_completes_commands_arguments_and_paths() {
         skills: SkillIndex::bundled(),
     };
     let mut app = App::new(runtime, options()).unwrap();
+    app.completion_sources.files = Arc::new(complete::index_files(&cwd));
     let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
     let back_tab = KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT);
 
@@ -433,17 +434,35 @@ async fn tab_completes_commands_arguments_and_paths() {
     assert_eq!(app.theme.name, "high-contrast");
 
     // Paths: the first Tab extends to the shared prefix, the popup lists
-    // the rest, and a unique file is accepted.
+    // the rest, and a unique file is accepted. Mentions are live from the
+    // cached index, so the popup is already there while typing.
     app.input.set_text("explain @sr");
+    let live = app.current_completion().expect("live mention popup");
+    assert_eq!(live.kind, complete::Kind::Path);
+    assert!(live.candidates.iter().any(|item| item.value == "src/"));
     app.handle_key(tab).await;
     assert_eq!(app.input.text(), "explain @src/");
-    assert!(app.current_completion().is_none());
-    app.handle_key(tab).await;
     let completion = app.current_completion().expect("path popup");
-    assert_eq!(completion.candidates[0].value, "src/ui/");
-    app.input.set_text("explain @src/m");
+    assert!(
+        completion
+            .candidates
+            .iter()
+            .any(|item| item.value == "src/ui/")
+    );
+    app.input.set_text("explain @src/main");
     app.handle_key(tab).await;
     assert_eq!(app.input.text(), "explain @src/main.rs ");
+
+    // A trailing space ends the mention, and Esc dismisses the live popup
+    // without clearing the prompt.
+    app.input.set_text("explain @src/");
+    assert!(app.current_completion().is_some());
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .await;
+    assert!(app.current_completion().is_none());
+    assert_eq!(app.input.text(), "explain @src/");
+    app.input.set_text("explain @src/ ");
+    assert!(app.current_completion().is_none());
 
     // Plain prose: Tab falls through to the textarea.
     app.input.set_text("hello");

@@ -203,7 +203,7 @@ Compaction is deterministic, not model-written. Tool output is archived with an 
 
 ### The TUI
 
-The terminal interface is the default. Tool calls render as cards, diffs and streamed Markdown are styled, and the context gauge stays visible. When the engine reports a prefix-cache hit, the header also shows `cache <cached>/<prompt>` tokens; `--json` usage events carry the same counts.
+The terminal interface is the default. It speaks in two voices: the model in Skoll's amber, the harness in Hati's silver-blue (the `sun` and `moon` theme tokens). Tool calls render as compact rows grouped with the thoughts between them, diffs and streamed Markdown are styled, and the context gauge stays visible. The terminal title shows whether a turn is running, waiting for approval, or done. When the engine reports a prefix-cache hit, the header also shows `cache <cached>/<prompt>` tokens; `--json` usage events carry the same counts.
 
 | Key | Action |
 |---|---|
