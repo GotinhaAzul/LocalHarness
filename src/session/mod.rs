@@ -6,6 +6,7 @@ pub mod rewind;
 pub mod store;
 pub mod tree;
 
+use std::io::BufRead as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -30,6 +31,85 @@ use crate::security::redact::{Redactor, contains_placeholder};
 pub const RESUMED_PLACEHOLDER_NOTE: &str = "\n[localharness] This result was restored from a saved session. [REDACTED:...] markers were substituted when it was saved and are not file content; re-read a file before editing it.";
 
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Prompt history is written next to the session files but is not a session.
+pub const PROMPT_HISTORY_FILE: &str = "prompt_history.jsonl";
+
+/// A session file with at least one user message.
+#[derive(Debug, Clone)]
+pub struct SessionFile {
+    pub id: String,
+    pub path: PathBuf,
+    pub modified: std::time::SystemTime,
+    /// The first user message exactly as saved.
+    pub first_user: String,
+}
+
+/// True for a file that can hold a session: `*.jsonl` other than the prompt
+/// history. Lock files use a different extension and never match.
+pub fn is_session_file(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|extension| extension == "jsonl")
+        && path.file_name().and_then(|name| name.to_str()) != Some(PROMPT_HISTORY_FILE)
+}
+
+/// Session files under `dir` that have at least one user message, newest
+/// first. Prompt history, lock files, and sessions that never got a prompt
+/// are skipped. Every caller that lists sessions should use this.
+pub fn list_session_files(dir: &Path) -> Vec<SessionFile> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !entry.file_type().is_ok_and(|kind| kind.is_file()) || !is_session_file(&path) {
+            continue;
+        }
+        let Some(id) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        let Some(first_user) = first_user_message(&path) else {
+            continue;
+        };
+        let modified = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        found.push(SessionFile {
+            id: id.to_string(),
+            path,
+            modified,
+            first_user,
+        });
+    }
+    found.sort_by(|left, right| {
+        right
+            .modified
+            .cmp(&left.modified)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    found
+}
+
+fn first_user_message(path: &Path) -> Option<String> {
+    let file = std::fs::File::open(path).ok()?;
+    for line in std::io::BufReader::new(file)
+        .lines()
+        .map_while(std::result::Result::ok)
+    {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(entry) = serde_json::from_str::<Entry>(line)
+            && let EntryKind::User(data) = entry.kind
+        {
+            return Some(data.content);
+        }
+    }
+    None
+}
 
 #[derive(Debug)]
 pub struct Session {
@@ -158,24 +238,12 @@ impl Session {
         Ok(session)
     }
 
-    /// Most recently modified session file for the project.
+    /// Most recently modified session that has a user message.
     pub fn latest_path(paths: &Paths) -> Result<Option<PathBuf>> {
-        let dir = paths.project_sessions_dir();
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            return Ok(None);
-        };
-        let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().is_some_and(|e| e == "jsonl")
-                && let Ok(meta) = entry.metadata()
-                && let Ok(modified) = meta.modified()
-                && best.as_ref().is_none_or(|(t, _)| modified > *t)
-            {
-                best = Some((modified, path));
-            }
-        }
-        Ok(best.map(|(_, path)| path))
+        Ok(list_session_files(&paths.project_sessions_dir())
+            .into_iter()
+            .next()
+            .map(|session| session.path))
     }
 
     pub fn header(&self) -> Option<&SessionData> {
@@ -612,6 +680,48 @@ mod tests {
             .unwrap();
         assert!(!dir.path().join("data").exists());
         assert_eq!(session.context_path().len(), 1);
+    }
+
+    #[test]
+    fn session_listing_skips_prompt_history_locks_and_empty_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths(dir.path());
+        let mut first = Session::create(&paths, header(), false).unwrap();
+        first
+            .append(EntryKind::User(UserData {
+                attachments: Vec::new(),
+                content: "first prompt\nwith a second line".into(),
+            }))
+            .unwrap();
+        first.fsync().unwrap();
+        let first_path = first.path.clone().unwrap();
+        drop(first);
+
+        // A launch that never sent a message leaves a header-only file.
+        let empty = Session::create(&paths, header(), false).unwrap();
+        let empty_path = empty.path.clone().unwrap();
+        drop(empty);
+
+        let sessions_dir = paths.project_sessions_dir();
+        std::fs::write(
+            sessions_dir.join(PROMPT_HISTORY_FILE),
+            "\"a recalled prompt\"\n",
+        )
+        .unwrap();
+        std::fs::write(sessions_dir.join("session.jsonl.lock"), "pid 1\n").unwrap();
+        std::fs::write(sessions_dir.join("broken.jsonl"), "not json\n").unwrap();
+
+        let listed = list_session_files(&sessions_dir);
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        assert_eq!(listed[0].path, first_path);
+        assert_eq!(listed[0].first_user, "first prompt\nwith a second line");
+        assert!(is_session_file(&first_path));
+        assert!(is_session_file(&empty_path));
+        assert!(!is_session_file(&sessions_dir.join(PROMPT_HISTORY_FILE)));
+        assert!(!is_session_file(&sessions_dir.join("session.jsonl.lock")));
+
+        // The empty, newer session is not `last`.
+        assert_eq!(Session::latest_path(&paths).unwrap(), Some(first_path));
     }
 
     #[test]

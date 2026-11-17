@@ -2,11 +2,11 @@
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
-use std::io::{BufRead, BufReader, BufWriter, Stdout};
+use std::io::{BufWriter, Stdout};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Once};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use ratatui::Terminal;
@@ -31,7 +31,7 @@ use crate::config::Config;
 use crate::context;
 use crate::git::{self, GitStatus};
 use crate::provider::{OpenAiCompatProvider, probe};
-use crate::session::{CompactionData, Entry, EntryKind, UserData};
+use crate::session::{CompactionData, EntryKind, UserData};
 use crate::skills::SkillIndex;
 use crate::tools::hunk::HunkReviewer as _;
 use crate::tools::todo::{PlanStatus, plan_snapshot};
