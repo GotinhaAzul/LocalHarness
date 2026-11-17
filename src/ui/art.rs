@@ -109,6 +109,10 @@ fn disc() -> Grid {
     grid
 }
 
+fn dark(c: Rgb) -> bool {
+    c == CORE || c == EYE
+}
+
 fn blit(canvas: &mut Grid, image: &Grid, x0: usize) {
     for (y, row) in image.iter().enumerate() {
         for (x, cell) in row.iter().enumerate() {
@@ -155,9 +159,12 @@ pub fn welcome(width: usize, theme: &Theme) -> Vec<Line<'static>> {
     grid.chunks(2)
         .map(|pair| {
             let mut spans = vec![Span::raw(pad.clone())];
+            // Without color the dark core and eyes would paint as solid
+            // blocks; they become holes so the shapes still read.
+            let ink = |cell: Option<Rgb>| cell.filter(|c| !(theme.no_color && dark(*c)));
             for x in 0..art_width {
-                let top = pair[0][x];
-                let bottom = pair.get(1).and_then(|row| row[x]);
+                let top = ink(pair[0][x]);
+                let bottom = ink(pair.get(1).and_then(|row| row[x]));
                 spans.push(match (top, bottom) {
                     (None, None) => Span::raw(" "),
                     (Some(t), None) => Span::styled("▀", Style::default().fg(color(t))),
@@ -235,6 +242,19 @@ mod tests {
         assert_eq!(lines.len(), DISC / 2);
         assert!(lines.iter().all(|line| width(line) <= 40));
         assert!(welcome(10, &theme).is_empty());
+    }
+
+    #[test]
+    fn without_color_the_core_is_a_hole() {
+        let mut theme = Theme::bundled("default");
+        theme.no_color = true;
+        let lines = welcome(40, &theme);
+        let middle: String = lines[DISC / 4]
+            .spans
+            .iter()
+            .map(|span| span.content.to_string())
+            .collect();
+        assert!(middle.trim().contains("  "), "{middle:?}");
     }
 
     #[test]

@@ -2193,15 +2193,16 @@ fn render_completions(frame: &mut Frame, scene: &Scene<'_>, area: Rect, theme: &
     {
         let selected = index == scene.completion_index;
         let marker = if selected { "› " } else { "  " };
+        let is_dir = label.ends_with('/');
         let label = clip_end(label, label_width);
         let mut line = Line::from(vec![
             Span::styled(marker, theme.bold(Role::Accent)),
             Span::styled(
                 format!("{label:<label_width$}"),
-                if selected {
-                    theme.bold(Role::Accent)
-                } else {
-                    theme.style(Role::Fg)
+                match (selected, is_dir) {
+                    (true, _) => theme.bold(Role::Accent),
+                    (false, true) => theme.style(Role::Moon),
+                    (false, false) => theme.style(Role::Fg),
                 },
             ),
             Span::styled(

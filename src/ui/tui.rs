@@ -19,7 +19,7 @@ use ratatui::crossterm::event::{
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
     BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate, EnterAlternateScreen,
-    LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    LeaveAlternateScreen, SetTitle, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::layout::Rect;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
@@ -443,6 +443,10 @@ struct App {
     repaint: bool,
     /// A permission question from the running turn, waiting for y/n.
     pending_ask: Option<permission::PendingAsk>,
+    /// The terminal title last written, so it is only sent on change.
+    title: String,
+    /// A turn finished since the last prompt was sent.
+    turn_done: bool,
     /// The last frame as drawn, for tests that check the screen.
     #[cfg(test)]
     last_frame: Option<ratatui::buffer::Buffer>,
@@ -536,6 +540,8 @@ impl App {
             hunk_edit: None,
             repaint: false,
             pending_ask: None,
+            title: String::new(),
+            turn_done: false,
             #[cfg(test)]
             last_frame: None,
         };
@@ -865,11 +871,15 @@ impl App {
         } else {
             ("not logged in · run /login".to_string(), true)
         };
-        let window = format!(
-            "{} · {}",
-            crate::ui::widgets::format_tokens(window_size),
-            source.label()
-        );
+        let window = if source.is_reliable() {
+            format!("{} context", crate::ui::widgets::format_tokens(window_size))
+        } else {
+            format!(
+                "{} context · {}",
+                crate::ui::widgets::format_tokens(window_size),
+                source.label()
+            )
+        };
         let rows = vec![
             ("model".to_string(), model.0, model.1),
             ("context".to_string(), window, !source.is_reliable()),
@@ -935,7 +945,36 @@ impl App {
         let _ = execute!(terminal.backend_mut(), BeginSynchronizedUpdate);
         let drawn = self.draw_frame(terminal);
         let _ = execute!(terminal.backend_mut(), EndSynchronizedUpdate);
+        let title = self.window_title();
+        if title != self.title {
+            let _ = execute!(terminal.backend_mut(), SetTitle(&title));
+            self.title = title;
+        }
         drawn
+    }
+
+    /// The terminal title: the state at a glance from another tab or a
+    /// multiplexer's window list.
+    fn window_title(&self) -> String {
+        let place = std::path::Path::new(&self.header.cwd)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("totality");
+        let state = if self.pending_ask.is_some() {
+            "? "
+        } else if self.turn_active {
+            "◐ "
+        } else if self.turn_done {
+            "✓ "
+        } else {
+            ""
+        };
+        let suffix = if self.pending_ask.is_some() {
+            " · needs approval"
+        } else {
+            ""
+        };
+        format!("{state}{place} · totality{suffix}")
     }
 
     fn draw_frame<B>(&mut self, terminal: &mut Terminal<B>) -> Result<()>
@@ -1318,6 +1357,7 @@ impl App {
         let core = runtime.core.clone();
         self.transcript.begin_turn(&text);
         self.turn_active = true;
+        self.turn_done = false;
         self.cancelling = false;
         self.turn_state = Some(AgentState::AssembleContext);
         self.turn_started = Some(Instant::now());
@@ -1350,6 +1390,7 @@ impl App {
             let _ = pending.reply.send(crate::policy::AskAnswer::Deny);
         }
         self.turn_active = false;
+        self.turn_done = true;
         self.cancelling = false;
         self.turn_state = None;
         self.turn_started = None;
