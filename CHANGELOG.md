@@ -9,6 +9,16 @@ release may change defaults when the change is called out below.
 
 ### Added
 
+- A welcome screen with Skoll and Hati, two pixel-art wolves closing in on an
+  eclipse, drawn with half blocks (the eclipse alone on narrow terminals,
+  outlines only with `NO_COLOR`).
+- `sun` and `moon` theme tokens for the interface's two voices (the model and
+  the harness), and the bundled themes `hati` and `skoll`.
+- Live, fuzzy `@` file mentions from a cached, gitignore-aware project index:
+  the popup shows each file's name and folder as you type.
+- The terminal title shows whether a turn is running, waiting for approval,
+  or done, and is restored on exit.
+
 - The skill index is capped at 200 characters per entry and 2400 characters in
   total; the remaining skills are listed by name and stay loadable.
   `[skills] index = "full" | "names" | "off"` chooses the form,
@@ -94,6 +104,14 @@ release may change defaults when the change is called out below.
 
 ### Changed
 
+- **Default theme:** `default` is now the warm dusk palette (`totality`); the
+  previous default is available as `classic`.
+- Tool rows label calls by their main argument (`Read src/cli.rs · first 130
+  lines`), fold read and recall output until ctrl+o, and sit on consecutive
+  lines with the thoughts between them. Markdown headings drop their `#`
+  markers and lists use round bullets. The spinner is an eclipse.
+- `/resume`, `/sessions`, `--continue`, and `/resume last` skip the prompt
+  history file and sessions without a user message; times read as `5 min ago`.
 - A model call that fails for a transient reason is retried inside the turn:
   a connection failure, a dropped or stalled stream, a 5xx except 501/505,
   408/504, or 429 (now its own `rate_limited` class). `[model] retries`
