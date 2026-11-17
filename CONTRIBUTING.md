@@ -25,7 +25,7 @@ macOS or Windows.
 
 ```sh
 git clone https://github.com/GotinhaAzul/LocalHarness
-cd Totality
+cd LocalHarness
 cargo build --release
 ./target/release/tot --help
 ```
