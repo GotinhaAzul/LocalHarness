@@ -159,6 +159,13 @@ enum BgEvent {
         endpoint: String,
         result: std::result::Result<Vec<String>, String>,
     },
+    /// A project file index built off the event loop.
+    Files {
+        root: PathBuf,
+        /// Identifies the newest scan; late older scans are dropped.
+        scan: u64,
+        files: Vec<String>,
+    },
     /// A core rebuilt for a model or profile switch.
     Rebuilt {
         switch: Switch,
@@ -426,6 +433,10 @@ struct App {
     /// the popup was opened, so frames do not recompute (or re-list
     /// directories) while nothing changed.
     completion_cache: RefCell<Option<(String, bool, Option<Completion>)>>,
+    /// The prompt text whose live `@` popup Esc dismissed.
+    completion_dismissed: RefCell<Option<String>>,
+    /// The newest project file scan, so stale scans do not overwrite it.
+    files_scan: u64,
     /// Background work reports here; the event loop takes the receiver.
     bg_tx: UnboundedSender<BgEvent>,
     bg_rx: Option<UnboundedReceiver<BgEvent>>,
@@ -527,6 +538,8 @@ impl App {
             show_plan: true,
             completion_sources: complete::Sources::default(),
             completion_cache: RefCell::new(None),
+            completion_dismissed: RefCell::new(None),
+            files_scan: 0,
             bg_tx,
             bg_rx: Some(bg_rx),
             switching: None,
@@ -543,6 +556,7 @@ impl App {
         app.transcript = Transcript::new(app.config.ui.show_reasoning);
         app.refresh_session_blocks();
         app.refresh_completion_sources(true);
+        app.spawn_files_refresh();
         app.attach_prompt_history();
         for warning in warnings {
             app.transcript.push_note("session warning", warning, false);
@@ -620,6 +634,24 @@ impl App {
         self.completion_cache.replace(None);
     }
 
+    /// Index the project's files off the event loop for live `@` mentions.
+    /// Called at startup and after a turn, when tools may have written files.
+    fn spawn_files_refresh(&mut self) {
+        let Some(root) = self.core().map(|core| core.paths.cwd.clone()) else {
+            return;
+        };
+        self.files_scan += 1;
+        let scan = self.files_scan;
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            let walk_root = root.clone();
+            let files = tokio::task::spawn_blocking(move || complete::index_files(&walk_root))
+                .await
+                .unwrap_or_default();
+            let _ = tx.send(BgEvent::Files { root, scan, files });
+        });
+    }
+
     /// List the endpoint's models off the event loop; the result lands in
     /// [`App::handle_bg`].
     fn spawn_models_refresh(&self) {
@@ -641,6 +673,14 @@ impl App {
 
     async fn handle_bg(&mut self, event: BgEvent) {
         match event {
+            BgEvent::Files { root, scan, files } => {
+                let current = self.core().map(|core| core.paths.cwd.clone());
+                if scan != self.files_scan || current.as_deref() != Some(root.as_path()) {
+                    return;
+                }
+                self.completion_sources.files = Arc::new(files);
+                self.completion_cache.replace(None);
+            }
             BgEvent::Models { endpoint, result } => {
                 let current = self
                     .core()
@@ -734,6 +774,9 @@ impl App {
     /// nothing useful to show.
     fn current_completion(&self) -> Option<Completion> {
         let before = self.input.before_cursor();
+        if self.completion_dismissed.borrow().as_deref() == Some(before.as_str()) {
+            return None;
+        }
         let popup = self.input.popup_open();
         if let Some((text, open, cached)) = self.completion_cache.borrow().as_ref()
             && *text == before
@@ -746,6 +789,13 @@ impl App {
         self.completion_cache
             .replace(Some((before, popup, completion.clone())));
         completion
+    }
+
+    /// Esc hides the live `@` popup until the prompt text changes.
+    fn dismiss_completion(&mut self) {
+        self.completion_dismissed
+            .replace(Some(self.input.before_cursor()));
+        self.input.reset_completion();
     }
 
     fn accept_candidate(&mut self, completion: &Completion, index: usize) {
@@ -1358,6 +1408,8 @@ impl App {
         self.transcript.finish_turn();
         // Also syncs the session file.
         self.refresh_session_blocks();
+        // Tools may have created or removed files; refresh `@` suggestions.
+        self.spawn_files_refresh();
         match outcome {
             Some(outcome) => {
                 // An exact error (for example `budget_static`) is the notice;

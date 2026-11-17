@@ -1,20 +1,32 @@
-//! Context-aware Tab completion for the prompt.
+//! Context-aware completion for the prompt.
 //!
 //! Completion is a pure function of the text before the cursor plus a
 //! snapshot of completion sources, so it is cheap to recompute every frame
-//! and easy to test. Three contexts are recognised:
+//! and easy to test. These contexts are recognised:
 //!
 //! - **command**: `/the` completes slash-command names;
 //! - **argument**: `/theme dr` completes the arguments a command accepts
 //!   (themes, profiles, skills, workflows, sessions, models, subcommands);
-//! - **path**: `@src/ui/in`, `./scr`, `~/no`, or any token containing `/`
-//!   completes filesystem paths. Paths are only listed on demand (Tab), never
-//!   automatically, so typing prose never touches the disk.
+//! - **mention**: `@src/ag` is answered live from a cached, gitignore-aware
+//!   index of the project's files ([`index_files`]), fuzzy-matched as a
+//!   subsequence. The disk is never walked per keystroke; the index is built
+//!   when the TUI starts and refreshed after a turn.
+//! - **path**: `./scr`, `~/no`, or any token containing `/` completes
+//!   filesystem paths on demand (Tab), never automatically, so ordinary
+//!   prose does not touch the disk. An `@` token falls back to listing a real
+//!   directory while the file index is still empty.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Directory entries listed for one path completion.
 const MAX_PATH_CANDIDATES: usize = 200;
+
+/// Files (and directories) kept in the cached project index.
+pub const MAX_INDEX_ENTRIES: usize = 20_000;
+
+/// Live `@` mentions shown at once.
+const MAX_MENTION_CANDIDATES: usize = 50;
 
 /// What kind of token is being completed; drives popup titles and how an
 /// accepted candidate is terminated.
@@ -121,6 +133,9 @@ pub struct Sources {
     pub sessions: Vec<(String, String)>,
     /// Models the endpoint reported the last time it was probed.
     pub models: Vec<String>,
+    /// Repository-relative paths for live `@` mentions, built once off the
+    /// event loop. Directories end in `/`.
+    pub files: Arc<Vec<String>>,
     /// The configured endpoint, offered first by `/login`.
     pub endpoint: String,
     pub cwd: PathBuf,
@@ -195,11 +210,21 @@ pub fn complete(
         return None;
     }
 
-    if !paths || token.is_empty() {
+    // Live `@` mentions come from the cached index, even before Tab. Only
+    // when there is no index yet does an existing directory prefix fall back
+    // to the on-demand listing.
+    if let Some(rest) = token.strip_prefix('@') {
+        if let Some(completion) = complete_mention(rest, token_start + 1, sources) {
+            return Some(completion);
+        }
+        if sources.files.is_empty() && rest.contains('/') {
+            return complete_path(rest, token_start + 1, sources, true);
+        }
         return None;
     }
-    if let Some(rest) = token.strip_prefix('@') {
-        return complete_path(rest, token_start + 1, sources, true);
+
+    if !paths || token.is_empty() {
+        return None;
     }
     if looks_like_path(token) {
         return complete_path(token, token_start, sources, false);
@@ -209,6 +234,142 @@ pub fn complete(
 
 fn looks_like_path(token: &str) -> bool {
     token.contains('/') || token.starts_with('.') || token.starts_with('~')
+}
+
+/// Repository-relative paths (directories with a trailing `/`) for live `@`
+/// mentions. Hidden entries are included; [`complete_mention`] filters them
+/// out unless the query asks for them. Ignored and `.git` contents are
+/// skipped, and the walk stops at [`MAX_INDEX_ENTRIES`].
+pub fn index_files(root: &Path) -> Vec<String> {
+    let mut walker = ignore::WalkBuilder::new(root);
+    walker
+        .hidden(false)
+        .parents(true)
+        .git_ignore(true)
+        .git_global(true)
+        .ignore(true)
+        .follow_links(false);
+    walker.filter_entry(|entry| entry.file_name() != ".git");
+
+    let mut files = Vec::new();
+    for entry in walker.build().flatten() {
+        if entry.depth() == 0 {
+            continue;
+        }
+        let Some(file_type) = entry.file_type() else {
+            continue;
+        };
+        let path = entry.path();
+        let Ok(relative) = path.strip_prefix(root) else {
+            continue;
+        };
+        let mut value = relative.to_string_lossy().replace('\\', "/");
+        if file_type.is_dir() {
+            value.push('/');
+        }
+        files.push(value);
+        if files.len() >= MAX_INDEX_ENTRIES {
+            break;
+        }
+    }
+    files.sort();
+    files.dedup();
+    files
+}
+
+fn complete_mention(token: &str, start: usize, sources: &Sources) -> Option<Completion> {
+    if sources.files.is_empty() {
+        return None;
+    }
+    let candidates = rank_files(token, sources.files.as_slice());
+    (!candidates.is_empty()).then(|| Completion {
+        kind: Kind::Path,
+        start,
+        token: token.to_string(),
+        candidates,
+    })
+}
+
+/// Fuzzy-match `query` against `files`. Ranking: a basename prefix, then a
+/// basename substring, then a path substring, then a subsequence; ties go to
+/// the shorter path, then alphabetical. Hidden paths appear only when the
+/// query itself starts with `.`.
+fn rank_files(query: &str, files: &[String]) -> Vec<Candidate> {
+    let wanted = query.to_lowercase();
+    let show_hidden = query.starts_with('.');
+    let mut ranked: Vec<(u8, &String)> = Vec::new();
+    for path in files {
+        if !show_hidden && path.split('/').any(|segment| segment.starts_with('.')) {
+            continue;
+        }
+        let lowered = path.to_lowercase();
+        let base = basename(path).to_lowercase();
+        let rank = if wanted.is_empty() || base.starts_with(&wanted) {
+            0
+        } else if base.contains(&wanted) {
+            1
+        } else if lowered.contains(&wanted) {
+            2
+        } else if is_subsequence(&wanted, &lowered) {
+            3
+        } else {
+            continue;
+        };
+        ranked.push((rank, path));
+    }
+    ranked.sort_by(|(left_rank, left), (right_rank, right)| {
+        left_rank
+            .cmp(right_rank)
+            .then_with(|| left.chars().count().cmp(&right.chars().count()))
+            .then_with(|| left.cmp(right))
+    });
+    ranked.truncate(MAX_MENTION_CANDIDATES);
+    ranked
+        .into_iter()
+        .map(|(_, path)| {
+            let directory = path.ends_with('/');
+            let base = basename(path);
+            Candidate {
+                value: path.clone(),
+                label: if directory {
+                    format!("{base}/")
+                } else {
+                    base.to_string()
+                },
+                description: parent(path).to_string(),
+            }
+        })
+        .collect()
+}
+
+/// The final path segment, without a directory's trailing `/`.
+fn basename(path: &str) -> &str {
+    path.trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or(path)
+}
+
+/// The path's directory, empty for top-level entries.
+fn parent(path: &str) -> &str {
+    path.trim_end_matches('/')
+        .rsplit_once('/')
+        .map(|(directory, _)| directory)
+        .unwrap_or("")
+}
+
+fn is_subsequence(needle: &str, haystack: &str) -> bool {
+    let mut wanted = needle.chars();
+    let mut next = wanted.next();
+    for ch in haystack.chars() {
+        let Some(expected) = next else {
+            return true;
+        };
+        if ch == expected {
+            next = wanted.next();
+        }
+    }
+    next.is_none()
 }
 
 fn complete_command(token: &str, start: usize, commands: &[(&str, &str)]) -> Option<Completion> {
@@ -549,11 +710,92 @@ mod tests {
         let dir_candidate = Candidate::new("src/ui/", "dir");
         assert_eq!(completion.insertion(&dir_candidate, false), "src/ui/");
 
-        // Hidden entries appear only when the token asks for them.
-        let completion = complete("@", COMMANDS, &src, true).unwrap();
+        // Live mentions use the index, including hidden entries on request.
+        let mut src = sources(dir.path());
+        src.files = Arc::new(vec![
+            ".hidden".into(),
+            "src/".into(),
+            "src/main.rs".into(),
+            "src/ui/".into(),
+            "src/ui/input.rs".into(),
+            "src/ui/input_extra.rs".into(),
+        ]);
+        let completion = complete("@", COMMANDS, &src, false).unwrap();
+        assert_eq!(completion.kind, Kind::Path);
         assert!(!values(&completion).contains(&".hidden"));
-        let completion = complete("@.h", COMMANDS, &src, true).unwrap();
+        let completion = complete("@.h", COMMANDS, &src, false).unwrap();
         assert_eq!(values(&completion), vec![".hidden"]);
+        // Accepting a file inserts the space that ends the mention.
+        let completion = complete("fix @src/main", COMMANDS, &src, false).unwrap();
+        let insertion = completion.insertion(&completion.candidates[0], false);
+        assert_eq!(insertion, "src/main.rs ");
+    }
+
+    #[test]
+    fn live_mentions_rank_and_describe_candidates() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut src = sources(dir.path());
+        src.files = Arc::new(vec![
+            "src/another/great.rs".into(),
+            "src/agent/mod.rs".into(),
+            "my_agent.rs".into(),
+            "agent.rs".into(),
+        ]);
+
+        let completion = complete("ask @ag", COMMANDS, &src, false).unwrap();
+        assert_eq!(
+            values(&completion),
+            vec![
+                "agent.rs",
+                "my_agent.rs",
+                "src/agent/mod.rs",
+                "src/another/great.rs",
+            ]
+        );
+        assert_eq!(completion.candidates[0].label, "agent.rs");
+        assert_eq!(completion.candidates[0].description, "");
+        assert_eq!(completion.candidates[2].label, "mod.rs");
+        assert_eq!(completion.candidates[2].description, "src/agent");
+
+        // Case-insensitive basename prefix, and short paths win ties.
+        let completion = complete("@AGENT", COMMANDS, &src, false).unwrap();
+        assert_eq!(values(&completion)[0], "agent.rs");
+
+        // At most 50 live candidates.
+        let mut many = sources(dir.path());
+        many.files = Arc::new(
+            (0..80)
+                .map(|index| format!("file{index:02}.rs"))
+                .collect::<Vec<_>>(),
+        );
+        let completion = complete("@file", COMMANDS, &many, false).unwrap();
+        assert_eq!(completion.candidates.len(), MAX_MENTION_CANDIDATES);
+    }
+
+    #[test]
+    fn the_file_index_honors_gitignore_and_hidden_names() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::create_dir_all(dir.path().join("ignored")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "ignored/\n").unwrap();
+        std::fs::write(dir.path().join("src/lib.rs"), "").unwrap();
+        std::fs::write(dir.path().join("ignored/skip.rs"), "").unwrap();
+        std::fs::write(dir.path().join(".git/config"), "").unwrap();
+        std::fs::write(dir.path().join(".hidden.rs"), "").unwrap();
+
+        let files = index_files(dir.path());
+        assert!(files.iter().any(|path| path == "src/lib.rs"), "{files:?}");
+        assert!(files.iter().any(|path| path == "src/"), "{files:?}");
+        assert!(files.iter().any(|path| path == ".hidden.rs"), "{files:?}");
+        assert!(
+            !files.iter().any(|path| path.starts_with("ignored")),
+            "{files:?}"
+        );
+        assert!(
+            !files.iter().any(|path| path.starts_with(".git/")),
+            "{files:?}"
+        );
     }
 
     #[test]
