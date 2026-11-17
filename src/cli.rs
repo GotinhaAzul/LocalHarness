@@ -566,13 +566,13 @@ pub async fn run(cli: Cli) -> Result<i32> {
     let resume = match (&cli.resume, cli.continue_last) {
         (Some(id_or_path), _) => {
             let direct = PathBuf::from(id_or_path);
-            if direct.is_file() {
+            if crate::session::is_session_file(&direct) && direct.is_file() {
                 Some(direct)
             } else {
                 let candidate = paths
                     .project_sessions_dir()
                     .join(format!("{id_or_path}.jsonl"));
-                if candidate.is_file() {
+                if crate::session::is_session_file(&candidate) && candidate.is_file() {
                     Some(candidate)
                 } else {
                     bail!(
@@ -1689,11 +1689,11 @@ fn run_rewind(paths: &Paths, spec: &str, force: bool) -> Result<i32> {
         })?,
         value => {
             let direct = PathBuf::from(value);
-            if direct.is_file() {
+            if crate::session::is_session_file(&direct) && direct.is_file() {
                 direct
             } else {
                 let candidate = paths.project_sessions_dir().join(format!("{value}.jsonl"));
-                if candidate.is_file() {
+                if crate::session::is_session_file(&candidate) && candidate.is_file() {
                     candidate
                 } else {
                     bail!(

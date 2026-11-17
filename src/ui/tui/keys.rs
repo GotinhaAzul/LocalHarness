@@ -146,6 +146,9 @@ impl App {
                 {
                     // Abandon a half-typed command (and its popup).
                     self.input.set_text("");
+                } else if self.current_completion().is_some() {
+                    // Dismiss the live `@` popup without touching the text.
+                    self.dismiss_completion();
                 } else if self.input.popup_open() {
                     self.input.reset_completion();
                 }

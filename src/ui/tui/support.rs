@@ -203,39 +203,22 @@ pub(super) fn available_workflows(paths: &crate::paths::Paths, trust: bool) -> V
 }
 
 pub(super) fn scan_sessions(paths: &crate::paths::Paths) -> Vec<SessionItem> {
-    let directory = paths.project_sessions_dir();
-    let Ok(entries) = std::fs::read_dir(&directory) else {
-        return Vec::new();
-    };
-    let mut found: Vec<(SystemTime, SessionItem)> = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
-            continue;
-        }
-        let Some(id) = path.file_stem().and_then(|stem| stem.to_str()) else {
-            continue;
-        };
-        let modified = entry
-            .metadata()
-            .and_then(|metadata| metadata.modified())
-            .unwrap_or(SystemTime::UNIX_EPOCH);
-        let preview = first_user_preview(&path);
-        let when = chrono::DateTime::<chrono::Local>::from(modified)
-            .format("%Y-%m-%d %H:%M")
-            .to_string();
-        found.push((
-            modified,
-            SessionItem {
-                id: id.to_string(),
-                preview,
-                when,
-                path,
-            },
-        ));
-    }
-    found.sort_by_key(|item| std::cmp::Reverse(item.0));
-    found.into_iter().map(|(_, item)| item).collect()
+    crate::session::list_session_files(&paths.project_sessions_dir())
+        .into_iter()
+        .map(|session| SessionItem {
+            id: session.id,
+            preview: clip_end(&first_line(&session.first_user), 80),
+            when: chrono::DateTime::<chrono::Local>::from(session.modified)
+                .format("%Y-%m-%d %H:%M")
+                .to_string(),
+            path: session.path,
+        })
+        .collect()
+}
+
+/// The first user message as one line, for a picker row.
+fn first_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Resolve `/resume <id>`: an exact id, else a unique id prefix or suffix (the
@@ -262,26 +245,4 @@ pub(super) fn match_session(items: &[SessionItem], needle: &str) -> Result<PathB
                 .join("\n")
         )),
     }
-}
-
-pub(super) fn first_user_preview(path: &Path) -> String {
-    let Ok(file) = std::fs::File::open(path) else {
-        return "(unreadable)".into();
-    };
-    for line in BufReader::new(file).lines().take(500).flatten() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        if let Ok(entry) = serde_json::from_str::<Entry>(&line)
-            && let EntryKind::User(data) = entry.kind
-        {
-            let text: String = data
-                .content
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ");
-            return clip_end(&text, 80);
-        }
-    }
-    "(no messages)".into()
 }
