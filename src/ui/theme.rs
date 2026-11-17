@@ -33,6 +33,10 @@ pub enum Role {
     System,
     Selection,
     Cursor,
+    /// Skoll, the sun: the model's voice.
+    Sun,
+    /// Hati, the moon: the harness's voice.
+    Moon,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -61,6 +65,8 @@ pub struct ThemeColors {
     pub system: Color,
     pub selection: Color,
     pub cursor: Color,
+    pub sun: Color,
+    pub moon: Color,
 }
 
 impl ThemeColors {
@@ -90,6 +96,8 @@ impl ThemeColors {
             Role::System => self.system,
             Role::Selection => self.selection,
             Role::Cursor => self.cursor,
+            Role::Sun => self.sun,
+            Role::Moon => self.moon,
         }
     }
 }
@@ -106,6 +114,9 @@ impl Theme {
     pub fn names() -> &'static [&'static str] {
         &[
             "default",
+            "hati",
+            "skoll",
+            "classic",
             "catppuccin-mocha",
             "gruvbox-dark",
             "high-contrast",
@@ -146,9 +157,13 @@ impl Theme {
             "gruvbox-dark" => ("gruvbox-dark", gruvbox()),
             "high-contrast" => ("high-contrast", high_contrast()),
             "light" => ("light", light()),
-            // Compatibility: older configs and scripts used the distro name.
-            "omarchy" | "" => ("default", default_dark()),
-            _ => (name, default_dark()),
+            "hati" => ("hati", hati()),
+            "skoll" => ("skoll", skoll()),
+            "classic" => ("classic", default_dark()),
+            // Compatibility: older configs and scripts used the distro name,
+            // and `totality` names the default palette.
+            "omarchy" | "totality" | "" => ("default", totality()),
+            _ => (name, totality()),
         };
         Theme {
             name: canonical.to_string(),
@@ -209,6 +224,8 @@ const ALL_ROLES: &[Role] = &[
     Role::System,
     Role::Selection,
     Role::Cursor,
+    Role::Sun,
+    Role::Moon,
 ];
 
 fn set_color(colors: &mut ThemeColors, role: Role, color: Color) {
@@ -237,6 +254,8 @@ fn set_color(colors: &mut ThemeColors, role: Role, color: Color) {
         Role::System => colors.system = color,
         Role::Selection => colors.selection = color,
         Role::Cursor => colors.cursor = color,
+        Role::Sun => colors.sun = color,
+        Role::Moon => colors.moon = color,
     }
 }
 
@@ -366,7 +385,7 @@ pub fn parse_theme(raw: &str, color_mode: ColorMode) -> Result<Theme, String> {
     let file: ThemeFile = toml::from_str(raw).map_err(|err| err.to_string())?;
     let mut theme = Theme {
         name: file.name.unwrap_or_else(|| "custom".into()),
-        colors: default_dark(),
+        colors: totality(),
         color_mode,
         no_color: false,
     };
@@ -404,6 +423,8 @@ fn role_from_key(key: &str) -> Option<Role> {
         "system" => Role::System,
         "selection" => Role::Selection,
         "cursor" => Role::Cursor,
+        "sun" => Role::Sun,
+        "moon" => Role::Moon,
         _ => return None,
     })
 }
@@ -480,6 +501,104 @@ pub fn detect_color_mode() -> ColorMode {
     ColorMode::Ansi16
 }
 
+/// The default palette: dusk. Warm paper on a violet night, with Skoll's
+/// amber for the model and Hati's silver-blue for the harness.
+fn totality() -> ThemeColors {
+    ThemeColors {
+        bg: Color::Rgb(22, 19, 26),
+        fg: Color::Rgb(236, 228, 218),
+        muted: Color::Rgb(138, 128, 144),
+        border: Color::Rgb(62, 53, 69),
+        accent: Color::Rgb(242, 166, 90),
+        accent_dim: Color::Rgb(138, 90, 46),
+        success: Color::Rgb(156, 204, 138),
+        warning: Color::Rgb(246, 193, 119),
+        error: Color::Rgb(235, 111, 111),
+        tool: Color::Rgb(169, 184, 216),
+        tool_running: Color::Rgb(206, 218, 244),
+        tool_ok: Color::Rgb(156, 204, 138),
+        tool_error: Color::Rgb(235, 111, 111),
+        reasoning: Color::Rgb(116, 106, 126),
+        code: Color::Rgb(232, 213, 181),
+        code_bg: Color::Rgb(37, 31, 42),
+        diff_add: Color::Rgb(156, 204, 138),
+        diff_del: Color::Rgb(235, 111, 111),
+        diff_hunk: Color::Rgb(169, 184, 216),
+        user: Color::Rgb(255, 210, 122),
+        assistant: Color::Rgb(236, 228, 218),
+        system: Color::Rgb(138, 128, 144),
+        selection: Color::Rgb(60, 46, 66),
+        cursor: Color::Rgb(242, 166, 90),
+        sun: Color::Rgb(242, 166, 90),
+        moon: Color::Rgb(169, 184, 216),
+    }
+}
+
+/// Hati's night: cool silver-blue chrome, the sun kept for the model.
+fn hati() -> ThemeColors {
+    ThemeColors {
+        bg: Color::Rgb(14, 17, 26),
+        fg: Color::Rgb(223, 229, 242),
+        muted: Color::Rgb(122, 134, 158),
+        border: Color::Rgb(46, 54, 76),
+        accent: Color::Rgb(169, 190, 236),
+        accent_dim: Color::Rgb(70, 86, 130),
+        success: Color::Rgb(150, 210, 170),
+        warning: Color::Rgb(240, 198, 120),
+        error: Color::Rgb(240, 120, 130),
+        tool: Color::Rgb(169, 190, 236),
+        tool_running: Color::Rgb(206, 218, 244),
+        tool_ok: Color::Rgb(150, 210, 170),
+        tool_error: Color::Rgb(240, 120, 130),
+        reasoning: Color::Rgb(98, 110, 140),
+        code: Color::Rgb(205, 214, 240),
+        code_bg: Color::Rgb(24, 29, 44),
+        diff_add: Color::Rgb(150, 210, 170),
+        diff_del: Color::Rgb(240, 120, 130),
+        diff_hunk: Color::Rgb(169, 190, 236),
+        user: Color::Rgb(206, 218, 244),
+        assistant: Color::Rgb(223, 229, 242),
+        system: Color::Rgb(122, 134, 158),
+        selection: Color::Rgb(36, 46, 72),
+        cursor: Color::Rgb(206, 218, 244),
+        sun: Color::Rgb(242, 176, 104),
+        moon: Color::Rgb(169, 190, 236),
+    }
+}
+
+/// Skoll's day: a warm light theme.
+fn skoll() -> ThemeColors {
+    ThemeColors {
+        bg: Color::Rgb(251, 245, 236),
+        fg: Color::Rgb(52, 42, 36),
+        muted: Color::Rgb(128, 112, 98),
+        border: Color::Rgb(222, 206, 186),
+        accent: Color::Rgb(184, 98, 30),
+        accent_dim: Color::Rgb(232, 196, 150),
+        success: Color::Rgb(62, 122, 52),
+        warning: Color::Rgb(160, 100, 10),
+        error: Color::Rgb(184, 52, 52),
+        tool: Color::Rgb(72, 92, 146),
+        tool_running: Color::Rgb(184, 98, 30),
+        tool_ok: Color::Rgb(62, 122, 52),
+        tool_error: Color::Rgb(184, 52, 52),
+        reasoning: Color::Rgb(146, 130, 116),
+        code: Color::Rgb(96, 58, 34),
+        code_bg: Color::Rgb(243, 233, 218),
+        diff_add: Color::Rgb(62, 122, 52),
+        diff_del: Color::Rgb(184, 52, 52),
+        diff_hunk: Color::Rgb(72, 92, 146),
+        user: Color::Rgb(168, 88, 24),
+        assistant: Color::Rgb(52, 42, 36),
+        system: Color::Rgb(128, 112, 98),
+        selection: Color::Rgb(240, 220, 190),
+        cursor: Color::Rgb(184, 98, 30),
+        sun: Color::Rgb(196, 110, 34),
+        moon: Color::Rgb(72, 92, 146),
+    }
+}
+
+/// The palette `default` used before 0.3, kept as `classic`.
 fn default_dark() -> ThemeColors {
     ThemeColors {
         bg: Color::Rgb(27, 27, 31),
@@ -506,6 +625,8 @@ fn default_dark() -> ThemeColors {
         system: Color::Rgb(113, 113, 122),
         selection: Color::Rgb(40, 52, 87),
         cursor: Color::Rgb(192, 202, 245),
+        sun: Color::Rgb(224, 175, 104),
+        moon: Color::Rgb(122, 162, 247),
     }
 }
 
@@ -535,6 +656,8 @@ fn catppuccin() -> ThemeColors {
         system: Color::Rgb(127, 132, 156),
         selection: Color::Rgb(49, 50, 68),
         cursor: Color::Rgb(205, 214, 244),
+        sun: Color::Rgb(250, 179, 135),
+        moon: Color::Rgb(180, 190, 254),
     }
 }
 
@@ -564,6 +687,8 @@ fn gruvbox() -> ThemeColors {
         system: Color::Rgb(146, 131, 116),
         selection: Color::Rgb(60, 56, 54),
         cursor: Color::Rgb(235, 219, 178),
+        sun: Color::Rgb(254, 128, 25),
+        moon: Color::Rgb(131, 165, 152),
     }
 }
 
@@ -593,6 +718,8 @@ fn high_contrast() -> ThemeColors {
         system: Color::Gray,
         selection: Color::Blue,
         cursor: Color::White,
+        sun: Color::LightYellow,
+        moon: Color::LightCyan,
     }
 }
 
@@ -622,6 +749,8 @@ fn light() -> ThemeColors {
         system: Color::Rgb(100, 100, 100),
         selection: Color::Rgb(220, 230, 245),
         cursor: Color::Rgb(30, 30, 30),
+        sun: Color::Rgb(180, 100, 20),
+        moon: Color::Rgb(30, 90, 180),
     }
 }
 

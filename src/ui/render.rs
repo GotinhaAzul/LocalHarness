@@ -169,6 +169,9 @@ pub struct Transcript {
     lines: Vec<Line<'static>>,
     /// How many of `lines` belong to the stable prefix.
     prefix_len: usize,
+    /// The last block in the stable prefix, so the live tail knows whether
+    /// it continues a group of tool rows.
+    prefix_last: Option<Block>,
     /// Rendered lines per finished block of `turn`, reused across frames.
     turn_cache: Vec<Option<Vec<Line<'static>>>>,
     /// Rendered `live_user`, reused while the reply streams.
@@ -202,6 +205,7 @@ impl Transcript {
             live_assistant: None,
             lines: Vec::new(),
             prefix_len: 0,
+            prefix_last: None,
             turn_cache: Vec::new(),
             live_user_cache: None,
             live_markdown: LiveMarkdown::default(),
@@ -463,22 +467,26 @@ impl Transcript {
             if let Some(banner) = &self.banner {
                 lines.extend(render_block(banner, width, theme, opts));
             }
+            // Session blocks in order, with notes placed at their anchors.
             let mut extra = self.extra.iter().peekable();
-            let push = |lines: &mut Vec<Line<'static>>, block: &Block| {
-                if !lines.is_empty() {
+            let mut ordered: Vec<&Block> =
+                Vec::with_capacity(self.session.len() + self.extra.len());
+            for (index, block) in self.session.iter().enumerate() {
+                while let Some((_, note)) = extra.next_if(|(anchor, _)| *anchor <= index) {
+                    ordered.push(note);
+                }
+                ordered.push(block);
+            }
+            ordered.extend(extra.map(|(_, note)| note));
+            let mut previous: Option<&Block> = None;
+            for block in &ordered {
+                if !lines.is_empty() && !groups_with(previous, block) {
                     lines.push(Line::raw(""));
                 }
                 lines.extend(render_block(block, width, theme, opts));
-            };
-            for (index, block) in self.session.iter().enumerate() {
-                while let Some((_, note)) = extra.next_if(|(anchor, _)| *anchor <= index) {
-                    push(&mut lines, note);
-                }
-                push(&mut lines, block);
+                previous = Some(block);
             }
-            for (_, note) in extra {
-                push(&mut lines, note);
-            }
+            self.prefix_last = previous.cloned();
             self.prefix_len = lines.len();
             self.lines = lines;
             self.turn_cache.clear();
@@ -489,8 +497,9 @@ impl Transcript {
 
         // The live user message precedes the turn's tool and text blocks.
         let mut lines = std::mem::take(&mut self.lines);
-        let separate = |lines: &mut Vec<Line<'static>>| {
-            if !lines.is_empty() {
+        let mut previous = self.prefix_last.as_ref();
+        let separate = |lines: &mut Vec<Line<'static>>, previous: Option<&Block>, block: &Block| {
+            if !lines.is_empty() && !groups_with(previous, block) {
                 lines.push(Line::raw(""));
             }
         };
@@ -498,17 +507,19 @@ impl Transcript {
             let rendered = self
                 .live_user_cache
                 .get_or_insert_with(|| render_block(user, width, theme, opts));
-            separate(&mut lines);
+            separate(&mut lines, previous, user);
             lines.extend(rendered.iter().cloned());
+            previous = Some(user);
         }
         self.turn_cache.resize(self.turn.len(), None);
         for (block, cached) in self.turn.iter().zip(self.turn_cache.iter_mut()) {
             let rendered = cached.get_or_insert_with(|| render_block(block, width, theme, opts));
-            separate(&mut lines);
+            separate(&mut lines, previous, block);
             lines.extend(rendered.iter().cloned());
+            previous = Some(block);
         }
         if let Some(block) = &self.live_assistant {
-            separate(&mut lines);
+            separate(&mut lines, previous, block);
             lines.extend(render_live_assistant(
                 block,
                 width,
@@ -703,6 +714,22 @@ pub fn blocks_from_session_after(session: &Session, floor_seq: u64) -> Vec<Block
     blocks
 }
 
+/// A block that is only collapsed reasoning: one line, part of the work.
+fn is_bare_thought(block: &Block) -> bool {
+    matches!(&block.kind, BlockKind::Assistant { text, .. } if text.trim().is_empty())
+}
+
+/// Tool rows and the thoughts between them read as one group of work, so
+/// they sit on consecutive lines; everything else gets a blank line.
+fn groups_with(previous: Option<&Block>, next: &Block) -> bool {
+    let Some(previous) = previous else {
+        return false;
+    };
+    let is_work =
+        |block: &Block| matches!(block.kind, BlockKind::Tool { .. }) || is_bare_thought(block);
+    is_work(previous) && is_work(next)
+}
+
 fn is_edit_tool(name: &str) -> bool {
     matches!(name, "edit" | "write" | "patch")
 }
@@ -750,23 +777,55 @@ pub fn blocks_from_session(session: &Session) -> Vec<Block> {
     blocks_from_session_after(session, 0)
 }
 
+/// A short label for a call's arguments: the one argument that says what
+/// the call is about (a path, a command, a pattern), plus a line range when
+/// there is one. Falls back to `key=value` pairs.
 fn summarize_arguments(value: &serde_json::Value) -> String {
-    let text = match value {
-        serde_json::Value::Object(map) if !map.is_empty() => map
+    let serde_json::Value::Object(map) = value else {
+        return one_line(&value.to_string(), 90);
+    };
+    let text = |key: &str| map.get(key).and_then(|value| value.as_str());
+    let number = |key: &str| map.get(key).and_then(|value| value.as_u64());
+    if let Some(name) = text("name")
+        && map.keys().all(|key| key == "name" || key == "reference")
+    {
+        return one_line(
+            &match text("reference") {
+                Some(reference) => format!("{name} › {reference}"),
+                None => name.to_string(),
+            },
+            90,
+        );
+    }
+    let primary = [
+        "path", "command", "pattern", "query", "url", "action", "artifact", "text",
+    ]
+    .iter()
+    .find_map(|key| text(key));
+    let Some(primary) = primary else {
+        let pairs = map
             .iter()
-            .map(|(key, value)| {
-                let rendered = match value {
-                    serde_json::Value::String(text) => text.clone(),
-                    other => other.to_string(),
-                };
-                format!("{key}={rendered}")
+            .map(|(key, value)| match value {
+                serde_json::Value::String(text) => format!("{key}={text}"),
+                other => format!("{key}={other}"),
             })
             .collect::<Vec<_>>()
-            .join(" "),
-        serde_json::Value::Object(_) => String::new(),
-        other => other.to_string(),
+            .join(" ");
+        return one_line(&pairs, 90);
     };
-    one_line(&text, 90)
+    let range = match (
+        number("start").or(number("offset")),
+        number("end"),
+        number("limit"),
+    ) {
+        (Some(start), Some(end), _) => format!(" · lines {start}–{end}"),
+        (Some(start), None, Some(limit)) => {
+            format!(" · lines {start}–{}", start + limit.saturating_sub(1))
+        }
+        (None, None, Some(limit)) => format!(" · first {limit} lines"),
+        _ => String::new(),
+    };
+    one_line(&format!("{primary}{range}"), 90)
 }
 
 fn strip_tool_header(content: &str) -> &str {
@@ -1124,7 +1183,7 @@ fn render_block(
                 ));
             }
             with_gutter(
-                Span::styled("✻ ", theme.style(Role::Muted)),
+                Span::styled("◑ ", theme.style(Role::Moon)),
                 vec![Line::from(spans)],
             )
         }
@@ -1153,7 +1212,8 @@ fn assistant_lines(
         ));
     }
     if !text.trim().is_empty() {
-        let marker = Span::styled("● ", theme.style(Role::Assistant));
+        // Skoll's voice: the model speaks under the sun.
+        let marker = Span::styled("● ", theme.style(Role::Sun));
         lines.extend(with_gutter(marker, markdown(text)));
     }
     lines
@@ -1226,9 +1286,14 @@ impl LiveMarkdown {
             self.head.push_str(segment);
         }
         let tail = &text[self.head.len()..];
+        let rendered = assistant_markdown(tail, width, theme);
         let mut out = self.lines.clone();
+        // A tail that shows nothing yet (a lone `#`) adds no separator.
+        if !tail.is_empty() && rendered.iter().all(|line| line.width() == 0) {
+            return out;
+        }
         join_segments(&mut out, self.ends_with_fence, tail);
-        out.extend(assistant_markdown(tail, width, theme));
+        out.extend(rendered);
         out
     }
 }
@@ -1313,14 +1378,11 @@ fn reasoning_lines(
 ) -> Vec<Line<'static>> {
     let tokens = (reasoning.chars().count() as u64).div_ceil(4);
     let italic = theme.style(Role::Reasoning).add_modifier(Modifier::ITALIC);
-    let label = if thinking { "Thinking…" } else { "Thought" };
-    let mut head = vec![
+    let label = if thinking { "thinking…" } else { "thought" };
+    let head = vec![
         Span::styled(label, italic),
         Span::styled(format!(" · {tokens} tokens"), theme.style(Role::Muted)),
     ];
-    if !expanded {
-        head.push(Span::styled("  ctrl+r to expand", theme.style(Role::Muted)));
-    }
     let mut content = vec![Line::from(head)];
     if expanded {
         for raw in reasoning.trim().lines() {
@@ -1380,6 +1442,11 @@ struct ToolView<'a> {
     artifact: Option<&'a str>,
 }
 
+/// Tools whose successful output stays folded until ctrl+o.
+fn quiet_when_collapsed(name: &str) -> bool {
+    matches!(name, "read" | "recall" | "skill" | "todo")
+}
+
 fn looks_like_diff(preview: &str) -> bool {
     let multi = preview.lines().nth(1).is_some();
     preview.lines().take(6).any(|line| {
@@ -1409,7 +1476,7 @@ fn truncate_body(mut body: Vec<Line<'static>>, limit: usize, theme: &Theme) -> V
 fn tool_lines(tool: ToolView<'_>, width: usize, theme: &Theme, expand: bool) -> Vec<Line<'static>> {
     let inner = width.saturating_sub(GUTTER).max(1);
     let (glyph, role) = match tool.status {
-        ToolStatus::Running => ("◌ ", Role::ToolRunning),
+        ToolStatus::Running => ("◐ ", Role::ToolRunning),
         ToolStatus::Ok => ("✓ ", Role::ToolOk),
         ToolStatus::Error => ("✗ ", Role::ToolError),
     };
@@ -1423,11 +1490,13 @@ fn tool_lines(tool: ToolView<'_>, width: usize, theme: &Theme, expand: bool) -> 
             }
         }
     }
-    if let Some(artifact) = tool.artifact {
+    // Archive ids matter when reading the full output, not at a glance.
+    if expand && let Some(artifact) = tool.artifact {
         meta.push_str(&format!(" · {}", artifact_note(artifact)));
     }
     let fixed = UnicodeWidthStr::width(title.as_str()) + UnicodeWidthStr::width(meta.as_str()) + 1;
-    let mut head = vec![Span::styled(title, theme.bold(Role::Fg))];
+    // Hati's voice: tool calls are the harness at work.
+    let mut head = vec![Span::styled(title, theme.bold(Role::Moon))];
     if !tool.summary.is_empty() && inner > fixed + 3 {
         head.push(Span::raw(" "));
         head.push(Span::styled(
@@ -1446,6 +1515,11 @@ fn tool_lines(tool: ToolView<'_>, width: usize, theme: &Theme, expand: bool) -> 
 
     let preview = tool.preview.trim_matches('\n');
     if preview.trim().is_empty() {
+        return lines;
+    }
+    // A file the model read is already on disk; its text is noise until
+    // asked for. Failures always show.
+    if !expand && tool.status == ToolStatus::Ok && quiet_when_collapsed(tool.name) {
         return lines;
     }
     let body_width = inner.saturating_sub(GUTTER).max(1);
@@ -1478,59 +1552,70 @@ fn banner_lines(
     width: usize,
     theme: &Theme,
 ) -> Vec<Line<'static>> {
-    let border = theme.style(Role::Border);
-    let box_width = width.min(72);
-    if box_width < 20 {
-        return vec![Line::styled(title.to_string(), theme.bold(Role::Accent))];
-    }
-    let inner = box_width - 4;
-    let label_width = rows
-        .iter()
-        .map(|(label, _, _)| UnicodeWidthStr::width(label.as_str()))
-        .max()
-        .unwrap_or(0);
-    let boxed = |spans: Vec<Span<'static>>| -> Line<'static> {
-        let used: usize = spans
+    let (name, version) = title.rsplit_once(' ').unwrap_or((title, ""));
+    let span_width = |spans: &[Span<'static>]| -> usize {
+        spans
             .iter()
             .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
-            .sum();
-        let mut out = vec![Span::styled("│ ", border)];
+            .sum()
+    };
+    let center = |spans: Vec<Span<'static>>| -> Line<'static> {
+        let pad = width.saturating_sub(span_width(&spans)) / 2;
+        let mut out = vec![Span::raw(" ".repeat(pad))];
         out.extend(spans);
-        out.push(Span::raw(" ".repeat(inner.saturating_sub(used))));
-        out.push(Span::styled(" │", border));
         Line::from(out)
     };
-    let mut lines = vec![Line::styled(
-        format!("╭{}╮", "─".repeat(box_width - 2)),
-        border,
-    )];
-    lines.push(boxed(vec![
-        Span::styled("✻ ", theme.style(Role::Accent)),
-        Span::styled(clip_end(title, inner - 2), theme.bold(Role::Fg)),
-    ]));
-    lines.push(boxed(Vec::new()));
-    for (label, value, warn) in rows {
-        let value_width = inner.saturating_sub(label_width + 4).max(1);
-        lines.push(boxed(vec![
-            Span::raw("  "),
-            Span::styled(format!("{label:<label_width$}  "), theme.style(Role::Muted)),
-            Span::styled(
-                clip_end(value, value_width),
-                theme.style(if *warn { Role::Warning } else { Role::Fg }),
-            ),
-        ]));
+    let mark = crate::ui::art::wordmark(name, theme);
+    if width < span_width(&mark) + 2 {
+        return vec![Line::styled(title.to_string(), theme.bold(Role::Accent))];
+    }
+
+    let mut lines = vec![Line::raw("")];
+    let art = crate::ui::art::welcome(width, theme);
+    if !art.is_empty() {
+        lines.extend(art);
+        lines.push(Line::raw(""));
+    }
+    lines.push(center(mark));
+    let tagline = if version.is_empty() {
+        "the loop, enforced".to_string()
+    } else {
+        format!("the loop, enforced · v{version}")
+    };
+    lines.push(center(vec![Span::styled(
+        tagline,
+        theme.style(Role::Muted).add_modifier(Modifier::ITALIC),
+    )]));
+    lines.push(Line::raw(""));
+
+    // Facts on one line when they fit, one per line when they do not.
+    let fact = |value: &str, warn: bool, room: usize| {
+        Span::styled(
+            clip_end(value, room.max(1)),
+            theme.style(if warn { Role::Warning } else { Role::Fg }),
+        )
+    };
+    let dot = || Span::styled("  ·  ", theme.style(Role::Muted));
+    let mut joined = Vec::new();
+    for (index, (_, value, warn)) in rows.iter().enumerate() {
+        if index > 0 {
+            joined.push(dot());
+        }
+        joined.push(fact(value, *warn, usize::MAX));
+    }
+    if span_width(&joined) + 2 <= width {
+        lines.push(center(joined));
+    } else {
+        for (_, value, warn) in rows {
+            lines.push(center(vec![fact(value, *warn, width.saturating_sub(2))]));
+        }
     }
     if !hint.is_empty() {
-        lines.push(boxed(Vec::new()));
-        lines.push(boxed(vec![Span::styled(
-            clip_end(&format!("  {hint}"), inner),
+        lines.push(center(vec![Span::styled(
+            clip_end(hint, width.saturating_sub(2).max(1)),
             theme.style(Role::Muted),
         )]));
     }
-    lines.push(Line::styled(
-        format!("╰{}╯", "─".repeat(box_width - 2)),
-        border,
-    ));
     lines
 }
 
@@ -2193,13 +2278,75 @@ mod tests {
         );
         let lines = blocks_to_lines(&[block], 80, &theme, false);
         let text = joined(&lines);
-        assert!(
-            text.starts_with("✓ Bash cargo test · 1.2s · [out-1]"),
-            "{text}"
-        );
+        assert!(text.starts_with("✓ Bash cargo test · 1.2s"), "{text}");
         assert!(text.contains("  ⎿ 12 passed"), "{text}");
         assert!(text.contains("0 failed"), "{text}");
+        assert!(!text.contains("[out-1]"), "{text}");
         assert_eq!(lines.len(), 3);
+        let opts = RenderOpts {
+            show_reasoning: false,
+            expand_tools: true,
+            live: false,
+        };
+        let block = Block::tool(
+            Some("call-1".into()),
+            "bash",
+            "cargo test",
+            ToolStatus::Ok,
+            Some(1200),
+            "12 passed",
+            Some("out-1.txt".into()),
+        );
+        let expanded = joined(&render_block(&block, 80, &theme, opts));
+        assert!(expanded.contains("· [out-1]"), "{expanded}");
+    }
+
+    #[test]
+    fn reads_fold_their_text_until_expanded_but_failures_show() {
+        let theme = Theme::bundled("default");
+        let read = Block::tool(
+            None,
+            "read",
+            "a.rs",
+            ToolStatus::Ok,
+            None,
+            "1 fn main() {}",
+            None,
+        );
+        let text = joined(&blocks_to_lines(&[read], 80, &theme, false));
+        assert_eq!(text, "✓ Read a.rs");
+        let failed = Block::tool(
+            None,
+            "read",
+            "b.rs",
+            ToolStatus::Error,
+            None,
+            "no such file",
+            None,
+        );
+        let text = joined(&blocks_to_lines(&[failed], 80, &theme, false));
+        assert!(text.contains("⎿ no such file"), "{text}");
+    }
+
+    #[test]
+    fn tool_rows_and_thoughts_group_without_blank_lines() {
+        let theme = Theme::bundled("default");
+        let blocks = [
+            Block::user("go"),
+            Block::assistant("", Some("plan".into())),
+            Block::tool(None, "read", "a.rs", ToolStatus::Ok, None, "", None),
+            Block::tool(None, "read", "b.rs", ToolStatus::Ok, None, "", None),
+            Block::assistant("done", None),
+        ];
+        let mut transcript = Transcript::new(false);
+        transcript.set_session(blocks.to_vec());
+        transcript.prepare(80, &theme, false);
+        let text = joined(transcript.lines());
+        assert!(
+            text.contains("tokens\n✓ Read a.rs\n✓ Read b.rs\n\n● done"),
+            "{text}"
+        );
+        assert!(text.starts_with("▌ go\n\n∴ thought"), "{text}");
     }
 
     #[test]
@@ -2249,7 +2396,7 @@ mod tests {
             None,
         );
         let text = joined(&blocks_to_lines(&[running, failed], 80, &theme, false));
-        assert!(text.contains("◌ Read a.rs · running…"), "{text}");
+        assert!(text.contains("◐ Read a.rs · running…"), "{text}");
         assert!(text.contains("✗ Edit b.rs · 5ms"), "{text}");
         assert!(text.contains("⎿ no match"), "{text}");
     }
@@ -2292,8 +2439,7 @@ mod tests {
             &theme,
             false,
         ));
-        assert!(collapsed.contains("∴ Thought"), "{collapsed}");
-        assert!(collapsed.contains("ctrl+r"));
+        assert!(collapsed.contains("∴ thought · 4 tokens"), "{collapsed}");
         assert!(!collapsed.contains("secret thought"));
         assert!(collapsed.contains("● answer"), "{collapsed}");
 
@@ -2357,7 +2503,7 @@ mod tests {
         let text = joined(&blocks_to_lines(&[block], 80, &theme, false));
         assert_eq!(
             text,
-            "✻ Worked for 1m 15s · 4 tool calls · 2 files changed · 1 failed"
+            "◑ Worked for 1m 15s · 4 tool calls · 2 files changed · 1 failed"
         );
     }
 
@@ -2436,7 +2582,7 @@ mod tests {
             })
             .unwrap();
         let text = buffer_text(&terminal);
-        assert!(text.contains("◌ Read src/main.rs · running…"), "{text}");
+        assert!(text.contains("◐ Read src/main.rs · running…"), "{text}");
         assert!(text.contains("›"), "prompt glyph missing:\n{text}");
         assert!(text.contains("──────"), "input rule missing:\n{text}");
     }

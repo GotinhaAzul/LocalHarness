@@ -400,10 +400,6 @@ impl<'t> Renderer<'t> {
             Tag::Heading { level, .. } => {
                 self.flush_line();
                 self.heading = Some(level);
-                self.push_span(Span::styled(
-                    format!("{} ", "#".repeat(level as usize)),
-                    self.theme.bold(Role::Accent),
-                ));
             }
             Tag::BlockQuote(_) => {
                 self.flush_line();
@@ -443,7 +439,7 @@ impl<'t> Renderer<'t> {
                         list.next = list.next.saturating_add(1);
                         marker
                     } else {
-                        "- ".to_string()
+                        if depth == 0 { "• " } else { "◦ " }.to_string()
                     };
                     let marker_width = UnicodeWidthStr::width(marker.as_str());
                     list.first_prefix = format!("{indent}{marker}");
@@ -597,10 +593,10 @@ impl<'t> Renderer<'t> {
     // -- inline helpers ----------------------------------------------------
 
     fn base_style(&self) -> Style {
-        let role = if self.heading.is_some() {
-            Role::Accent
-        } else {
-            Role::Assistant
+        // Top-level headings carry the accent; deeper ones are bold text.
+        let role = match self.heading {
+            Some(HeadingLevel::H1 | HeadingLevel::H2) => Role::Accent,
+            _ => Role::Assistant,
         };
         let mut style = self.theme.style(role);
         if self.heading.is_some() || self.strong > 0 {
@@ -982,8 +978,11 @@ mod tests {
     fn headings_are_bold_accent() {
         let theme = theme();
         let lines = render_markdown("# Title", 40, &theme);
-        assert!(text_of(&lines).contains("Title"));
+        assert_eq!(text_of(&lines).trim(), "Title");
         assert!(has_style(&lines, theme.bold(Role::Accent)));
+        let lines = render_markdown("### Small", 40, &theme);
+        assert_eq!(text_of(&lines).trim(), "Small");
+        assert!(has_style(&lines, theme.bold(Role::Assistant)));
     }
 
     #[test]
@@ -991,9 +990,9 @@ mod tests {
         let theme = theme();
         let lines = render_markdown("- one\n  - nested\n- two", 40, &theme);
         let text = text_of(&lines);
-        assert!(text.contains("- one"));
-        assert!(text.contains("- nested"));
-        assert!(text.contains("- two"));
+        assert!(text.contains("• one"));
+        assert!(text.contains("◦ nested"));
+        assert!(text.contains("• two"));
         assert!(text.find("nested").unwrap() > text.find("one").unwrap());
     }
 

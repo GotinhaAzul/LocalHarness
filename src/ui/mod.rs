@@ -1,5 +1,6 @@
 //! TUI application.
 
+pub mod art;
 pub mod complete;
 pub mod highlight;
 pub mod input;

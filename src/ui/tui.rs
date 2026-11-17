@@ -147,7 +147,7 @@ Hold Shift while dragging to select text ([ui] mouse = false disables
 mouse capture).";
 
 /// Footer hints while idle.
-const HINTS: &str = "enter send · ⇧enter newline · / commands · tab complete · @file attach · ctrl+r thinking · ctrl+o output";
+const HINTS: &str = "⇧enter newline · ctrl+r thinking · ctrl+o tool output · pgup scroll";
 
 /// Shortest gap between two frames while output streams (~60 fps). Input
 /// events draw immediately.
@@ -187,7 +187,8 @@ impl Switch {
 /// Lines per mouse-wheel notch.
 const WHEEL_LINES: usize = 3;
 
-const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+/// The moon crossing the sun and back.
+const SPINNER: &[&str] = &["○", "◔", "◑", "◕", "●", "◕", "◑", "◔"];
 
 /// What the model stream is producing right now, for the activity line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -869,10 +870,6 @@ impl App {
             crate::ui::widgets::format_tokens(window_size),
             source.label()
         );
-        let session = match runtime.session.lock() {
-            Ok(session) => session.id.clone(),
-            Err(poison) => poison.into_inner().id.clone(),
-        };
         let rows = vec![
             ("model".to_string(), model.0, model.1),
             ("context".to_string(), window, !source.is_reliable()),
@@ -881,13 +878,12 @@ impl App {
                 crate::ui::widgets::display_cwd(&core.paths.cwd.display().to_string()),
                 false,
             ),
-            ("session".to_string(), session, false),
         ];
         self.transcript.set_banner(Some(render::Block {
             kind: render::BlockKind::Banner {
-                title: format!("LocalHarness {}", env!("CARGO_PKG_VERSION")),
+                title: format!("Totality {}", env!("CARGO_PKG_VERSION")),
                 rows,
-                hint: "/help commands · /model switch model · /resume past sessions".into(),
+                hint: "/help commands  ·  /model switch model  ·  /resume past sessions".into(),
             },
             ts: None,
         }));
@@ -1139,12 +1135,19 @@ impl App {
             (Some(AgentState::SettleGates), []) => ("Verifying…".into(), String::new()),
             _ => ("Preparing context…".into(), String::new()),
         };
+        // The model's phases glow like the sun; the harness's like the moon.
+        let role =
+            if self.running_tools.is_empty() && self.turn_state == Some(AgentState::StreamModel) {
+                Role::Sun
+            } else {
+                Role::Moon
+            };
         Some(ActivityData {
             spinner,
             label,
             detail,
             meta: meta.join(" · "),
-            role: Role::Accent,
+            role,
         })
     }
 

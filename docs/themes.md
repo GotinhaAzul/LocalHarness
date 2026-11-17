@@ -1,8 +1,15 @@
 # Themes
 
-Themes are TOML files with semantic tokens. Bundled: `default`,
-`catppuccin-mocha`, `gruvbox-dark`, `high-contrast`, `light`. `omarchy` is
-accepted as an alias for `default`, so older configs keep working. User themes
+Themes are TOML files with semantic tokens. Bundled: `default` (dusk, also
+called `totality`), `hati` (cool night), `skoll` (warm light), `classic` (the
+pre-0.3 default), `catppuccin-mocha`, `gruvbox-dark`, `high-contrast`, and
+`light`. `omarchy` is accepted as an alias for `default`, so older configs keep
+working.
+
+Two tokens carry the interface's two voices: `sun` (Skoll) colors the model,
+its reply marker and its streaming phases; `moon` (Hati) colors the harness,
+its tool rows, turn summaries, and tool phases. Missing tokens fall back to the
+default palette. User themes
 live in `~/.config/localharness/themes/<name>.toml`.
 
 ```toml
@@ -33,6 +40,8 @@ assistant = "#e4e4e7"
 system = "#71717a"
 selection = "#283457"
 cursor = "#c0caf5"
+sun = "#f2a65a"
+moon = "#a9b8d8"
 ```
 
 Values: `#rgb`, `#rrggbb`, ANSI names (`red`, `bright_blue`, ...),
