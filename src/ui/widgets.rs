@@ -849,20 +849,31 @@ pub fn tree_lines(view: &TreeView, width: usize, theme: &Theme) -> Vec<Line<'sta
 }
 
 pub fn sessions_lines(view: &SessionsModal, width: usize, theme: &Theme) -> Vec<Line<'static>> {
+    // What the session was about leads; when it ran sits on the right. The
+    // id is for scripts (`/resume <id>`), so it stays out of the way.
     let mut lines = Vec::new();
     for (index, item) in view.items.iter().enumerate() {
-        let preview_max = width
-            .saturating_sub(item.id.len() + item.when.len() + 8)
-            .max(10);
-        let spans = vec![
-            Span::styled(item.id.clone(), theme.style(Role::Muted)),
-            Span::raw("  "),
-            Span::styled(clip_end(&item.preview, preview_max), theme.style(Role::Fg)),
-            Span::raw("  "),
+        let selected = index == view.selected;
+        let when = UnicodeWidthStr::width(item.when.as_str());
+        let room = width.saturating_sub(when + 4).max(10);
+        let title = clip_end(&item.preview, room);
+        let gap = width
+            .saturating_sub(2 + UnicodeWidthStr::width(title.as_str()) + when)
+            .max(2);
+        let mut line = Line::from(vec![
+            Span::styled(if selected { "› " } else { "  " }, theme.bold(Role::Accent)),
+            Span::styled(
+                title,
+                if selected {
+                    theme.bold(Role::Fg)
+                } else {
+                    theme.style(Role::Fg)
+                },
+            ),
+            Span::raw(" ".repeat(gap)),
             Span::styled(item.when.clone(), theme.style(Role::Muted)),
-        ];
-        let mut line = Line::from(spans);
-        if index == view.selected {
+        ]);
+        if selected {
             line = line.style(selected_style(theme));
         }
         lines.push(line);
