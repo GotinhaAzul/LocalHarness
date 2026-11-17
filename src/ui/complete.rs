@@ -304,7 +304,11 @@ fn rank_files(query: &str, files: &[String]) -> Vec<Candidate> {
         }
         let lowered = path.to_lowercase();
         let base = basename(path).to_lowercase();
-        let rank = if wanted.is_empty() || base.starts_with(&wanted) {
+        // A query with a `/` names a place: a path that starts with it wins.
+        let rank = if wanted.is_empty()
+            || base.starts_with(&wanted)
+            || wanted.contains('/') && lowered.starts_with(&wanted)
+        {
             0
         } else if base.contains(&wanted) {
             1
@@ -756,6 +760,16 @@ mod tests {
         assert_eq!(completion.candidates[0].description, "");
         assert_eq!(completion.candidates[2].label, "mod.rs");
         assert_eq!(completion.candidates[2].description, "src/agent");
+
+        // A query with a directory ranks paths under it first.
+        let mut nested = sources(dir.path());
+        nested.files = Arc::new(vec![
+            "src/security/redact.rs".into(),
+            "src/ui/tree.rs".into(),
+            "src/ui/render.rs".into(),
+        ]);
+        let completion = complete("@src/ui/re", COMMANDS, &nested, false).unwrap();
+        assert_eq!(values(&completion)[0], "src/ui/render.rs");
 
         // Case-insensitive basename prefix, and short paths win ties.
         let completion = complete("@AGENT", COMMANDS, &src, false).unwrap();

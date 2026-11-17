@@ -208,12 +208,31 @@ pub(super) fn scan_sessions(paths: &crate::paths::Paths) -> Vec<SessionItem> {
         .map(|session| SessionItem {
             id: session.id,
             preview: clip_end(&first_line(&session.first_user), 80),
-            when: chrono::DateTime::<chrono::Local>::from(session.modified)
-                .format("%Y-%m-%d %H:%M")
-                .to_string(),
+            when: relative_when(
+                chrono::DateTime::<chrono::Local>::from(session.modified),
+                chrono::Local::now(),
+            ),
             path: session.path,
         })
         .collect()
+}
+
+/// How long ago a session was last touched, the way a person says it; older
+/// than a week shows the date.
+pub(super) fn relative_when(
+    then: chrono::DateTime<chrono::Local>,
+    now: chrono::DateTime<chrono::Local>,
+) -> String {
+    let minutes = (now - then).num_minutes().max(0);
+    let days = (now.date_naive() - then.date_naive()).num_days();
+    match minutes {
+        0 => "just now".into(),
+        1..=59 => format!("{minutes} min ago"),
+        _ if days == 0 => format!("{} h ago", minutes / 60),
+        _ if days == 1 => format!("yesterday {}", then.format("%H:%M")),
+        _ if days < 7 => format!("{days} days ago"),
+        _ => then.format("%Y-%m-%d").to_string(),
+    }
 }
 
 /// The first user message as one line, for a picker row.
@@ -244,5 +263,23 @@ pub(super) fn match_session(items: &[SessionItem], needle: &str) -> Result<PathB
                 .collect::<Vec<_>>()
                 .join("\n")
         )),
+    }
+}
+
+#[cfg(test)]
+mod when_tests {
+    use super::relative_when;
+    use chrono::{Duration, Local, TimeZone};
+
+    #[test]
+    fn session_times_read_like_speech() {
+        let now = Local.with_ymd_and_hms(2026, 11, 17, 18, 0, 0).unwrap();
+        let ago = |delta: Duration| relative_when(now - delta, now);
+        assert_eq!(ago(Duration::seconds(20)), "just now");
+        assert_eq!(ago(Duration::minutes(5)), "5 min ago");
+        assert_eq!(ago(Duration::hours(3)), "3 h ago");
+        assert_eq!(ago(Duration::hours(20)), "yesterday 22:00");
+        assert_eq!(ago(Duration::days(4)), "4 days ago");
+        assert_eq!(ago(Duration::days(30)), "2026-10-18");
     }
 }

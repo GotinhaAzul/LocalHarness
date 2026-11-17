@@ -2206,7 +2206,7 @@ fn render_completions(frame: &mut Frame, scene: &Scene<'_>, area: Rect, theme: &
                 },
             ),
             Span::styled(
-                format!(" {}", clip_end(description, description_width)),
+                format!(" {}", fit_description(description, description_width)),
                 theme.style(Role::Muted),
             ),
         ]);
@@ -2216,6 +2216,17 @@ fn render_completions(frame: &mut Frame, scene: &Scene<'_>, area: Rect, theme: &
         lines.push(line);
     }
     frame.render_widget(Paragraph::new(lines).block(block), popup);
+}
+
+/// A directory keeps its end, where the distinguishing part is
+/// (`…/security-red-references`); prose keeps its start.
+fn fit_description(description: &str, width: usize) -> String {
+    let count = description.chars().count();
+    if count <= width || !description.contains('/') || width < 2 {
+        return clip_end(description, width);
+    }
+    let tail: String = description.chars().skip(count - (width - 1)).collect();
+    format!("…{tail}")
 }
 
 fn render_modal(frame: &mut Frame, modal: &ModalData, area: Rect, theme: &Theme) {
