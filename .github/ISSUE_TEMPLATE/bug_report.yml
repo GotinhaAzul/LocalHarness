@@ -6,7 +6,7 @@ body:
     attributes:
       value: |
         A bug in the harness, the TUI, or the tool protocol belongs here.
-        **A vulnerability does not** — use [private reporting](https://github.com/GotinhaAzul/LocalHarness/security/advisories/new) instead.
+        **A vulnerability does not** — use [private reporting](https://github.com/GotinhaAzul/Totality/security/advisories/new) instead.
 
         Redact bearer tokens, client names, and anything under NDA before you paste.
 

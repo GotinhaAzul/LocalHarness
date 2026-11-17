@@ -1,4 +1,4 @@
-# Maintainer: Totality contributors <https://github.com/GotinhaAzul/LocalHarness/issues>
+# Maintainer: Totality contributors <https://github.com/GotinhaAzul/Totality/issues>
 #
 # Source package: builds with the distribution Rust toolchain. Update pkgver
 # and sha256sums for each release; the release workflow attaches a rendered
@@ -8,7 +8,7 @@ pkgver=0.2.0
 pkgrel=1
 pkgdesc='Local-first agent harness for coding and security work'
 arch=('x86_64' 'aarch64')
-url='https://github.com/GotinhaAzul/LocalHarness'
+url='https://github.com/GotinhaAzul/Totality'
 license=('MIT' 'Apache-2.0')
 depends=('gcc-libs')
 makedepends=('cargo' 'rust')

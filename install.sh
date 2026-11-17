@@ -12,7 +12,7 @@
 #                          (default: https://github.com/<repo>/releases/download)
 #   TOT_INSTALL_SOURCE_DIR  read artifacts from a local directory instead of
 #                          downloading; used by the offline installer test
-#   TOT_REPO                owner/name on GitHub (default: GotinhaAzul/LocalHarness)
+#   TOT_REPO                owner/name on GitHub (default: GotinhaAzul/Totality)
 #   TOT_TARGET              override the detected target triple
 #   TOT_NO_EXTRAS=1         skip completions and the man page
 #
@@ -25,7 +25,7 @@
 
 set -eu
 
-REPO="${TOT_REPO:-${LH_REPO:-GotinhaAzul/LocalHarness}}"
+REPO="${TOT_REPO:-${LH_REPO:-GotinhaAzul/Totality}}"
 VERSION="${TOT_VERSION:-${LH_VERSION:-${1:-latest}}}"
 DEST="${TOT_INSTALL_DIR:-${LH_INSTALL_DIR:-${HOME}/.local/bin}}"
 BASE_URL="${TOT_INSTALL_BASE_URL:-${LH_INSTALL_BASE_URL:-https://github.com/${REPO}/releases/download}}"

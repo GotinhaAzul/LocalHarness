@@ -8,7 +8,7 @@ as the tools it drives.
 
 Do not open a public issue, discussion, or PR for a vulnerability.
 
-Use **[Report a vulnerability](https://github.com/GotinhaAzul/LocalHarness/security/advisories/new)**
+Use **[Report a vulnerability](https://github.com/GotinhaAzul/Totality/security/advisories/new)**
 on the Security tab. Private vulnerability reporting is enabled on this
 repository; the report, the discussion, and the fix stay private until an
 advisory is published.

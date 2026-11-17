@@ -1,4 +1,4 @@
-# Maintainer: Totality contributors <https://github.com/GotinhaAzul/LocalHarness/issues>
+# Maintainer: Totality contributors <https://github.com/GotinhaAzul/Totality/issues>
 #
 # Prebuilt static musl binary from a GitHub release. The release workflow
 # renders this file with real sha256sums and attaches it to the release; update
@@ -8,7 +8,7 @@ pkgver=0.2.0
 pkgrel=1
 pkgdesc='Local-first agent harness for coding and security work'
 arch=('x86_64' 'aarch64')
-url='https://github.com/GotinhaAzul/LocalHarness'
+url='https://github.com/GotinhaAzul/Totality'
 license=('MIT' 'Apache-2.0')
 provides=('totality' 'tot')
 conflicts=('totality')

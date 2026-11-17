@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 description = "Local-first agent harness for coding and security work"
-repository = "https://github.com/GotinhaAzul/LocalHarness"
+repository = "https://github.com/GotinhaAzul/Totality"
 keywords = ["agent", "llm", "tui", "security"]
 categories = ["command-line-utilities", "development-tools"]
 

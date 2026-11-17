@@ -8,8 +8,8 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/GotinhaAzul/LocalHarness/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/GotinhaAzul/LocalHarness/ci.yml?style=flat-square&label=CI" alt="CI"></a>
-  <a href="https://github.com/GotinhaAzul/LocalHarness/releases/latest"><img src="https://img.shields.io/github/v/release/GotinhaAzul/LocalHarness?style=flat-square&color=F2A65A" alt="Latest release"></a>
+  <a href="https://github.com/GotinhaAzul/Totality/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/GotinhaAzul/Totality/ci.yml?style=flat-square&label=CI" alt="CI"></a>
+  <a href="https://github.com/GotinhaAzul/Totality/releases/latest"><img src="https://img.shields.io/github/v/release/GotinhaAzul/Totality?style=flat-square&color=F2A65A" alt="Latest release"></a>
   <a href="LICENSE-MIT"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-A9B8D8?style=flat-square" alt="License: MIT OR Apache-2.0"></a>
   <img src="https://img.shields.io/badge/telemetry-none-9CCC8A?style=flat-square" alt="No telemetry">
 </p>
@@ -43,7 +43,7 @@ A smaller local model, kept honest, gets real work done.
 ## Install
 
 ```sh
-curl -fsSLO https://github.com/GotinhaAzul/LocalHarness/releases/latest/download/install.sh
+curl -fsSLO https://github.com/GotinhaAzul/Totality/releases/latest/download/install.sh
 less install.sh   # read it first
 sh install.sh     # static binary into ~/.local/bin, checksum-verified, no sudo
 ```
@@ -53,8 +53,8 @@ sh install.sh     # static binary into ~/.local/bin, checksum-verified, no sudo
 
 | Channel | Command |
 |---|---|
-| From source | `cargo install --git https://github.com/GotinhaAzul/LocalHarness --locked` (Rust 1.88+) |
-| Nix | `nix profile install github:GotinhaAzul/LocalHarness` |
+| From source | `cargo install --git https://github.com/GotinhaAzul/Totality --locked` (Rust 1.88+) |
+| Nix | `nix profile install github:GotinhaAzul/Totality` |
 | Docker | `docker build -f packaging/docker/Dockerfile -t totality .` then `docker run --rm -it -v "$PWD:/workspace" totality` |
 | AUR | `totality` and `totality-bin` recipes in [`packaging/aur/`](packaging/aur/) (publish pending) |
 | Homebrew | Best-effort formula in [`packaging/homebrew/`](packaging/homebrew/) (not in a tap yet) |

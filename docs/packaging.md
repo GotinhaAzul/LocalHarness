@@ -50,7 +50,7 @@ uses `sudo` and never runs a package manager. Download it and read it before
 running; do not pipe it into a shell:
 
 ```sh
-curl -fsSLO https://github.com/GotinhaAzul/LocalHarness/releases/latest/download/install.sh
+curl -fsSLO https://github.com/GotinhaAzul/Totality/releases/latest/download/install.sh
 less install.sh
 sh install.sh
 ```
@@ -61,7 +61,7 @@ sh install.sh
 | `TOT_INSTALL_DIR` | Binary directory; defaults to `$HOME/.local/bin` |
 | `TOT_INSTALL_BASE_URL` | Release download root; defaults to the GitHub release URL |
 | `TOT_INSTALL_SOURCE_DIR` | Read artifacts from a local directory instead of downloading |
-| `TOT_REPO` | `owner/name` to install from; defaults to `GotinhaAzul/LocalHarness` |
+| `TOT_REPO` | `owner/name` to install from; defaults to `GotinhaAzul/Totality` |
 | `TOT_TARGET` | Force a target triple instead of detecting one |
 | `TOT_NO_EXTRAS` | Set to `1` to skip completions and the man page |
 | `XDG_DATA_HOME` | Completion and man-page root; defaults to `~/.local/share` |
