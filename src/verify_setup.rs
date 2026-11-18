@@ -1,9 +1,11 @@
 //! Proposing verify steps for a project that has none (#128).
 //!
-//! Detection reads manifest files only ([`crate::tools::project`]); nothing
-//! from the repository runs until the user accepts. Accepted steps are kept
-//! in the user's data directory, keyed by the project path, so they load on
-//! later runs without `--trust`: the user chose them, the repository did not.
+//! Detection reads manifest files and Python test files, and asks the Python
+//! interpreter whether pytest is importable ([`crate::tools::project`]);
+//! nothing from the repository runs until the user accepts. Accepted steps are
+//! kept in the user's data directory, keyed by the project path, so they load
+//! on later runs without `--trust`: the user chose them, the repository did
+//! not.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

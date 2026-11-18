@@ -78,7 +78,7 @@ Twenty-four built-ins in three packs. `coding` (core + coding) is the default; `
 
 - **`repo_map`** returns a cached, budget-capped outline of files and top-level symbols; a compact version ships in the system prompt.
 - **`lsp`** adds language-server diagnostics after edits when a supported server is installed and the file belongs to a real project. A missing or cold server never fails an edit.
-- **`test`** detects vitest, jest, go, cargo, pytest, or an npm test script and returns only the first failure.
+- **`test`** detects vitest, jest, go, cargo, pytest, Python unittest, or an npm test script and returns only the first failure.
 - **`review`** reads the working tree and checks the diff before the session settles.
 - **`undo`** reverts the last `edit`, `patch`, or `write` from session snapshots, and refuses when the file changed after the harness wrote it. Changes made through `bash` are not tracked.
 - **Hunk review.** `review = "multi_file"` (the default) pauses before a turn's second file mutation, shows the proposed hunks in the TUI, and writes only what you accept. Rejected hunks are reported back to the model with their ranges, accepted hunks land atomically, and `undo` still steps back over them. `always` reviews every mutation; `off` restores immediate writes. Headless `--print` has no reviewer, so it auto-accepts and never blocks.

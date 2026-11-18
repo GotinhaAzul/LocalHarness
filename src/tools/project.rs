@@ -1,11 +1,14 @@
 //! Project detection: the runner detection shared with the `test` tool, and
-//! the manifest-only verify step candidates that `verify`, `tot doctor` and the
+//! the detected verify step candidates that `verify`, `tot doctor` and the
 //! startup prompt propose.
 //!
-//! Nothing here executes a command. Detection reads manifest and config files
-//! and returns strings; deciding to run one is the caller's job, and one that
-//! needs the user's consent.
+//! Detection reads manifest and config files and returns strings; deciding to
+//! run one is the caller's job, and one that needs the user's consent. The one
+//! process it starts is a Python import probe, since whether pytest is
+//! installed is not visible in the project tree. Nothing from the repository
+//! runs.
 
+use std::ffi::OsString;
 use std::path::Path;
 
 use serde_json::Value;
@@ -13,7 +16,8 @@ use serde_json::Value;
 use crate::tools::ToolResult;
 
 /// Files whose presence means the directory is a Python project. `test` uses
-/// this list to pick pytest; verify detection reports the ones it finds.
+/// this list to pick a Python runner; verify detection reports the ones it
+/// finds.
 const PYTHON_MARKERS: [&str; 7] = [
     "pyproject.toml",
     "setup.py",
@@ -41,6 +45,7 @@ pub(crate) enum Runner {
     Vitest,
     Jest,
     Pytest,
+    Unittest,
     Go,
     Npm,
 }
@@ -52,6 +57,7 @@ impl Runner {
             Runner::Vitest => "vitest",
             Runner::Jest => "jest",
             Runner::Pytest => "pytest",
+            Runner::Unittest => "unittest",
             Runner::Go => "go",
             Runner::Npm => "npm",
         }
@@ -59,17 +65,31 @@ impl Runner {
 }
 
 /// Pick the runner for one test file (or the whole project when `path` is
-/// `None`). Only the file extension and the manifests are read; nothing runs.
+/// `None`). The file extension and the manifests are read; the only process
+/// started is the pytest import probe.
 pub(crate) fn detect_runner(cwd: &Path, path: Option<&Path>) -> Result<Runner, ToolResult> {
+    detect_runner_with(cwd, path, pytest_available)
+}
+
+/// [`detect_runner`] with the pytest probe injected so tests can exercise both
+/// the pytest and the stdlib unittest path without depending on the machine.
+fn detect_runner_with(
+    cwd: &Path,
+    path: Option<&Path>,
+    pytest_available: impl Fn() -> bool,
+) -> Result<Runner, ToolResult> {
     let extension = path
         .and_then(|path| path.extension())
         .and_then(|extension| extension.to_str())
         .map(|extension| extension.to_ascii_lowercase());
+    let python_test = path.is_some_and(is_python_test_file);
 
     match extension.as_deref() {
         Some("rs") if cwd.join("Cargo.toml").exists() => return Ok(Runner::Cargo),
         Some("go") if cwd.join("go.mod").exists() => return Ok(Runner::Go),
-        Some("py") if python_project(cwd) => return Ok(Runner::Pytest),
+        Some("py") if python_project(cwd) || python_test => {
+            return Ok(python_runner(cwd, pytest_available()));
+        }
         Some("ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs") => {
             if let Some(runner) = node_runner(cwd) {
                 return Ok(runner);
@@ -86,8 +106,8 @@ pub(crate) fn detect_runner(cwd: &Path, path: Option<&Path>) -> Result<Runner, T
     {
         return Ok(runner);
     }
-    if python_project(cwd) {
-        return Ok(Runner::Pytest);
+    if python_project(cwd) || !python_test_files(cwd).is_empty() {
+        return Ok(python_runner(cwd, pytest_available()));
     }
     if cwd.join("go.mod").exists() {
         return Ok(Runner::Go);
@@ -96,7 +116,7 @@ pub(crate) fn detect_runner(cwd: &Path, path: Option<&Path>) -> Result<Runner, T
     Err(ToolResult::err(
         "NO_TEST_RUNNER",
         format!(
-            "no test runner detected in {}; looked for Cargo.toml, package.json with vitest/jest or an npm test script, pyproject.toml/setup.py/pytest.ini, and go.mod. Pass \"path\" to a test file or add one of those files.",
+            "no test runner detected in {}; looked for Cargo.toml, package.json with vitest/jest or an npm test script, pyproject.toml/setup.py/pytest.ini, test_*.py or *_test.py, and go.mod. Pass \"path\" to a test file or add one of those files.",
             cwd.display()
         ),
     ))
@@ -106,6 +126,96 @@ fn python_project(cwd: &Path) -> bool {
     PYTHON_MARKERS
         .iter()
         .any(|marker| cwd.join(marker).exists())
+}
+
+/// Prefer pytest when the project configures it or the interpreter can import
+/// it; otherwise the stdlib unittest runner is always available with Python.
+fn python_runner(cwd: &Path, pytest_available: bool) -> Runner {
+    if pytest_available || pytest_configured(cwd) {
+        Runner::Pytest
+    } else {
+        Runner::Unittest
+    }
+}
+
+fn pytest_configured(cwd: &Path) -> bool {
+    ["pytest.ini", "conftest.py"]
+        .iter()
+        .any(|marker| cwd.join(marker).exists())
+        || std::fs::read_to_string(cwd.join("pyproject.toml"))
+            .is_ok_and(|text| text.contains("[tool.pytest"))
+        || std::fs::read_to_string(cwd.join("setup.cfg"))
+            .is_ok_and(|text| text.contains("[tool:pytest]"))
+}
+
+/// Whether `python3 -m pytest` would be able to import pytest. This is the one
+/// detection step that starts a process: a package's presence is not visible in
+/// the project tree, and the import check is cheap and side-effect free. The
+/// answer is cached for the process.
+fn pytest_available() -> bool {
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        std::process::Command::new(python_program())
+            .args(["-c", "import pytest"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    })
+}
+
+/// The Python interpreter the `test` tool and [`pytest_available`] use:
+/// `python3` when it is on `PATH`, else `python`.
+pub(crate) fn python_program() -> OsString {
+    let search = std::env::var_os("PATH");
+    let has_python3 = search.is_some_and(|search| {
+        std::env::split_paths(&search)
+            .map(|dir| dir.join("python3"))
+            .any(|candidate| is_executable(&candidate))
+    });
+    if has_python3 {
+        OsString::from("python3")
+    } else {
+        OsString::from("python")
+    }
+}
+
+/// A `.py` file named `test_*.py` or `*_test.py` is a Python test even when the
+/// directory has no manifest.
+fn is_python_test_file(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(is_python_test_name)
+}
+
+fn is_python_test_name(name: &str) -> bool {
+    let path = Path::new(name);
+    let python = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("py"));
+    let stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or_default();
+    python && (stem.starts_with("test_") || stem.ends_with("_test"))
+}
+
+/// Top-level Python test files, sorted. A directory with only these and no
+/// manifest is still a Python test project.
+fn python_test_files(cwd: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(cwd) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+        .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
+        .filter(|name| is_python_test_name(name))
+        .collect();
+    names.sort();
+    names
 }
 
 fn node_runner(cwd: &Path) -> Option<Runner> {
@@ -217,25 +327,32 @@ pub struct DetectedVerify {
     pub kind: Option<&'static str>,
     /// Steps in run order: build or type check, lint, then test.
     pub steps: Vec<DetectedStep>,
-    /// Manifest and config files that made the project count as detected.
+    /// Manifest and config files, or Python test files, that made the project
+    /// count as detected.
     pub markers: Vec<String>,
 }
 
-/// Detect candidate verify steps from manifest files only. Pure: reads files,
-/// never executes anything.
+/// Detect candidate verify steps from manifest files and Python test files.
+/// Pure apart from the pytest import probe: reads files, never executes
+/// repository code.
 ///
 /// Only the first ecosystem found is reported, checked in the order Cargo,
 /// Node, Python, Go. A polyglot repository therefore gets one predictable set
 /// of steps rather than a mix that the user has to prune.
 pub fn detect_verify_steps(cwd: &Path) -> DetectedVerify {
+    detect_verify_steps_with(cwd, pytest_available)
+}
+
+fn detect_verify_steps_with(cwd: &Path, pytest_available: impl Fn() -> bool) -> DetectedVerify {
     if cwd.join("Cargo.toml").exists() {
         return cargo_steps(cwd);
     }
     if cwd.join("package.json").is_file() {
         return node_steps(cwd);
     }
-    if python_project(cwd) {
-        return python_steps(cwd);
+    let test_files = python_test_files(cwd);
+    if python_project(cwd) || !test_files.is_empty() {
+        return python_steps(cwd, &test_files, pytest_available());
     }
     if cwd.join("go.mod").exists() {
         return go_steps();
@@ -342,13 +459,21 @@ fn has_dependency(parsed: &Value, name: &str) -> bool {
         })
 }
 
-fn python_steps(cwd: &Path) -> DetectedVerify {
+fn python_steps(cwd: &Path, test_files: &[String], pytest_available: bool) -> DetectedVerify {
     let pyproject = std::fs::read_to_string(cwd.join("pyproject.toml")).unwrap_or_default();
-    let markers: Vec<String> = PYTHON_MARKERS
+    let mut markers: Vec<String> = PYTHON_MARKERS
         .iter()
         .filter(|marker| cwd.join(marker).exists())
         .map(|marker| (*marker).to_string())
         .collect();
+    if !test_files.is_empty() {
+        for name in test_files.iter().take(5) {
+            markers.push(name.clone());
+        }
+        if test_files.len() > 5 {
+            markers.push(format!("and {} more test files", test_files.len() - 5));
+        }
+    }
     let mut steps = Vec::new();
 
     if cwd.join("mypy.ini").exists() || pyproject.contains("[tool.mypy") {
@@ -360,7 +485,12 @@ fn python_steps(cwd: &Path) -> DetectedVerify {
     {
         steps.push(DetectedStep::new("lint", "ruff check"));
     }
-    steps.push(DetectedStep::new("test", "pytest -x"));
+    let test = if python_runner(cwd, pytest_available) == Runner::Pytest {
+        "python3 -m pytest -x"
+    } else {
+        "python3 -m unittest"
+    };
+    steps.push(DetectedStep::new("test", test));
 
     DetectedVerify {
         kind: Some("python"),
@@ -439,11 +569,73 @@ mod tests {
     fn detects_pytest_and_go() {
         let py = temp_project(&[("pyproject.toml", "[project]\nname = \"x\"\n")]);
         assert_eq!(
-            detect_runner(py.path(), None).expect("pytest"),
+            detect_runner_with(py.path(), None, || true).expect("pytest"),
             Runner::Pytest
         );
         let go = temp_project(&[("go.mod", "module example.com/x\n")]);
         assert_eq!(detect_runner(go.path(), None).expect("go"), Runner::Go);
+    }
+
+    #[test]
+    fn bare_python_test_file_needs_no_manifest() {
+        let dir = temp_project(&[(
+            "test_x.py",
+            "import unittest\nclass T(unittest.TestCase):\n    def test_ok(self):\n        pass\n",
+        )]);
+        let path = dir.path().join("test_x.py");
+        assert_eq!(
+            detect_runner_with(dir.path(), Some(&path), || false).expect("unittest"),
+            Runner::Unittest
+        );
+        assert_eq!(
+            detect_runner_with(dir.path(), Some(&path), || true).expect("pytest"),
+            Runner::Pytest
+        );
+        assert_eq!(
+            detect_runner_with(dir.path(), None, || false).expect("unittest"),
+            Runner::Unittest
+        );
+        assert_eq!(
+            detect_runner_with(dir.path(), None, || true).expect("pytest"),
+            Runner::Pytest
+        );
+    }
+
+    #[test]
+    fn other_python_files_still_need_a_manifest() {
+        let dir = temp_project(&[("helper.py", "VALUE = 1\n")]);
+        let path = dir.path().join("helper.py");
+        let error = detect_runner_with(dir.path(), Some(&path), || true).expect_err("no runner");
+        assert!(error.content.starts_with("[NO_TEST_RUNNER]"));
+    }
+
+    #[test]
+    fn python_test_names_follow_the_pytest_convention() {
+        for name in ["test_x.py", "x_test.py", "test_.py", "test_x.PY"] {
+            assert!(is_python_test_name(name), "{name}");
+        }
+        for name in [
+            "x.py",
+            "testing.py",
+            "test.py",
+            "test_x.txt",
+            "xtest.py",
+            "TEST_X.PY",
+        ] {
+            assert!(!is_python_test_name(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn project_pytest_config_wins_over_the_import_probe() {
+        let dir = temp_project(&[(
+            "pyproject.toml",
+            "[project]\nname = \"x\"\n[tool.pytest.ini_options]\n",
+        )]);
+        assert_eq!(
+            detect_runner_with(dir.path(), None, || false).expect("pytest"),
+            Runner::Pytest
+        );
     }
 
     #[test]
@@ -559,7 +751,7 @@ mod tests {
             ("mypy.ini", "[mypy]\n"),
             ("setup.cfg", ""),
         ]);
-        let detected = detect_verify_steps(dir.path());
+        let detected = detect_verify_steps_with(dir.path(), || true);
         assert_eq!(detected.kind, Some("python"));
         assert_eq!(
             detected.markers,
@@ -570,7 +762,7 @@ mod tests {
             vec![
                 ("typecheck", "mypy ."),
                 ("lint", "ruff check"),
-                ("test", "pytest -x"),
+                ("test", "python3 -m pytest -x"),
             ]
         );
     }
@@ -578,8 +770,17 @@ mod tests {
     #[test]
     fn python_without_lint_config_only_tests() {
         let dir = temp_project(&[("pyproject.toml", "[project]\nname = \"x\"\n")]);
-        let detected = detect_verify_steps(dir.path());
-        assert_eq!(steps(&detected), vec![("test", "pytest -x")]);
+        let detected = detect_verify_steps_with(dir.path(), || true);
+        assert_eq!(steps(&detected), vec![("test", "python3 -m pytest -x")]);
+    }
+
+    #[test]
+    fn bare_python_test_dir_proposes_the_stdlib_runner() {
+        let dir = temp_project(&[("test_x.py", "import unittest\n")]);
+        let detected = detect_verify_steps_with(dir.path(), || false);
+        assert_eq!(detected.kind, Some("python"));
+        assert_eq!(detected.markers, vec!["test_x.py".to_string()]);
+        assert_eq!(steps(&detected), vec![("test", "python3 -m unittest")]);
     }
 
     #[test]

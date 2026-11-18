@@ -921,9 +921,9 @@ form. `tot doctor` prints both sizes.
   pre-edit bytes and returns `EDIT_REGRESSION` with a fix hint. Pre-existing
   errors are suppressed, and a clean, cold, or non-project edit adds no text.
   The check never starts a cold server and caps its warm wait at 250 ms.
-- `test` detects vitest, jest, go, cargo, pytest, or an npm test script. It runs
-  one file or one test and returns only the first failure, capped at 2500
-  characters. Parsers strip ANSI and progress noise.
+- `test` detects vitest, jest, go, cargo, pytest, Python unittest, or an npm
+  test script. It runs one file or one test and returns only the first failure,
+  capped at 2500 characters. Parsers strip ANSI and progress noise.
 - `review` reads `git status --porcelain=v1 -z`, numstat, and the diff. It scans
   added lines for secrets, debug statements, TODOs, lockfiles, config files,
   deletion-heavy changes, binary files, and source changes without tests. The
