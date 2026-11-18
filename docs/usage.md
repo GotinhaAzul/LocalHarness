@@ -60,10 +60,10 @@ PASS  cargo  42 passed (3.1 s)
 ```
 
 - **Read before edit.** `edit`, `write`, and `patch` require a prior read of the same file. A changed file must be read again.
-- **Plan before the third mutation.** `todo` is free for two edits or two files, then a plan is required.
+- **Plan before the third file.** `todo` is free for a run that touches one or two files; repeated edits to the same file are one change. From the third distinct file, an edit needs a plan. A finished turn is never reopened for one.
 - **Verify before settle.** After changes, configured steps run; a real failure blocks the turn.
 - **Review after verify.** The `review` pass checks the diff for secrets, debug statements, lockfiles, deletion-heavy changes, and source changes whose module has no test.
-- **Stop the loop, not the work.** Loop and stall guards end a repeating run with a status, not a silent bill. Budget checkpoints renew while the run is still producing new results.
+- **Stop the loop, not the work.** Loop and stall guards end a repeating run with a status, not a silent bill. A guard or budget stop gives the model one tool-less step to summarize what it changed and what is left. Budget checkpoints renew on the same progress the stall tracker counts: a file change or a passing verification.
 - **Name the next action.** Every error tells the model what to do instead of leaving it to guess.
 
 ## Tools that know the codebase
@@ -76,11 +76,12 @@ Twenty-four built-ins in three packs. `coding` (core + coding) is the default; `
 | Coding | `repo_map` `lsp` `test` `review` |
 | Security | `surface` `evidence` `detect` `attack_path` `finding` `iocs` |
 
-- **`repo_map`** returns a cached, budget-capped outline of files and top-level symbols; a compact version ships in the system prompt.
+- **`grep`** searches text, gitignore-aware, and `path=artifact:out-3` searches a stored tool result such as a fetched page.
+- **`repo_map`** returns a cached, budget-capped outline of files and top-level symbols; a compact version ships in the system prompt. Every non-ignored file appears: non-code and outline-less files are listed by directory (`inbox/ (26 files: 6 .txt, 5 .html, …)`) with a closing count for anything the budget left out. `vendor/`, `dist/`, `build/`, and `target/` are only skipped when `.gitignore` excludes them.
 - **`lsp`** adds language-server diagnostics after edits when a supported server is installed and the file belongs to a real project. A missing or cold server never fails an edit.
 - **`test`** detects vitest, jest, go, cargo, pytest, Python unittest, or an npm test script and returns only the first failure.
 - **`review`** reads the working tree and checks the diff before the session settles. It is scoped to the session root: a workspace inside a larger repository reports only its own changes, and `git` mutations refuse to touch the enclosing repository.
-- **`undo`** reverts the last `edit`, `patch`, or `write` from session snapshots, and refuses when the file changed after the harness wrote it. Changes made through `bash` are not tracked.
+- **`undo`** reverts the last `edit`, `patch`, or `write` from session snapshots, and refuses when the file changed after the harness wrote it. Before a destructive `bash` command (`rm`, `mv`, `find -delete`, `truncate`, or `>` over a file), the harness snapshots the named files, so `undo` and `/rewind` can bring them back; each such result names the snapshot. `git clean` is not parsed.
 - **Hunk review.** `review = "multi_file"` (the default) pauses before a turn's second file mutation, shows the proposed hunks in the TUI, and writes only what you accept. Rejected hunks are reported back to the model with their ranges, accepted hunks land atomically, and `undo` still steps back over them. `always` reviews every mutation; `off` restores immediate writes. Headless `--print` has no reviewer, so it auto-accepts and never blocks.
 - **`read`/`grep`/`glob`** respect ignore files and keep results small; oversized output is archived and available through `recall`.
 - **Hash edits (opt-in)** — `edit_mode = "hash"` makes `read` print content hashes and lets `patch` apply `PUT`/`CUT`/`REM`/`MV` line anchors from `path#snapshot`; stale anchors write nothing and return fresh ones. Exact-text `edit` remains the default. See [configuration](configuration.md#hash-anchored-edits).

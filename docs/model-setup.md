@@ -257,7 +257,13 @@ usable_prompt = effective_window - max_output_tokens - safety_margin
 ```
 
 `max_output_tokens` is capped at a quarter of the window (a 4096-token server
-reserves 1024 for output). The safety margin is 5% of the window, minimum 512
+reserves 1024 for output). On a thinking model — `thinking = "on"`, a
+configured `reasoning_field`, or a reply that reported `reasoning_tokens` — the
+reservation is raised automatically to `min(window / 4, 32768)`, because
+reasoning counts against the same cap. A `length` stop retries once with double
+the cap (and once with `thinking_control` applied) before the model is nudged.
+`tot doctor` prints the effective value as `output: N tokens (…)`, and the
+session header records it. The safety margin is 5% of the window, minimum 512
 tokens. Compaction starts at
 80% of the usable prompt, or when the provider returns a context-length error.
 Prompt token counts from `usage` correct the character-based estimate after each
@@ -414,10 +420,13 @@ the server reported nothing; the harness falls back to the configured
 - **"server silently truncated the prompt"**: the engine's context is smaller
   than the prompt. Raise it (`OLLAMA_CONTEXT_LENGTH`, Modelfile `num_ctx`,
   llama.cpp `-c`). Until then the harness compacts to the observed window.
-- **"output token limit"**: a reply was cut at `max_output_tokens` (default
-  4096). A cut tool call is not run and the model is asked to send smaller
-  calls; cut prose is continued. Raise `[model] max_output_tokens` if it
-  repeats.
+- **"output token limit"**: a reply was cut at the effective output
+  reservation (default 4096; `min(window/4, 32768)` for a thinking model). The
+  first cut retries with a larger reservation, the next with thinking off when
+  the profile has a `thinking_control`; after that a cut tool call is not run
+  and the model is asked for smaller calls. If the output-recovery allowance
+  runs out with an empty reply the turn ends as a budget stop, never `Done`;
+  raise `[model] max_output_tokens` if it repeats.
 - **"repetition guard"**: the model fell into an exact loop and was stopped
   early. Apply a sampler preset (`qwen-coding`, `gemma-chat`, `glm-agent`),
   lower `temperature`, or set `min_p`/`repeat_penalty`/DRY values in the model

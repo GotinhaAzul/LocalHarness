@@ -63,6 +63,10 @@ pub struct DoctorManifest {
     /// manifests suggest when they are not.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verify: Option<VerifyStatus>,
+    /// The output reservation this model runs with, and why. A thinking model
+    /// gets `min(window / 4, 32768)` instead of the 4096 default.
+    pub output_tokens: Option<u32>,
+    pub output_source: Option<String>,
 }
 
 /// Verify configuration as `tot doctor` reports it.
@@ -418,6 +422,8 @@ impl DoctorManifest {
             usage_report: None,
             tool_schemas: None,
             verify: None,
+            output_tokens: None,
+            output_source: None,
         }
     }
 
@@ -476,6 +482,12 @@ impl DoctorManifest {
         if let Some(source) = &self.context.per_slot_source {
             out.push_str(&format!("  per slot from: {source}\n"));
         }
+        if let Some(tokens) = self.output_tokens {
+            out.push_str(&format!(
+                "output: {tokens} tokens ({})\n",
+                self.output_source.as_deref().unwrap_or("configured")
+            ));
+        }
         out.push_str(&format!("tools: {}", self.tool_dialect));
         if let Some(parser) = &self.tool_parser {
             out.push_str(&format!(" (parser: {parser})"));
@@ -517,6 +529,12 @@ impl DoctorManifest {
             self.reasoning_field.as_deref().unwrap_or("unknown")
         ));
         out.push_str(&format!("structured output: {}\n", self.structured_output));
+        if let Some(tokens) = self.output_tokens {
+            out.push_str(&format!(
+                "output: {tokens} tokens ({})\n",
+                self.output_source.as_deref().unwrap_or("configured")
+            ));
+        }
         out.push_str(&format!(
             "cache: {}\n",
             self.cache_mode.as_deref().unwrap_or("unknown")
@@ -819,6 +837,8 @@ mod tests {
             usage_report: None,
             tool_schemas: None,
             verify: None,
+            output_tokens: None,
+            output_source: None,
         }
     }
 
@@ -862,6 +882,18 @@ mod tests {
     }
 
     #[test]
+    fn text_manifest_prints_the_effective_output_cap() {
+        let mut manifest = sample_manifest();
+        manifest.output_tokens = Some(32_768);
+        manifest.output_source = Some("raised for a thinking model".into());
+        let text = manifest.to_text();
+        assert!(
+            text.contains("output: 32768 tokens (raised for a thinking model)"),
+            "{text}"
+        );
+    }
+
+    #[test]
     fn text_manifest_surfaces_the_tool_probe() {
         let mut manifest = sample_manifest();
         assert!(manifest.to_text().contains("tool probe: not run"));
@@ -894,6 +926,8 @@ mod tests {
             "tool_probe",
             "reasoning_field",
             "structured_output",
+            "output_tokens",
+            "output_source",
             "cache_mode",
             "slots",
             "tokenizer_route",

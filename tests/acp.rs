@@ -1026,6 +1026,54 @@ async fn denying_permission_leaves_no_side_effect() {
 }
 
 #[tokio::test]
+async fn harness_notices_are_thought_chunks_not_the_answer() {
+    let (base, _fake) = spawn_endpoint(vec![Script::Text("safe answer".into())]).await;
+    let (_dir, root) = workdir();
+    // A binary mention cannot be attached, so the turn emits a notice.
+    std::fs::write(root.join("scan.bin"), [0u8, 1, 2, 3]).unwrap();
+    let mut client = Client::spawn(&base, &root).await;
+    client
+        .request(
+            1,
+            "initialize",
+            json!({"protocolVersion": 1}),
+            Permission::Allow,
+        )
+        .await;
+    let session = client.new_session(2, &root).await;
+
+    let (response, notifications) = client
+        .request(
+            3,
+            "session/prompt",
+            json!({
+                "sessionId": session,
+                "prompt": [{"type": "text", "text": "look at @scan.bin"}],
+            }),
+            Permission::Allow,
+        )
+        .await;
+    assert_eq!(response["result"]["stopReason"], "end_turn", "{response}");
+    let answer = updates(&notifications, "agent_message_chunk")
+        .iter()
+        .map(text_of)
+        .collect::<String>();
+    assert!(answer.contains("safe answer"), "{answer}");
+    assert!(
+        !answer.contains("not attached") && !answer.contains("[harness]"),
+        "a harness notice must not merge into the model's answer: {answer}"
+    );
+    let thoughts = updates(&notifications, "agent_thought_chunk")
+        .iter()
+        .map(text_of)
+        .collect::<String>();
+    assert!(
+        thoughts.contains("[harness]") && thoughts.contains("not attached"),
+        "the notice is out of band: {thoughts}"
+    );
+}
+
+#[tokio::test]
 async fn terminal_access_is_absent_and_typed() {
     let (base, _fake) = spawn_endpoint(vec![]).await;
     let (_dir, root) = workdir();

@@ -1383,6 +1383,24 @@ impl ModelProfile {
         }
     }
 
+    /// The request's `extra_body` with the thinking control merged in even
+    /// when the policy would leave thinking on. Used for one retry after a
+    /// length stop spent the whole output budget thinking. `None` when the
+    /// profile configures no control.
+    pub fn request_extra_body_thinking_off(&self) -> Option<serde_json::Value> {
+        let control = self
+            .thinking_control
+            .as_ref()
+            .and_then(|value| serde_json::to_value(value).ok())?;
+        let mut base = self
+            .extra_body
+            .as_ref()
+            .and_then(|value| serde_json::to_value(value).ok())
+            .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
+        merge_json(&mut base, control);
+        Some(base)
+    }
+
     /// The request's `extra_body`: the profile's, with `thinking_control`
     /// merged on top when thinking is off. Refuses when thinking must be off
     /// but the profile names no control, since sending the request anyway

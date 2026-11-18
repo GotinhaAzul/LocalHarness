@@ -42,10 +42,27 @@ enum StepOutcome {
     Cancelled,
 }
 
-fn no_verify_error() -> ToolResult {
+fn no_verify_error(ctx: &ToolContext) -> ToolResult {
+    // Name the command this project actually uses, so the error is a next
+    // action instead of `cargo test` in a Python repository.
+    let detected = crate::tools::project::detect_verify_steps(&ctx.cwd);
+    let step = detected
+        .steps
+        .iter()
+        .find(|step| step.name == "test")
+        .or_else(|| detected.steps.last());
+    let suggestion = match step {
+        Some(step) => format!(
+            "Detected from {}: {}. Run it through bash now, for example {{\"command\":\"{}\"}}, or save the detected steps with `tot verify --init` and call verify again.",
+            detected.markers.join(", "),
+            step.command,
+            step.command
+        ),
+        None => "Add [[steps]] entries to .harness/verify.toml (trusted projects) or a [verify] section to your config, for example:\n[[steps]]\nname = \"test\"\ncommand = [\"cargo\", \"test\"]".into(),
+    };
     ToolResult::err(
         "NO_VERIFY",
-        "no verification steps are configured. Add [[steps]] entries to .harness/verify.toml (trusted projects) or a [verify] section to your config, for example:\n[[steps]]\nname = \"test\"\ncommand = [\"cargo\", \"test\"]",
+        format!("no verification steps are configured, so verify has nothing to run. {suggestion}"),
     )
 }
 
@@ -112,7 +129,7 @@ impl Tool for VerifyTool {
 
     async fn call(&self, ctx: &ToolContext, args: Value) -> ToolResult {
         if ctx.verify.steps.is_empty() {
-            return no_verify_error();
+            return no_verify_error(ctx);
         }
         let filter = optional_str(&args, "step");
         let steps = match select_steps(ctx, filter.as_deref()) {
@@ -494,5 +511,33 @@ mod tests {
             result.content
         );
         assert!(result.content.contains("verify.toml"), "{}", result.content);
+    }
+
+    #[tokio::test]
+    async fn no_steps_suggests_the_detected_project_command() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("pyproject.toml"),
+            "[project]\nname = \"demo\"\n",
+        )
+        .unwrap();
+        let ctx = crate::tools::write::test_context(dir.path());
+        let result = VerifyTool.call(&ctx, json!({})).await;
+        assert!(result.is_error);
+        assert!(
+            result.content.contains("pyproject.toml"),
+            "must name the marker it detected: {}",
+            result.content
+        );
+        assert!(
+            result.content.contains("bash") && result.content.contains("pytest"),
+            "must offer a runnable detected command: {}",
+            result.content
+        );
+        assert!(
+            !result.content.contains("cargo test"),
+            "must not suggest cargo in a Python project: {}",
+            result.content
+        );
     }
 }

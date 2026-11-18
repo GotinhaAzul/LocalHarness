@@ -236,6 +236,15 @@ pub async fn create_runtime(
     let window_source = resolved.source;
     let window_truth = resolved.truth;
     let configured_window = resolved.configured;
+    // A thinking model spends output tokens on reasoning; reserve the
+    // quarter-of-window cap instead of the 4096 default.
+    let thinking =
+        profile.thinking == crate::config::ThinkingPolicy::On || profile.reasoning_field.is_some();
+    let output = crate::context::output_reservation(
+        context_window,
+        config.model.max_output_tokens,
+        thinking,
+    );
     let provider: Arc<dyn Provider> =
         Arc::new(OpenAiCompatProvider::new(&config.model, model.clone())?);
     warn_if_remote(&config.model.endpoint);
@@ -302,7 +311,7 @@ pub async fn create_runtime(
                 profile: config.profile_name().to_string(),
                 app: APP_VERSION.to_string(),
                 redact,
-                context: session_context(window_truth.as_ref()),
+                context: session_context(window_truth.as_ref(), output),
                 permissions: Some(session_permissions.clone()),
             },
             options.no_session,
@@ -389,7 +398,7 @@ pub async fn create_runtime(
             );
         }
     }
-    if let Some(context) = session_context(window_truth.as_ref()) {
+    if let Some(context) = session_context(window_truth.as_ref(), output) {
         let payload = serde_json::to_value(&context)
             .ok()
             .and_then(|value| value.as_object().cloned())
@@ -484,7 +493,7 @@ pub async fn create_runtime(
     if let Some(text) = structured_protocol(structured.as_ref()) {
         system_prompt.push_str(&text);
     }
-    let mut budget = TokenBudget::new(context_window, config.model.max_output_tokens);
+    let mut budget = TokenBudget::new(context_window, output.tokens);
     let sampled = tokio::time::timeout(
         Duration::from_secs(2),
         probe::token_count(&probe_provider, &system_prompt),
@@ -637,6 +646,7 @@ pub async fn create_runtime(
         approver: options.approver.clone(),
         reviewer: Default::default(),
         permissions,
+        gate_errors: Default::default(),
     };
 
     Ok(Runtime {
@@ -782,6 +792,13 @@ pub async fn rebuild_core(old: &Arc<Core>, mut config: Config) -> Result<Arc<Cor
         }
     }
     let (_, mut model_profile) = config.model_profile();
+    let thinking = model_profile.thinking == crate::config::ThinkingPolicy::On
+        || model_profile.reasoning_field.is_some();
+    let output = crate::context::output_reservation(
+        context_window,
+        config.model.max_output_tokens,
+        thinking,
+    );
     let mut tool_specs = ToolRegistry::specs_with(&tools, model_profile.short_tool_schemas());
     let skills = SkillIndex::load(&old.paths, config.trust)
         .advertised_for(&crate::tools::active_packs(&tools));
@@ -855,7 +872,7 @@ pub async fn rebuild_core(old: &Arc<Core>, mut config: Config) -> Result<Arc<Cor
     if let Some(text) = structured_protocol(structured.as_ref()) {
         system_prompt.push_str(&text);
     }
-    let mut budget = TokenBudget::new(context_window, config.model.max_output_tokens);
+    let mut budget = TokenBudget::new(context_window, output.tokens);
     if same_target {
         // The tokenizer calibration only holds for the same model.
         budget.chars_per_token = old.budget.chars_per_token;
@@ -954,6 +971,7 @@ pub async fn rebuild_core(old: &Arc<Core>, mut config: Config) -> Result<Arc<Cor
         approver: old.approver.clone(),
         reviewer: std::sync::RwLock::new(old.reviewer()),
         permissions,
+        gate_errors: Default::default(),
         // Endpoint bring-up is not retried on `/model` or `/login`; only a
         // still-running bring-up for the same target carries over.
         startup: if same_target {
@@ -996,15 +1014,25 @@ pub(crate) fn window_notice(
 
 /// Session-header form of a probed window. Absent when nothing was known, so
 /// a guessed default is never recorded as measured.
-fn session_context(truth: Option<&probe::WindowTruth>) -> Option<SessionContextWindow> {
-    let truth = truth.filter(|truth| truth.is_known())?;
-    let sources = truth.source_map();
+fn session_context(
+    truth: Option<&probe::WindowTruth>,
+    output: crate::context::OutputReservation,
+) -> Option<SessionContextWindow> {
+    let truth = truth.filter(|truth| truth.is_known());
+    // The output reservation is recorded even when the window was not probed:
+    // it is chosen from the configured window and matters to a later reader.
+    if truth.is_none() && output.source == "configured" {
+        return None;
+    }
+    let sources = truth.map(|truth| truth.source_map()).unwrap_or_default();
     Some(SessionContextWindow {
-        trained: truth.trained,
-        allocated: truth.allocated,
-        per_slot: truth.per_slot,
-        effective: truth.effective,
+        trained: truth.and_then(|truth| truth.trained),
+        allocated: truth.and_then(|truth| truth.allocated),
+        per_slot: truth.and_then(|truth| truth.per_slot),
+        effective: truth.map_or(0, |truth| truth.effective),
         sources: (!sources.is_empty()).then_some(sources),
+        output: Some(output.tokens),
+        output_source: Some(output.source.to_string()),
     })
 }
 

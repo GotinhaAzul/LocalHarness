@@ -149,6 +149,11 @@ impl BashTool {
             return ToolResult::err("GIT_DESTRUCTIVE", message);
         }
 
+        // A command that deletes or overwrites is snapshotted first, so
+        // `undo` and `/rewind` can bring the files back even though the
+        // change happens outside the harness's own write path.
+        let snapshots = crate::tools::undo::bash_snapshots(ctx, &command);
+
         if ctx.is_cancelled() {
             return cancelled_result();
         }
@@ -208,11 +213,39 @@ impl BashTool {
         let exit_code = status.and_then(|status| status.code());
 
         let body = render_preview(&stdout, &stderr);
-        let details = json!({
+        let mut details = json!({
             "exit_code": exit_code,
             "timed_out": timed_out,
             "cancelled": cancelled,
         });
+        let mut snapshot_note = String::new();
+        if !snapshots.is_empty() {
+            let entries = crate::tools::undo::bash_change_entries(&snapshots);
+            if !entries.is_empty() {
+                let names: Vec<&str> = entries
+                    .iter()
+                    .take(5)
+                    .filter_map(|entry| entry.get("path").and_then(Value::as_str))
+                    .collect();
+                let more = entries.len().saturating_sub(names.len());
+                let more = if more > 0 {
+                    format!(", and {more} more")
+                } else {
+                    String::new()
+                };
+                let limit = if snapshots.len() >= crate::tools::undo::MAX_BASH_SNAPSHOTS {
+                    " (snapshot limit reached; some files were not captured)"
+                } else {
+                    ""
+                };
+                snapshot_note = format!(
+                    "[snapshot] saved {} file(s) before this command: {}{more}{limit}. If it deleted or overwrote something you need, undo restores it and /rewind brings it back.\n",
+                    entries.len(),
+                    names.join(", ")
+                );
+            }
+            details["session"] = json!(entries);
+        }
 
         let mut content = String::new();
         let is_error = if timed_out {
@@ -239,6 +272,7 @@ impl BashTool {
             }
             true
         };
+        content.push_str(&snapshot_note);
         content.push_str(&body);
 
         ToolResult {
@@ -633,6 +667,177 @@ mod tests {
             result.content.starts_with("[SEC_SCOPE]"),
             "{}",
             result.content
+        );
+    }
+
+    /// Record the `details.session` entries the agent loop would persist.
+    fn record_session(details: &Value, ctx: &crate::tools::ToolContext) {
+        let entries = details["session"].as_array().cloned().unwrap_or_default();
+        let mut session = ctx.session.lock().unwrap();
+        for entry in entries {
+            let Some(kind) = entry.get("kind").and_then(Value::as_str) else {
+                continue;
+            };
+            let mut payload = entry.as_object().cloned().unwrap_or_default();
+            payload.remove("kind");
+            session
+                .append(crate::session::EntryKind::Custom(
+                    crate::session::CustomData {
+                        kind: kind.to_string(),
+                        payload,
+                    },
+                ))
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_bash_delete_is_snapshotted_and_undo_restores_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let notes = dir.path().join("notes.txt.bak");
+        std::fs::write(&notes, "customer contract renewal terms (only copy!)\n").unwrap();
+        let ctx = test_context(dir.path());
+
+        let result = BashTool
+            .call(&ctx, json!({"command": "rm notes.txt.bak"}))
+            .await;
+        assert!(!result.is_error, "{}", result.content);
+        assert!(!notes.exists());
+        assert!(
+            result.content.contains("[snapshot] saved 1 file(s)"),
+            "{}",
+            result.content
+        );
+        let details = result.details.clone().unwrap();
+        record_session(&details, &ctx);
+
+        let undone = crate::tools::undo::UndoTool
+            .call(&ctx, json!({"path": "notes.txt.bak"}))
+            .await;
+        assert!(!undone.is_error, "{}", undone.content);
+        assert_eq!(
+            std::fs::read_to_string(&notes).unwrap(),
+            "customer contract renewal terms (only copy!)\n"
+        );
+        assert!(
+            undone.content.contains("bash command"),
+            "{}",
+            undone.content
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failing_delete_still_records_the_files_it_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("keep.txt"), "only copy\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("blocked")).unwrap();
+        let ctx = test_context(dir.path());
+
+        // `rm keep.txt blocked` removes the file, then fails on the directory.
+        let result = BashTool
+            .call(&ctx, json!({"command": "rm keep.txt blocked"}))
+            .await;
+        assert!(result.is_error, "{}", result.content);
+        assert!(!dir.path().join("keep.txt").exists());
+        let details = result.details.clone().unwrap();
+        let entries = details["session"].as_array().cloned().unwrap_or_default();
+        assert_eq!(entries.len(), 1, "{details}");
+        assert_eq!(entries[0]["path"], "keep.txt");
+        record_session(&details, &ctx);
+
+        let undone = crate::tools::undo::UndoTool
+            .call(&ctx, json!({"path": "keep.txt"}))
+            .await;
+        assert!(!undone.is_error, "{}", undone.content);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("keep.txt")).unwrap(),
+            "only copy\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn redirection_forms_are_parsed_and_created_files_are_undoable() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_context(dir.path());
+        for (command, created) in [
+            ("echo one > out.txt", "out.txt"),
+            ("echo two >err.txt 2>/dev/null", "err.txt"),
+            ("printf three>attached.txt", "attached.txt"),
+            ("echo four &>both.txt", "both.txt"),
+        ] {
+            let result = BashTool.call(&ctx, json!({"command": command})).await;
+            assert!(!result.is_error, "{command}: {}", result.content);
+            assert!(
+                dir.path().join(created).is_file(),
+                "{command} must create {created}"
+            );
+            let details = result.details.clone().unwrap();
+            let entries = details["session"].as_array().cloned().unwrap_or_default();
+            assert!(
+                entries.iter().any(
+                    |entry| entry["path"].as_str() == Some(created) && entry["created"] == true
+                ),
+                "{command}: {details}"
+            );
+            record_session(&details, &ctx);
+            let undone = crate::tools::undo::UndoTool
+                .call(&ctx, json!({"path": created}))
+                .await;
+            assert!(!undone.is_error, "{}", undone.content);
+            assert!(
+                !dir.path().join(created).exists(),
+                "undo must remove a file the bash command created"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_redirection_target_gets_no_undo_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("same.txt");
+        std::fs::write(&path, "same\n").unwrap();
+        let ctx = test_context(dir.path());
+        let result = BashTool
+            .call(&ctx, json!({"command": "echo same > same.txt"}))
+            .await;
+        assert!(!result.is_error, "{}", result.content);
+        let details = result.details.unwrap();
+        assert!(
+            details["session"]
+                .as_array()
+                .is_none_or(|entries| entries.is_empty()),
+            "an identical overwrite is not a change: {details}"
+        );
+        assert!(
+            !result.content.contains("[snapshot] saved"),
+            "{}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_redirection_is_snapshotted_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("app.log");
+        std::fs::write(&log, "old line\n").unwrap();
+        let ctx = test_context(dir.path());
+        let result = BashTool
+            .call(&ctx, json!({"command": "echo new > app.log"}))
+            .await;
+        assert!(!result.is_error, "{}", result.content);
+        let details = result.details.clone().unwrap();
+        assert_eq!(details["session"].as_array().unwrap().len(), 1, "{details}");
+        record_session(&details, &ctx);
+        std::fs::write(dir.path().join("app.log"), "changed again\n").unwrap();
+        // The recorded after-hash does not match, so undo refuses to discard
+        // the newer content.
+        let undone = crate::tools::undo::UndoTool
+            .call(&ctx, json!({"path": "app.log"}))
+            .await;
+        assert!(
+            undone.content.starts_with("[UNDO_CONFLICT]"),
+            "{}",
+            undone.content
         );
     }
 }

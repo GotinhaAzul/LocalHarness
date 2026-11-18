@@ -116,7 +116,10 @@ pub fn event_json(event: &AgentEvent) -> Value {
             message,
             recoverable,
         } => json!({"code": code, "message": message, "recoverable": recoverable}),
-        AgentEvent::TurnDone(outcome) => json!({"status": format!("{:?}", outcome.status)}),
+        AgentEvent::TurnDone(outcome) => json!({
+            "status": format!("{:?}", outcome.status),
+            "gate_errors": outcome.gate_errors,
+        }),
     };
     value["type"] = json!(event_name(event));
     value
@@ -149,6 +152,7 @@ mod tests {
             AgentEvent::TurnDone(TurnOutcome {
                 status: TurnStatus::Done,
                 error: None,
+                gate_errors: Default::default(),
             }),
         ];
         for event in &events {
@@ -163,8 +167,9 @@ mod tests {
             event_json(&AgentEvent::TurnDone(TurnOutcome {
                 status: TurnStatus::Cancelled,
                 error: None,
+                gate_errors: Default::default(),
             })),
-            json!({"type": "done", "status": "Cancelled"})
+            json!({"type": "done", "status": "Cancelled", "gate_errors": {}})
         );
     }
 }

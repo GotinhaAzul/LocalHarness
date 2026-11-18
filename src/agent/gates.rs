@@ -129,13 +129,15 @@ pub struct TurnFacts {
 }
 
 impl TurnFacts {
+    /// A run that changed three distinct files is multi-step. Counting edits
+    /// instead made two follow-up edits to one file look like a whole project.
     pub fn multi_step(&self) -> bool {
-        self.mutations >= 2 || self.files.len() >= 2
+        self.files.len() >= 3
     }
 
-    /// The settle-time todo gate: multi-step work without a plan. Work whose
-    /// every change already passed verification is finished, so asking for a
-    /// plan after the fact would only reopen it.
+    /// Whether the settle path considers this run multi-step work without a
+    /// plan. Informational only: the plan gate runs before an edit, never as
+    /// the last action, so a finished turn is not reopened for ceremony.
     pub fn needs_plan(&self) -> bool {
         self.multi_step()
             && !self.todo_plan_present
@@ -176,7 +178,13 @@ pub fn analyze_turn_since(
             EntryKind::Custom(custom) => match custom.kind.as_str() {
                 "fs-change" => {
                     facts.mutations += 1;
-                    if let Some(path) = custom.payload.get("path").and_then(|v| v.as_str())
+                    // A pre-command snapshot from `bash` is recovery
+                    // bookkeeping; it does not make the run a multi-file edit
+                    // that needs a plan.
+                    let from_bash =
+                        custom.payload.get("bash").and_then(|value| value.as_bool()) == Some(true);
+                    if !from_bash
+                        && let Some(path) = custom.payload.get("path").and_then(|v| v.as_str())
                         && !facts.files.iter().any(|f| f == path)
                     {
                         facts.files.push(path.to_string());
@@ -273,7 +281,6 @@ impl GateTools {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SettleKind {
-    Todo,
     Verify,
     Review,
 }
@@ -296,13 +303,6 @@ pub struct AutoChecks {
 }
 
 pub fn auto_checks(facts: &TurnFacts, progress: &RunProgress, tools: GateTools) -> AutoChecks {
-    let none = AutoChecks {
-        verify: false,
-        review: false,
-    };
-    if tools.todo && facts.needs_plan() {
-        return none;
-    }
     let verify = tools.verify
         && facts.verify_configured
         && (facts.unverified_mutations
@@ -314,24 +314,11 @@ pub fn auto_checks(facts: &TurnFacts, progress: &RunProgress, tools: GateTools) 
 }
 
 /// Decide whether the turn settles or continues with a gate instruction.
+///
+/// The plan gate is enforced before an edit ([`todo_edit_gate`]), not here: a
+/// turn that reached settlement is finishing, and demanding a plan as the last
+/// action only produces a plan written after the work.
 pub fn settle(facts: &TurnFacts, progress: &mut RunProgress, tools: GateTools) -> SettleDecision {
-    if tools.todo && facts.needs_plan() {
-        if progress.can_continue_settle() {
-            progress.settle_continuations += 1;
-            return SettleDecision::Continue {
-                kind: SettleKind::Todo,
-                message: format!(
-                    "[totality] todo gate: this run changed {} file(s) across {} mutation(s) but has no plan. Call the todo tool with action \"plan\" and the remaining tasks before continuing. Do not make more edits until the plan exists.",
-                    facts.files.len(),
-                    facts.mutations
-                ),
-            };
-        }
-        return SettleDecision::Block {
-            message: "todo gate: this multi-step run still has no plan after two reminders. Add a plan with todo action \"plan\" in the next turn.".into(),
-        };
-    }
-
     let verify_needed = tools.verify
         && facts.verify_configured
         && (facts.unverified_mutations
@@ -363,40 +350,48 @@ pub fn settle(facts: &TurnFacts, progress: &mut RunProgress, tools: GateTools) -
     SettleDecision::Done
 }
 
-/// The todo edit gate: after two mutations or two files, further edits need a
-/// plan. Returns a block result when the call must not run.
+/// The todo edit gate: once a run has changed two distinct files, an edit to a
+/// third distinct file needs a plan. Returns a block result when the call must
+/// not run. Re-editing a file the run already changed is always allowed: the
+/// gate counts logical files, not edits.
 pub fn todo_edit_gate(
     tool: &str,
-    mutations: usize,
-    files: usize,
+    target: Option<&str>,
+    files: &[String],
     plan_present: bool,
 ) -> Option<ToolResult> {
     if !matches!(tool, "edit" | "write" | "patch") {
         return None;
     }
-    if plan_present || !(mutations >= 2 || files >= 2) {
+    if plan_present {
+        return None;
+    }
+    let already_changed = target.is_some_and(|target| files.iter().any(|file| file == target));
+    // Re-editing a file the run already changed never needs a plan, even
+    // after the third file.
+    if already_changed {
+        return None;
+    }
+    let logical = files.len() + usize::from(target.is_some());
+    if logical < 3 {
         return None;
     }
     Some(ToolResult::err(
         "TODO_PLAN",
         format!(
-            "this run has {mutations} mutation(s) across {files} file(s); a plan is now required. Call todo with {{\"action\":\"plan\",\"tasks\":[\"...\"]}} first, then retry this edit."
+            "this run has changed {logical} distinct files; a plan is now required. Call todo with {{\"action\":\"plan\",\"tasks\":[\"...\"]}} first, then retry this edit. Editing a file already changed does not need a new plan."
         ),
     ))
 }
 
 /// One line for the result of a mutation that leaves the run one step from
-/// [`todo_edit_gate`]: `mutations` and `files` count this mutation. `None`
-/// when a plan exists or the gate is still more than one step away.
-pub fn todo_gate_notice(
-    mutations: usize,
-    files: usize,
-    plan_present: bool,
-) -> Option<&'static str> {
-    if plan_present || !(mutations >= 2 || files >= 2) {
+/// [`todo_edit_gate`]: `files` counts this mutation. `None` when a plan exists
+/// or the gate is still more than one step away.
+pub fn todo_gate_notice(files: usize, plan_present: bool) -> Option<&'static str> {
+    if plan_present || files < 2 {
         return None;
     }
-    Some("[totality] the next edit needs a plan: call todo action=\"plan\" first.")
+    Some("[totality] the next edit to a new file needs a plan: call todo action=\"plan\" first.")
 }
 
 #[cfg(test)]
@@ -408,8 +403,8 @@ mod tests {
     #[test]
     fn verified_work_is_not_reopened_for_a_plan() {
         let mut facts = TurnFacts {
-            mutations: 2,
-            files: vec!["src/lib.rs".into()],
+            mutations: 3,
+            files: vec!["src/lib.rs".into(), "src/a.rs".into(), "src/b.rs".into()],
             verify_configured: true,
             ..TurnFacts::default()
         };
@@ -544,55 +539,52 @@ mod tests {
     }
 
     #[test]
-    fn todo_gate_continues_then_blocks() {
+    fn a_finished_turn_is_not_reopened_for_a_plan() {
+        // Three changed files without a plan is a warning at settlement, not
+        // a continuation; the plan gate lives before the next edit.
         let mut progress = RunProgress::new(limits());
         let facts = TurnFacts {
-            mutations: 2,
-            files: vec!["a".into(), "b".into()],
+            mutations: 3,
+            files: vec!["a".into(), "b".into(), "c".into()],
             ..TurnFacts::default()
         };
+        assert!(facts.needs_plan());
         assert!(matches!(
             settle(
                 &facts,
                 &mut progress,
                 GateTools {
                     todo: true,
-                    verify: true,
-                    review: true
+                    verify: false,
+                    review: false
                 }
             ),
-            SettleDecision::Continue {
-                kind: SettleKind::Todo,
-                ..
-            }
+            SettleDecision::Done
         ));
-        assert!(matches!(
-            settle(
-                &facts,
-                &mut progress,
-                GateTools {
-                    todo: true,
-                    verify: true,
-                    review: true
-                }
-            ),
-            SettleDecision::Continue {
-                kind: SettleKind::Todo,
-                ..
-            }
-        ));
-        assert!(matches!(
-            settle(
-                &facts,
-                &mut progress,
-                GateTools {
-                    todo: true,
-                    verify: true,
-                    review: true
-                }
-            ),
-            SettleDecision::Block { .. }
-        ));
+        assert_eq!(progress.settle_continuations, 0);
+    }
+
+    #[test]
+    fn the_edit_gate_counts_distinct_files_not_edits() {
+        let files = |names: &[&str]| {
+            names
+                .iter()
+                .map(|name| name.to_string())
+                .collect::<Vec<_>>()
+        };
+        // Two edits to one file are one change: the second is not a new file.
+        assert!(todo_edit_gate("edit", Some("a.rs"), &files(&["a.rs"]), false).is_none());
+        assert!(todo_edit_gate("edit", Some("b.rs"), &files(&["a.rs"]), false).is_none());
+        // The edit that would touch a third distinct file needs a plan.
+        assert!(todo_edit_gate("edit", Some("c.rs"), &files(&["a.rs", "b.rs"]), false).is_some());
+        // Editing a file already changed is always allowed.
+        assert!(todo_edit_gate("edit", Some("a.rs"), &files(&["a.rs", "b.rs"]), false).is_none());
+        // A plan, or a read-only tool, is never blocked.
+        assert!(todo_edit_gate("edit", Some("c.rs"), &files(&["a.rs", "b.rs"]), true).is_none());
+        assert!(todo_edit_gate("read", Some("c.rs"), &files(&["a.rs", "b.rs"]), false).is_none());
+        assert!(todo_gate_notice(2, false).is_some());
+        assert!(todo_gate_notice(2, true).is_none());
+        assert!(todo_gate_notice(1, false).is_none());
     }
 
     #[test]
@@ -652,14 +644,6 @@ mod tests {
             ),
             SettleDecision::Done
         ));
-    }
-
-    #[test]
-    fn edit_gate_requires_plan_after_two_mutations() {
-        assert!(todo_edit_gate("edit", 1, 1, false).is_none());
-        assert!(todo_edit_gate("edit", 2, 1, false).is_some());
-        assert!(todo_edit_gate("edit", 2, 2, true).is_none());
-        assert!(todo_edit_gate("read", 5, 5, false).is_none());
     }
 
     fn session(dir: &std::path::Path) -> Session {

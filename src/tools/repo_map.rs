@@ -51,6 +51,22 @@ struct FileOutline {
     symbols: Vec<Symbol>,
 }
 
+/// A file the map lists without an outline: an unknown extension, an empty
+/// file, or one too large or too binary to parse.
+#[derive(Debug, Clone)]
+struct OtherFile {
+    path: PathBuf,
+}
+
+/// Everything one scan found. `at_cap` marks a walk stopped at [`MAX_FILES`].
+#[derive(Debug, Default)]
+struct ScanResult {
+    outlined: Vec<FileOutline>,
+    other: Vec<OtherFile>,
+    /// The walk stopped at [`MAX_FILES`]; the exact remainder is unknown.
+    at_cap: bool,
+}
+
 /// A process-local cache of parsed outlines. Files are re-read only when their
 /// size or modification time changes, so repeated `repo_map` calls stay cheap.
 #[derive(Default)]
@@ -71,10 +87,10 @@ impl RepoIndex {
     }
 
     /// The shorter map injected into the system prompt. Empty when the tree has
-    /// no source files, so the prompt does not carry a useless section.
+    /// no files at all, so the prompt does not carry a useless section.
     pub fn brief(&self, root: &Path, budget: usize) -> String {
         let files = self.scan(root, None);
-        if files.is_empty() {
+        if files.outlined.is_empty() && files.other.is_empty() {
             return String::new();
         }
         render_map(
@@ -85,7 +101,7 @@ impl RepoIndex {
         )
     }
 
-    fn scan(&self, root: &Path, scope: Option<&Path>) -> Vec<FileOutline> {
+    fn scan(&self, root: &Path, scope: Option<&Path>) -> ScanResult {
         let base = scope.unwrap_or(root);
         let mut builder = WalkBuilder::new(base);
         builder
@@ -95,7 +111,9 @@ impl RepoIndex {
             .git_exclude(true)
             .parents(true)
             .follow_links(false)
-            .max_filesize(Some(MAX_FILE_BYTES))
+            // `vendor`, `dist`, `build` and `target` are only skipped when
+            // git ignores them: a checked-in vendor tree is source, and its
+            // path is a fact the map must not hide.
             .filter_entry(|entry| {
                 let name = entry.file_name().to_string_lossy();
                 !matches!(
@@ -103,40 +121,46 @@ impl RepoIndex {
                     ".git"
                         | ".hg"
                         | ".svn"
-                        | "target"
                         | "node_modules"
-                        | "dist"
-                        | "build"
                         | ".venv"
                         | "venv"
                         | "__pycache__"
                         | ".next"
                         | ".cache"
-                        | "vendor"
                 )
             });
 
-        let mut outlines = Vec::new();
+        let mut outlined = Vec::new();
+        let mut other = Vec::new();
+        let mut at_cap = false;
         let mut cache = self
             .cache
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         for entry in builder.build().flatten() {
-            if outlines.len() >= MAX_FILES {
+            if outlined.len() + other.len() >= MAX_FILES {
+                // Stop walking a pathological tree; the map names the cap.
+                at_cap = true;
                 break;
             }
             if !entry.file_type().is_some_and(|kind| kind.is_file()) {
                 continue;
             }
             let path = entry.path();
-            let Some(language) = language_for(path) else {
-                continue;
-            };
             let Ok(meta) = entry.metadata() else {
                 continue;
             };
             let size = meta.len();
+            let Some(language) = language_for(path) else {
+                other.push(OtherFile {
+                    path: path.to_path_buf(),
+                });
+                continue;
+            };
             if size == 0 || size > MAX_FILE_BYTES {
+                other.push(OtherFile {
+                    path: path.to_path_buf(),
+                });
                 continue;
             }
             let modified = meta.modified().ok();
@@ -148,10 +172,15 @@ impl RepoIndex {
                     let Ok(bytes) = std::fs::read(path) else {
                         continue;
                     };
-                    if bytes.iter().take(4096).any(|byte| *byte == 0) {
-                        continue;
-                    }
-                    let text = String::from_utf8_lossy(&bytes);
+                    let text = match crate::tools::encoding::decode(&bytes) {
+                        crate::tools::encoding::Decoded::Text { text, .. } => text,
+                        crate::tools::encoding::Decoded::Binary => {
+                            other.push(OtherFile {
+                                path: path.to_path_buf(),
+                            });
+                            continue;
+                        }
+                    };
                     let symbols = extract_symbols(path, &text);
                     cache.insert(
                         path.to_path_buf(),
@@ -164,19 +193,32 @@ impl RepoIndex {
                     symbols
                 }
             };
-            outlines.push(FileOutline {
+            if symbols.is_empty() {
+                // A file with no outline is just a path; group it with the
+                // other path-only files instead of spending a section on it.
+                other.push(OtherFile {
+                    path: path.to_path_buf(),
+                });
+                continue;
+            }
+            outlined.push(FileOutline {
                 path: path.to_path_buf(),
                 language,
                 symbols,
             });
         }
-        outlines.sort_by(|left, right| {
+        outlined.sort_by(|left, right| {
             language_rank(left.language)
                 .cmp(&language_rank(right.language))
                 .then_with(|| depth(root, &left.path).cmp(&depth(root, &right.path)))
                 .then_with(|| left.path.cmp(&right.path))
         });
-        outlines
+        other.sort_by(|left, right| left.path.cmp(&right.path));
+        ScanResult {
+            outlined,
+            other,
+            at_cap,
+        }
     }
 }
 
@@ -194,22 +236,34 @@ fn depth(root: &Path, path: &Path) -> usize {
         .unwrap_or(usize::MAX)
 }
 
-fn render_map(root: &Path, files: &[FileOutline], budget: usize, per_file: usize) -> String {
-    if files.is_empty() {
-        return "repo map: no source files found. Supported: Rust, Python, TypeScript/JavaScript, Go, C/C++, Java, C#, Kotlin, Ruby, Markdown, TOML, Shell.".to_string();
+fn render_map(root: &Path, files: &ScanResult, budget: usize, per_file: usize) -> String {
+    if files.outlined.is_empty() && files.other.is_empty() {
+        return "repo map: no files found (everything is gitignored or the directory is empty)."
+            .to_string();
     }
-    let total: usize = files.iter().map(|file| file.symbols.len()).sum();
-    let mut out = format!("repo map: {} files, {total} symbols\n", files.len());
+    let total: usize = files.outlined.iter().map(|file| file.symbols.len()).sum();
+    let mut out = if files.other.is_empty() {
+        format!(
+            "repo map: {} files, {total} symbols\n",
+            files.outlined.len()
+        )
+    } else {
+        format!(
+            "repo map: {} files, {total} symbols; {} other files listed by directory\n",
+            files.outlined.len(),
+            files.other.len()
+        )
+    };
     let mut used = out.chars().count();
-    let reserve = 90usize.min(budget / 4);
+    let reserve = 120usize.min(budget / 4);
     let content_budget = budget.saturating_sub(reserve);
     let mut omitted = 0usize;
-    for (index, file) in files.iter().enumerate() {
+    for (index, file) in files.outlined.iter().enumerate() {
         let display = display_path(root, &file.path);
         let header = format!("\n{display} ({})", file.language);
         let header_cost = header.chars().count() + 1;
         if used + header_cost > content_budget {
-            omitted = files.len() - index;
+            omitted += files.outlined.len() - index;
             break;
         }
         out.push_str(&header);
@@ -244,19 +298,106 @@ fn render_map(root: &Path, files: &[FileOutline], budget: usize, per_file: usize
             }
         }
     }
-    if omitted > 0 {
+
+    // Every non-ignored file appears, either with its own outline above or in
+    // one compact line per directory. A directory is named with its files
+    // when they fit, otherwise with a count by extension, so the model can
+    // tell a complete listing from a summary.
+    if !files.other.is_empty() {
+        let groups = group_other(root, &files.other);
+        let heading = "\nother files:\n";
+        if used + heading.chars().count() > content_budget {
+            omitted += files.other.len();
+        } else {
+            out.push_str(heading);
+            used += heading.chars().count();
+            let mut shown = 0usize;
+            for (dir, paths) in &groups {
+                let rendered = render_group(dir, paths);
+                let cost = rendered.chars().count() + 1;
+                if used + cost > content_budget {
+                    break;
+                }
+                out.push_str(&rendered);
+                out.push('\n');
+                used += cost;
+                shown += paths.len();
+            }
+            omitted += files.other.len().saturating_sub(shown);
+        }
+    }
+
+    if files.at_cap {
         let note =
-            format!("\n… {omitted} files omitted; narrow with repo_map path=<dir> or raise budget");
+            format!("\n… indexed at most {MAX_FILES} files; narrow with repo_map path=<dir>");
         if used + note.chars().count() <= budget {
             out.push_str(&note);
         }
-    } else if files.len() >= MAX_FILES {
-        let note = format!("\n… indexed at most {MAX_FILES} files");
+    } else if omitted > 0 {
+        let note = format!(
+            "\n… {omitted} more file(s) not shown; use glob or repo_map path=<dir> to list them"
+        );
         if used + note.chars().count() <= budget {
             out.push_str(&note);
         }
     }
     out
+}
+
+/// One directory's non-outlined files, in path order.
+fn group_other(root: &Path, files: &[OtherFile]) -> Vec<(String, Vec<String>)> {
+    let mut groups: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for file in files {
+        let relative = file
+            .path
+            .strip_prefix(root)
+            .unwrap_or(&file.path)
+            .to_string_lossy()
+            .into_owned();
+        let (dir, name) = match relative.rsplit_once('/') {
+            Some((dir, name)) => (format!("{dir}/"), name.to_string()),
+            None => ("./".to_string(), relative),
+        };
+        groups.entry(dir).or_default().push(name);
+    }
+    groups.into_iter().collect()
+}
+
+/// `inbox/ (26 files: 5 .eml, 5 .html, …)` for a large directory, or the file
+/// names when there are few.
+fn render_group(dir: &str, names: &[String]) -> String {
+    if names.len() <= 6 {
+        return format!("{dir} ({} file(s): {})", names.len(), names.join(", "));
+    }
+    let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for name in names {
+        let extension = name
+            .rsplit_once('.')
+            .filter(|(stem, _)| !stem.is_empty())
+            .map(|(_, extension)| extension)
+            .unwrap_or("(no extension)");
+        *counts.entry(extension).or_default() += 1;
+    }
+    let mut parts: Vec<(usize, String)> = counts
+        .into_iter()
+        .map(|(extension, count)| {
+            let label = if extension == "(no extension)" {
+                "without extension".to_string()
+            } else {
+                format!(".{extension}")
+            };
+            (count, format!("{count} {label}"))
+        })
+        .collect();
+    parts.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    let shown: Vec<String> = parts.iter().take(6).map(|(_, text)| text.clone()).collect();
+    let more = if parts.len() > shown.len() {
+        ",".to_string()
+    } else {
+        String::new()
+    };
+    format!("{dir} ({} files: {}{more})", names.len(), shown.join(", "))
 }
 
 fn language_for(path: &Path) -> Option<&'static str> {
@@ -747,8 +888,8 @@ mod tests {
             "pub struct Runtime {\n    value: u32,\n}\n\nimpl Runtime {\n    pub async fn run(&self) {\n    }\n}\n\nfn helper() {}\n",
         );
         let files = RepoIndex::new().scan(dir.path(), None);
-        assert_eq!(files.len(), 1);
-        let names: Vec<String> = files[0]
+        assert_eq!(files.outlined.len(), 1);
+        let names: Vec<String> = files.outlined[0]
             .symbols
             .iter()
             .map(|symbol| format!("{} {}", symbol.kind, symbol.name))
@@ -771,6 +912,7 @@ mod tests {
         write(dir.path(), "Cargo.toml", "[package]\nname = \"demo\"\n");
         let files = RepoIndex::new().scan(dir.path(), None);
         let flat: Vec<String> = files
+            .outlined
             .iter()
             .flat_map(|file| file.symbols.iter().map(|symbol| symbol.name.clone()))
             .collect();
@@ -778,6 +920,72 @@ mod tests {
         assert!(flat.contains(&"run".to_string()));
         assert!(flat.contains(&"Project".to_string()));
         assert!(flat.contains(&"package".to_string()));
+    }
+
+    #[test]
+    fn non_code_files_are_listed_instead_of_disappearing() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "inbox/a.txt", "invoice a\n");
+        write(dir.path(), "inbox/b.json", "{}\n");
+        write(dir.path(), "inbox/c.md", "# Invoice C\n");
+        write(dir.path(), "Makefile", "all:\n\ttrue\n");
+        write(dir.path(), "src/lib.rs", "pub fn run() {}\n");
+
+        let map = RepoIndex::new().map(dir.path(), None, 3000);
+        for wanted in ["inbox/", "a.txt", "b.json", "c.md", "Makefile"] {
+            assert!(map.contains(wanted), "missing {wanted}: {map}");
+        }
+        // A text-only tree still gets a brief: the old map was empty.
+        let brief = RepoIndex::new().brief(dir.path(), 1800);
+        assert!(
+            brief.contains("a.txt") || brief.contains("inbox/"),
+            "{brief}"
+        );
+    }
+
+    #[test]
+    fn a_large_data_directory_is_summarised_by_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        for extension in ["txt", "html", "json", "eml", "md"] {
+            for index in 0..5 {
+                write(
+                    dir.path(),
+                    &format!("inbox/INV-{extension}-{index}.{extension}"),
+                    "content\n",
+                );
+            }
+        }
+        let map = RepoIndex::new().map(dir.path(), None, 3000);
+        assert!(
+            map.contains("inbox/ (25 files:"),
+            "expected a counted directory line: {map}"
+        );
+        for extension in [".txt", ".html", ".json", ".eml", ".md"] {
+            assert!(map.contains(extension), "{extension} missing: {map}");
+        }
+    }
+
+    #[test]
+    fn only_gitignored_build_directories_are_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        // `ignore` only applies .gitignore inside a repository.
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        write(dir.path(), ".gitignore", "dist/\n");
+        write(dir.path(), "vendor/lib/SOURCE.md", "# Vendored source\n");
+        write(dir.path(), "dist/bundle.js", "var x = 1;\n");
+        write(dir.path(), "build/out.rs", "pub fn built() {}\n");
+
+        let map = RepoIndex::new().map(dir.path(), None, 3000);
+        assert!(
+            map.contains("vendor/lib/SOURCE.md") || map.contains("vendor/lib/"),
+            "a checked-in vendor tree is source: {map}"
+        );
+        assert!(
+            !map.contains("dist/bundle.js") && !map.contains("dist/"),
+            "a gitignored dist is skipped: {map}"
+        );
+        // `build/` is not gitignored here, so it is a real directory.
+        assert!(map.contains("build/out.rs"), "{map}");
     }
 
     #[test]
@@ -792,7 +1000,7 @@ mod tests {
         }
         let map = RepoIndex::new().map(dir.path(), None, 600);
         assert!(map.chars().count() <= 600, "{} chars", map.chars().count());
-        assert!(map.contains("files omitted; narrow with repo_map"));
+        assert!(map.contains("more file(s) not shown; use glob or repo_map"));
     }
 
     #[test]

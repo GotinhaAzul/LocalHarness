@@ -46,6 +46,9 @@ pub enum TurnStatus {
 pub struct TurnOutcome {
     pub status: TurnStatus,
     pub error: Option<(String, String)>,
+    /// Harness gate errors in this turn, by code. Reported in the `--json`
+    /// `done` event so harness overhead can be measured.
+    pub gate_errors: std::collections::BTreeMap<String, u32>,
 }
 
 impl TurnOutcome {
@@ -53,6 +56,7 @@ impl TurnOutcome {
         Self {
             status,
             error: None,
+            gate_errors: std::collections::BTreeMap::new(),
         }
     }
 
@@ -60,6 +64,7 @@ impl TurnOutcome {
         Self {
             status: TurnStatus::Error,
             error: Some((code.to_string(), message.into())),
+            gate_errors: std::collections::BTreeMap::new(),
         }
     }
 
@@ -69,6 +74,7 @@ impl TurnOutcome {
         Self {
             status: TurnStatus::Budget,
             error: Some((code.to_string(), message.into())),
+            gate_errors: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -97,7 +103,15 @@ pub async fn run_turn(
     tx: UnboundedSender<AgentEvent>,
     cancel: CancellationToken,
 ) -> TurnOutcome {
-    let outcome = run_turn_inner(core.clone(), user_text, tx.clone(), cancel).await;
+    if let Ok(mut counts) = core.gate_errors.lock() {
+        counts.clear();
+    }
+    let mut outcome = run_turn_inner(core.clone(), user_text, tx.clone(), cancel).await;
+    outcome.gate_errors = core
+        .gate_errors
+        .lock()
+        .map(|counts| counts.clone())
+        .unwrap_or_default();
 
     // Lifecycle hook: stop runs once for every turn ending, including budget,
     // stall, cancellation, and errors. It is advisory: a block is visible but
@@ -317,7 +331,7 @@ async fn prepare_turn_context(core: &Core, startup_pending: bool) -> TurnContext
     let mut budget = core.budget.clone();
     let (effective, source) = core.effective_window();
     if effective > 0 && effective != budget.context_window {
-        budget = budget.resized_to(effective, core.config.model.max_output_tokens);
+        budget = budget.resized_to(effective, core.budget.max_output_tokens);
     }
     let known_window = core
         .server_window
@@ -346,7 +360,7 @@ async fn prepare_turn_context(core: &Core, startup_pending: bool) -> TurnContext
                 .map(|configured| configured.min(truth.effective))
                 .unwrap_or(truth.effective);
             if window > 0 {
-                budget = budget.resized_to(window, core.config.model.max_output_tokens);
+                budget = budget.resized_to(window, core.budget.max_output_tokens);
                 window_guessed = false;
                 core.remember_window(window);
                 if core.window_notice.is_none() {
@@ -417,7 +431,7 @@ async fn run_loop(
         .detected_window
         .load(std::sync::atomic::Ordering::Relaxed);
     if detected > 0 && detected != budget.context_window {
-        budget = budget.resized_to(detected, core.config.model.max_output_tokens);
+        budget = budget.resized_to(detected, core.budget.max_output_tokens);
     }
     // Probe the served window once per turn while it is still a guess.
     let mut window_probe_pending = !core.window_source.is_reliable() && detected == 0;
@@ -447,6 +461,10 @@ async fn run_loop(
     let mut compacted_since_model_call = false;
     let mut invalid_tool_calls = 0u32;
     let mut one_call_reminded = false;
+    // One request with the profile's thinking control merged in, after a
+    // length stop showed reasoning is eating the output budget. It is turned
+    // back off as soon as that request is sent.
+    let mut force_thinking_off = false;
 
     loop {
         if cancel.is_cancelled() {
@@ -467,6 +485,15 @@ async fn run_loop(
             BudgetCheck::Renewed(reason) => report_renewal(core.as_ref(), tx, &progress, reason),
             BudgetCheck::Exhausted(reason) => {
                 let message = progress.checkpoint_message(reason);
+                finish_with_summary(
+                    core,
+                    tx,
+                    cancel,
+                    &budget,
+                    tool_specs_cost,
+                    "the budget checkpoint found no progress",
+                )
+                .await;
                 append_error(&core.session, reason.code(), &message, true);
                 let _ = tx.send(AgentEvent::Error {
                     code: reason.code().into(),
@@ -478,6 +505,15 @@ async fn run_loop(
         }
         if progress.stalled() {
             let message = progress.stall_message();
+            finish_with_summary(
+                core,
+                tx,
+                cancel,
+                &budget,
+                tool_specs_cost,
+                "the run stopped making progress",
+            )
+            .await;
             append_error(&core.session, StopReason::Stalled.code(), &message, true);
             let _ = tx.send(AgentEvent::Guard {
                 code: "stalled".into(),
@@ -664,19 +700,26 @@ async fn run_loop(
         }
         let request_prefix =
             context::prompt_prefix(leading_system(&assembled), &core.tool_specs_json);
-        let extra_body = match core
-            .model_profile
-            .request_extra_body(!core.tool_specs.is_empty())
-        {
-            Ok(body) => body,
-            Err(message) => {
-                append_error(&core.session, "thinking_policy", &message, false);
-                let _ = tx.send(AgentEvent::Error {
-                    code: "thinking_policy".into(),
-                    message: message.clone(),
-                    recoverable: false,
-                });
-                return TurnOutcome::error("thinking_policy", message);
+        let extra_body = if force_thinking_off {
+            match core.model_profile.request_extra_body_thinking_off() {
+                Some(body) => Some(body),
+                None => {
+                    match core
+                        .model_profile
+                        .request_extra_body(!core.tool_specs.is_empty())
+                    {
+                        Ok(body) => body,
+                        Err(message) => return thinking_policy_error(core, tx, message),
+                    }
+                }
+            }
+        } else {
+            match core
+                .model_profile
+                .request_extra_body(!core.tool_specs.is_empty())
+            {
+                Ok(body) => body,
+                Err(message) => return thinking_policy_error(core, tx, message),
             }
         };
         let request = ChatRequest {
@@ -779,6 +822,7 @@ async fn run_loop(
             }
         };
 
+        force_thinking_off = false;
         let assistant = match result {
             Ok(assistant) => assistant,
             Err(err) if err.class == ErrorClass::Cancelled => {
@@ -844,6 +888,19 @@ async fn run_loop(
                     tracing::warn!(%error, "cannot persist partial assistant output");
                 }
                 let code = err.class.code().to_string();
+                if progress.output_recoveries == 0 && !progress.output_raised {
+                    // A cut tool call is the same signal as a cut answer:
+                    // the reservation was small for this model.
+                    let target = budget.max_output_tokens.saturating_mul(2);
+                    apply_output_raise(
+                        core,
+                        &mut budget,
+                        &mut progress,
+                        &static_prompt,
+                        target,
+                        tx,
+                    );
+                }
                 if progress.output_recoveries < MAX_OUTPUT_RECOVERIES {
                     progress.output_recoveries += 1;
                     append_error(&core.session, &code, &err.message, true);
@@ -860,6 +917,15 @@ async fn run_loop(
                     .to_string();
                 append_error(&core.session, &code, &message, false);
                 let _ = tx.send(AgentEvent::Guard { code, message });
+                finish_with_summary(
+                    core,
+                    tx,
+                    cancel,
+                    &budget,
+                    tool_specs_cost,
+                    "repeated tool calls were cut off by the output limit",
+                )
+                .await;
                 return TurnOutcome::ok(TurnStatus::Stalled);
             }
             Err(err) => {
@@ -879,6 +945,18 @@ async fn run_loop(
             }
         };
 
+        // A thinking model spends output tokens on reasoning before it emits
+        // anything. Once the engine reports reasoning, reserve the
+        // quarter-of-window cap for it instead of the 4k default.
+        raise_output_for_reasoning(
+            core,
+            &mut budget,
+            &mut progress,
+            &static_prompt,
+            &assistant,
+            tx,
+        );
+
         if window_probe_pending {
             window_probe_pending = false;
             if let Some(window) = detect_served_window(core).await {
@@ -887,7 +965,7 @@ async fn run_loop(
                     .load(std::sync::atomic::Ordering::Relaxed);
                 let window = if known > 0 { window.min(known) } else { window };
                 core.remember_window(window);
-                budget = budget.resized_to(window, core.config.model.max_output_tokens);
+                budget = budget.resized_to(window, core.budget.max_output_tokens);
                 let _ = tx.send(AgentEvent::WindowDetected {
                     window,
                     source: "llama.cpp after the first reply".into(),
@@ -1014,7 +1092,13 @@ async fn run_loop(
         // compact or retry on its own allowance instead of a per-turn budget.
         compacted_since_model_call = false;
         progress.recovered_context();
-        let recovery = recover_output(core, &mut assistant, &mut progress, &mut call_ledger);
+        let recovery = recover_output(
+            core,
+            &mut assistant,
+            &mut progress,
+            &mut call_ledger,
+            budget.max_output_tokens,
+        );
         if let Some(notice) = recovery.notice {
             let _ = tx.send(AgentEvent::Notice(notice));
         }
@@ -1044,6 +1128,51 @@ async fn run_loop(
                 });
                 return TurnOutcome::ok(TurnStatus::Blocked);
             }
+            // Before repeating the same nudge, change something. A cut reply
+            // usually means the reservation was too small, so the first
+            // length stop doubles it; if that is not possible and the model
+            // profile names a thinking control, one retry runs with thinking
+            // off. Only then does the unchanged nudge repeat.
+            let mut retried = false;
+            if recovery.length_stop && !progress.output_raised {
+                let target = budget.max_output_tokens.saturating_mul(2);
+                let (old, new) = apply_output_raise(
+                    core,
+                    &mut budget,
+                    &mut progress,
+                    &static_prompt,
+                    target,
+                    tx,
+                );
+                retried = new > old;
+            }
+            if !retried
+                && recovery.length_stop
+                && !progress.thinking_retry_used
+                && !force_thinking_off
+                && !core.model_profile.thinking_off(!core.tool_specs.is_empty())
+                && core
+                    .model_profile
+                    .request_extra_body_thinking_off()
+                    .is_some()
+            {
+                progress.thinking_retry_used = true;
+                force_thinking_off = true;
+                retried = true;
+                let _ = tx.send(AgentEvent::Notice(
+                    "retrying once with thinking off through the profile's thinking_control: reasoning was using the whole output budget"
+                        .into(),
+                ));
+            }
+            if retried {
+                progress.output_recoveries += 1;
+                if let Err(err) = append_assistant(&core.session, assistant)
+                    .and_then(|()| append_user(&core.session, &nudge))
+                {
+                    return TurnOutcome::error("session_write", err.to_string());
+                }
+                continue;
+            }
             if progress.output_recoveries < MAX_OUTPUT_RECOVERIES {
                 progress.output_recoveries += 1;
                 if let Err(err) = append_assistant(&core.session, assistant)
@@ -1062,6 +1191,32 @@ async fn run_loop(
                     message: message.into(),
                 });
                 return TurnOutcome::ok(TurnStatus::Stalled);
+            }
+            // The recovery allowance is gone and the last reply was not an
+            // answer. Ending `Done` here reported success for a turn that
+            // produced nothing; a budget stop with the reason is the truth.
+            if recovery.empty_reply || recovery.length_stop {
+                let _ = append_assistant(&core.session, assistant);
+                let code = if recovery.empty_reply {
+                    "empty_reply"
+                } else {
+                    "output_limit"
+                };
+                let message = format!(
+                    "the model returned no usable reply after {MAX_OUTPUT_RECOVERIES} output recoveries ({code}): {} The turn ended without a result; raise [model] max_output_tokens or [model] context_window, or turn thinking off with the profile's thinking_control.",
+                    if recovery.empty_reply {
+                        "the last replies were empty"
+                    } else {
+                        "the last replies were cut at the output limit"
+                    }
+                );
+                append_error(&core.session, code, &message, false);
+                let _ = tx.send(AgentEvent::Error {
+                    code: code.into(),
+                    message: message.clone(),
+                    recoverable: false,
+                });
+                return TurnOutcome::budget(code, message);
             }
         }
         let has_calls = assistant
@@ -1105,6 +1260,7 @@ async fn run_loop(
                         continue;
                     }
                     let message = "plan mode: the turn ended without a todo plan after reminders. Ask again for a plan; nothing was changed.".to_string();
+                    count_gate_error(core, "gate_block");
                     append_error(&core.session, "gate_block", &message, true);
                     let _ = tx.send(AgentEvent::Error {
                         code: "gate_block".into(),
@@ -1187,6 +1343,7 @@ async fn run_loop(
                     continue;
                 }
                 SettleDecision::Block { message } => {
+                    count_gate_error(core, "gate_block");
                     append_error(&core.session, "gate_block", &message, true);
                     let _ = tx.send(AgentEvent::Error {
                         code: "gate_block".into(),
@@ -1216,6 +1373,15 @@ async fn run_loop(
                     );
                 }
                 let message = progress.checkpoint_message(reason);
+                finish_with_summary(
+                    core,
+                    tx,
+                    cancel,
+                    &budget,
+                    tool_specs_cost,
+                    "the tool-call checkpoint found no progress",
+                )
+                .await;
                 append_error(&core.session, reason.code(), &message, true);
                 let _ = tx.send(AgentEvent::Error {
                     code: reason.code().into(),
@@ -1266,6 +1432,15 @@ async fn run_loop(
         }
 
         if let Some((code, message)) = batch.guard {
+            finish_with_summary(
+                core,
+                tx,
+                cancel,
+                &budget,
+                tool_specs_cost,
+                "the loop guard stopped a repeating run",
+            )
+            .await;
             append_error(&core.session, &code, &message, true);
             let _ = tx.send(AgentEvent::Guard {
                 code: code.clone(),
@@ -1325,6 +1500,15 @@ async fn run_loop(
         }
         if progress.stalled() {
             let message = progress.stall_message();
+            finish_with_summary(
+                core,
+                tx,
+                cancel,
+                &budget,
+                tool_specs_cost,
+                "the run stopped making progress",
+            )
+            .await;
             append_error(&core.session, StopReason::Stalled.code(), &message, true);
             let _ = tx.send(AgentEvent::Guard {
                 code: "stalled".into(),
@@ -1358,6 +1542,94 @@ fn context_window_event(
             window: budget.context_window,
         });
     }
+}
+
+/// A refused thinking policy is a configuration error, not a retryable one.
+fn thinking_policy_error(
+    core: &Core,
+    tx: &UnboundedSender<AgentEvent>,
+    message: String,
+) -> TurnOutcome {
+    append_error(&core.session, "thinking_policy", &message, false);
+    let _ = tx.send(AgentEvent::Error {
+        code: "thinking_policy".into(),
+        message: message.clone(),
+        recoverable: false,
+    });
+    TurnOutcome::error("thinking_policy", message)
+}
+
+/// Raise the output reservation for a thinking model once the engine proved it
+/// reasons: `reasoning_tokens` in usage, or a length stop on reasoning alone.
+/// Returns the old and new caps when the raise happened.
+fn raise_output_for_reasoning(
+    core: &Core,
+    budget: &mut TokenBudget,
+    progress: &mut RunProgress,
+    static_prompt: &StaticPrompt,
+    assistant: &AssistantData,
+    tx: &UnboundedSender<AgentEvent>,
+) -> Option<(u32, u32)> {
+    if progress.output_raised {
+        return None;
+    }
+    let reasoned = assistant
+        .usage
+        .as_ref()
+        .and_then(|usage| usage.reasoning_tokens)
+        .unwrap_or(0)
+        > 0
+        || (assistant.content.is_none()
+            && assistant
+                .stop_reason
+                .as_deref()
+                .is_some_and(|reason| matches!(reason, "length" | "max_tokens")));
+    if !reasoned {
+        return None;
+    }
+    let target =
+        crate::context::output_reservation(budget.context_window, budget.max_output_tokens, true);
+    let (old, new) = apply_output_raise(core, budget, progress, static_prompt, target.tokens, tx);
+    (old != new).then_some((old, new))
+}
+
+/// Apply a larger output reservation when the prompt still fits. Returns the
+/// old and new caps.
+fn apply_output_raise(
+    core: &Core,
+    budget: &mut TokenBudget,
+    progress: &mut RunProgress,
+    static_prompt: &StaticPrompt,
+    target: u32,
+    tx: &UnboundedSender<AgentEvent>,
+) -> (u32, u32) {
+    let old = budget.max_output_tokens;
+    let capped = target.min((budget.context_window / 4).max(1));
+    if capped <= old {
+        return (old, old);
+    }
+    let raised = budget.resized_to(budget.context_window, capped);
+    if static_prompt.total > raised.usable_prompt() {
+        // A bigger reservation would squeeze the fixed prompt out.
+        return (old, old);
+    }
+    *budget = raised;
+    progress.output_raised = true;
+    let _ = tx.send(AgentEvent::Notice(format!(
+        "raised the output limit from {old} to {capped} tokens (window {}); reasoning counts against the same budget",
+        budget.context_window
+    )));
+    if let Ok(mut session) = core.session.lock() {
+        let data = CustomData::new("output-limit")
+            .with("from", old)
+            .with("to", capped)
+            .with("window", budget.context_window)
+            .with("reason", "thinking model");
+        if let Err(error) = session.append(EntryKind::Custom(data)) {
+            tracing::warn!(%error, "cannot record the raised output limit");
+        }
+    }
+    (old, capped)
 }
 
 /// Refuse a turn whose fixed prompt cannot fit the effective window. The
@@ -1694,6 +1966,10 @@ struct OutputRecovery {
     /// The reply was not a valid instance of the requested schema. It must
     /// never settle as the final answer.
     structured_invalid: bool,
+    /// The reply was cut by the output limit.
+    length_stop: bool,
+    /// The reply carried no text and no tool call.
+    empty_reply: bool,
 }
 
 /// Repair what can be repaired in place (tool calls written as text) and name
@@ -1703,6 +1979,7 @@ fn recover_output(
     assistant: &mut AssistantData,
     progress: &mut RunProgress,
     ledger: &mut CallLedger,
+    output_limit: u32,
 ) -> OutputRecovery {
     let mut out = OutputRecovery::default();
     if assistant.stop_reason.as_deref() == Some(REPETITION_STOP) {
@@ -1778,7 +2055,8 @@ fn recover_output(
     // A model that hit its output limit mid-call delivered invalid JSON; the
     // call is dropped, never dispatched.
     if assistant.stop_reason.as_deref() == Some("length") {
-        let limit = format!(" ({} tokens)", core.config.model.max_output_tokens);
+        out.length_stop = true;
+        let limit = format!(" ({output_limit} tokens)");
         if calls.is_empty() {
             out.nudge = Some(if content_empty {
                 "[totality] output limit: you used the whole output budget thinking. Stop deliberating and act now: make one tool call or give a concise answer.".to_string()
@@ -1792,6 +2070,7 @@ fn recover_output(
             ));
         }
     } else if calls.is_empty() && content_empty {
+        out.empty_reply = true;
         out.nudge = Some("[totality] empty response: you returned no text and no tool call (reasoning alone is not an answer). Make the next tool call, or give your final answer outside the reasoning block.".into());
     }
     out
@@ -2801,15 +3080,21 @@ async fn execute_batch(
                             false,
                             turn_start,
                         );
-                        if gate_tools.todo
-                            && let Some(block) = gates::todo_edit_gate(
+                        if gate_tools.todo {
+                            let mut changed_files: Vec<String> = current.files.clone();
+                            changed_files.extend(inferred_files.iter().cloned());
+                            let target = args_path
+                                .as_ref()
+                                .and_then(|raw| ctx.resolve(raw).ok())
+                                .map(|path| display_path(&ctx.cwd, &path));
+                            if let Some(block) = gates::todo_edit_gate(
                                 &call.name,
-                                current.mutations + inferred_mutations,
-                                unique_file_count(&current.files, &inferred_files),
+                                target.as_deref(),
+                                &changed_files,
                                 plan_present || current.todo_plan_present,
-                            )
-                        {
-                            result = block;
+                            ) {
+                                result = block;
+                            }
                         }
                     }
 
@@ -3104,7 +3389,6 @@ async fn execute_batch(
             let mut files = inferred_files.clone();
             files.insert(path.clone());
             if let Some(notice) = gates::todo_gate_notice(
-                current.mutations + inferred_mutations + 1,
                 unique_file_count(&current.files, &files),
                 plan_present || current.todo_plan_present,
             ) {
@@ -3189,6 +3473,9 @@ async fn execute_batch(
             }
         }
         batch_chars += capped.content.chars().count();
+        if result.is_error {
+            note_gate_error(core, &result.content);
+        }
         let tool_result = ToolResult {
             content: capped.content.clone(),
             is_error: result.is_error,
@@ -3221,79 +3508,82 @@ async fn execute_batch(
 
         let mut verified_ok = false;
         let mut changed = false;
-        if !tool_result.is_error {
-            if let Some(details) = &tool_result.details {
-                if let Some(entries) = details.get("session").and_then(|v| v.as_array()) {
-                    for entry in entries {
-                        let kind = entry.get("kind").and_then(|v| v.as_str()).unwrap_or("");
-                        if kind.is_empty() {
-                            continue;
-                        }
-                        let mut payload = entry.as_object().cloned().unwrap_or_default();
-                        payload.remove("kind");
-                        let custom = CustomData {
-                            kind: kind.to_string(),
-                            payload,
-                        };
-                        if custom.kind == "verify-result"
-                            && custom.payload.get("passed").and_then(|v| v.as_bool()) == Some(true)
-                        {
-                            verified_ok = true;
-                        }
-                        if custom.kind == "todo-state"
-                            && custom
-                                .payload
-                                .get("tasks")
-                                .and_then(|v| v.as_array())
-                                .is_some_and(|tasks| !tasks.is_empty())
-                        {
-                            plan_present = true;
-                        }
-                        if custom.kind == "fs-change" {
-                            changed = true;
-                            if let Some(path) = custom.payload.get("path").and_then(|v| v.as_str())
-                            {
-                                inferred_mutations += 1;
+        if let Some(details) = &tool_result.details {
+            if let Some(entries) = details.get("session").and_then(|v| v.as_array()) {
+                for entry in entries {
+                    let kind = entry.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+                    if kind.is_empty() {
+                        continue;
+                    }
+                    let mut payload = entry.as_object().cloned().unwrap_or_default();
+                    payload.remove("kind");
+                    let custom = CustomData {
+                        kind: kind.to_string(),
+                        payload,
+                    };
+                    if custom.kind == "verify-result"
+                        && custom.payload.get("passed").and_then(|v| v.as_bool()) == Some(true)
+                    {
+                        verified_ok = true;
+                    }
+                    if custom.kind == "todo-state"
+                        && custom
+                            .payload
+                            .get("tasks")
+                            .and_then(|v| v.as_array())
+                            .is_some_and(|tasks| !tasks.is_empty())
+                    {
+                        plan_present = true;
+                    }
+                    if custom.kind == "fs-change" {
+                        changed = true;
+                        let from_bash =
+                            custom.payload.get("bash").and_then(|value| value.as_bool())
+                                == Some(true);
+                        if let Some(path) = custom.payload.get("path").and_then(|v| v.as_str()) {
+                            inferred_mutations += 1;
+                            if !from_bash {
                                 inferred_files.insert(path.to_string());
                             }
                         }
-                        deferred.push(custom);
                     }
-                }
-                if details.get("end_turn").and_then(|v| v.as_bool()) == Some(true) {
-                    end_turn = true;
-                }
-                if details.get("thread_split").and_then(|v| v.as_bool()) == Some(true) {
-                    thread_split = Some(ThreadSplit {
-                        kickoff: details
-                            .get("kickoff")
-                            .and_then(|v| v.as_str())
-                            .map(str::to_string),
-                    });
-                    end_turn = true;
+                    deferred.push(custom);
                 }
             }
-            if matches!(call.name.as_str(), "write" | "edit" | "patch" | "undo")
-                && let Some(path) = &args_path
-            {
-                // A write to a path outside the session directory (including
-                // a temporary root) is scratch: it neither counts as progress
-                // nor clears the loop guard's counts.
-                changed = ctx
-                    .resolve(path)
-                    .map(|resolved| inside_workspace(&ctx.cwd, &resolved))
-                    .unwrap_or(false);
-                inferred_mutations += 1;
-                inferred_files.insert(path.clone());
-                let display = repaired
-                    .as_ref()
-                    .map(|_| display_path(&ctx.cwd, &ctx.cwd.join(path)))
-                    .unwrap_or_else(|| path.clone());
-                deferred.push(crate::tools::undo::fs_change_entry(
-                    display,
-                    tool_result.details.as_ref(),
-                ));
+            if details.get("end_turn").and_then(|v| v.as_bool()) == Some(true) {
+                end_turn = true;
             }
+            if details.get("thread_split").and_then(|v| v.as_bool()) == Some(true) {
+                thread_split = Some(ThreadSplit {
+                    kickoff: details
+                        .get("kickoff")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
+                });
+                end_turn = true;
+            }
+        }
+        if !tool_result.is_error
+            && matches!(call.name.as_str(), "write" | "edit" | "patch" | "undo")
+            && let Some(path) = &args_path
+        {
+            // A write to a path outside the session directory (including
+            // a temporary root) is scratch: it neither counts as progress
+            // nor clears the loop guard's counts.
+            changed = ctx
+                .resolve(path)
+                .map(|resolved| inside_workspace(&ctx.cwd, &resolved))
+                .unwrap_or(false);
+            inferred_mutations += 1;
+            inferred_files.insert(path.clone());
+            let display = repaired
+                .as_ref()
+                .map(|_| display_path(&ctx.cwd, &ctx.cwd.join(path)))
+                .unwrap_or_else(|| path.clone());
+            deferred.push(crate::tools::undo::fs_change_entry(
+                display,
+                tool_result.details.as_ref(),
+            ));
         }
 
         let fingerprint = fingerprint(&call.name, &raw, &tool_result.content);
@@ -3520,8 +3810,12 @@ async fn finish_review(
                             applied += outcome.accepted;
                         }
                         if let Some(final_content) = &outcome.final_content {
-                            final_hashes
-                                .push(crate::tools::undo::content_hash(final_content.as_bytes()));
+                            // Hash the bytes that land on disk, encoding
+                            // included, so undo and rewind compare the file.
+                            let bytes =
+                                crate::tools::encoding::encode(final_content, write.encoding)
+                                    .unwrap_or_else(|| final_content.as_bytes().to_vec());
+                            final_hashes.push(crate::tools::undo::content_hash(&bytes));
                         }
                     }
                     if changed {
@@ -3767,6 +4061,120 @@ fn tool_body(content: &str) -> &str {
 
 /// A tool result's preview for the UI: line breaks kept (a diff or test
 /// output is unreadable flattened), at most 40 lines and 2000 characters.
+/// Give the model one tool-less request to say what it did and what is left,
+/// before a stalled or exhausted turn ends. The turn keeps its status; the
+/// summary is what the person sees instead of a mid-thought sentence.
+async fn finish_with_summary(
+    core: &Core,
+    tx: &UnboundedSender<AgentEvent>,
+    cancel: &CancellationToken,
+    budget: &TokenBudget,
+    tool_specs_cost: ToolSpecCost,
+    reason: &str,
+) {
+    if cancel.is_cancelled() {
+        return;
+    }
+    let message = format!(
+        "[totality] stop: the harness ended this turn ({reason}). Do not call tools and do not start new work. In a few short sentences, summarize what you changed, what works, and what is left, so the person can continue."
+    );
+    if let Err(error) = append_user(&core.session, &message) {
+        tracing::warn!(%error, "cannot append the summary request");
+        return;
+    }
+    let findings = core.findings_summary();
+    let assembled = assemble_context(core, budget, findings.as_ref(), tool_specs_cost);
+    // Keep the profile's extra_body even when it has no thinking control: a
+    // template flag or sampler there may be required by the engine.
+    let extra_body = core
+        .model_profile
+        .request_extra_body_thinking_off()
+        .or_else(|| core.model_profile.request_extra_body(false).ok().flatten())
+        .or_else(|| {
+            core.model_profile
+                .extra_body
+                .as_ref()
+                .and_then(|value| serde_json::to_value(value).ok())
+        });
+    let request = ChatRequest {
+        model: core.provider.model().to_string(),
+        messages: assembled.messages,
+        tools: Vec::new(),
+        tool_choice: None,
+        parallel_tool_calls: None,
+        samplers: crate::provider::SamplerSettings::resolve(
+            &core.config.model,
+            &core.model_profile,
+        ),
+        engine: core.engine,
+        response_schema: None,
+        max_tokens: budget.max_output_tokens.min(1536),
+        stop: core.model_profile.stop.clone(),
+        extra_body,
+        include_usage: true,
+        reasoning_field: core.model_profile.reasoning_field.clone(),
+    };
+    // A clone: the summary's usage must not recalibrate the turn budget.
+    let mut summary_budget = budget.clone();
+    let mut ledger = CallLedger::from_session(&core.session.lock().expect("session lock"));
+    let mut partial = None;
+    let _ = tx.send(AgentEvent::State(AgentState::StreamModel));
+    match stream_assistant(
+        core,
+        request,
+        tx,
+        cancel,
+        &mut summary_budget,
+        assembled.estimated_tokens,
+        assembled.char_count,
+        ToolSpecCost::default(),
+        &mut partial,
+        &mut ledger,
+    )
+    .await
+    {
+        Ok(mut assistant) => {
+            // The summary request carries no tools; a provider that answers
+            // with a call anyway must not leave an unpaired tool call in the
+            // branch.
+            assistant.tool_calls = None;
+            if let Err(error) = append_assistant(&core.session, assistant) {
+                tracing::warn!(%error, "cannot append the final summary");
+            }
+        }
+        Err(error) => {
+            let _ = tx.send(AgentEvent::Notice(format!(
+                "the final summary could not be generated: {}",
+                crate::text::clip(&error.message, 200)
+            )));
+        }
+    }
+}
+
+/// Count a harness gate refusal for the turn's `--json` summary. Only codes
+/// that mean "the harness spent a call stopping the model" count; a real tool
+/// failure does not.
+fn note_gate_error(core: &Core, content: &str) {
+    let Some(rest) = content.strip_prefix('[') else {
+        return;
+    };
+    let Some((code, _)) = rest.split_once(']') else {
+        return;
+    };
+    if matches!(
+        code,
+        "TODO_PLAN" | "NO_VERIFY" | "READ_FIRST" | "gate_block"
+    ) {
+        count_gate_error(core, code);
+    }
+}
+
+fn count_gate_error(core: &Core, code: &str) {
+    if let Ok(mut counts) = core.gate_errors.lock() {
+        *counts.entry(code.to_string()).or_default() += 1;
+    }
+}
+
 fn preview_block(text: &str) -> String {
     let mut out = String::new();
     for (index, line) in text.lines().enumerate() {
@@ -4470,6 +4878,7 @@ mod tests {
             permissions: std::sync::Arc::new(crate::policy::Permissions::with_mode(
                 crate::policy::PermissionMode::Yolo,
             )),
+            gate_errors: Default::default(),
             config,
             paths: paths.clone(),
             provider: Arc::new(ProbeProvider {

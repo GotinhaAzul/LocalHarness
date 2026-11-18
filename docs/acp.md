@@ -66,6 +66,12 @@ control sequences with the same `sanitize::display` used by the TUI. Streamed
 deltas are buffered when an escape sequence straddles two chunks, so its
 payload never reaches the client as visible text.
 
+Harness diagnostics (the todo and verify gates, provider retries, compaction,
+output-limit notices) are sent as `agent_thought_chunk` with the text
+`[harness] …` on its own lines, never as `agent_message_chunk`. A client can
+therefore show them separately from the model's answer and filter them out of
+a chat transcript.
+
 Stop reasons match the CLI's turn status:
 
 | CLI status | ACP `stopReason` |

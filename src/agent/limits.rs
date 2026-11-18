@@ -115,13 +115,15 @@ pub struct RunProgress {
     epoch_started_at: Instant,
     /// How many times a productive checkpoint renewed the allowance.
     pub renewals: u32,
-    /// Cumulative tool-call index of the last result that produced usable new
-    /// information, a file change, or a passing verification.
+    /// Cumulative tool-call index of the last result that changed a file, passed
+    /// a verification, or was new information from a read-only call: the
+    /// progress the stall tracker respects.
     last_progress_call: Option<u32>,
     last_progress_at: Option<Instant>,
-    /// Result digests already seen this turn. A repeated result is not new
-    /// information even when the call arguments differ.
-    seen_results: HashSet<u64>,
+    /// Digest of each read-only result already seen. Exploration that keeps
+    /// returning the same bytes is not progress; a new page, file, or listing
+    /// is. Failed and mutating calls never count here.
+    seen_reads: HashSet<u64>,
     pub stall: StallTracker,
     pub settle_continuations: u32,
     pub verify_attempts: u32,
@@ -130,6 +132,11 @@ pub struct RunProgress {
     pub last_stop: Option<StopReason>,
     /// Harness nudges spent on broken output this turn.
     pub output_recoveries: u32,
+    /// Whether the output reservation was already raised this turn (for a
+    /// thinking model or after a length stop).
+    pub output_raised: bool,
+    /// Whether one retry already turned thinking off.
+    pub thinking_retry_used: bool,
     /// Whether the user was told that tool calls are arriving as text.
     pub text_calls_noticed: bool,
     /// Whether the exact tokenizer check already forced a compaction. Reset
@@ -157,7 +164,7 @@ impl RunProgress {
             renewals: 0,
             last_progress_call: None,
             last_progress_at: None,
-            seen_results: HashSet::new(),
+            seen_reads: HashSet::new(),
             stall: StallTracker::new(stall_calls, family_limit, success_limit),
             settle_continuations: 0,
             verify_attempts: 0,
@@ -166,6 +173,8 @@ impl RunProgress {
             context_retry_used: false,
             last_stop: None,
             output_recoveries: 0,
+            output_raised: false,
+            thinking_retry_used: false,
             text_calls_noticed: false,
             presend_compaction_used: false,
         }
@@ -215,15 +224,23 @@ impl RunProgress {
     }
 
     /// Record a tool result. `outcome.result` is the content shown to the
-    /// model; a result content that was already seen this turn is a repeat, not
-    /// new information, even when the call arguments differ. A failed call
-    /// never counts as new information. `cwd` is the workspace the call ran in.
+    /// model. Progress is the same fact the stall tracker counts: a file
+    /// change or a passing verification. A new result on its own does not
+    /// renew a checkpoint, so the budget cannot say "still making progress"
+    /// while the stall guard says the last calls changed nothing. `cwd` is the
+    /// workspace the call ran in.
     pub fn record_tool_result(&mut self, cwd: &Path, outcome: ToolOutcome<'_>) {
         self.tool_calls += 1;
         self.epoch_tool_calls += 1;
         self.stall.observe(cwd, outcome);
-        let novel = !outcome.is_error && self.seen_results.insert(result_digest(outcome.result));
-        if outcome.changed_file || outcome.verified_ok || novel {
+        // Read-only exploration is not a loop: a new page, listing, or file is
+        // progress the stall tracker exempts. A new result from a call that
+        // does work is not, or the budget would renew while the family guard
+        // counts the same calls as idle successes.
+        let novel_read = outcome.read_only
+            && !outcome.is_error
+            && self.seen_reads.insert(result_digest(outcome.result));
+        if outcome.changed_file || outcome.verified_ok || novel_read {
             self.last_progress_call = Some(self.tool_calls);
             self.last_progress_at = Some(Instant::now());
         }
@@ -263,9 +280,8 @@ impl RunProgress {
     /// Message for a checkpoint that ended the turn.
     pub fn checkpoint_message(&self, reason: StopReason) -> String {
         let window = self.limits.stall_calls;
-        let no_progress = format!(
-            "no new result, file change, or passing verification in the last {window} call(s)"
-        );
+        let no_progress =
+            format!("no file change or passing verification in the last {window} call(s)");
         match reason {
             StopReason::ToolBudget => format!(
                 "tool-call checkpoint: {} calls in this allowance, {no_progress}. The run is repeating without progress; summarize the last known state or start a new turn with a different approach.",
@@ -276,7 +292,7 @@ impl RunProgress {
                 self.epoch_model_calls
             ),
             StopReason::WallClock => format!(
-                "wall-clock checkpoint: {} minutes in this allowance, no new result, file change, or passing verification. The run is repeating without progress; summarize the last known state or start a new turn with a different approach.",
+                "wall-clock checkpoint: {} minutes in this allowance, {no_progress}. The run is repeating without progress; summarize the last known state or start a new turn with a different approach.",
                 self.limits.max_wall.as_secs() / 60
             ),
             StopReason::Stalled => {
@@ -289,7 +305,7 @@ impl RunProgress {
     /// User-facing notice when a productive checkpoint renews the allowance.
     pub fn renewal_message(&self, trigger: StopReason) -> String {
         format!(
-            "budget checkpoint renewed ({}): {} tool calls, {} model calls, {} min used; the run is still producing new results or file changes, so the turn continues.",
+            "budget checkpoint renewed ({}): {} tool calls, {} model calls, {} min used; files are still changing or a verification is passing, so the turn continues.",
             trigger.code(),
             self.tool_calls,
             self.model_calls,
@@ -435,6 +451,10 @@ pub struct StallTracker {
     failures: HashMap<String, Counter>,
     repeats: HashMap<String, Counter>,
     idle_successes: HashMap<String, Counter>,
+    /// Identical call arguments *and* identical result, even when other calls
+    /// interleave. A re-fetch at the same offset or a no-op edit repeated
+    /// forever is a loop the consecutive counter cannot see.
+    duplicates: HashMap<String, Counter>,
     trip: Option<Trip>,
     /// Workspace identity, read lazily and reused by every counter.
     workspace: WorkspaceMemo,
@@ -454,6 +474,7 @@ impl StallTracker {
             failures: HashMap::new(),
             repeats: HashMap::new(),
             idle_successes: HashMap::new(),
+            duplicates: HashMap::new(),
             trip: None,
             workspace: WorkspaceMemo::default(),
             fingerprint: workspace_state,
@@ -483,6 +504,31 @@ impl StallTracker {
         // reported file change (above) or the end-of-batch re-check clears it.
         if self.trip.is_some() {
             return;
+        }
+        // The same arguments producing the same result is a loop even when
+        // other calls interleave (A, B, A, B, …), which the consecutive
+        // counter cannot see. `bg logs` is exempt: a slow build can print the
+        // same line for a while and is still advancing.
+        // A failed call repeated with the same error is a loop whatever the
+        // tool; a re-fetch at the same offset is the documented case for a
+        // read. Ordinary reads and `bg logs` polls may legitimately return the
+        // same bytes while the turn is making progress elsewhere.
+        let duplicate_watch =
+            outcome.is_error || outcome.family == "fetch" || outcome.family.starts_with("fetch ");
+        if duplicate_watch {
+            let key = format!(
+                "{}\u{1}{:016x}",
+                outcome.signature,
+                result_digest(outcome.result)
+            );
+            if let Some(count) = self.bump(cwd, Counted::Duplicate, &key) {
+                self.set_trip_with_detail(
+                    TripKind::Duplicate,
+                    outcome.family,
+                    count,
+                    Some(fingerprint_detail(outcome.result)),
+                );
+            }
         }
         if outcome.is_error {
             if let Some(count) = self.bump(cwd, Counted::Failure, outcome.family) {
@@ -518,6 +564,7 @@ impl StallTracker {
             Counted::Failure => &mut self.failures,
             Counted::Repeat => &mut self.repeats,
             Counted::Success => &mut self.idle_successes,
+            Counted::Duplicate => &mut self.duplicates,
         };
         bump(
             counters,
@@ -530,6 +577,16 @@ impl StallTracker {
     }
 
     fn set_trip(&mut self, kind: TripKind, family: &str, count: u32) {
+        self.set_trip_with_detail(kind, family, count, None);
+    }
+
+    fn set_trip_with_detail(
+        &mut self,
+        kind: TripKind,
+        family: &str,
+        count: u32,
+        detail: Option<String>,
+    ) {
         if self.trip.is_some() {
             return;
         }
@@ -538,6 +595,7 @@ impl StallTracker {
             kind,
             family: family.to_string(),
             count,
+            detail,
             workspace,
         });
     }
@@ -546,6 +604,7 @@ impl StallTracker {
         self.failures.clear();
         self.repeats.clear();
         self.idle_successes.clear();
+        self.duplicates.clear();
         self.trip = None;
     }
 
@@ -569,6 +628,7 @@ impl StallTracker {
         self.failures.clear();
         self.repeats.clear();
         self.idle_successes.clear();
+        self.duplicates.clear();
     }
 
     pub fn stalled(&self) -> bool {
@@ -595,6 +655,17 @@ impl StallTracker {
                 "{} successful calls of {} changed no file and passed no verification this turn; stop repeating it and report the last known state, or change approach in a new turn",
                 trip.count, trip.family
             ),
+            TripKind::Duplicate => {
+                let detail = trip
+                    .detail
+                    .as_deref()
+                    .map(|detail| format!(" The result was: {detail}"))
+                    .unwrap_or_default();
+                format!(
+                    "the same {} call returned byte-identical output {} times this turn; you already have that result.{detail} Do not repeat it: use the artifact or the lines you already have, or change approach in a new turn",
+                    trip.family, trip.count
+                )
+            }
         })
     }
 }
@@ -604,6 +675,7 @@ enum TripKind {
     Repeated,
     Failed,
     Unproductive,
+    Duplicate,
 }
 
 #[derive(Debug)]
@@ -611,6 +683,9 @@ struct Trip {
     kind: TripKind,
     family: String,
     count: u32,
+    /// A short excerpt of the repeated result, so the stop message can quote
+    /// the error or the content that came back.
+    detail: Option<String>,
     /// Workspace state when the trip fired. If the batch that follows changed
     /// it, the turn is not stalled.
     workspace: Option<String>,
@@ -630,6 +705,7 @@ enum Counted {
     Failure,
     Repeat,
     Success,
+    Duplicate,
 }
 
 impl Counted {
@@ -637,8 +713,24 @@ impl Counted {
         match self {
             Counted::Failure | Counted::Repeat => family_limit,
             Counted::Success => success_limit,
+            // Three identical (arguments, result) pairs in one turn is a
+            // loop; the third is where the guard speaks. Zero disables it
+            // with the family guard.
+            Counted::Duplicate => {
+                if family_limit == 0 {
+                    0
+                } else {
+                    3
+                }
+            }
         }
     }
+}
+
+/// A one-line excerpt of a repeated result for the stop message.
+fn fingerprint_detail(result: &str) -> String {
+    let flat = result.split_whitespace().collect::<Vec<_>>().join(" ");
+    crate::text::clip(&flat, 220)
 }
 
 /// How the workspace is identified. A function pointer rather than a closure
@@ -1294,7 +1386,9 @@ mod tests {
             "bash cat :: cat notes.txt",
             "new facts",
             false,
-            false,
+            // A checkpoint renews on the same progress the stall tracker
+            // counts: a file change or a passing verification.
+            true,
             false,
         );
         assert_eq!(
@@ -1393,7 +1487,9 @@ mod tests {
                 &format!("bash cat :: cat notes-{calls}.txt"),
                 &format!("result {calls}"),
                 false,
-                false,
+                // The last call changed a file: that is what renews a
+                // checkpoint, not a merely new result.
+                calls == 8,
                 false,
             );
         }
@@ -1614,6 +1710,73 @@ mod tests {
     }
 
     #[test]
+    fn identical_failures_trip_at_the_third_repeat_even_when_interleaved() {
+        let dir = empty_workspace();
+        let mut progress = RunProgress::new(limits());
+        let fail = |progress: &mut RunProgress, dir: &Path| {
+            record(
+                progress,
+                dir,
+                "edit",
+                "edit :: path=a.rs",
+                "[NO_CHANGE] `old` and `new` are identical",
+                true,
+                false,
+                false,
+            );
+        };
+        fail(&mut progress, dir.path());
+        // A different call between two identical failures must not reset the
+        // duplicate count; only a file change does.
+        record(
+            &mut progress,
+            dir.path(),
+            "bash ls",
+            "bash ls :: ls",
+            "a.rs",
+            false,
+            false,
+            false,
+        );
+        fail(&mut progress, dir.path());
+        assert!(!progress.stalled(), "two repeats are not yet a loop");
+        fail(&mut progress, dir.path());
+        assert!(progress.stalled());
+        assert!(
+            progress
+                .stall_message()
+                .contains("`old` and `new` are identical"),
+            "the stop message quotes the repeated error: {}",
+            progress.stall_message()
+        );
+    }
+
+    #[test]
+    fn ordinary_reads_with_the_same_output_do_not_trip_the_duplicate_guard() {
+        // #138: reading the same bytes again is inspection. Alternate two
+        // paths so the consecutive-identical guard is not the thing under
+        // test; the duplicate counter must also stay off for a successful
+        // read, even when its result repeats.
+        let dir = empty_workspace();
+        let mut progress = RunProgress::new(limits());
+        for index in 0..8 {
+            let path = if index % 2 == 0 { "a.rs" } else { "b.rs" };
+            record_reading(
+                &mut progress,
+                dir.path(),
+                "read",
+                &format!("read :: path={path}"),
+                "working tree clean",
+                false,
+                false,
+                false,
+                true,
+            );
+            assert!(!progress.stalled(), "call {} is inspection", index + 1);
+        }
+    }
+
+    #[test]
     fn identical_successful_calls_trip_the_repeat_guard() {
         let dir = empty_workspace();
         let mut progress = RunProgress::new(limits());
@@ -1634,6 +1797,47 @@ mod tests {
         }
         assert!(progress.stalled());
         assert!(progress.stall_message().contains("same call was repeated"));
+    }
+
+    #[test]
+    fn identical_failures_trip_on_the_third_repeat_even_interleaved() {
+        let dir = empty_workspace();
+        let mut progress = RunProgress::new(limits());
+        let signature = "edit :: path=a.txt,old=<body>,new=<body>";
+        let error = "[NO_CHANGE] `old` and `new` are identical; nothing to replace";
+        for round in 0..3 {
+            record(
+                &mut progress,
+                dir.path(),
+                "edit path=a.txt",
+                signature,
+                error,
+                true,
+                false,
+                false,
+            );
+            if round < 2 {
+                // A different call in between must not hide the repeat.
+                record(
+                    &mut progress,
+                    dir.path(),
+                    "read",
+                    &format!("read :: path=b{round}.txt"),
+                    &format!("b{round} contents"),
+                    false,
+                    false,
+                    false,
+                );
+                assert!(!progress.stalled(), "round {round} is below the limit");
+            }
+        }
+        assert!(progress.stalled());
+        let message = progress.stall_message();
+        assert!(message.contains("byte-identical output"), "{message}");
+        assert!(
+            message.contains("NO_CHANGE"),
+            "the error is quoted: {message}"
+        );
     }
 
     #[test]
