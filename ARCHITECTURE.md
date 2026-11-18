@@ -933,12 +933,11 @@ form. `tot doctor` prints both sizes.
   capped at 2500 characters. Parsers strip ANSI and progress noise.
 - `review` reads `git status --porcelain=v1 -z`, numstat, and the diff. It scans
   added lines for secrets, debug statements, TODOs, lockfiles, config files,
-  deletion-heavy changes, binary files, and source changes without tests. The
-  diff is capped and truncation names the follow-up call. Every read is scoped
-  to the session root: a workspace without a `.git` of its own reports only the
-  files under it, never the enclosing repository's changes or `../` paths.
   deletion-heavy changes, binary files, and source changes whose module has no
-  test. The diff is capped and truncation names the follow-up call.
+  test. The diff is capped and truncation names the follow-up call. Every read
+  is scoped to the session root: a workspace without a `.git` of its own
+  reports only the files under it, never the enclosing repository's changes or
+  `../` paths.
 - `finding` supports `add`, `update`, `list`, `report`, `verify`. Severities:
   critical, high, medium, low, info. Statuses: open, fixed, accepted,
   false-positive. `add` requires title, severity, target, and evidence.

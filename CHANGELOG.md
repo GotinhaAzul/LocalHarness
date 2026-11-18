@@ -73,42 +73,29 @@ release may change defaults when the change is called out below.
   `review`, `status`, `diff`, `log`, `blame` and `commit_message` report only
   files under the workspace and paths that leave it are refused, while
   `stage`, `unstage`, `commit`, `undo`, `branch`/`worktree` mutations,
-  `/commit` and `pr draft` return `GIT_REPO_OUTSIDE_ROOT` and change nothing in the parent
-  repository ([#136](https://github.com/GotinhaAzul/LocalHarness/issues/136)).
+  `/commit` and `pr draft` return `GIT_REPO_OUTSIDE_ROOT` and change nothing
+  in the parent repository ([#136](https://github.com/GotinhaAzul/LocalHarness/issues/136)).
 - The stall guard saw only consecutive identical calls, so a turn could burn
-  its whole tool budget in an OCR loop: the D09 run made 126 tool calls in
-  420 s, mostly exit-0 probes that each printed slightly different garbage,
-  and neither the stall nor the tool checkpoint stopped it. Calls are now
-  grouped into a tool family and three cumulative per-turn counts stop the
-  turn as `stalled`: repeated calls (successful or failing), failing calls,
-  and successful calls that changed no workspace file and passed no verify.
-  Interleaving a different call, a same-family success, and writes outside the
-  session directory do not reset them; a workspace change or a passing verify
-  does. Read-only calls never count as repeats or idle successes: read-only
-  tools, the reading actions of mixed tools (`bg logs`, `todo list`,
-  `pr checks`, ...), and bash commands that only read (`cat`, `git show`,
-  `git status`, `curl`/`wget` without a writing flag, `gh pr view`, ...), so
-  polling a build or reading forty pages is not a loop; the identical-call
-  cycle guard records them without tripping, and a read repeated with the same
-  output is still caught by the stall guard. A counter
-  fingerprinted the workspace by building a git content tree, which wrote a
-  blob per untracked file into `.git/objects` and cost about a second on a
-  large file; the identity is now `git status --untracked-files=all` from the
-  session directory plus HEAD and each listed path's size and mtime, which
-  writes nothing, and it is memoized: read once for the first counter, reused
-  by later counters, re-read only to decide a trip and once at the end of the
-  batch, and invalidated by a reported file change. So a `sed -i` fix loop that
-  really changes files is not a stall. `[budgets] max_same_tool_family`
-  (default 8) and
-  `max_same_tool_family_success` (default 24) set the limits, and 0 disables
-  either
+  its whole tool budget in a loop: one OCR run made 126 tool calls in 420 s,
+  mostly exit-0 probes with slightly different output. Calls are now grouped
+  into tool families, and three cumulative per-turn counts stop the turn as
+  `stalled`: repeated calls, failing calls, and successful calls that changed
+  no workspace file. A workspace change or a passing verify resets them;
+  interleaving, same-family successes and writes outside the session
+  directory do not. Read-only calls (read-only tools, `bg logs`, `git show`,
+  `curl` GETs, `gh pr view`, ...) never count, so polling a build is not a
+  loop. Before stopping, the guard checks a memoized workspace fingerprint
+  (`git status` plus sizes and mtimes; nothing is written to `.git`), so a
+  `sed -i` fix loop that changes files continues. `[budgets]
+  max_same_tool_family` (default 8) and `max_same_tool_family_success`
+  (default 24) set the limits; 0 disables either
   ([#138](https://github.com/GotinhaAzul/LocalHarness/issues/138)).
 - A tool call cut off by the output token limit no longer ends the turn as
   `Error`. The partial call is still never executed, but the model is now told
   to split it into smaller calls and the loop continues, sharing the three
   output-recovery nudges; after those it stops as `stalled` with
   `tool_call_truncated` and names `max_output_tokens` as the next action. The
-  prose streamed before the cut is kept with `stop_reason: length`
+  cut reply is kept with `stop_reason: length`
   ([#140](https://github.com/GotinhaAzul/LocalHarness/issues/140)).
 - A compaction in the middle of one long agentic turn no longer sends a
   conversation without a user message. The kept tail started at an assistant
