@@ -1,10 +1,11 @@
 [advisories]
 version = 2
 yanked = "warn"
-# serde_yaml is deprecated and pulls unsafe-libyaml, which has no safe
-# upgrade. The advisory is unmaintained-only, not a vulnerability; replace
-# serde_yaml before lifting this ignore.
-ignore = ["RUSTSEC-2024-0449"]
+# Both advisories are unmaintained-only, not vulnerabilities, and have no
+# safe upgrade:
+# - serde_yaml pulls unsafe-libyaml; replace serde_yaml before lifting this.
+# - chrono (RUSTSEC-2026-0543); replace with jiff or time before lifting this.
+ignore = ["RUSTSEC-2024-0449", "RUSTSEC-2026-0543"]
 
 [licenses]
 version = 2

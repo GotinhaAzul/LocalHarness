@@ -515,28 +515,26 @@ mod tests {
 
     #[tokio::test]
     async fn no_steps_suggests_the_detected_project_command() {
+        // Go detection is deterministic: the Python path depends on whether
+        // pytest is importable on the machine, which differs in CI.
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("pyproject.toml"),
-            "[project]\nname = \"demo\"\n",
-        )
-        .unwrap();
+        std::fs::write(dir.path().join("go.mod"), "module example.com/demo\n").unwrap();
         let ctx = crate::tools::write::test_context(dir.path());
         let result = VerifyTool.call(&ctx, json!({})).await;
         assert!(result.is_error);
         assert!(
-            result.content.contains("pyproject.toml"),
+            result.content.contains("go.mod"),
             "must name the marker it detected: {}",
             result.content
         );
         assert!(
-            result.content.contains("bash") && result.content.contains("pytest"),
+            result.content.contains("bash") && result.content.contains("go test ./..."),
             "must offer a runnable detected command: {}",
             result.content
         );
         assert!(
             !result.content.contains("cargo test"),
-            "must not suggest cargo in a Python project: {}",
+            "must not suggest cargo in a Go project: {}",
             result.content
         );
     }
