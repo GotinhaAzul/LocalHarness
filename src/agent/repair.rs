@@ -464,8 +464,8 @@ pub fn repair_with_notes(tool: &str, raw: &str, schema: &Value) -> Result<Repair
         return Err(RepairError::new(
             "interactive_command",
             format!(
-                "`{blocked}` is interactive and would hang the harness. {}. Non-interactive alternative: bash with a single command, or bg for long-running work.",
-                remedy_for(blocked)
+                "`{}` is interactive and would hang the harness. {}. Non-interactive alternative: bash with a single command, or bg for long-running work.",
+                blocked.description, blocked.remedy
             ),
         ));
     }
@@ -773,53 +773,193 @@ fn edit_distance(a: &str, b: &str) -> usize {
     row[b.len()]
 }
 
+/// A TTY-only invocation and the non-interactive call shape to use instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Interactive {
+    /// Short description used in the error, such as `vim`.
+    pub description: &'static str,
+    /// Program-specific advice the model can follow to recover.
+    pub remedy: &'static str,
+}
+
+impl Interactive {
+    fn new(description: &'static str) -> Self {
+        Self {
+            description,
+            remedy: remedy_for(description),
+        }
+    }
+
+    fn database(program: &str) -> Self {
+        let (description, remedy) = match program {
+            "sqlite3" => (
+                "an interactive sqlite3 shell",
+                "Pass a query after the database path, for example `sqlite3 DB \"select 1;\"`",
+            ),
+            "mysql" => (
+                "an interactive mysql shell",
+                "Pass a query with -e, for example `mysql -e 'select 1'`",
+            ),
+            "redis-cli" => (
+                "an interactive redis-cli shell",
+                "Pass the command as operands, for example `redis-cli ping`",
+            ),
+            _ => (
+                "an interactive database shell",
+                "Pass a query with -c, for example `psql -c 'select 1'`",
+            ),
+        };
+        Self {
+            description,
+            remedy,
+        }
+    }
+}
+
 /// Detect TTY-only invocations that would hang the harness.
-pub fn interactive_command(command: &str) -> Option<&'static str> {
+pub fn interactive_command(command: &str) -> Option<Interactive> {
     let mut tokens = command.split_whitespace();
     let program = tokens.next()?.rsplit('/').next().unwrap_or("");
     let rest: Vec<&str> = tokens.collect();
     let editors = ["vim", "vi", "nvim", "nano", "emacs", "pico", "micro"];
     if editors.contains(&program) {
-        return Some(match program {
+        return Some(Interactive::new(match program {
             "vim" | "vi" | "nvim" => "vim",
             "nano" => "nano",
             "emacs" => "emacs",
             _ => "an editor",
-        });
+        }));
     }
     let pagers = ["less", "more", "most"];
     if pagers.contains(&program) {
-        return Some("a pager");
+        return Some(Interactive::new("a pager"));
     }
     let monitors = ["top", "htop", "btop", "watch"];
     if monitors.contains(&program) {
-        return Some(match program {
+        return Some(Interactive::new(match program {
             "watch" => "watch",
             _ => "top",
-        });
+        }));
     }
     if ["man", "info"].contains(&program) {
-        return Some("a pager");
+        return Some(Interactive::new("a pager"));
     }
     if ["tmux", "screen"].contains(&program) {
-        return Some("a terminal multiplexer");
+        return Some(Interactive::new("a terminal multiplexer"));
     }
     if ["psql", "mysql", "sqlite3", "redis-cli"].contains(&program)
-        && !rest
-            .iter()
-            .any(|arg| *arg == "-c" || *arg == "--command" || *arg == "-e")
+        && !database_runs_batch(program, &rest, command)
     {
-        return Some("an interactive database shell");
+        return Some(Interactive::database(program));
     }
     if ["python", "python3", "node", "irb", "ghci", "php", "ruby"].contains(&program)
         && rest.is_empty()
     {
-        return Some("a REPL");
+        return Some(Interactive::new("a REPL"));
     }
     if program == "ssh" && rest.len() <= 1 {
-        return Some("ssh");
+        return Some(Interactive::new("ssh"));
     }
     None
+}
+
+/// Whether a database client has work to do without prompting for input.
+fn database_runs_batch(program: &str, args: &[&str], command: &str) -> bool {
+    // A redirect feeds the client a file or heredoc instead of the TTY.
+    if command.contains('<') {
+        return true;
+    }
+    match program {
+        "sqlite3" => sqlite3_runs_batch(args),
+        // psql also runs a script with -f, and -l/-?/-V print and exit.
+        "psql" => has_flag(
+            args,
+            &[
+                "-c",
+                "--command",
+                "-f",
+                "--file",
+                "-l",
+                "--list",
+                "-?",
+                "--help",
+                "-V",
+                "--version",
+            ],
+        ),
+        // mysql only takes a statement with -e; a bare name is a database.
+        "mysql" => has_flag(
+            args,
+            &["-e", "--execute", "-?", "--help", "-V", "--version"],
+        ),
+        // redis-cli runs the command given as operands, not a flag.
+        "redis-cli" => {
+            has_flag(args, &["-x", "--version", "-v", "--help"])
+                || positional_args(
+                    args,
+                    &[
+                        "-h", "-p", "-s", "-a", "-u", "-n", "-r", "-i", "--user", "--pass", "--db",
+                        "--eval",
+                    ],
+                ) > 0
+        }
+        _ => true,
+    }
+}
+
+/// `sqlite3 [options] DB [SQL]` runs the trailing operand and exits; the help,
+/// version, and `-cmd` options never reach the prompt either.
+fn sqlite3_runs_batch(args: &[&str]) -> bool {
+    if has_flag(
+        args,
+        &["-help", "--help", "-version", "--version", "-cmd", "--cmd"],
+    ) {
+        return true;
+    }
+    if positional_args(
+        args,
+        &[
+            "-cmd",
+            "--cmd",
+            "-init",
+            "-separator",
+            "-nullvalue",
+            "-newline",
+            "-vfs",
+        ],
+    ) >= 2
+    {
+        return true;
+    }
+    false
+}
+
+fn has_flag(args: &[&str], flags: &[&str]) -> bool {
+    args.iter().any(|arg| {
+        flags.contains(arg)
+            || arg
+                .split_once('=')
+                .is_some_and(|(name, _)| name.starts_with("--") && flags.contains(&name))
+    })
+}
+
+/// Count operands, skipping the values of options that take one.
+fn positional_args(args: &[&str], value_flags: &[&str]) -> usize {
+    let mut operands = 0;
+    let mut index = 0;
+    while index < args.len() {
+        if args[index].starts_with('-') && args[index].len() > 1 {
+            index += if value_flags.contains(&args[index]) {
+                2
+            } else {
+                1
+            };
+            continue;
+        }
+        operands += 1;
+        index += 1;
+    }
+    operands
 }
 
 fn remedy_for(blocked: &str) -> &'static str {
@@ -830,7 +970,6 @@ fn remedy_for(blocked: &str) -> &'static str {
         "a terminal multiplexer" => "Run the underlying command directly, or use bg",
         "ssh" => "Use `ssh host 'command'` so the command runs non-interactively",
         "a REPL" => "Pass the script as an argument, for example `python script.py`",
-        "an interactive database shell" => "Pass a query with -c, for example `psql -c 'select 1'`",
         _ => "Use a non-interactive command",
     }
 }
@@ -1086,6 +1225,75 @@ mod tests {
         let schema = schema_for("bash");
         let err = repair("bash", r#"{"command":"vim a.rs"}"#, &schema).unwrap_err();
         assert_eq!(err.code, "interactive_command");
+    }
+
+    #[test]
+    fn database_clients_with_work_are_not_interactive() {
+        for command in [
+            r#"sqlite3 db "select 1;""#,
+            "sqlite3 -help",
+            "sqlite3 --version",
+            "sqlite3 db -cmd '.tables'",
+            "sqlite3 <schema.sql",
+            "psql -c 'select 1'",
+            "psql -f query.sql",
+            "mysql -e 'select 1'",
+            "redis-cli ping",
+            "redis-cli -p 6379 get key",
+        ] {
+            assert!(
+                interactive_command(command).is_none(),
+                "`{command}` runs without a TTY"
+            );
+        }
+    }
+
+    #[test]
+    fn database_clients_without_work_are_rejected() {
+        for command in [
+            "sqlite3",
+            "sqlite3 db",
+            "psql mydb",
+            "psql",
+            "mysql mydb",
+            "redis-cli",
+        ] {
+            assert!(
+                interactive_command(command).is_some(),
+                "`{command}` would prompt for input"
+            );
+        }
+    }
+
+    #[test]
+    fn database_remedies_match_the_program() {
+        let sqlite = interactive_command("sqlite3 db").expect("blocked");
+        assert!(sqlite.remedy.contains(r#"sqlite3 DB "select 1;""#));
+        assert!(!sqlite.remedy.contains("-c"));
+        assert!(
+            interactive_command("psql db")
+                .unwrap()
+                .remedy
+                .contains("psql -c 'select 1'")
+        );
+        assert!(
+            interactive_command("mysql db")
+                .unwrap()
+                .remedy
+                .contains("mysql -e 'select 1'")
+        );
+        assert!(
+            interactive_command("redis-cli")
+                .unwrap()
+                .remedy
+                .contains("redis-cli ping")
+        );
+
+        // The error a model reads carries the program-specific advice.
+        let err = repair("bash", r#"{"command":"sqlite3 db"}"#, &schema_for("bash")).unwrap_err();
+        assert_eq!(err.code, "interactive_command");
+        assert!(err.message.contains(r#"sqlite3 DB "select 1;""#));
+        assert!(!err.message.contains("psql"));
     }
 
     #[test]
