@@ -24,7 +24,9 @@ use crate::tools::{ToolResult, display_path};
 
 use super::calls::CallLedger;
 use super::gates::{self, LoopDecision, LoopGuard, SettleDecision};
-use super::limits::{BudgetCheck, RunProgress, StopReason};
+use super::limits::{
+    BudgetCheck, RunProgress, StopReason, ToolOutcome, call_read_only, tool_family, tool_signature,
+};
 use super::{AgentEvent, AgentState, Core};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -475,15 +477,11 @@ async fn run_loop(
             }
         }
         if progress.stalled() {
-            append_error(
-                &core.session,
-                StopReason::Stalled.code(),
-                StopReason::Stalled.message(),
-                true,
-            );
+            let message = progress.stall_message();
+            append_error(&core.session, StopReason::Stalled.code(), &message, true);
             let _ = tx.send(AgentEvent::Guard {
                 code: "stalled".into(),
-                message: StopReason::Stalled.message().into(),
+                message,
             });
             return TurnOutcome::ok(TurnStatus::Stalled);
         }
@@ -825,6 +823,44 @@ async fn run_loop(
                     budget.context_window
                 )));
                 continue;
+            }
+            // The output limit cut a tool call before its JSON closed, so the
+            // call was dropped and nothing ran. It has no id to pair with a
+            // result, so the recovery step is a user nudge that asks for
+            // smaller calls; the allowance is shared with the other output
+            // repairs.
+            Err(err) if err.class == ErrorClass::ToolCallTruncated => {
+                // Record the cut reply even when it carried no prose, so the
+                // nudge below follows an assistant turn and roles keep
+                // alternating for templates that require it.
+                let cut = partial.take().unwrap_or_else(|| AssistantData {
+                    content: None,
+                    reasoning: None,
+                    tool_calls: None,
+                    usage: None,
+                    stop_reason: Some("length".into()),
+                });
+                if let Err(error) = append_assistant(&core.session, cut) {
+                    tracing::warn!(%error, "cannot persist partial assistant output");
+                }
+                let code = err.class.code().to_string();
+                if progress.output_recoveries < MAX_OUTPUT_RECOVERIES {
+                    progress.output_recoveries += 1;
+                    append_error(&core.session, &code, &err.message, true);
+                    let _ = tx.send(AgentEvent::Notice(format!(
+                        "the model's tool call was cut off by the output token limit; asking it to split the call into smaller steps ({}/{MAX_OUTPUT_RECOVERIES})",
+                        progress.output_recoveries
+                    )));
+                    if let Err(error) = append_user(&core.session, TRUNCATED_CALL_NUDGE) {
+                        return TurnOutcome::error("session_write", error.to_string());
+                    }
+                    continue;
+                }
+                let message = "the model's tool call was cut off by the output token limit after the output-recovery allowance ran out; nothing was executed. Raise [model] max_output_tokens or split the task into smaller steps."
+                    .to_string();
+                append_error(&core.session, &code, &message, false);
+                let _ = tx.send(AgentEvent::Guard { code, message });
+                return TurnOutcome::ok(TurnStatus::Stalled);
             }
             Err(err) => {
                 if let Some(partial) = partial.take()
@@ -1288,15 +1324,11 @@ async fn run_loop(
             return TurnOutcome::ok(TurnStatus::Done);
         }
         if progress.stalled() {
-            append_error(
-                &core.session,
-                StopReason::Stalled.code(),
-                StopReason::Stalled.message(),
-                true,
-            );
+            let message = progress.stall_message();
+            append_error(&core.session, StopReason::Stalled.code(), &message, true);
             let _ = tx.send(AgentEvent::Guard {
                 code: "stalled".into(),
-                message: StopReason::Stalled.message().into(),
+                message,
             });
             return TurnOutcome::ok(TurnStatus::Stalled);
         }
@@ -1647,6 +1679,11 @@ const REPETITION_STOP: &str = "repetition";
 /// Nudges for broken output (loops, cut-offs, empty replies) per turn.
 const MAX_OUTPUT_RECOVERIES: u32 = 3;
 
+/// Fed back as a user message when the output limit cut a tool call before
+/// its JSON closed. The call is never dispatched, so no result can be paired
+/// with it; the message is the recovery step.
+const TRUNCATED_CALL_NUDGE: &str = "[totality] your tool call was cut off by the output token limit, so nothing ran. Send smaller calls: one short step per call instead of one long script or one large write, then continue.";
+
 #[derive(Default)]
 struct OutputRecovery {
     /// One line for the user.
@@ -1783,7 +1820,7 @@ struct StreamAccum {
 impl StreamAccum {
     /// Content streamed so far, without tool calls, for a cancelled or failed
     /// generation. Keeps the branch useful after an interruption.
-    fn partial(&self) -> Option<AssistantData> {
+    fn partial(&self, stop_reason: &str) -> Option<AssistantData> {
         let keep_reasoning = !self.strip_reasoning && !self.reasoning.is_empty();
         if self.content.trim().is_empty() && !keep_reasoning {
             return None;
@@ -1797,7 +1834,7 @@ impl StreamAccum {
             reasoning: keep_reasoning.then(|| self.reasoning.clone()),
             tool_calls: None,
             usage: self.usage.clone(),
-            stop_reason: Some("cancelled".into()),
+            stop_reason: Some(stop_reason.to_string()),
         })
     }
 
@@ -2046,15 +2083,16 @@ async fn stream_assistant(
         let _ = tx.send(AgentEvent::Usage(usage.clone()));
     }
     if let Err(err) = accum.validate_calls() {
-        *partial = accum.partial();
+        // A truncated call was cut by the output limit, not cancelled.
+        *partial = accum.partial("length");
         return Err(err);
     }
     if let Some(err) = failure {
-        *partial = accum.partial();
+        *partial = accum.partial("cancelled");
         return Err(err);
     }
     if cancel.is_cancelled() {
-        *partial = accum.partial();
+        *partial = accum.partial("cancelled");
         return Err(ProviderError::new(
             ErrorClass::Cancelled,
             "generation cancelled",
@@ -2873,7 +2911,8 @@ async fn execute_batch(
                                 call.name,
                                 super::repair::canonical_json(&guard_args(&call.name, &args))
                             );
-                            match loop_guard.check_and_record(signature) {
+                            let read_only = reads_only(core, &call.name, &raw);
+                            match loop_guard.check_and_record(signature, read_only) {
                                 LoopDecision::Tripped { reason } => {
                                     result = ToolResult::err("loop_guard", reason.clone());
                                     guard_trip = Some(("loop_guard".into(), reason));
@@ -3237,7 +3276,13 @@ async fn execute_batch(
             if matches!(call.name.as_str(), "write" | "edit" | "patch" | "undo")
                 && let Some(path) = &args_path
             {
-                changed = true;
+                // A write to a path outside the session directory (including
+                // a temporary root) is scratch: it neither counts as progress
+                // nor clears the loop guard's counts.
+                changed = ctx
+                    .resolve(path)
+                    .map(|resolved| inside_workspace(&ctx.cwd, &resolved))
+                    .unwrap_or(false);
                 inferred_mutations += 1;
                 inferred_files.insert(path.clone());
                 let display = repaired
@@ -3252,12 +3297,21 @@ async fn execute_batch(
         }
 
         let fingerprint = fingerprint(&call.name, &raw, &tool_result.content);
+        let family = tool_family(&call.name, &raw);
+        let signature = tool_signature(&call.name, &raw);
+        let read_only = reads_only(core, &call.name, &raw);
         progress.record_tool_result(
-            &fingerprint,
-            &tool_result.content,
-            tool_result.is_error,
-            changed,
-            verified_ok,
+            &ctx.cwd,
+            ToolOutcome {
+                fingerprint: &fingerprint,
+                family: &family,
+                signature: &signature,
+                result: &tool_result.content,
+                is_error: tool_result.is_error,
+                changed_file: changed,
+                verified_ok,
+                read_only,
+            },
         );
         if changed || verified_ok {
             // A file change or a passing verification is real progress; the
@@ -3318,6 +3372,11 @@ async fn execute_batch(
             }
         }
     }
+
+    // The batch may have changed the workspace after the family guard fired
+    // (a `sed -i`, a script writing a file the harness never saw). Only a trip
+    // that survived the whole batch ends the turn.
+    progress.recheck_workspace(&ctx.cwd);
 
     let guard = guard_trip.map(|(code, reason)| {
         (
@@ -3455,7 +3514,9 @@ async fn finish_review(
                             }
                         }
                         if outcome.changed {
-                            changed = true;
+                            // A write outside the workspace is scratch, not
+                            // progress the guards should credit.
+                            changed |= inside_workspace(&ctx.cwd, &write.path);
                             applied += outcome.accepted;
                         }
                         if let Some(final_content) = &outcome.final_content {
@@ -3616,12 +3677,22 @@ async fn finish_review(
             }
         }
         let raw = arguments_raw(&call.call.arguments);
+        let family = tool_family(&call.call.name, &raw);
+        let signature = tool_signature(&call.call.name, &raw);
+        let fingerprint = fingerprint(&call.call.name, &raw, &tool_result.content);
+        let read_only = reads_only(core, &call.call.name, &raw);
         progress.record_tool_result(
-            &fingerprint(&call.call.name, &raw, &tool_result.content),
-            &tool_result.content,
-            tool_result.is_error,
-            changed,
-            false,
+            &ctx.cwd,
+            ToolOutcome {
+                fingerprint: &fingerprint,
+                family: &family,
+                signature: &signature,
+                result: &tool_result.content,
+                is_error: tool_result.is_error,
+                changed_file: changed,
+                verified_ok: false,
+                read_only,
+            },
         );
         if changed {
             loop_guard.record_progress();
@@ -3728,6 +3799,31 @@ fn fingerprint(name: &str, args: &str, content: &str) -> String {
     args.hash(&mut hasher);
     content.hash(&mut hasher);
     format!("{name}:{:016x}", hasher.finish())
+}
+
+/// Whether a call only inspects: the tool's own read-only declaration, or the
+/// loop guard's per-action table for a tool whose actions mix reads and writes
+/// (`bg logs` against `bg start`, `git status` against `git commit`).
+fn reads_only(core: &Core, name: &str, arguments: &str) -> bool {
+    core.tools
+        .iter()
+        .find(|tool| tool.name() == name)
+        .is_some_and(|tool| tool.read_only())
+        || call_read_only(name, arguments)
+}
+
+/// Whether a write target belongs to the workspace. Absolute paths outside the
+/// session directory — a temporary root, a scratch file in another tree — are
+/// not progress: changing them does not advance the task, so they neither renew
+/// the stall guard's counts nor clear the loop guard's.
+fn inside_workspace(cwd: &std::path::Path, target: &std::path::Path) -> bool {
+    let root = cwd
+        .canonicalize()
+        .unwrap_or_else(|_| crate::tools::normalize(cwd));
+    let path = target
+        .canonicalize()
+        .unwrap_or_else(|_| crate::tools::normalize(target));
+    path.starts_with(&root)
 }
 
 fn append_user(session: &crate::tools::SessionHandle, text: &str) -> anyhow::Result<()> {

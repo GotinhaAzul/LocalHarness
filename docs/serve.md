@@ -14,14 +14,20 @@ tot --endpoint http://127.0.0.1:8080 --model qwen3 serve
 ```
 
 stdout carries exactly one JSON line with the address and the **path** of the
-token file. Human-readable notes go to stderr. The token itself is never
-printed or logged.
+token file. Read that path from the line instead of assuming one: the token
+file lives under the data directory, which is `~/.local/share/totality` on a
+fresh install but stays `~/.local/share/localharness` on an install upgraded
+from a pre-0.3 release ([configuration](configuration.md#paths)). Human-readable
+notes go to stderr. The token itself is never printed or logged.
 
 ## Quick start
 
 ```sh
-BASE=http://127.0.0.1:43817
-TOKEN=$(cat ~/.local/share/totality/serve/token-43817)
+# Paste the one JSON line that `tot serve` printed in its terminal.
+LINE='{"listening":"http://127.0.0.1:43817","token_file":"/home/me/.local/share/totality/serve/token-43817"}'
+BASE=$(jq -r .listening <<< "$LINE")
+TOKEN_FILE=$(jq -r .token_file <<< "$LINE")
+TOKEN=$(cat "$TOKEN_FILE")
 auth=(-H "Authorization: Bearer $TOKEN")
 
 # 1. Create a session rooted at the server's working directory.
@@ -37,6 +43,10 @@ curl -sN "${auth[@]}" "$BASE/v1/sessions/$ID/events?after=$AFTER"
 # Cancel from another shell.
 curl -s "${auth[@]}" -X POST $BASE/v1/sessions/$ID/cancel
 ```
+
+`jq` parses the line; without it, `sed -n 's/.*"token_file":"\([^"]*\)".*/\1/p'`
+extracts the same path. Do not hard-code either directory name: `--token-file`
+puts the file wherever you want, and the server removes it when it stops.
 
 ## Flags
 

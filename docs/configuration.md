@@ -5,23 +5,66 @@ defaults. Environment variables fill the gaps.
 
 ## Paths
 
+Defaults use the XDG bases: `$XDG_CONFIG_HOME` (default `~/.config`) and
+`$XDG_DATA_HOME` (default `~/.local/share`). Each holds a `totality/`
+directory, or an existing pre-0.3 `localharness/` one — see
+[Data and config directories](#data-and-config-directories).
+
 | Purpose | Default |
 |---|---|
-| Global config | `~/.config/totality/config.toml` |
-| Profiles | `~/.config/totality/profiles/` |
-| Skills | `~/.config/totality/skills/<name>/SKILL.md` |
-| Skills lockfile | `~/.config/totality/skills.lock` |
-| Skills trash | `~/.config/totality/skills-trash/` |
-| Workflows | `~/.config/totality/workflows/` |
-| External tools | `~/.config/totality/tools/*.toml` |
+| Global config | `<config dir>/config.toml` |
+| Profiles | `<config dir>/profiles/` |
+| Skills | `<config dir>/skills/<name>/SKILL.md` |
+| Skills lockfile | `<config dir>/skills.lock` |
+| Skills trash | `<config dir>/skills-trash/` |
+| Workflows | `<config dir>/workflows/` |
+| External tools | `<config dir>/tools/*.toml` |
 | MCP servers | `[mcp.<name>]` tables in `config.toml` ([docs/mcp.md](mcp.md)) |
-| Themes | `~/.config/totality/themes/*.toml` |
-| Data | `~/.local/share/totality/` |
-| Sessions | `~/.local/share/totality/sessions/<project-id>/` |
-| Engagements | `~/.local/share/totality/engagements/<name>/` |
+| Themes | `<config dir>/themes/*.toml` |
+| Data | `<data dir>/` |
+| Sessions | `<data dir>/sessions/<project-id>/` |
+| Engagements | `<data dir>/engagements/<name>/` |
 | Project config | `<cwd>/.harness/` (requires `--trust`) |
 
-`TOT_CONFIG_DIR` and `TOT_DATA_DIR` override the roots.
+The full paths, with no override and no legacy directory present, are
+`~/.config/totality/config.toml` and `~/.local/share/totality/`.
+
+### Data and config directories
+
+`TOT_CONFIG_DIR` and `TOT_DATA_DIR` set the roots outright; when unset, each
+root is resolved on its own in this order:
+
+1. `<XDG base>/totality`, unless it does not exist and the legacy directory
+   does.
+2. `<XDG base>/localharness`, when it exists as a directory and `totality`
+   does not.
+
+So a fresh install uses `~/.config/totality` and `~/.local/share/totality`,
+while an install upgraded from a pre-0.3 release keeps reading and writing
+`~/.config/localharness` and `~/.local/share/localharness`, with its config
+and sessions intact. If both exist, `totality` wins; if neither exists, it is
+created.
+
+To migrate, stop every `tot` process, then either move the directories or point
+the variables at the old paths:
+
+```sh
+# Stop `tot` first, then rename while the new name does not exist yet:
+mv ~/.local/share/localharness ~/.local/share/totality
+mv ~/.config/localharness ~/.config/totality
+
+# Or leave them in place and pin the roots:
+export TOT_DATA_DIR=~/.local/share/localharness
+export TOT_CONFIG_DIR=~/.config/localharness
+```
+
+If a `totality` directory already exists, merge the two by hand; `mv` would put
+the old directory inside the existing one.
+
+The pre-0.3 `LH_DATA_DIR` and `LH_CONFIG_DIR` names are still read when the
+`TOT_` ones are unset. Scripts that need a fixed path should not assume either
+directory name: `tot serve` prints its token file's path on the startup line,
+and `TOT_DATA_DIR` pins the root outright.
 
 ## Example
 
@@ -76,6 +119,35 @@ max_tool_calls = 120
 max_model_calls = 40
 max_wall_minutes = 30
 stall_calls = 12
+# Repeated or failing calls of one tool family allowed in a turn before it
+# stops as stalled. A family is `bash`'s program and subcommand, or another
+# tool's name plus its key arguments (a body argument such as `content` does
+# not create a new family). Temporary-path and number normalization apply to
+# bash families only: `tesseract /tmp/a/r.png --psm 6` and
+# `tesseract /tmp/b/r.png --psm 3` are one family, while two `read` calls for
+# different paths are two. Interleaving, an exit-0 call of the family, and a
+# success that changes nothing do not reset the count; a workspace change or a
+# passing verify does. Read-only calls are not counted as repeats (and a
+# failing read-only call still counts as a failure); a read repeated with the
+# same output is caught by `stall_calls` instead. 0 disables the guard.
+max_same_tool_family = 8
+# Successful calls of one family that changed no workspace file and passed no
+# verify, allowed in a turn. A same-family success does not reset it, so a
+# model that reruns OCR or conversion probes forever is stopped even when every
+# probe exits 0. Inspection is exempt: read-only tools (read, grep, glob,
+# recall, repo_map, lsp, evidence, fetch, skill, review, iocs, surface,
+# attack_path); the reading actions of mixed tools (bg logs/status, todo list,
+# thread status, finding list, detect validate, pr checks/review,
+# git status/diff/log/blame/commit_message, git branch|worktree op = "list");
+# and bash commands that only read (cat, ls, rg, git show, git ls-files,
+# curl/wget without a writing flag, gh pr view|list|diff|checks,
+# gh issue view|list, and a gh api GET).
+# A long exploratory analysis turn with many distinct `python3 -c` probes and
+# no file writes can reach this limit, because each probe exits 0 and changed
+# nothing. Raise `max_same_tool_family_success` for that kind of work, or set it
+# to 0 to disable the guard. Writes outside the session directory, including
+# temporary paths, do not count as progress.
+max_same_tool_family_success = 24
 verify_attempts = 2
 
 [prompt]
@@ -389,7 +461,9 @@ session and stops; the user reviews it in the TUI and approves with
 message; `\n` starts a new line; `cancel` drops either). A commit is made only
 while the staged diff still matches the preview. `allow` runs the action at
 once and suits unattended runs; headless `--print` has no way to approve, so
-`normal` leaves the preview unapplied there.
+`normal` leaves the preview unapplied there. When the session root sits inside
+a larger git work tree instead of at its root, `/commit` and the `git` tool's
+mutating actions refuse and change nothing.
 
 ## Permissions
 
@@ -586,7 +660,7 @@ Steps run sequentially without a shell and stop at the first failure.
 | `TOT_NO_SESSION` | Disable persistence |
 | `TOT_TRUST` | Trust project config |
 | `TOT_AGENTS_MD` | Set to `0` to skip the AGENTS.md chain |
-| `TOT_CONFIG_DIR`, `TOT_DATA_DIR` | Override roots |
+| `TOT_CONFIG_DIR`, `TOT_DATA_DIR` | Override roots (pre-0.3 `LH_CONFIG_DIR`, `LH_DATA_DIR` still work) |
 | `TOT_HOME` | Home used for `~/.claude/skills` and `~/.agents/skills` discovery |
 | `TOT_SKIP_TOOL_PROBE` | Skip the one-shot tool-call conformance probe |
 | `NO_COLOR` | Disable color |

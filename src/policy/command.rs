@@ -31,6 +31,29 @@ const READ_ONLY_GIT: &[&str] = &[
     "reflog",
 ];
 
+/// `git branch` flags that write: delete, move, copy, create, force, or change
+/// the upstream of a branch.
+const MUTATING_BRANCH_FLAGS: &[&str] = &[
+    "-d",
+    "-D",
+    "-m",
+    "-M",
+    "-c",
+    "-C",
+    "-f",
+    "-u",
+    "--delete",
+    "--move",
+    "--copy",
+    "--force",
+    "--create-reflog",
+    "--set-upstream-to",
+    "--unset-upstream",
+    "--edit-description",
+    "--track",
+    "--no-track",
+];
+
 /// Flags that turn an otherwise read-only program into a writer or executor.
 const WRITING_FLAGS: &[(&str, &[&str])] = &[
     (
@@ -152,9 +175,160 @@ fn git_subcommand(args: &[String]) -> Option<&str> {
     None
 }
 
+/// `gh` subcommands that only read: `pr view|list|diff|checks`,
+/// `issue view|list`, and an `api` request that is not a write.
+fn gh_reads(args: &[String]) -> bool {
+    let Some((group, rest)) = args.split_first() else {
+        return false;
+    };
+    match group.as_str() {
+        "pr" => rest
+            .first()
+            .is_some_and(|op| matches!(op.as_str(), "view" | "list" | "diff" | "checks")),
+        "issue" => rest
+            .first()
+            .is_some_and(|op| matches!(op.as_str(), "view" | "list")),
+        "api" => gh_api_reads(rest),
+        _ => false,
+    }
+}
+
+/// `gh api` reads unless it names a method other than GET or sends a body.
+fn gh_api_reads(args: &[String]) -> bool {
+    let mut index = 0;
+    while let Some(arg) = args.get(index) {
+        match arg.as_str() {
+            "-f" | "-F" | "--field" | "--raw-field" | "--input" => return false,
+            "-X" | "--method" => {
+                let Some(method) = args.get(index + 1) else {
+                    return false;
+                };
+                if !method.eq_ignore_ascii_case("GET") {
+                    return false;
+                }
+                index += 2;
+                continue;
+            }
+            other => {
+                let method = other.strip_prefix("--method=");
+                if let Some(method) = method {
+                    if !method.eq_ignore_ascii_case("GET") {
+                        return false;
+                    }
+                } else if other.starts_with("-f")
+                    || other.starts_with("-F")
+                    || other.starts_with("--field=")
+                    || other.starts_with("--raw-field=")
+                {
+                    return false;
+                }
+            }
+        }
+        index += 1;
+    }
+    true
+}
+
+/// `git branch` and `git worktree` are read-only only in their listing form:
+/// no branch name to create, and no flag that moves, deletes, or re-points one.
+fn git_lists(args: &[String], sub: &str) -> bool {
+    let start = args
+        .iter()
+        .position(|arg| arg == sub)
+        .map_or(0, |position| position + 1);
+    let rest = &args[start..];
+    match sub {
+        "worktree" => rest.first().is_some_and(|op| op == "list"),
+        "branch" => {
+            let listed = rest.iter().any(|arg| arg == "--list");
+            !rest.iter().any(|arg| {
+                MUTATING_BRANCH_FLAGS
+                    .iter()
+                    .any(|flag| flag_matches(arg, flag))
+            }) && (listed || rest.iter().all(|arg| arg.starts_with('-')))
+        }
+        _ => false,
+    }
+}
+
+/// Flags that make `curl` write a file, upload one, or send a request body.
+const CURL_WRITING_FLAGS: &[&str] = &[
+    "-X",
+    "--request",
+    "-d",
+    "--data",
+    "--data-raw",
+    "--data-binary",
+    "--data-urlencode",
+    "--json",
+    "-T",
+    "--upload-file",
+    "-o",
+    "--output",
+    "--output-dir",
+    "--create-dirs",
+    "-O",
+    "--remote-name",
+    "--remote-name-all",
+    "-F",
+    "--form",
+    "-c",
+    "--cookie-jar",
+    "-D",
+    "--dump-header",
+    "-K",
+    "--config",
+];
+
+/// Flags that make `wget` write a file or send a request body.
+const WGET_WRITING_FLAGS: &[&str] = &[
+    "-O",
+    "--output-document",
+    "-o",
+    "--output-file",
+    "-a",
+    "--append-output",
+    "-P",
+    "--directory-prefix",
+    "--post-data",
+    "--post-file",
+    "--body-data",
+    "--body-file",
+];
+
+fn curl_reads(args: &[String]) -> bool {
+    !args.iter().any(|arg| {
+        CURL_WRITING_FLAGS
+            .iter()
+            .any(|flag| flag_matches(arg, flag))
+    })
+}
+
+fn wget_reads(args: &[String]) -> bool {
+    !args.iter().any(|arg| {
+        WGET_WRITING_FLAGS
+            .iter()
+            .any(|flag| flag_matches(arg, flag))
+    })
+}
+
 /// True when every simple command in `command` is on the read-only allowlist
 /// and nothing redirects output, substitutes commands, or spawns a subshell.
 pub fn is_read_only(command: &str) -> bool {
+    classify_read_only(command, false)
+}
+
+/// Read-only for the loop guard, which exempts inspection from its
+/// unproductive-call budget: like [`is_read_only`], but also accepts the
+/// remote and repository reads that plan mode keeps out of its allowlist —
+/// `curl`/`wget` without a writing flag, `gh pr/issue/api` reads, and
+/// `git branch`/`git worktree` listings. A distinct `curl` GET or
+/// `git show HEAD~3:file` is exploration, not a loop.
+pub fn reads_only(command: &str) -> bool {
+    classify_read_only(command, true)
+}
+
+fn classify_read_only(command: &str, remote_reads: bool) -> bool {
     let trimmed = command.trim();
     if trimmed.is_empty() {
         return false;
@@ -178,7 +352,8 @@ pub fn is_read_only(command: &str) -> bool {
         }
         if name == "git" {
             return git_subcommand(args).is_some_and(|sub| {
-                READ_ONLY_GIT.contains(&sub) && (sub != "reflog" || reflog_is_read_only(args))
+                (READ_ONLY_GIT.contains(&sub) && (sub != "reflog" || reflog_is_read_only(args)))
+                    || (remote_reads && git_lists(args, sub))
             }) && !args
                 .iter()
                 .any(|a| a == "--output" || a.starts_with("--output="));
@@ -186,6 +361,14 @@ pub fn is_read_only(command: &str) -> bool {
         if name == "env" && !args.is_empty() {
             // `env cmd` runs another program.
             return false;
+        }
+        if remote_reads {
+            match name {
+                "curl" => return curl_reads(args),
+                "wget" => return wget_reads(args),
+                "gh" => return gh_reads(args),
+                _ => {}
+            }
         }
         if !READ_ONLY_PROGRAMS.contains(&name) {
             return false;
@@ -314,6 +497,80 @@ mod tests {
             "",
         ] {
             assert!(!is_read_only(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn inspection_commands_are_read_only_for_the_loop_guard() {
+        for command in [
+            "curl -s https://example.com/report",
+            "curl -sS -H 'Accept: text/plain' https://example.com/a",
+            "curl --compressed https://example.com",
+            "wget -q https://example.com",
+            "git show HEAD~3:src/main.rs",
+            "git -C sub show HEAD:src/main.rs",
+            "git blame src/main.rs",
+            "git ls-files",
+            "git rev-parse HEAD",
+            "git grep todo",
+            "git branch",
+            "git branch -a -v",
+            "git branch --list 'feat*'",
+            "git worktree list",
+            "gh pr view 12",
+            "gh pr list",
+            "gh pr diff 12",
+            "gh pr checks",
+            "gh issue view 7",
+            "gh issue list",
+            "gh api repos/owner/repo",
+            "gh api -X GET repos/owner/repo",
+            "gh api --method=GET repos/owner/repo",
+            "curl -s https://example.com | head -20",
+        ] {
+            assert!(reads_only(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn writing_remote_commands_are_not_read_only() {
+        for command in [
+            "curl -X POST https://example.com",
+            "curl -d a=b https://example.com",
+            "curl --data-binary @f https://example.com",
+            "curl -T report.txt https://example.com",
+            "curl -o out.txt https://example.com",
+            "curl -O https://example.com/a.txt",
+            "curl -F file=@a.png https://example.com",
+            "wget -O out.txt https://example.com/a",
+            "wget --post-data=a=b https://example.com",
+            "gh pr create",
+            "gh pr comment 12",
+            "gh api -X POST repos/owner/repo",
+            "gh api -f title=x repos/owner/repo",
+            "gh api --input body.json repos/owner/repo",
+            "git branch new-branch",
+            "git branch -D old",
+            "git branch --move a b",
+            "git worktree add ../x",
+            "git push",
+            "git show HEAD:file > out.txt",
+        ] {
+            assert!(!reads_only(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn plan_mode_read_only_stays_strict() {
+        // Remote reads are not plan-mode read-only: they reach the network.
+        for command in [
+            "curl -s https://example.com",
+            "wget -q https://example.com",
+            "gh pr list",
+            "git branch",
+        ] {
+            assert!(!is_read_only(command), "{command}");
+            assert!(reads_only(command), "{command}");
         }
     }
 

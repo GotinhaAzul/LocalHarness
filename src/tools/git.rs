@@ -13,6 +13,7 @@
 //! [`destructive_git`] refuses it in `bash` and `bg` too.
 
 use std::collections::BTreeMap;
+use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -121,6 +122,20 @@ fn dispatch(ctx: &ToolContext, config: &GitConfig, args: &Value) -> ToolResult {
         }
         _ => false,
     };
+    // The session root is the boundary. A workspace without a repository of
+    // its own must not mutate the repository that happens to contain it.
+    if mutating && let Some(top) = enclosing_repo(&ctx.cwd) {
+        return ToolResult::err(
+            "GIT_REPO_OUTSIDE_ROOT",
+            format!(
+                "{} is inside the git work tree at {}, not at its root, so the harness will not change that repository from here. Read-only status, diff, log, blame and commit_message stay limited to {}; run \"git init\" here with the user's agreement, or start the session at {}.",
+                ctx.cwd.display(),
+                top.display(),
+                ctx.cwd.display(),
+                top.display()
+            ),
+        );
+    }
     if mutating && read_only_mode(ctx) {
         return ToolResult::err(
             "GIT_READ_ONLY",
@@ -306,6 +321,71 @@ pub fn content_tree(cwd: &Path) -> Option<String> {
     (!tree.is_empty()).then(|| tree.to_string())
 }
 
+/// A cheap identity of the working tree that writes nothing to the object
+/// store: `git status --porcelain=v1 -z --untracked-files=all -- .` from
+/// `cwd`, plus HEAD, plus the size and modification time of every path the
+/// status lists. `content_tree` hashes file *content* by adding it to a
+/// throwaway index, which writes a blob per untracked file into the real
+/// `.git/objects` (a 64 MB file becomes a 69 MB loose object); the loop guard
+/// fingerprints on many distinct calls, so it uses this instead. Scoping the
+/// status to `.` keeps a workspace nested in a larger repository from reading
+/// the whole parent. `None` outside a repository or when git fails.
+pub fn working_state(cwd: &Path) -> Option<String> {
+    if !is_repo(cwd) {
+        return None;
+    }
+    let top = git_line(cwd, &["rev-parse", "--show-toplevel"])?;
+    let top = Path::new(&top);
+    let status = git(
+        cwd,
+        &[
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--",
+            ".",
+        ],
+    );
+    if !status.ok {
+        return None;
+    }
+    let head = git_line(cwd, &["rev-parse", "--verify", "--quiet", "HEAD"]).unwrap_or_default();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    head.hash(&mut hasher);
+    // Porcelain paths are repository-root relative even when run from a
+    // subdirectory, so they resolve against the top level.
+    for entry in status.stdout.split('\0').filter(|entry| !entry.is_empty()) {
+        // `XY path`; a rename or copy names the original path in the next
+        // entry, which the loop reaches on its own.
+        if entry.len() <= 3 {
+            continue;
+        }
+        hash_path_metadata(&top.join(&entry[3..]), &mut hasher);
+    }
+    Some(format!("{:016x}", hasher.finish()))
+}
+
+/// Hash a path's size and modification time, not its content: enough to see a
+/// `sed -i` or a new file without reading or storing the bytes.
+fn hash_path_metadata(path: &Path, hasher: &mut impl Hasher) {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => {
+            meta.len().hash(hasher);
+            let modified = meta
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |elapsed| elapsed.as_nanos());
+            modified.hash(hasher);
+        }
+        Err(_) => {
+            // A deleted path: stable, and different from any existing file.
+            u8::MAX.hash(hasher);
+        }
+    }
+}
+
 /// Whether HEAD holds exactly the content recorded in `tree`. Files present
 /// in `tree` but not in HEAD are allowed only while they are still on disk
 /// (untracked leftovers that the commit does not carry).
@@ -342,6 +422,56 @@ pub fn is_repo(cwd: &Path) -> bool {
     git_line(cwd, &["rev-parse", "--is-inside-work-tree"]).as_deref() == Some("true")
 }
 
+/// The work-tree root that contains `cwd`, when it is an ancestor of the
+/// session root rather than the root itself. `None` when `cwd` is the root.
+fn enclosing_repo(cwd: &Path) -> Option<PathBuf> {
+    let top = git_line(cwd, &["rev-parse", "--show-toplevel"])?;
+    let top = PathBuf::from(top);
+    let top = top.canonicalize().unwrap_or(top);
+    let root = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    (top != root).then_some(top)
+}
+
+/// Reject a diff/log/blame path that resolves outside the session root.
+fn ensure_inside_root(ctx: &ToolContext, raw: &str) -> Result<(), ToolResult> {
+    // A leading `:` is pathspec magic (`:/`, `:(top)`), which git resolves
+    // from the repository top rather than the session root.
+    if raw.trim_start().starts_with(':') {
+        return Err(ToolResult::err(
+            "GIT_OUTSIDE_WORKSPACE",
+            format!(
+                "{raw} is a git pathspec with magic; pass a plain path under the session root {}",
+                ctx.cwd.display()
+            ),
+        ));
+    }
+    let resolved = super::normalize(&ctx.resolve(raw)?);
+    let root = ctx.cwd.canonicalize().unwrap_or_else(|_| ctx.cwd.clone());
+    if !resolved.starts_with(&root) && !resolved.starts_with(&ctx.cwd) {
+        return Err(ToolResult::err(
+            "GIT_OUTSIDE_WORKSPACE",
+            format!(
+                "{raw} is outside the session root {}; git actions only touch files under it",
+                ctx.cwd.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Whether a status path leaves the session root: absolute, or through `..`.
+fn path_escapes(path: &str) -> bool {
+    let path = path.trim().trim_matches('"');
+    Path::new(path).is_absolute() || path.split('/').any(|part| part == "..")
+}
+
+fn status_line_escapes(line: &str) -> bool {
+    let Some(rest) = line.get(3..) else {
+        return false;
+    };
+    rest.split(" -> ").any(path_escapes)
+}
+
 pub fn head(cwd: &Path) -> Option<String> {
     git_line(cwd, &["rev-parse", "--verify", "--quiet", "HEAD"])
 }
@@ -360,11 +490,20 @@ pub fn dirty_tracked(cwd: &Path) -> Vec<String> {
         .collect()
 }
 
-/// `(status letter, path)` for each staged file.
+/// `(status letter, path)` for each staged file under the session root.
 pub fn staged_files(cwd: &Path) -> Vec<(char, String)> {
     git(
         cwd,
-        &["diff", "--cached", "--name-status", "-M", "--no-color"],
+        &[
+            "diff",
+            "--cached",
+            "--name-status",
+            "-M",
+            "--no-color",
+            "--relative",
+            "--",
+            ".",
+        ],
     )
     .stdout
     .lines()
@@ -396,19 +535,33 @@ fn ok_with_session(content: String, entries: Vec<Value>) -> ToolResult {
 // Read-only actions
 
 fn status(ctx: &ToolContext) -> ToolResult {
-    let run = git(&ctx.cwd, &["status", "--short", "--branch"]);
+    // `-- .` keeps the enclosing repository's changes out of a workspace that
+    // has no repository of its own; the filter drops any path that still
+    // leaves the session root (a rename or a pathspec edge case).
+    let run = git(&ctx.cwd, &["status", "--short", "--branch", "--", "."]);
     if !run.ok {
         return ToolResult::err("GIT_FAILED", run.error());
     }
-    let text = run.stdout.trim_end();
+    let text = run
+        .stdout
+        .lines()
+        .filter(|line| !status_line_escapes(line))
+        .collect::<Vec<_>>()
+        .join("\n");
     if text.lines().count() <= 1 {
         return ToolResult::ok(format!("{text}\nworking tree clean"));
     }
-    ToolResult::ok(text.to_string())
+    ToolResult::ok(text)
 }
 
 fn diff(ctx: &ToolContext, args: &Value) -> ToolResult {
-    let mut argv = vec!["diff", "--no-color"];
+    let mut argv = vec![
+        "diff",
+        "--no-color",
+        "--relative",
+        "--src-prefix=a/",
+        "--dst-prefix=b/",
+    ];
     if optional_bool(args, "staged").unwrap_or(false) {
         argv.push("--cached");
     }
@@ -417,8 +570,14 @@ fn diff(ctx: &ToolContext, args: &Value) -> ToolResult {
     }
     let path = optional_str(args, "path");
     if let Some(path) = &path {
+        if let Err(err) = ensure_inside_root(ctx, path) {
+            return err;
+        }
         argv.push("--");
         argv.push(path);
+    } else {
+        argv.push("--");
+        argv.push(".");
     }
     let run = git(&ctx.cwd, &argv);
     if !run.ok {
@@ -452,8 +611,17 @@ fn log(ctx: &ToolContext, args: &Value) -> ToolResult {
     ];
     let path = optional_str(args, "path");
     if let Some(path) = &path {
+        if let Err(err) = ensure_inside_root(ctx, path) {
+            return err;
+        }
         argv.push("--");
         argv.push(path);
+    } else if enclosing_repo(&ctx.cwd).is_some() {
+        // A path-limited log skips commits that touch nothing under the root;
+        // at the root itself the unfiltered history is the same and keeps
+        // empty commits visible.
+        argv.push("--");
+        argv.push(".");
     }
     let run = git(&ctx.cwd, &argv);
     if !run.ok {
@@ -472,6 +640,9 @@ fn blame(ctx: &ToolContext, args: &Value) -> ToolResult {
             "blame needs path, for example {\"action\":\"blame\",\"path\":\"src/main.rs\",\"start\":10,\"end\":40}",
         );
     };
+    if let Err(err) = ensure_inside_root(ctx, &path) {
+        return err;
+    }
     let start = args.get("start").and_then(Value::as_u64);
     let end = args.get("end").and_then(Value::as_u64);
     let range = match (start, end) {
@@ -859,7 +1030,13 @@ fn capitalize(text: &str) -> String {
 
 fn recent_subjects(cwd: &Path) -> Vec<String> {
     let count = STYLE_SAMPLE.to_string();
-    let run = git(cwd, &["log", "--no-merges", "--format=%s", "-n", &count]);
+    let mut args = vec!["log", "--no-merges", "--format=%s", "-n", count.as_str()];
+    // Inside an enclosing repository, sample only commits that touched the
+    // session root, so unrelated subjects from the parent never show.
+    if enclosing_repo(cwd).is_some() {
+        args.extend(["--", "."]);
+    }
+    let run = git(cwd, &args);
     if !run.ok {
         return Vec::new();
     }
@@ -882,10 +1059,13 @@ pub fn draft(cwd: &Path, subject_max: usize) -> Option<Draft> {
     }
     let report = detect_style(&recent_subjects(cwd));
     let subject = draft_subject(&report, &files, subject_max);
-    let shortstat = git(cwd, &["diff", "--cached", "--shortstat", "--no-color"])
-        .stdout
-        .trim()
-        .to_string();
+    let shortstat = git(
+        cwd,
+        &["diff", "--cached", "--shortstat", "--no-color", "--", "."],
+    )
+    .stdout
+    .trim()
+    .to_string();
     Some(Draft {
         report,
         files,
@@ -1157,6 +1337,20 @@ pub fn resolve(session: &mut Session, action: &str, outcome: &str) -> anyhow::Re
     )
 }
 
+/// The same boundary for the user's `/commit` path, which calls the helpers
+/// below directly instead of going through [`dispatch`].
+pub(crate) fn refuse_outside_root(cwd: &Path) -> Result<(), String> {
+    let Some(top) = enclosing_repo(cwd) else {
+        return Ok(());
+    };
+    Err(format!(
+        "{} is inside the git work tree at {}, not at its root, so the harness will not commit or publish in that repository. Run \"git init\" here with the user's agreement, or start the session at {}.",
+        cwd.display(),
+        top.display(),
+        top.display()
+    ))
+}
+
 /// `/commit` without an argument: the open preview, or a new one drafted from
 /// the staged diff with no model.
 pub fn show_or_draft_commit(
@@ -1164,6 +1358,7 @@ pub fn show_or_draft_commit(
     session: &mut Session,
     subject_max: usize,
 ) -> Result<String, String> {
+    refuse_outside_root(cwd)?;
     if let Some(open) = pending(session, "commit") {
         let message = open.get("message").and_then(Value::as_str).unwrap_or("");
         return Ok(format!(
@@ -1189,6 +1384,7 @@ pub fn record_commit_preview(
     message: &str,
     subject_max: usize,
 ) -> Result<String, String> {
+    refuse_outside_root(cwd)?;
     prepare_commit(cwd, message, subject_max).map_err(|err| err.content)?;
     if pending(session, "commit").is_some() {
         resolve(session, "commit", "replaced").map_err(|e| e.to_string())?;
@@ -1216,6 +1412,7 @@ pub fn confirm_commit(
     session: &mut Session,
     subject_max: usize,
 ) -> Result<String, String> {
+    refuse_outside_root(cwd)?;
     let Some(open) = pending(session, "commit") else {
         return Err("no commit is waiting for approval; run /commit to draft one".into());
     };
@@ -1708,6 +1905,82 @@ mod tests {
         dispatch(ctx, config, &args)
     }
 
+    /// Every entry under `.git/objects`, so a test can prove nothing was
+    /// written there.
+    fn object_count(dir: &Path) -> usize {
+        fn walk(path: &Path) -> usize {
+            let Ok(entries) = std::fs::read_dir(path) else {
+                return 0;
+            };
+            entries
+                .flatten()
+                .map(|entry| {
+                    let path = entry.path();
+                    if path.is_dir() { walk(&path) } else { 1 }
+                })
+                .sum()
+        }
+        walk(&dir.join(".git/objects"))
+    }
+
+    #[test]
+    fn working_state_writes_no_objects_for_untracked_files() {
+        let dir = tempfile::tempdir().unwrap();
+        repo(dir.path());
+        std::fs::write(dir.path().join("tracked.txt"), "one\n").unwrap();
+        commit_all(dir.path(), "one");
+        // Big enough that a content hash would leave a visible loose object.
+        std::fs::write(dir.path().join("untracked.bin"), vec![7u8; 256 * 1024]).unwrap();
+        let before = object_count(dir.path());
+        let state = working_state(dir.path()).expect("a repository has a state");
+        assert!(!state.is_empty());
+        assert_eq!(
+            object_count(dir.path()),
+            before,
+            "the fingerprint must not add blobs to the object store"
+        );
+    }
+
+    #[test]
+    fn working_state_sees_a_working_tree_change() {
+        let dir = tempfile::tempdir().unwrap();
+        repo(dir.path());
+        std::fs::write(dir.path().join("tracked.txt"), "one\n").unwrap();
+        commit_all(dir.path(), "one");
+        let first = working_state(dir.path()).expect("state");
+        // Same status line, different size and mtime: only the stat sees it.
+        std::fs::write(dir.path().join("tracked.txt"), "one\ntwo\n").unwrap();
+        let second = working_state(dir.path()).expect("state");
+        assert_ne!(first, second);
+        // A new untracked file is a change too.
+        std::fs::write(dir.path().join("new.txt"), "new\n").unwrap();
+        let third = working_state(dir.path()).expect("state");
+        assert_ne!(second, third);
+    }
+
+    #[test]
+    fn working_state_is_scoped_to_the_working_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        repo(dir.path());
+        let nested = dir.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::write(nested.join("inside.txt"), "one\n").unwrap();
+        std::fs::write(dir.path().join("outside.txt"), "one\n").unwrap();
+        commit_all(dir.path(), "one");
+        let first = working_state(&nested).expect("state");
+        // A change beside the nested workspace is not part of its state.
+        std::fs::write(dir.path().join("outside.txt"), "two, longer\n").unwrap();
+        assert_eq!(first, working_state(&nested).expect("state"));
+        std::fs::write(nested.join("inside.txt"), "two, longer\n").unwrap();
+        assert_ne!(first, working_state(&nested).expect("state"));
+    }
+
+    #[test]
+    fn working_state_is_none_outside_a_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(working_state(dir.path()), None);
+    }
+
     #[test]
     fn destructive_commands_are_refused() {
         for command in [
@@ -1970,6 +2243,26 @@ mod tests {
         );
         let env = call(&ctx, &config, json!({"action":"stage","paths":[".env"]}));
         assert!(env.content.contains("GIT_SECRET_FILE"), "{}", env.content);
+    }
+
+    #[test]
+    fn commit_commands_refuse_a_parent_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("parent");
+        let workspace = parent.join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        repo(&parent);
+        std::fs::write(workspace.join("a.txt"), "one\n").unwrap();
+        let ctx = test_context(&workspace);
+        let mut session = ctx.session.lock().unwrap();
+        let errors = [
+            show_or_draft_commit(&workspace, &mut session, 72).unwrap_err(),
+            confirm_commit(&workspace, &mut session, 72).unwrap_err(),
+            record_commit_preview(&workspace, &mut session, "Update\n\nWhy.", 72).unwrap_err(),
+        ];
+        for error in errors {
+            assert!(error.contains("inside the git work tree"), "{error}");
+        }
     }
 
     #[test]

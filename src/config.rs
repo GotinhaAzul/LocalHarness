@@ -425,6 +425,18 @@ impl Config {
         if self.budgets.max_tool_calls == 0 {
             bail!("budgets.max_tool_calls must be at least 1");
         }
+        // Zero disables these two; 1 would end a turn on the very first call.
+        for (key, value) in [
+            ("max_same_tool_family", self.budgets.max_same_tool_family),
+            (
+                "max_same_tool_family_success",
+                self.budgets.max_same_tool_family_success,
+            ),
+        ] {
+            if value == 1 {
+                bail!("budgets.{key} must be 0 (disabled) or at least 2");
+            }
+        }
         if self.model.context_window == Some(0) {
             bail!("model.context_window must be greater than 0");
         }
@@ -1021,6 +1033,17 @@ pub struct BudgetConfig {
     /// Consecutive identical calls and the no-progress window used by the
     /// checkpoints.
     pub stall_calls: u32,
+    /// Failing or repeated calls of one tool family (same program and
+    /// operation, or same tool and key arguments) allowed in a turn before it
+    /// stops as stalled. Zero disables the guard. Read-only calls are not
+    /// counted as repeats; a read repeated with the same output is caught by
+    /// `stall_calls`.
+    pub max_same_tool_family: u32,
+    /// Successful calls of one tool family that changed no workspace file and
+    /// passed no verify allowed in a turn before it stops as stalled. A
+    /// same-family success does not reset the count. Read-only calls are
+    /// exempt. Zero disables the guard.
+    pub max_same_tool_family_success: u32,
     pub verify_attempts: u32,
     /// Characters one tool result may occupy in context. Unset scales with
     /// the usable prompt (4%, clamped to 2500..16000).
@@ -1039,6 +1062,8 @@ impl Default for BudgetConfig {
             max_model_calls: 40,
             max_wall_minutes: 30,
             stall_calls: 12,
+            max_same_tool_family: 8,
+            max_same_tool_family_success: 24,
             verify_attempts: 2,
             result_cap_chars: None,
             batch_cap_chars: None,
@@ -1881,6 +1906,29 @@ thinking_control = { chat_template_kwargs = { enable_thinking = false } }
         assert_eq!(base["a"]["y"].as_integer(), Some(2));
         assert_eq!(base["c"]["q"].as_integer(), Some(4));
         assert_eq!(base["b"]["z"].as_integer(), Some(3));
+    }
+
+    #[test]
+    fn family_budgets_accept_zero_and_reject_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[budgets]\nmax_same_tool_family = 0\nmax_same_tool_family_success = 0\n",
+        )
+        .unwrap();
+        let cfg = Config::load(&path, None).unwrap();
+        assert_eq!(cfg.budgets.max_same_tool_family, 0, "0 disables the guard");
+        assert_eq!(cfg.budgets.max_same_tool_family_success, 0);
+
+        std::fs::write(&path, "[budgets]\nmax_same_tool_family_success = 1\n").unwrap();
+        let error = Config::load(&path, None).unwrap_err().to_string();
+        assert!(error.contains("max_same_tool_family_success"), "{error}");
+        assert!(error.contains("0 (disabled) or at least 2"), "{error}");
+
+        std::fs::write(&path, "[budgets]\nmax_same_tool_family = 1\n").unwrap();
+        let error = Config::load(&path, None).unwrap_err().to_string();
+        assert!(error.contains("max_same_tool_family must be"), "{error}");
     }
 
     #[test]

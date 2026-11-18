@@ -35,8 +35,8 @@ impl Tool for WriteTool {
         crate::tools::object_schema(
             json!({
                 "path": {"type": "string", "description": "File to write, relative to the working directory."},
-                "content": {"type": "string", "description": "Full file content."},
-                "allow_empty": {"type": "boolean", "description": "Permit writing an empty file."},
+                "content": {"type": "string", "description": "Full file content. May be empty when creating a file, such as __init__.py or .gitkeep."},
+                "allow_empty": {"type": "boolean", "description": "Permit emptying an existing non-empty file. Not needed to create an empty file or to rewrite one that is already empty."},
                 "overwrite": {"type": "boolean", "description": "Replace a partially-read file anyway; the file must still be unchanged since the last read. Use only when the read intentionally covered part of the file."}
             }),
             &["path", "content"],
@@ -86,12 +86,6 @@ fn run(ctx: &ToolContext, args: &Value) -> Result<ToolResult, ToolResult> {
     let allow_empty = optional_bool(args, "allow_empty").unwrap_or(false);
     let overwrite = optional_bool(args, "overwrite").unwrap_or(false);
 
-    if content.is_empty() && !allow_empty {
-        return Err(ToolResult::err(
-            "EMPTY_CONTENT",
-            "content is empty; pass \"allow_empty\": true to write an intentionally empty file",
-        ));
-    }
     if content.len() > MAX_CONTENT {
         return Err(ToolResult::err(
             "CONTENT_TOO_LARGE",
@@ -114,6 +108,18 @@ fn run(ctx: &ToolContext, args: &Value) -> Result<ToolResult, ToolResult> {
             return Err(ToolResult::err(
                 "WRITE_FAILED",
                 format!("{display} is a directory; pass a file path"),
+            ));
+        }
+        // An empty write only needs the flag when it would discard existing
+        // content. Creating an empty file, or rewriting one that is already
+        // empty, loses nothing.
+        if content.is_empty() && !allow_empty && meta.len() > 0 {
+            return Err(ToolResult::err(
+                "TRUNCATE",
+                format!(
+                    "this would truncate {display} ({} bytes); to empty an existing file intentionally pass \"allow_empty\": true",
+                    meta.len()
+                ),
             ));
         }
         let gate = {
@@ -500,23 +506,87 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refuses_empty_content_without_flag() {
+    async fn creates_empty_file_without_flag() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = test_context(dir.path());
 
+        for name in ["pkg/__init__.py", ".gitkeep"] {
+            let result = WriteTool
+                .call(&ctx, json!({"path": name, "content": ""}))
+                .await;
+            assert!(!result.is_error, "{}", result.content);
+            let details = result.details.unwrap();
+            assert_eq!(details["created"].as_bool(), Some(true));
+            assert_eq!(details["bytes"].as_u64(), Some(0));
+            let meta = std::fs::metadata(dir.path().join(name)).unwrap();
+            assert_eq!(meta.len(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_write_refuses_to_truncate_a_non_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "old\n").unwrap();
+        let ctx = test_context(dir.path());
+
         let denied = WriteTool
-            .call(&ctx, json!({"path": "empty.txt", "content": ""}))
+            .call(&ctx, json!({"path": "a.txt", "content": ""}))
             .await;
         assert!(denied.is_error);
-        assert!(denied.content.starts_with("[EMPTY_CONTENT]"));
+        assert!(
+            denied.content.starts_with("[TRUNCATE]"),
+            "{}",
+            denied.content
+        );
+        assert!(denied.content.contains("a.txt"), "{}", denied.content);
+        assert!(denied.content.contains("4 bytes"), "{}", denied.content);
+        assert!(
+            denied.content.contains("\"allow_empty\": true"),
+            "{}",
+            denied.content
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "old\n"
+        );
+    }
 
-        let allowed = WriteTool
+    #[tokio::test]
+    async fn allow_empty_truncates_a_non_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "old\n").unwrap();
+        let ctx = test_context(dir.path());
+        let _ = ReadTool.call(&ctx, json!({"path": "a.txt"})).await;
+
+        let written = WriteTool
             .call(
                 &ctx,
-                json!({"path": "empty.txt", "content": "", "allow_empty": true}),
+                json!({"path": "a.txt", "content": "", "allow_empty": true}),
             )
             .await;
-        assert!(!allowed.is_error, "{}", allowed.content);
+        assert!(!written.is_error, "{}", written.content);
+        let details = written.details.unwrap();
+        assert_eq!(details["created"].as_bool(), Some(false));
+        assert_eq!(details["bytes"].as_u64(), Some(0));
+        assert_eq!(
+            std::fs::metadata(dir.path().join("a.txt")).unwrap().len(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_write_over_an_empty_file_needs_no_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("empty.txt"), "").unwrap();
+        let ctx = test_context(dir.path());
+        // An existing file still needs a read before it can be replaced.
+        let read = ReadTool.call(&ctx, json!({"path": "empty.txt"})).await;
+        assert!(!read.is_error, "{}", read.content);
+
+        let written = WriteTool
+            .call(&ctx, json!({"path": "empty.txt", "content": ""}))
+            .await;
+        assert!(!written.is_error, "{}", written.content);
         assert_eq!(
             std::fs::metadata(dir.path().join("empty.txt"))
                 .unwrap()

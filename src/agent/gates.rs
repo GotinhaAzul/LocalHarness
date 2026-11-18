@@ -12,6 +12,12 @@ use super::limits::RunProgress;
 /// repeated four times in a row. Legitimate multi-step work (edit A, verify,
 /// edit B, verify, edit A, verify) must not trip it: an exact argument cycle
 /// means nothing changed in between, and a file change clears the history.
+///
+/// A read-only call is recorded but never trips it: polling `bg logs`, reading
+/// many files, or fetching URLs is inspection, and the same arguments can
+/// carry new output every time (a build that keeps writing). The identical
+/// results that make a read loop useless are caught by the stall guard, which
+/// compares fingerprints including the result.
 #[derive(Debug)]
 pub struct LoopGuard {
     history: VecDeque<String>,
@@ -39,11 +45,20 @@ impl LoopGuard {
     }
 
     /// Record the call about to run and decide whether it continues a loop.
-    pub fn check_and_record(&mut self, signature: impl Into<String>) -> LoopDecision {
+    /// `read_only` calls are history only: they break a run of identical
+    /// mutations but cannot themselves be a loop worth stopping.
+    pub fn check_and_record(
+        &mut self,
+        signature: impl Into<String>,
+        read_only: bool,
+    ) -> LoopDecision {
         let signature = signature.into();
         self.history.push_back(signature.clone());
         while self.history.len() > self.capacity {
             self.history.pop_front();
+        }
+        if read_only {
+            return LoopDecision::Ok;
         }
 
         let consecutive = self
@@ -415,12 +430,40 @@ mod tests {
         let mut guard = LoopGuard::new();
         let signature = "read:{\"path\":\"a\"}";
         for _ in 0..3 {
-            assert_eq!(guard.check_and_record(signature), LoopDecision::Ok);
+            assert_eq!(guard.check_and_record(signature, false), LoopDecision::Ok);
         }
         assert!(matches!(
-            guard.check_and_record(signature),
+            guard.check_and_record(signature, false),
             LoopDecision::Tripped { .. }
         ));
+    }
+
+    #[test]
+    fn loop_guard_never_trips_on_a_read_only_call() {
+        let mut guard = LoopGuard::new();
+        // Polling the same job is inspection: the output can be new every time,
+        // and the arguments alone are not a loop.
+        for _ in 0..30 {
+            assert_eq!(
+                guard.check_and_record("bg:{\"action\":\"logs\"}", true),
+                LoopDecision::Ok
+            );
+        }
+    }
+
+    #[test]
+    fn a_read_between_identical_mutations_keeps_them_apart() {
+        let mut guard = LoopGuard::new();
+        for _ in 0..3 {
+            assert_eq!(guard.check_and_record("edit:a", false), LoopDecision::Ok);
+        }
+        assert_eq!(
+            guard.check_and_record("read:{\"path\":\"a\"}", true),
+            LoopDecision::Ok
+        );
+        for _ in 0..3 {
+            assert_eq!(guard.check_and_record("edit:a", false), LoopDecision::Ok);
+        }
     }
 
     #[test]
@@ -428,8 +471,14 @@ mod tests {
         let mut guard = LoopGuard::new();
         for cycle in 1..=4 {
             let mut tripped = false;
-            tripped |= matches!(guard.check_and_record("a"), LoopDecision::Tripped { .. });
-            tripped |= matches!(guard.check_and_record("b"), LoopDecision::Tripped { .. });
+            tripped |= matches!(
+                guard.check_and_record("a", false),
+                LoopDecision::Tripped { .. }
+            );
+            tripped |= matches!(
+                guard.check_and_record("b", false),
+                LoopDecision::Tripped { .. }
+            );
             if cycle < 4 {
                 assert!(!tripped, "cycle {cycle} must not trip the guard");
             } else {
@@ -444,7 +493,10 @@ mod tests {
         for cycle in 1..=4 {
             let mut tripped = false;
             for call in ["a", "b", "c", "d", "e"] {
-                tripped |= matches!(guard.check_and_record(call), LoopDecision::Tripped { .. });
+                tripped |= matches!(
+                    guard.check_and_record(call, false),
+                    LoopDecision::Tripped { .. }
+                );
             }
             if cycle < 4 {
                 assert!(!tripped, "cycle {cycle} must not trip the guard");
@@ -467,7 +519,7 @@ mod tests {
             "edit:{\"path\":\"c.rs\",\"old\":\"w\"}",
             "verify:{}",
         ] {
-            assert_eq!(guard.check_and_record(call), LoopDecision::Ok);
+            assert_eq!(guard.check_and_record(call, false), LoopDecision::Ok);
         }
     }
 
@@ -475,14 +527,14 @@ mod tests {
     fn loop_guard_progress_resets_history() {
         let mut guard = LoopGuard::new();
         for _ in 0..3 {
-            assert_eq!(guard.check_and_record("same"), LoopDecision::Ok);
+            assert_eq!(guard.check_and_record("same", false), LoopDecision::Ok);
         }
         guard.record_progress();
         for _ in 0..3 {
-            assert_eq!(guard.check_and_record("same"), LoopDecision::Ok);
+            assert_eq!(guard.check_and_record("same", false), LoopDecision::Ok);
         }
         assert!(matches!(
-            guard.check_and_record("same"),
+            guard.check_and_record("same", false),
             LoopDecision::Tripped { .. }
         ));
     }

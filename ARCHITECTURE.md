@@ -107,8 +107,10 @@ Streaming:
   object, or a different engine id). Handles SGLang fragments, vLLM whole
   calls, Ollama calls without `id` or `index`, and object-valued `arguments`.
 - JSON is validated at close. When `finish_reason` is `length` (or
-  `max_tokens`) and a call's arguments are empty or incomplete, the turn fails
-  with `tool_call_truncated` and the call is never executed.
+  `max_tokens`) and a call's arguments are empty or incomplete, the
+  completion fails with `tool_call_truncated` and the call is never returned;
+  the loop feeds the cut back to the model as a user nudge (3.7) instead of
+  ending the turn.
 - An in-stream `error` object (`{"error":{...}}` or `{"error":"..."}`) aborts
   the turn with the server's message, even after an HTTP 200.
 - A server that ignores `stream: true` and answers `application/json` is
@@ -353,10 +355,11 @@ observable.
 | Read-before-edit | `edit`/`patch` on an existing file require a prior `read` with a matching stat stamp (`mtime`, size). `write` also requires full-line coverage of the existing file, or an explicit `overwrite: true`; a result capped by the result or batch limit marks coverage incomplete. A changed file requires a re-read. Creation is allowed. A successful `edit`/`patch`/`write` re-stamps only the file it wrote, so consecutive edits need no re-read while any outside change still does. |
 | Scope gate | Security-sensitive commands are checked against the user-set engagement scope. No scope blocks with `SEC_SCOPE` and the `/sec scope add` call. Best-effort, not a sandbox. |
 | Sandbox | When `--sandbox` is set, `bash` and `bg` run in a bubblewrap namespace (or the Landlock fallback): read-only root, hidden `$HOME`, private `/tmp`, no network, and `.git` read-only in `workspace-write`. Startup fails closed when no backend exists; a per-command wrap failure returns `SANDBOX_UNAVAILABLE`. Commands never fall back to an unsandboxed run. |
-| Loop guard | Signature is tool name plus canonical arguments. Four identical calls in a row, or an exact 2-8 call cycle repeated four times, blocks the call and ends the turn with a recovery instruction and the `stalled` status (exit code 2 from `tot -p`, never a successful workflow step). A file change or a passing verification clears the history, so long multi-step work does not trip it. No automatic session replacement in v1. |
+| Loop guard | Signature is tool name plus canonical arguments. Four identical calls in a row, or an exact 2-8 call cycle repeated four times, blocks the call and ends the turn with a recovery instruction and the `stalled` status (exit code 2 from `tot -p`, never a successful workflow step). A file change or a passing verification clears the history, so long multi-step work does not trip it. A read-only call (a read-only tool, a reading action such as `bg logs`, `todo list`, `pr checks`, `git status` or `git branch op = "list"`, or a bash command that only reads) is recorded in the history but never trips it: the same poll can carry new output every time, and a read with the same output is caught by the stall guard. No automatic session replacement in v1. |
 | Interactive command guard | Blocks `vim`, `less`, `top`, `htop`, `watch`, `nano`, `ssh` without a command, and similar TTY-only invocations. |
 | Budget checkpoint | Tool calls, model calls, and wall clock are checked at 120 calls, 40 model calls, and 30 minutes. A checkpoint that finds a new result, a file change, or a passing verify within the last `stall_calls` calls renews the allowance and the turn continues. A checkpoint with no recent progress ends the turn and reports why. |
 | Stall | Twelve consecutive calls with no new result fingerprint, no file change, and no successful verify. Ends the turn with the last known state. |
+| Tool-family guard | Calls are grouped into a family: `bash` by program and operation, other tools by name plus key arguments (body arguments are ignored; temporary-path and number normalization is for bash families only). Three cumulative counters run across the turn: repeated calls of one family (successful or not), failing calls of one family, and successful calls of one family that changed no workspace file and passed no verify. They stop the turn as `stalled` at `[budgets] max_same_tool_family` (8; repeated and failing calls) and `max_same_tool_family_success` (24; unproductive successes). Interleaving another call, a success of the same family, and writes outside the session directory do not reset them; a workspace change or a passing verify does. 0 disables either budget. Read-only calls never count as repeats or as idle successes — read-only tools, the reading actions of mixed tools, and bash commands that only read (`cat`, `git show`, `curl` without a writing flag, `gh pr view`, ...) — though a failing read-only call still counts as a failure; a read repeated with the same output is caught by the stall guard. The workspace is fingerprinted lazily: the first counter that needs a baseline reads it, every later counter reuses that reading, a fresh reading is taken only to decide a trip and once at the end of the batch, and a call that reports a file change invalidates it. In a repository the fingerprint is `git status --porcelain=v1 -z --untracked-files=all -- .` from the session directory plus HEAD and the size and mtime of each listed path (nothing is written to the object store); elsewhere it is a bounded mtime/size walk. So a `sed -i` fix loop that really changes files is not a stall. |
 | Todo gate | After two mutations or edits touching two files, the run is multi-step and requires a plan. The final task requires a fresh passing verify when verification is configured. |
 | Verify gate | Successful mutations newer than the last passing verify are unverified. Continue up to two times with a verify instruction, then record the unverified state and allow settle. |
 | Review nudge | One continuation per run after mutations, asking for `review`. Never fights verify or todo gates. |
@@ -418,7 +421,7 @@ continues. Nudges are capped at three per turn.
 | `<think>` / `<thinking>` in content | Split out while streaming (tags may straddle deltas) and stored as reasoning; text before a lone `</think>` too. |
 | Tool calls written as text | With `tool_mode` `repair` or `auto`, parsed into native calls before gates run (formats in `docs/model-setup.md`). Fenced/bare JSON must name an active tool and end the reply. |
 | Exact repetition | The stream is checked as it grows; a tail of one unit repeated at least 5 times and 600 bytes stops generation, keeps one copy, and nudges. Repeated loops end the turn as `stalled`. |
-| `finish_reason = length` | A cut tool call (arguments not valid JSON) does not run; the model is told to send smaller calls. Cut prose is continued. A reply that spent the budget thinking is told to act. |
+| `finish_reason = length` | A cut tool call (arguments not valid JSON) does not run and is not replayed; the model is told to split it into smaller calls, spending the output-recovery allowance. When the allowance (shared with the other output repairs) runs out, the turn ends as `stalled` with `tool_call_truncated`. The cut reply is kept as an assistant entry with `stop_reason: length` (with its prose, if any), so roles keep alternating. Cut prose is continued. A reply that spent the budget thinking is told to act. |
 | Empty reply | One nudge to call a tool or answer. |
 | Silent prompt truncation | The engine's `truncated` flag and context-shift count are proof and end the turn. Arithmetic signals need a second witness: `prompt_tokens + cached_tokens` covering the prompt means an uncached-only report; `/tokenize` decides between a cut prompt (it exceeds the window) and a wrong report (it fits); a count under 512 tokens is a broken usage field; impossible characters per token with a plausible count is a confirmed cut; a plain shortfall must repeat on the next call. A wrong report keeps the reply, warns once, stops calibrating from usage on that endpoint, and is recorded for `tot doctor`, which reports it without sending a chat completion. |
 
@@ -754,6 +757,10 @@ only the marker and the `rewind` entry are appended.
       surface.json
 ```
 
+`~/.local/share` is `$XDG_DATA_HOME`, and `totality` is replaced by the
+pre-0.3 `localharness` while that is the only one of the two present
+(`named_dir` in `src/paths.rs`). `TOT_DATA_DIR` replaces the whole root.
+
 - Evidence artifacts are append-only and `0600`; each ledger entry carries the
   SHA-256 of the artifact. The surface inventory is rewritten atomically after
   each command that produces observations.
@@ -921,13 +928,16 @@ form. `tot doctor` prints both sizes.
   pre-edit bytes and returns `EDIT_REGRESSION` with a fix hint. Pre-existing
   errors are suppressed, and a clean, cold, or non-project edit adds no text.
   The check never starts a cold server and caps its warm wait at 250 ms.
-- `test` detects vitest, jest, go, cargo, pytest, or an npm test script. It runs
-  one file or one test and returns only the first failure, capped at 2500
-  characters. Parsers strip ANSI and progress noise.
+- `test` detects vitest, jest, go, cargo, pytest, Python unittest, or an npm
+  test script. It runs one file or one test and returns only the first failure,
+  capped at 2500 characters. Parsers strip ANSI and progress noise.
 - `review` reads `git status --porcelain=v1 -z`, numstat, and the diff. It scans
   added lines for secrets, debug statements, TODOs, lockfiles, config files,
-  deletion-heavy changes, binary files, and source changes without tests. The
-  diff is capped and truncation names the follow-up call.
+  deletion-heavy changes, binary files, and source changes whose module has no
+  test. The diff is capped and truncation names the follow-up call. Every read
+  is scoped to the session root: a workspace without a `.git` of its own
+  reports only the files under it, never the enclosing repository's changes or
+  `../` paths.
 - `finding` supports `add`, `update`, `list`, `report`, `verify`. Severities:
   critical, high, medium, low, info. Statuses: open, fixed, accepted,
   false-positive. `add` requires title, severity, target, and evidence.
@@ -972,6 +982,16 @@ form. `tot doctor` prints both sizes.
 
 `git` and `pr` (coding pack) replace improvised `git`/`gh` in `bash`:
 
+- The session root is the boundary. When it sits inside a larger work tree (a
+  workspace with no `.git` of its own), `status`, `diff`, `log`, `blame` and
+  `commit_message` are scoped to it and paths that leave it are dropped or
+  refused; `stage`, `unstage`, `commit`, `undo`, and `branch`/`worktree`
+  creation, switching or removal return `GIT_REPO_OUTSIDE_ROOT`, `/commit`
+  and `pr draft` refuse for the same reason, and nothing changes. Paths that
+  start with `:` (git pathspec magic such as `:/`) are refused, since git
+  resolves them from the repository top. `branch list` and
+  `worktree list` stay read-only, and starting the session at the work-tree
+  root restores the full surface.
 - Read-only actions (`status`, `diff`, `log`, `blame`, `commit_message`, `pr
   checks`, `pr review`) run directly. With `--sandbox read-only` they are all
   `git` can do.
@@ -1893,6 +1913,10 @@ non-read-only tool call.
 | Engagements | `~/.local/share/totality/engagements/` |
 | Project config | `<cwd>/.harness/` |
 
+`~/.config` and `~/.local/share` are `$XDG_CONFIG_HOME` and `$XDG_DATA_HOME`.
+In each, `totality` gives way to the pre-0.3 `localharness` while only that
+exists. `TOT_CONFIG_DIR` and `TOT_DATA_DIR` replace the roots outright.
+
 ### 10.2 Precedence
 
 CLI flags > project config (if trusted) > global config > built-in defaults.
@@ -1945,6 +1969,8 @@ max_tool_calls = 120            # checkpoint interval; productive runs renew
 max_model_calls = 40            # checkpoint interval; productive runs renew
 max_wall_minutes = 30           # checkpoint interval; productive runs renew
 stall_calls = 12
+max_same_tool_family = 8        # repeated and failing calls per family per turn; 0 disables
+max_same_tool_family_success = 24  # unproductive successes per family per turn; 0 disables
 verify_attempts = 2
 
 [prompt]

@@ -1,6 +1,6 @@
 //! `review` tool: working-tree stats, risk findings, and the capped diff.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -22,6 +22,14 @@ const SOURCE_EXTS: &[&str] = &[
     "rs", "py", "ts", "tsx", "js", "jsx", "mjs", "cjs", "go", "c", "h", "cc", "cpp", "hpp", "java",
     "rb", "cs", "kt", "kts", "swift", "php", "scala", "lua", "sh",
 ];
+
+const JS_TS_EXTS: &[&str] = &["ts", "tsx", "js", "jsx", "mjs", "cjs"];
+
+/// Files that carry no behavior, so they need no test of their own.
+const MARKER_FILES: &[&str] = &["__init__.py", ".gitkeep", "conftest.py"];
+
+/// Cap for the in-file scan for a Rust `#[cfg(test)]` module.
+const MAX_INLINE_TEST_SCAN: u64 = 1024 * 1024;
 
 const LOCKFILES: &[&str] = &[
     "Cargo.lock",
@@ -88,7 +96,7 @@ impl ReviewTool {
             .clamp(1, MAX_DIFF_LINES as u64) as usize;
 
         let snapshot = collect_snapshot(&ctx.cwd, staged).await?;
-        let findings = scan(&snapshot);
+        let findings = scan(&snapshot, &ctx.cwd);
         let content = render(&snapshot, &findings, lines);
         let (added, removed) = snapshot.totals();
 
@@ -169,27 +177,97 @@ struct FileStat {
 
 async fn collect_snapshot(cwd: &Path, staged: bool) -> Result<Snapshot, ToolResult> {
     ensure_repo(cwd).await?;
+    // The session root, not the enclosing repository, is the scope. A root
+    // without a `.git` of its own must not report a parent's changes.
+    let prefix = repo_prefix(cwd).await?;
 
-    let status_raw = git(cwd, &["status", "--porcelain=v1", "-z"]).await?;
+    let status_raw = git(
+        cwd,
+        &[
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--",
+            ".",
+        ],
+    )
+    .await?;
     let numstat_args: &[&str] = if staged {
-        &["diff", "--cached", "--numstat"]
+        &["diff", "--cached", "--numstat", "--relative", "--", "."]
     } else {
-        &["diff", "--numstat"]
+        &["diff", "--numstat", "--relative", "--", "."]
     };
     let numstat_raw = git(cwd, numstat_args).await?;
     let diff_args: &[&str] = if staged {
-        &["diff", "--cached", "--", "."]
+        &[
+            "diff",
+            "--cached",
+            "--relative",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+            "--",
+            ".",
+        ]
     } else {
-        &["diff", "--", "."]
+        &[
+            "diff",
+            "--relative",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+            "--",
+            ".",
+        ]
     };
     let diff = git(cwd, diff_args).await?;
 
     Ok(Snapshot {
         staged,
-        status: parse_status(&status_raw),
+        status: parse_status(&status_raw)
+            .into_iter()
+            .filter_map(|entry| scope_status(entry, &prefix))
+            .collect(),
         file_stats: parse_numstat(&numstat_raw),
         diff,
     })
+}
+
+/// The session root relative to the work-tree root, without a trailing slash.
+async fn repo_prefix(cwd: &Path) -> Result<String, ToolResult> {
+    let raw = git(cwd, &["rev-parse", "--show-prefix"]).await?;
+    Ok(raw.trim().trim_matches('/').to_string())
+}
+
+/// Rewrite a work-tree-relative status path as session-root-relative, dropping
+/// anything outside the root. `git status -z` reports paths from the work-tree
+/// root even when git runs in a subdirectory.
+fn scope_status(entry: StatusEntry, prefix: &str) -> Option<StatusEntry> {
+    let path = scope_path(&entry.path, prefix)?;
+    Some(StatusEntry { path, ..entry })
+}
+
+fn scope_path(path: &str, prefix: &str) -> Option<String> {
+    if escapes_root(path) {
+        return None;
+    }
+    if prefix.is_empty() {
+        return Some(path.to_string());
+    }
+    let rest = path.strip_prefix(prefix)?;
+    if rest.is_empty() {
+        return Some(".".to_string());
+    }
+    let rest = rest.strip_prefix('/')?;
+    if rest.is_empty() {
+        return Some(".".to_string());
+    }
+    Some(rest.to_string())
+}
+
+/// Whether a reported path leaves the session root.
+fn escapes_root(path: &str) -> bool {
+    let path = path.trim_matches('"');
+    Path::new(path).is_absolute() || path.split('/').any(|part| part == "..")
 }
 
 async fn ensure_repo(cwd: &Path) -> Result<(), ToolResult> {
@@ -560,13 +638,106 @@ fn is_test_path(path: &str) -> bool {
         || name.contains("_spec.")
 }
 
+fn is_marker_path(path: &str) -> bool {
+    MARKER_FILES.contains(&file_name(path))
+}
+
+fn is_empty_file(root: &Path, path: &str) -> bool {
+    std::fs::metadata(root.join(path)).is_ok_and(|metadata| metadata.len() == 0)
+}
+
+fn is_non_empty_file(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|metadata| metadata.len() > 0)
+}
+
+/// Conventional test file names for a module named `<stem>.<extension>`.
+fn test_file_names(stem: &str, extension: &str) -> Vec<String> {
+    let mut names = vec![
+        format!("test_{stem}.{extension}"),
+        format!("{stem}_test.{extension}"),
+        format!("{stem}.test.{extension}"),
+        format!("{stem}.spec.{extension}"),
+    ];
+    if JS_TS_EXTS.contains(&extension) {
+        for suffix in ["test", "spec"] {
+            for other in JS_TS_EXTS {
+                names.push(format!("{stem}.{suffix}.{other}"));
+            }
+        }
+    }
+    names
+}
+
+/// Whether a conventional test file for this module already exists.
+///
+/// The search is bounded: a fixed set of names checked next to the module,
+/// in a `tests`/`__tests__` sibling, and in the repository `tests`/
+/// `__tests__` directories. It never walks the tree.
+fn has_test_file(root: &Path, path: &str) -> bool {
+    let module = Path::new(path);
+    let name = file_name(path);
+    let Some((stem, extension)) = name.rsplit_once('.') else {
+        return false;
+    };
+    let extension = extension.to_ascii_lowercase();
+    let parent = module.parent().unwrap_or_else(|| Path::new(""));
+    let sibling_dirs = [
+        parent.to_path_buf(),
+        parent.join("tests"),
+        parent.join("__tests__"),
+    ];
+    let root_dirs = [PathBuf::from("tests"), PathBuf::from("__tests__")];
+    let names = test_file_names(stem, &extension);
+    let found = |dir: &Path, names: &[String]| {
+        names
+            .iter()
+            .any(|name| is_non_empty_file(&root.join(dir).join(name)))
+    };
+    if sibling_dirs.iter().any(|dir| found(dir, &names)) {
+        return true;
+    }
+    if root_dirs.iter().any(|dir| found(dir, &names)) {
+        return true;
+    }
+    // Rust integration tests pick their own file names under `tests/`.
+    let integration = [format!("{stem}.rs")];
+    extension == "rs" && root_dirs.iter().any(|dir| found(dir, &integration))
+}
+
+/// Rust keeps tests in the same file under `#[cfg(test)]`.
+fn has_inline_tests(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if metadata.len() > MAX_INLINE_TEST_SCAN {
+        return false;
+    }
+    std::fs::read(path).is_ok_and(|bytes| String::from_utf8_lossy(&bytes).contains("cfg(test)"))
+}
+
+fn has_test(root: &Path, path: &str) -> bool {
+    if has_test_file(root, path) {
+        return true;
+    }
+    extension_of(path).as_deref() == Some("rs") && has_inline_tests(&root.join(path))
+}
+
+/// A changed source module that has no test of its own.
+fn is_untested_source(root: &Path, path: &str) -> bool {
+    is_source_path(path)
+        && !is_test_path(path)
+        && !is_marker_path(path)
+        && !is_empty_file(root, path)
+        && !has_test(root, path)
+}
+
 fn is_deletion_heavy(stat: &FileStat) -> bool {
     let added = stat.added.unwrap_or(0);
     let removed = stat.removed.unwrap_or(0);
     removed > 20 && removed * 5 > (added + removed) * 3
 }
 
-fn scan(snapshot: &Snapshot) -> Vec<Finding> {
+fn scan(snapshot: &Snapshot, root: &Path) -> Vec<Finding> {
     let scanner = Scanner::new();
     let added = added_lines(&snapshot.diff);
     let mut findings: Vec<Finding> = Vec::new();
@@ -654,9 +825,7 @@ fn scan(snapshot: &Snapshot) -> Vec<Finding> {
     let tests_changed = changed.iter().any(|path| is_test_path(path));
     if !tests_changed
         && !full(&findings)
-        && let Some(source) = changed
-            .iter()
-            .find(|path| is_source_path(path) && !is_test_path(path))
+        && let Some(source) = changed.iter().find(|path| is_untested_source(root, path))
     {
         findings.push(Finding::new(
                 source,
@@ -773,6 +942,21 @@ mod tests {
     }
 
     #[test]
+    fn session_paths_drop_the_enclosing_repository() {
+        assert_eq!(
+            scope_path("workspace/note.txt", "workspace").as_deref(),
+            Some("note.txt")
+        );
+        assert_eq!(scope_path("workspace/", "workspace").as_deref(), Some("."));
+        assert_eq!(scope_path("workspace", "workspace").as_deref(), Some("."));
+        assert_eq!(scope_path("workspace-other/x", "workspace"), None);
+        assert_eq!(scope_path("outside.md", "workspace"), None);
+        assert_eq!(scope_path("../unrelated.md", "workspace"), None);
+        assert_eq!(scope_path("/etc/passwd", "workspace"), None);
+        assert_eq!(scope_path("src/lib.rs", "").as_deref(), Some("src/lib.rs"));
+    }
+
+    #[test]
     fn parses_status_entries_with_renames() {
         let raw = "R  new.rs\0old.rs\0?? scratch.txt\0M  src/lib.rs\0";
         let entries = parse_status(raw);
@@ -839,7 +1023,7 @@ fn run() { println!(\"debug\"); }\n\
 
         let snapshot = collect_snapshot(dir.path(), false).await.expect("snapshot");
         assert_eq!(snapshot.changed_paths().len(), 2);
-        let findings = scan(&snapshot);
+        let findings = scan(&snapshot, dir.path());
         let joined: Vec<String> = findings
             .iter()
             .map(|finding| match finding.line {
@@ -895,7 +1079,7 @@ fn run() { println!(\"debug\"); }\n\
         let dir = init_repo(&[("src/big.rs", &long_file)]);
         std::fs::write(dir.path().join("src/big.rs"), "line 0\n").expect("truncate");
         let snapshot = collect_snapshot(dir.path(), false).await.expect("snapshot");
-        let findings = scan(&snapshot);
+        let findings = scan(&snapshot, dir.path());
         assert!(
             findings
                 .iter()
@@ -920,7 +1104,7 @@ fn run() { println!(\"debug\"); }\n\
         }
         let dir = init_repo(&[("README.md", "hello\n")]);
         let snapshot = collect_snapshot(dir.path(), false).await.expect("snapshot");
-        let findings = scan(&snapshot);
+        let findings = scan(&snapshot, dir.path());
         assert!(findings.is_empty());
         assert_eq!(
             render(&snapshot, &findings, 400),
@@ -971,5 +1155,114 @@ fn run() { println!(\"debug\"); }\n\
         assert!(!is_test_path("src/contest.rs"));
         assert!(is_source_path("src/main.rs"));
         assert!(!is_source_path("README.md"));
+    }
+
+    #[test]
+    fn marker_paths_are_recognized() {
+        assert!(is_marker_path("pkg/__init__.py"));
+        assert!(is_marker_path("docs/.gitkeep"));
+        assert!(is_marker_path("tests/conftest.py"));
+        assert!(!is_marker_path("pkg/app.py"));
+    }
+
+    #[test]
+    fn conventional_test_names_cover_the_common_languages() {
+        let names = test_file_names("calc", "go");
+        assert!(names.contains(&"calc_test.go".to_string()));
+        let names = test_file_names("app", "ts");
+        assert!(names.contains(&"app.test.ts".to_string()));
+        assert!(names.contains(&"app.spec.js".to_string()));
+        let names = test_file_names("fizzbuzz", "py");
+        assert!(names.contains(&"test_fizzbuzz.py".to_string()));
+        assert!(names.contains(&"fizzbuzz_test.py".to_string()));
+    }
+
+    fn has_missing_test_finding(findings: &[Finding]) -> bool {
+        findings
+            .iter()
+            .any(|finding| finding.message.contains("without test changes"))
+    }
+
+    #[tokio::test]
+    async fn test_file_next_to_the_module_silences_the_finding() {
+        if !git_available() {
+            return;
+        }
+        let dir = init_repo(&[
+            ("fizzbuzz.py", "def values(n):\n    return n\n"),
+            ("test_fizzbuzz.py", "def test_values():\n    assert True\n"),
+        ]);
+        std::fs::write(
+            dir.path().join("fizzbuzz.py"),
+            "def values(n):\n    return n + 1\n",
+        )
+        .expect("modify source");
+        let snapshot = collect_snapshot(dir.path(), false).await.expect("snapshot");
+        let findings = scan(&snapshot, dir.path());
+        assert!(!has_missing_test_finding(&findings), "unexpected finding");
+    }
+
+    #[tokio::test]
+    async fn test_file_under_tests_silences_the_finding() {
+        if !git_available() {
+            return;
+        }
+        let dir = init_repo(&[
+            ("app/calc.py", "def add(a, b):\n    return a + b\n"),
+            ("tests/test_calc.py", "def test_add():\n    assert True\n"),
+        ]);
+        std::fs::write(
+            dir.path().join("app/calc.py"),
+            "def add(a, b):\n    return a + b + 0\n",
+        )
+        .expect("modify source");
+        let snapshot = collect_snapshot(dir.path(), false).await.expect("snapshot");
+        let findings = scan(&snapshot, dir.path());
+        assert!(!has_missing_test_finding(&findings), "unexpected finding");
+    }
+
+    #[tokio::test]
+    async fn rust_inline_test_module_silences_the_finding() {
+        if !git_available() {
+            return;
+        }
+        let base = "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n\n\
+#[cfg(test)]\nmod tests {\n    #[test]\n    fn adds() {\n        assert_eq!(super::add(1, 1), 2);\n    }\n}\n";
+        let dir = init_repo(&[("src/lib.rs", base)]);
+        std::fs::write(
+            dir.path().join("src/lib.rs"),
+            base.replace("a + b", "b + a"),
+        )
+        .expect("modify source");
+        let snapshot = collect_snapshot(dir.path(), false).await.expect("snapshot");
+        let findings = scan(&snapshot, dir.path());
+        assert!(!has_missing_test_finding(&findings), "unexpected finding");
+    }
+
+    #[tokio::test]
+    async fn marker_and_empty_files_need_no_tests() {
+        if !git_available() {
+            return;
+        }
+        let dir = init_repo(&[("pkg/app.py", "print('base')\n")]);
+        std::fs::write(dir.path().join("pkg/__init__.py"), "").expect("marker");
+        std::fs::write(dir.path().join("notes.py"), "").expect("empty module");
+        let snapshot = collect_snapshot(dir.path(), false).await.expect("snapshot");
+        assert_eq!(snapshot.changed_paths().len(), 2);
+        let findings = scan(&snapshot, dir.path());
+        assert!(!has_missing_test_finding(&findings), "unexpected finding");
+    }
+
+    #[tokio::test]
+    async fn new_source_module_without_a_test_is_flagged() {
+        if !git_available() {
+            return;
+        }
+        let dir = init_repo(&[("README.md", "hello\n")]);
+        std::fs::write(dir.path().join("newmod.py"), "def run():\n    return 1\n")
+            .expect("new module");
+        let snapshot = collect_snapshot(dir.path(), false).await.expect("snapshot");
+        let findings = scan(&snapshot, dir.path());
+        assert!(has_missing_test_finding(&findings), "expected the finding");
     }
 }

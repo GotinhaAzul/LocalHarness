@@ -5,8 +5,8 @@ on stdio, so an editor can host a Totality thread instead of a terminal.
 Zed, Neovim, and Emacs clients that speak ACP can drive it.
 
 The process speaks only newline-delimited JSON-RPC on stdout. Diagnostics go to
-the log file (`$TOT_DATA_DIR/totality.log` or
-`~/.local/share/totality/totality.log`), never to the protocol stream.
+the log file, `totality.log` in the data directory; see
+[configuration](configuration.md#paths). They never go to the protocol stream.
 
 ## Zed
 

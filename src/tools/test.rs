@@ -2,7 +2,7 @@
 //! and returns only the first failure.
 
 use std::ffi::OsString;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Component, Path};
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -12,7 +12,7 @@ use tokio::io::AsyncReadExt;
 use tokio::process::{ChildStderr, ChildStdout, Command};
 
 use crate::text::clip;
-use crate::tools::project::{Runner, detect_runner, is_executable};
+use crate::tools::project::{Runner, detect_runner, is_executable, python_program};
 use crate::tools::{
     Tool, ToolContext, ToolPack, ToolResult, display_path, object_schema, optional_str,
     optional_u64,
@@ -145,21 +145,6 @@ impl Default for TestTool {
     }
 }
 
-fn find_binary(name: &str) -> Option<PathBuf> {
-    if name.contains('/') {
-        let path = PathBuf::from(name);
-        return is_executable(&path).then_some(path);
-    }
-    let search = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&search) {
-        let candidate = dir.join(name);
-        if is_executable(&candidate) {
-            return Some(candidate);
-        }
-    }
-    None
-}
-
 // ---------------------------------------------------------------------------
 // Command construction
 // ---------------------------------------------------------------------------
@@ -247,12 +232,7 @@ fn build_invocation(
             builder
         }
         Runner::Pytest => {
-            let program = if find_binary("python3").is_some() {
-                OsString::from("python3")
-            } else {
-                OsString::from("python")
-            };
-            let mut builder = Builder::new(program);
+            let mut builder = Builder::new(python_program());
             builder.arg("-m").arg("pytest");
             match (&shown_path, test) {
                 (Some(path), Some(test)) => {
@@ -265,6 +245,17 @@ fn build_invocation(
                     builder.arg("-k").arg(test);
                 }
                 (None, None) => {}
+            }
+            builder
+        }
+        Runner::Unittest => {
+            let mut builder = Builder::new(python_program());
+            builder.arg("-m").arg("unittest");
+            if let Some(test) = test {
+                builder.arg("-k").arg(test);
+            }
+            if let Some(path) = &shown_path {
+                builder.arg(path);
             }
             builder
         }
@@ -583,6 +574,62 @@ mod tests {
             .map(|arg| arg.to_string_lossy().to_string())
             .collect();
         assert_eq!(args, vec!["-m", "pytest", "tests/test_api.py::test_ok"]);
+    }
+
+    #[test]
+    fn unittest_target_joins_file_and_filter() {
+        let dir = temp_project(&[]);
+        let path = dir.path().join("test_x.py");
+        let invocation =
+            build_invocation(dir.path(), Runner::Unittest, Some(&path), Some("test_ok"));
+        let args: Vec<String> = invocation
+            .args
+            .iter()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(args, vec!["-m", "unittest", "-k", "test_ok", "test_x.py"]);
+    }
+
+    fn python_available() -> bool {
+        std::process::Command::new(python_program())
+            .arg("--version")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    #[tokio::test]
+    async fn bare_python_test_file_passes_without_a_manifest() {
+        if !python_available() {
+            return;
+        }
+        let dir = temp_project(&[(
+            "test_x.py",
+            "import unittest\n\nclass T(unittest.TestCase):\n    def test_ok(self):\n        self.assertEqual(1, 1)\n",
+        )]);
+        let ctx = crate::tools::bash::test_context(dir.path());
+        let result = TestTool.call(&ctx, json!({"path": "test_x.py"})).await;
+        assert!(!result.is_error, "{}", result.content);
+        assert!(result.content.starts_with("PASS"), "{}", result.content);
+        assert_eq!(result.details.unwrap()["exit_code"].as_i64(), Some(0));
+    }
+
+    #[tokio::test]
+    async fn bare_python_test_file_failure_is_reported() {
+        if !python_available() {
+            return;
+        }
+        let dir = temp_project(&[(
+            "test_x.py",
+            "import unittest\n\nclass T(unittest.TestCase):\n    def test_fails(self):\n        self.assertEqual(1, 2)\n",
+        )]);
+        let ctx = crate::tools::bash::test_context(dir.path());
+        let result = TestTool.call(&ctx, json!({"path": "test_x.py"})).await;
+        assert!(!result.is_error, "{}", result.content);
+        assert!(result.content.starts_with("FAIL"), "{}", result.content);
+        assert_ne!(result.details.unwrap()["exit_code"].as_i64(), Some(0));
     }
 
     #[test]

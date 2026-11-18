@@ -690,7 +690,7 @@ fn run_verify(config: &Config, paths: &Paths, init: bool) -> Result<i32> {
         .with_context(|| "cannot save the verify steps")?;
     if detected.steps.is_empty() {
         println!(
-            "no verify steps detected in {}; looked for Cargo.toml, package.json, pyproject.toml/setup.py/pytest.ini, and go.mod. Add [[steps]] to a [verify] config section instead.",
+            "no verify steps detected in {}; looked for Cargo.toml, package.json, pyproject.toml/setup.py/pytest.ini, test_*.py or *_test.py, and go.mod. Add [[steps]] to a [verify] config section instead.",
             paths.cwd.display()
         );
         return Ok(1);
