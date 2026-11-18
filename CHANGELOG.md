@@ -75,6 +75,21 @@ release may change defaults when the change is called out below.
   `stage`, `unstage`, `commit`, `undo`, `branch`/`worktree` mutations,
   `/commit` and `pr draft` return `GIT_REPO_OUTSIDE_ROOT` and change nothing in the parent
   repository ([#136](https://github.com/GotinhaAzul/LocalHarness/issues/136)).
+- The stall guard saw only consecutive identical calls, so a turn could burn
+  its whole tool budget in an OCR loop: the D09 run made 126 tool calls in
+  420 s, mostly exit-0 probes that each printed slightly different garbage,
+  and neither the stall nor the tool checkpoint stopped it. Calls are now
+  grouped into a tool family and three cumulative per-turn counts stop the
+  turn as `stalled`: repeated calls (successful or failing), failing calls,
+  and successful calls that changed no workspace file and passed no verify.
+  Interleaving a different call, a same-family success, and writes outside the
+  session directory do not reset them; a workspace change or a passing verify
+  does. A counter fingerprints the workspace when it starts and re-checks it
+  when it is about to trip, so a `sed -i` fix loop that really changes files is
+  not a stall. `[budgets] max_same_tool_family` (default 8) and
+  `max_same_tool_family_success` (default 24) set the limits, and 0 disables
+  either
+  ([#138](https://github.com/GotinhaAzul/LocalHarness/issues/138)).
 - A compaction in the middle of one long agentic turn no longer sends a
   conversation without a user message. The kept tail started at an assistant
   entry, so the request was `system, assistant, tool, ...`, and Qwen-family

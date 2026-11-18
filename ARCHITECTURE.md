@@ -357,7 +357,7 @@ observable.
 | Interactive command guard | Blocks `vim`, `less`, `top`, `htop`, `watch`, `nano`, `ssh` without a command, and similar TTY-only invocations. |
 | Budget checkpoint | Tool calls, model calls, and wall clock are checked at 120 calls, 40 model calls, and 30 minutes. A checkpoint that finds a new result, a file change, or a passing verify within the last `stall_calls` calls renews the allowance and the turn continues. A checkpoint with no recent progress ends the turn and reports why. |
 | Stall | Twelve consecutive calls with no new result fingerprint, no file change, and no successful verify. Ends the turn with the last known state. |
-| Tool-family guard | Calls are grouped into a family: `bash` by program and subcommand (quoted code, here-doc bodies, temporary paths, and numbers ignored), other tools by name plus normalized key arguments. Eight failing calls of one family in a turn end it as `stalled` with the family named, even when other calls are interleaved. A successful call of the family, a file change, or a passing verify clears the count. `[budgets] max_same_tool_family` sets the limit. |
+| Tool-family guard | Calls are grouped into a family: `bash` by program and operation, other tools by name plus key arguments (body arguments are ignored; temporary-path and number normalization is for bash families only). Three cumulative counters run across the turn: repeated calls of one family (successful or not), failing calls of one family, and successful calls of one family that changed no workspace file and passed no verify. They stop the turn as `stalled` at `[budgets] max_same_tool_family` (8; repeated and failing calls) and `max_same_tool_family_success` (24; unproductive successes). Interleaving another call, a success of the same family, and writes outside the session directory do not reset them; a workspace change or a passing verify does. 0 disables either budget. Read-only bash programs and read-only tools are exempt from the success budget. When a counter first runs and when it is about to trip, the workspace is fingerprinted (git content tree, else a bounded mtime/size walk), so a `sed -i` fix loop that really changes files is not a stall. |
 | Todo gate | After two mutations or edits touching two files, the run is multi-step and requires a plan. The final task requires a fresh passing verify when verification is configured. |
 | Verify gate | Successful mutations newer than the last passing verify are unverified. Continue up to two times with a verify instruction, then record the unverified state and allow settle. |
 | Review nudge | One continuation per run after mutations, asking for `review`. Never fights verify or todo gates. |
@@ -1958,7 +1958,8 @@ max_tool_calls = 120            # checkpoint interval; productive runs renew
 max_model_calls = 40            # checkpoint interval; productive runs renew
 max_wall_minutes = 30           # checkpoint interval; productive runs renew
 stall_calls = 12
-max_same_tool_family = 8        # failing calls per tool family per turn
+max_same_tool_family = 8        # repeated and failing calls per family per turn; 0 disables
+max_same_tool_family_success = 24  # unproductive successes per family per turn; 0 disables
 verify_attempts = 2
 
 [prompt]

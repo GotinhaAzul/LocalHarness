@@ -1793,6 +1793,184 @@ async fn successful_commands_of_one_family_are_not_a_loop() {
     );
 }
 
+/// Run `git init` in a temporary workspace so `git status` succeeds there.
+fn init_repo(dir: &std::path::Path) {
+    let status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["init", "-q"])
+        .status()
+        .expect("run git init");
+    assert!(status.success());
+}
+
+/// The D09 run from the issue: one command is repeated for real, every call
+/// exits 0, and near-identical probes run in between. No result is an error,
+/// so only the repeated call shows the loop.
+#[tokio::test]
+async fn repeated_successful_calls_between_probes_end_the_turn_as_stalled() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("receipt.txt"), "TOTAL 42\n").unwrap();
+    for index in 0..30 {
+        std::fs::write(
+            dir.path().join(format!("receipt-{index}.txt")),
+            format!("TOTAL {index}\n"),
+        )
+        .unwrap();
+    }
+    let mut scripts: Vec<Script> = Vec::new();
+    for index in 0..30 {
+        scripts.push(call_script(
+            &format!("probe_{index}"),
+            "bash",
+            json!({"command": format!("cat receipt-{index}.txt")}),
+        ));
+        scripts.push(call_script(
+            &format!("again_{index}"),
+            "bash",
+            json!({"command": "cat receipt.txt"}),
+        ));
+    }
+    scripts.push(text_script("done"));
+    let harness = harness(dir.path(), scripts, &["bash"]);
+    let (outcome, events) = run(&harness, "ocr the receipt").await;
+    assert_eq!(
+        outcome.status,
+        TurnStatus::Stalled,
+        "identical exit-0 calls are a loop even when probes run in between"
+    );
+    assert_eq!(
+        harness.provider.requests.lock().unwrap().len(),
+        16,
+        "eight repeats of the same call, interleaved with eight probes"
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::Guard { code, message }
+            if code == "stalled" && message.contains("same call was repeated")
+    )));
+}
+
+/// A write to a scratch file outside the workspace is not task progress: it
+/// must not clear the failing family counts.
+#[tokio::test]
+async fn a_scratch_write_does_not_reset_the_family_count() {
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = std::env::temp_dir().join(format!(
+        "totality-scratch-{}-{}.txt",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos())
+    ));
+    let mut scripts: Vec<Script> = (0..4)
+        .map(|index| {
+            call_script(
+                &format!("probe_{index}"),
+                "bash",
+                json!({"command": format!("cat missing-receipt-{index}.txt")}),
+            )
+        })
+        .collect();
+    scripts.push(call_script(
+        "scratch",
+        "write",
+        json!({"path": scratch.display().to_string(), "content": "scratch\n"}),
+    ));
+    scripts.extend((4..8).map(|index| {
+        call_script(
+            &format!("probe_{index}"),
+            "bash",
+            json!({"command": format!("cat missing-receipt-{index}.txt")}),
+        )
+    }));
+    scripts.push(text_script("done"));
+    let harness = harness(dir.path(), scripts, &["bash", "write"]);
+    let (outcome, _) = run(&harness, "ocr").await;
+    let _ = std::fs::remove_file(&scratch);
+    assert_eq!(
+        outcome.status,
+        TurnStatus::Stalled,
+        "eight failing probes in one family stop the turn"
+    );
+    assert_eq!(
+        harness.provider.requests.lock().unwrap().len(),
+        9,
+        "the scratch write is the fifth call, so the eighth failing probe is the ninth"
+    );
+}
+
+/// A fix loop that rewrites a file through bash changes the workspace without
+/// the harness seeing a file change, so it must not be stopped as a stall.
+#[tokio::test]
+async fn a_bash_edit_loop_that_changes_a_file_is_not_stopped() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("code.txt"), "one\n").unwrap();
+    let mut scripts: Vec<Script> = (0..10)
+        .map(|index| {
+            call_script(
+                &format!("fix_{index}"),
+                "bash",
+                json!({"command": format!("sed -i '1s/^/x{index} /' code.txt; exit 1")}),
+            )
+        })
+        .collect();
+    scripts.push(text_script("done"));
+    let harness = harness(dir.path(), scripts, &["bash"]);
+    let (outcome, _) = run(&harness, "fix the failing check").await;
+    assert_eq!(
+        outcome.status,
+        TurnStatus::Done,
+        "the failing calls changed the file, so they are work, not a loop"
+    );
+    assert_eq!(
+        harness.provider.requests.lock().unwrap().len(),
+        11,
+        "all ten calls ran"
+    );
+}
+
+/// Reading many files and checking status are ordinary inspection, even when
+/// the calls succeed without changing anything.
+#[tokio::test]
+async fn successful_reads_and_status_checks_do_not_trip() {
+    let dir = tempfile::tempdir().unwrap();
+    for index in 0..30 {
+        std::fs::write(
+            dir.path().join(format!("note-{index}.txt")),
+            format!("line {index}\n"),
+        )
+        .unwrap();
+    }
+    init_repo(dir.path());
+    let mut scripts: Vec<Script> = Vec::new();
+    for index in 0..30 {
+        scripts.push(call_script(
+            &format!("read_{index}"),
+            "bash",
+            json!({"command": format!("cat note-{index}.txt")}),
+        ));
+        if index % 11 == 0 {
+            scripts.push(call_script(
+                &format!("status_{index}"),
+                "bash",
+                json!({"command": "git status"}),
+            ));
+        }
+    }
+    scripts.push(text_script("done"));
+    let harness = harness(dir.path(), scripts, &["bash"]);
+    let (outcome, _) = run(&harness, "look around").await;
+    assert_eq!(outcome.status, TurnStatus::Done);
+    let session = harness.session.lock().unwrap();
+    let results = session
+        .branch_entries()
+        .into_iter()
+        .filter(|entry| matches!(entry.kind, EntryKind::ToolResult(_)))
+        .count();
+    assert_eq!(results, 33, "every read and status check ran");
+}
+
 #[tokio::test]
 async fn model_budget_stops_before_another_call() {
     let dir = tempfile::tempdir().unwrap();

@@ -9,6 +9,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -24,9 +25,12 @@ pub struct RunLimits {
     /// Checkpoint interval, not a hard cap.
     pub max_wall: Duration,
     pub stall_calls: u32,
-    /// Consecutive calls of one tool family that may fail without ending the
-    /// turn.
+    /// Failing or repeated calls of one tool family allowed in a turn. Zero
+    /// disables the guard.
     pub max_same_tool_family: u32,
+    /// Successful calls of one family that change nothing allowed in a turn.
+    /// Zero disables the guard.
+    pub max_same_tool_family_success: u32,
     pub verify_attempts: u32,
 }
 
@@ -37,7 +41,8 @@ impl From<&BudgetConfig> for RunLimits {
             max_model_calls: config.max_model_calls.max(1),
             max_wall: Duration::from_secs(u64::from(config.max_wall_minutes.max(1)) * 60),
             stall_calls: config.stall_calls.max(1),
-            max_same_tool_family: config.max_same_tool_family.max(1),
+            max_same_tool_family: config.max_same_tool_family,
+            max_same_tool_family_success: config.max_same_tool_family_success,
             verify_attempts: config.verify_attempts,
         }
     }
@@ -139,6 +144,7 @@ impl RunProgress {
     pub fn new(limits: RunLimits) -> Self {
         let stall_calls = limits.stall_calls;
         let family_limit = limits.max_same_tool_family;
+        let success_limit = limits.max_same_tool_family_success;
         let now = Instant::now();
         Self {
             limits,
@@ -152,7 +158,7 @@ impl RunProgress {
             last_progress_call: None,
             last_progress_at: None,
             seen_results: HashSet::new(),
-            stall: StallTracker::new(stall_calls, family_limit),
+            stall: StallTracker::new(stall_calls, family_limit, success_limit),
             settle_continuations: 0,
             verify_attempts: 0,
             review_nudged: false,
@@ -208,25 +214,16 @@ impl RunProgress {
         }
     }
 
-    /// Record a tool result. `result` is the content shown to the model; a
-    /// result content that was already seen this turn is a repeat, not new
-    /// information, even when the call arguments differ. A failed call never
-    /// counts as new information.
-    pub fn record_tool_result(
-        &mut self,
-        fingerprint: &str,
-        family: &str,
-        result: &str,
-        is_error: bool,
-        changed_file: bool,
-        verified_ok: bool,
-    ) {
+    /// Record a tool result. `outcome.result` is the content shown to the
+    /// model; a result content that was already seen this turn is a repeat, not
+    /// new information, even when the call arguments differ. A failed call
+    /// never counts as new information. `cwd` is the workspace the call ran in.
+    pub fn record_tool_result(&mut self, cwd: &Path, outcome: ToolOutcome<'_>) {
         self.tool_calls += 1;
         self.epoch_tool_calls += 1;
-        self.stall
-            .observe(fingerprint, family, is_error, changed_file, verified_ok);
-        let novel = !is_error && self.seen_results.insert(result_digest(result));
-        if changed_file || verified_ok || novel {
+        self.stall.observe(cwd, outcome);
+        let novel = !outcome.is_error && self.seen_results.insert(result_digest(outcome.result));
+        if outcome.changed_file || outcome.verified_ok || novel {
             self.last_progress_call = Some(self.tool_calls);
             self.last_progress_at = Some(Instant::now());
         }
@@ -242,6 +239,13 @@ impl RunProgress {
         self.stall
             .family_reason()
             .unwrap_or_else(|| StopReason::Stalled.message().to_string())
+    }
+
+    /// Re-check a recorded family trip once a batch is over. A call later in
+    /// the same batch may have changed the workspace (a `sed -i`, a script
+    /// writing a file); the run was making progress, so it is not a stall.
+    pub fn recheck_workspace(&mut self, cwd: &Path) {
+        self.stall.recheck(cwd);
     }
 
     /// A successful reply breaks a context-error episode: the next compaction
@@ -322,67 +326,158 @@ fn result_digest(result: &str) -> u64 {
     hasher.finish()
 }
 
+/// One tool result as the stall guard sees it.
+#[derive(Debug, Clone, Copy)]
+pub struct ToolOutcome<'a> {
+    /// The call and its result, for the consecutive-identical strike counter.
+    pub fingerprint: &'a str,
+    /// Canonical family of the call: `bash` by program and operation, other
+    /// tools by name and key arguments.
+    pub family: &'a str,
+    /// The family plus the arguments that make this exact call distinct.
+    pub signature: &'a str,
+    /// Result content shown to the model.
+    pub result: &'a str,
+    pub is_error: bool,
+    pub changed_file: bool,
+    pub verified_ok: bool,
+}
+
+/// Detects a turn that repeats itself. One counter watches consecutive
+/// identical fingerprints; three cumulative counters watch a tool family
+/// across the whole turn: failing calls, repeated calls (successful or not),
+/// and successful calls that changed nothing and passed no verification.
+///
+/// Only a file change, a passing verification, or a workspace that changed
+/// since the counter started clears a family counter. A different call in
+/// between, or a success of the same family, does not.
 #[derive(Debug)]
 pub struct StallTracker {
     needed: u32,
     strikes: u32,
     last: Option<String>,
-    /// Failed calls per canonical tool family this turn. Unlike `strikes`,
-    /// these counts do not reset when a different call happens in between.
+    /// Failing and repeated calls per family. Zero disables.
     family_limit: u32,
-    families: HashMap<String, u32>,
-    family_trip: Option<(String, u32)>,
+    /// Successful calls that changed nothing per family. Zero disables.
+    success_limit: u32,
+    failures: HashMap<String, Counter>,
+    repeats: HashMap<String, Counter>,
+    idle_successes: HashMap<String, Counter>,
+    trip: Option<Trip>,
 }
 
 impl StallTracker {
-    pub fn new(needed: u32, family_limit: u32) -> Self {
+    pub fn new(needed: u32, family_limit: u32, success_limit: u32) -> Self {
         Self {
             needed,
             strikes: 0,
             last: None,
             family_limit,
-            families: HashMap::new(),
-            family_trip: None,
+            success_limit,
+            failures: HashMap::new(),
+            repeats: HashMap::new(),
+            idle_successes: HashMap::new(),
+            trip: None,
         }
     }
 
-    pub fn observe(
-        &mut self,
-        fingerprint: &str,
-        family: &str,
-        is_error: bool,
-        changed_file: bool,
-        verified_ok: bool,
-    ) {
-        if changed_file || verified_ok {
+    pub fn observe(&mut self, cwd: &Path, outcome: ToolOutcome<'_>) {
+        if outcome.changed_file || outcome.verified_ok {
             self.strikes = 0;
-            self.last = Some(fingerprint.to_string());
-            // Real progress clears every family: the run is not looping.
-            self.families.clear();
+            self.last = Some(outcome.fingerprint.to_string());
+            // Real progress clears every counter: the run is not looping.
+            self.clear();
             return;
         }
-        if self.last.as_deref() == Some(fingerprint) {
+        if self.last.as_deref() == Some(outcome.fingerprint) {
             self.strikes += 1;
         } else {
             self.strikes = 1;
-            self.last = Some(fingerprint.to_string());
+            self.last = Some(outcome.fingerprint.to_string());
         }
 
-        if is_error {
-            let count = self.families.entry(family.to_string()).or_insert(0);
-            *count += 1;
-            if *count >= self.family_limit && self.family_trip.is_none() {
-                self.family_trip = Some((family.to_string(), *count));
+        let mut workspace = Workspace::new(cwd);
+        if let Some(count) = bump(
+            &mut self.repeats,
+            outcome.signature,
+            self.family_limit,
+            &mut workspace,
+        ) {
+            self.set_trip(TripKind::Repeated, outcome.signature, count, &mut workspace);
+        }
+        if outcome.is_error {
+            if let Some(count) = bump(
+                &mut self.failures,
+                outcome.family,
+                self.family_limit,
+                &mut workspace,
+            ) {
+                self.set_trip(TripKind::Failed, outcome.family, count, &mut workspace);
             }
-        } else {
-            // A successful call of this family is that family making progress,
-            // so its earlier failures no longer count against it.
-            self.families.remove(family);
+            return;
+        }
+        if is_read_only(outcome.family) {
+            return;
+        }
+        let coarse = coarse_family(outcome.family);
+        if let Some(count) = bump(
+            &mut self.idle_successes,
+            &coarse,
+            self.success_limit,
+            &mut workspace,
+        ) {
+            self.set_trip(TripKind::Unproductive, &coarse, count, &mut workspace);
         }
     }
 
+    fn set_trip(
+        &mut self,
+        kind: TripKind,
+        family: &str,
+        count: u32,
+        workspace: &mut Workspace<'_>,
+    ) {
+        if self.trip.is_some() {
+            return;
+        }
+        self.trip = Some(Trip {
+            kind,
+            family: family.to_string(),
+            count,
+            workspace: workspace.current().map(str::to_string),
+        });
+    }
+
+    fn clear(&mut self) {
+        self.failures.clear();
+        self.repeats.clear();
+        self.idle_successes.clear();
+        self.trip = None;
+    }
+
+    /// Re-check a recorded trip once its batch is over: a call in the same
+    /// batch may have changed the workspace, which makes the repetition real
+    /// work rather than a loop.
+    pub fn recheck(&mut self, cwd: &Path) {
+        let Some(trip) = self.trip.take() else {
+            return;
+        };
+        let now = workspace_state(cwd);
+        let changed = matches!(
+            (trip.workspace.as_deref(), now.as_deref()),
+            (Some(before), Some(after)) if before != after
+        );
+        if !changed {
+            self.trip = Some(trip);
+            return;
+        }
+        self.failures.clear();
+        self.repeats.clear();
+        self.idle_successes.clear();
+    }
+
     pub fn stalled(&self) -> bool {
-        self.strikes >= self.needed || self.family_trip.is_some()
+        self.strikes >= self.needed || self.trip.is_some()
     }
 
     pub fn strikes(&self) -> u32 {
@@ -391,30 +486,214 @@ impl StallTracker {
 
     /// Stop message for the family guard, once it has fired.
     pub fn family_reason(&self) -> Option<String> {
-        self.family_trip.as_ref().map(|(family, count)| {
-            format!(
-                "the same tool family ({family}) ran {count} failing calls this turn without a file change or a passing verification; stop repeating it and report the last known state, or change approach in a new turn"
-            )
+        let trip = self.trip.as_ref()?;
+        Some(match trip.kind {
+            TripKind::Repeated => format!(
+                "the same call was repeated {} times this turn without changing a file or passing a verification ({}); stop repeating it and report the last known state, or change approach in a new turn",
+                trip.count, trip.family
+            ),
+            TripKind::Failed => format!(
+                "the same tool family ({}) ran {} failing calls this turn without a file change or a passing verification; stop repeating it and report the last known state, or change approach in a new turn",
+                trip.family, trip.count
+            ),
+            TripKind::Unproductive => format!(
+                "{} successful calls of {} changed no file and passed no verification this turn; stop repeating it and report the last known state, or change approach in a new turn",
+                trip.count, trip.family
+            ),
         })
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum TripKind {
+    Repeated,
+    Failed,
+    Unproductive,
+}
+
+#[derive(Debug)]
+struct Trip {
+    kind: TripKind,
+    family: String,
+    count: u32,
+    /// Workspace state when the trip fired. If the batch that follows changed
+    /// it, the turn is not stalled.
+    workspace: Option<String>,
+}
+
+/// A cumulative count for one key, plus the workspace state when the count
+/// started so real work in between can clear it.
+#[derive(Debug, Default)]
+struct Counter {
+    count: u32,
+    baseline: Option<String>,
+}
+
+/// Count one call for `key`. Returns the count once it reaches `limit`, unless
+/// the workspace changed since the counter started: then the calls did real
+/// work and the counter restarts instead of stopping the turn.
+fn bump(
+    counters: &mut HashMap<String, Counter>,
+    key: &str,
+    limit: u32,
+    workspace: &mut Workspace<'_>,
+) -> Option<u32> {
+    if limit == 0 {
+        return None;
+    }
+    let counter = counters.entry(key.to_string()).or_default();
+    if counter.count == 0 {
+        counter.baseline = workspace.current().map(str::to_string);
+    }
+    counter.count += 1;
+    if counter.count < limit {
+        return None;
+    }
+    let changed = match (counter.baseline.as_deref(), workspace.current()) {
+        (Some(before), Some(now)) => before != now,
+        // Without a readable workspace the guard keeps its stop: the call did
+        // not report a file change either.
+        _ => false,
+    };
+    if !changed {
+        return Some(counter.count);
+    }
+    counter.count = 0;
+    counter.baseline = None;
+    None
+}
+
+/// Workspace state read at most once per call, so a call that starts or trips
+/// several counters reads it once.
+struct Workspace<'a> {
+    cwd: &'a Path,
+    state: Option<String>,
+    read: bool,
+}
+
+impl<'a> Workspace<'a> {
+    fn new(cwd: &'a Path) -> Self {
+        Self {
+            cwd,
+            state: None,
+            read: false,
+        }
+    }
+
+    fn current(&mut self) -> Option<&str> {
+        if !self.read {
+            self.state = workspace_state(self.cwd);
+            self.read = true;
+        }
+        self.state.as_deref()
+    }
+}
+
+/// Identity of the working tree, used to tell real work from a loop: the git
+/// content tree in a repository, otherwise a bounded walk of paths, sizes, and
+/// modification times. `None` when it cannot be read.
+pub fn workspace_state(cwd: &Path) -> Option<String> {
+    if let Some(tree) = crate::tools::git::content_tree(cwd) {
+        return Some(tree);
+    }
+    if !cwd.is_dir() {
+        return None;
+    }
+    Some(metadata_digest(cwd))
+}
+
+/// Bounded walk for a directory that is not a git repository. Build output and
+/// dependency trees are skipped, like the repository map does, so a build does
+/// not read as a file change.
+fn metadata_digest(root: &Path) -> String {
+    const MAX_ENTRIES: usize = 2_000;
+    let mut builder = ignore::WalkBuilder::new(root);
+    builder
+        .hidden(true)
+        .git_ignore(true)
+        .git_global(false)
+        .git_exclude(true)
+        .parents(false)
+        .follow_links(false)
+        .filter_entry(|entry| {
+            let name = entry.file_name().to_string_lossy();
+            !matches!(
+                name.as_ref(),
+                ".git"
+                    | ".hg"
+                    | ".svn"
+                    | "target"
+                    | "node_modules"
+                    | "dist"
+                    | "build"
+                    | ".venv"
+                    | "venv"
+                    | "__pycache__"
+                    | ".next"
+                    | ".cache"
+                    | "vendor"
+            )
+        });
+    let mut entries: Vec<(String, u64, u128)> = Vec::new();
+    for entry in builder.build().flatten() {
+        if entries.len() >= MAX_ENTRIES {
+            break;
+        }
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let modified = meta
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |elapsed| elapsed.as_nanos());
+        let path = entry.path().strip_prefix(root).unwrap_or(entry.path());
+        entries.push((path.to_string_lossy().into_owned(), meta.len(), modified));
+    }
+    entries.sort();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    entries.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
 /// Canonical family for a tool call, so near-identical retries count as the
 /// same operation: `bash` calls by program (and subcommand for tools that take
-/// one), other tools by name and normalized key arguments. Cosmetic changes —
-/// temporary paths, numbers, quoted code, here-doc bodies — do not create a
-/// new family.
+/// one), other tools by name and key arguments. Body arguments (`content`,
+/// `old`, `new`, ...) do not create a new family.
 pub fn tool_family(name: &str, arguments: &str) -> String {
     let args: Value = serde_json::from_str(arguments).unwrap_or(Value::Null);
     if name == "bash" {
         let command = args.get("command").and_then(Value::as_str).unwrap_or("");
         return format!("bash {}", bash_family(command));
     }
-    let args = canonical_args(&args);
+    let args = canonical_args(&args, false);
     if args.is_empty() {
         name.to_string()
     } else {
         format!("{name} {args}")
+    }
+}
+
+/// The family plus the arguments that make one call distinct, so a repeat can
+/// be told from a near-identical retry. Here-doc bodies, temporary paths, and
+/// bare numbers are hidden for `bash`; other tools keep their arguments, so
+/// two writes with different content are two calls.
+pub fn tool_signature(name: &str, arguments: &str) -> String {
+    let args: Value = serde_json::from_str(arguments).unwrap_or(Value::Null);
+    let family = tool_family(name, arguments);
+    let detail = if name == "bash" {
+        let command = args.get("command").and_then(Value::as_str).unwrap_or("");
+        normalize_text(&strip_heredocs(command))
+    } else {
+        canonical_args(&args, true)
+    };
+    if detail.is_empty() {
+        family
+    } else {
+        format!("{family} :: {detail}")
     }
 }
 
@@ -444,8 +723,59 @@ const SUBCOMMAND_PROGRAMS: &[&str] = &[
 ];
 
 const WRAPPERS: &[&str] = &[
-    "sudo", "doas", "env", "time", "command", "nohup", "exec", "nice", "stdbuf",
+    "sudo", "doas", "env", "time", "timeout", "command", "nohup", "exec", "nice", "stdbuf",
 ];
+
+/// Flags that take a value, so the word after them is not the operation:
+/// `git -C repo status`, `kubectl -n ns get pods`, `nice -n 5 cargo test`.
+const VALUE_FLAGS: &[&str] = &[
+    "-C",
+    "-c",
+    "-n",
+    "-u",
+    "-b",
+    "-R",
+    "-s",
+    "--context",
+    "--namespace",
+    "--target",
+    "--profile",
+];
+
+/// Bash programs that only read. A successful call that changed nothing is
+/// ordinary inspection, not a stall.
+const READ_ONLY_PROGRAMS: &[&str] = &[
+    "cat", "head", "tail", "ls", "stat", "wc", "rg", "grep", "find", "file", "du", "tree", "pwd",
+    "echo", "which",
+];
+
+/// Tools that only read. Their successful calls never count against the
+/// unproductive-success budget.
+const READ_ONLY_TOOLS: &[&str] = &[
+    "read", "grep", "glob", "recall", "repo_map", "lsp", "evidence", "fetch", "skill",
+];
+
+/// Whether a family only reads, as `tool_family` renders it: `bash cat`, or a
+/// read-only tool's name and arguments.
+fn is_read_only(family: &str) -> bool {
+    if let Some(rest) = family.strip_prefix("bash ") {
+        let program = rest.split(' ').next().unwrap_or(rest);
+        return READ_ONLY_PROGRAMS.contains(&program);
+    }
+    let name = family.split(' ').next().unwrap_or(family);
+    READ_ONLY_TOOLS.contains(&name)
+}
+
+/// The family without its subcommand, for the unproductive-success counter:
+/// `bash cargo test` and `bash cargo build` are both `bash cargo`, and every
+/// read of the same tool collapses to the tool name.
+fn coarse_family(family: &str) -> String {
+    if let Some(rest) = family.strip_prefix("bash ") {
+        let program = rest.split(' ').next().unwrap_or(rest);
+        return format!("bash {program}");
+    }
+    family.split(' ').next().unwrap_or(family).to_string()
+}
 
 /// Argument keys that carry code or file bodies. Their contents change between
 /// retries, so they say nothing about the operation.
@@ -475,17 +805,17 @@ fn bash_family(command: &str) -> String {
             index += 1;
             continue;
         }
-        if matches!(token.as_str(), "cd" | "pushd") {
-            index += 1;
-            while tokens.get(index).is_some_and(|next| next.starts_with('-')) {
+        if matches!(token.as_str(), "cd" | "pushd" | "popd") {
+            index = skip_flags(&tokens, index + 1);
+            if tokens.get(index).is_some() {
                 index += 1;
             }
-            index += 1;
             continue;
         }
         if WRAPPERS.contains(&token.as_str()) {
-            index += 1;
-            while tokens.get(index).is_some_and(|next| next.starts_with('-')) {
+            index = skip_flags(&tokens, index + 1);
+            // `timeout 30 cargo test`: the duration is a bare word.
+            if token == "timeout" && tokens.get(index).is_some() {
                 index += 1;
             }
             continue;
@@ -496,14 +826,30 @@ fn bash_family(command: &str) -> String {
     if !SUBCOMMAND_PROGRAMS.contains(&program) {
         return program.to_string();
     }
-    let operation = tokens[index + 1..]
-        .iter()
-        .find(|token| is_operation(token))
+    let operation = tokens
+        .get(skip_flags(&tokens, index + 1))
+        .filter(|token| is_operation(token))
         .map(String::as_str);
     match operation {
         Some(operation) => format!("{program} {operation}"),
         None => program.to_string(),
     }
+}
+
+/// Skip flags starting at `index`, consuming the value of a flag that takes
+/// one. Returns the index of the first word that is not a flag or a value.
+fn skip_flags(tokens: &[String], mut index: usize) -> usize {
+    while let Some(token) = tokens.get(index) {
+        if !token.starts_with('-') {
+            break;
+        }
+        let takes_value = VALUE_FLAGS.contains(&token.as_str());
+        index += 1;
+        if takes_value {
+            index += 1;
+        }
+    }
+    index
 }
 
 fn is_assignment(token: &str) -> bool {
@@ -613,7 +959,7 @@ fn shell_words(command: &str) -> Vec<String> {
                         current.push(next);
                     }
                 }
-                ch if ch.is_whitespace() || matches!(ch, ';' | '|' | '&') => {
+                ch if ch.is_whitespace() || matches!(ch, ';' | '|' | '&' | '<' | '>') => {
                     if !current.is_empty() {
                         words.push(std::mem::take(&mut current));
                     }
@@ -628,7 +974,7 @@ fn shell_words(command: &str) -> Vec<String> {
     words
 }
 
-fn canonical_args(args: &Value) -> String {
+fn canonical_args(args: &Value, keep_bodies: bool) -> String {
     let Value::Object(map) = args else {
         return String::new();
     };
@@ -637,7 +983,7 @@ fn canonical_args(args: &Value) -> String {
         if value.is_null() {
             continue;
         }
-        let value = if BODY_KEYS.contains(&key.as_str()) {
+        let value = if !keep_bodies && BODY_KEYS.contains(&key.as_str()) {
             "<body>".to_string()
         } else {
             canonical_value(value)
@@ -650,7 +996,7 @@ fn canonical_args(args: &Value) -> String {
 
 fn canonical_value(value: &Value) -> String {
     match value {
-        Value::String(text) => normalize_text(text),
+        Value::String(text) => collapse(text),
         Value::Array(items) => {
             let mut items: Vec<String> = items.iter().map(canonical_value).collect();
             items.sort();
@@ -659,25 +1005,42 @@ fn canonical_value(value: &Value) -> String {
         Value::Bool(flag) => flag.to_string(),
         Value::Number(number) => number.to_string(),
         Value::Null => String::new(),
-        other => normalize_text(&other.to_string()),
+        other => collapse(&other.to_string()),
     }
 }
 
-/// Collapse whitespace and hide temporary-directory names, which change on
-/// every call even when the operation is the same.
+/// Collapse whitespace so formatting differences do not create a new call.
+fn collapse(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Collapse whitespace and hide temporary-directory names and bare numbers,
+/// which change between retries even when the operation is the same. Used for
+/// bash commands only: a file path in another tool's arguments is that tool's
+/// target, not noise.
 fn normalize_text(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for word in text.split_whitespace() {
         if !out.is_empty() {
             out.push(' ');
         }
-        out.push_str(&normalize_temp_path(word));
+        out.push_str(&normalize_word(word));
     }
     out
 }
 
+fn normalize_word(word: &str) -> String {
+    if !word.is_empty() && word.chars().all(|ch| ch.is_ascii_digit()) {
+        return "<n>".to_string();
+    }
+    normalize_temp_path(word)
+}
+
+/// Temporary directories whose names change on every call.
+const TEMP_ROOTS: &[&str] = &["/tmp/", "/var/tmp/", "/private/tmp/"];
+
 fn normalize_temp_path(word: &str) -> String {
-    for root in ["/tmp/", "/var/tmp/", "/private/tmp/"] {
+    for root in TEMP_ROOTS {
         if let Some(rest) = word.strip_prefix(root)
             && let Some((_, tail)) = rest.split_once('/')
         {
@@ -698,21 +1061,72 @@ mod tests {
             max_wall: Duration::from_secs(600),
             stall_calls: 3,
             max_same_tool_family: 8,
+            max_same_tool_family_success: 24,
             verify_attempts: 2,
         }
     }
 
-    fn progress_with_one_result(progress: &mut RunProgress, result: &str) {
-        progress.record_tool_result(result, result, result, false, false, false);
+    fn disabled() -> RunLimits {
+        RunLimits {
+            stall_calls: 1_000,
+            max_same_tool_family: 0,
+            max_same_tool_family_success: 0,
+            ..limits()
+        }
+    }
+
+    /// A fresh, empty workspace: its state never changes during a test.
+    fn empty_workspace() -> tempfile::TempDir {
+        tempfile::tempdir().unwrap()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record(
+        progress: &mut RunProgress,
+        cwd: &Path,
+        family: &str,
+        signature: &str,
+        result: &str,
+        is_error: bool,
+        changed: bool,
+        verified: bool,
+    ) {
+        let fingerprint = format!("{signature} | {result}");
+        progress.record_tool_result(
+            cwd,
+            ToolOutcome {
+                fingerprint: &fingerprint,
+                family,
+                signature,
+                result,
+                is_error,
+                changed_file: changed,
+                verified_ok: verified,
+            },
+        );
+    }
+
+    fn args(command: &str) -> String {
+        serde_json::json!({"command": command}).to_string()
     }
 
     #[test]
     fn productive_model_checkpoint_renews() {
+        let dir = empty_workspace();
         let mut progress = RunProgress::new(limits());
         for _ in 0..4 {
             progress.model_call_started();
         }
-        progress_with_one_result(&mut progress, "new facts");
+        record(
+            &mut progress,
+            dir.path(),
+            "bash cat",
+            "bash cat :: cat notes.txt",
+            "new facts",
+            false,
+            false,
+            false,
+        );
         assert_eq!(
             progress.model_checkpoint(),
             BudgetCheck::Renewed(StopReason::ModelBudget)
@@ -738,12 +1152,14 @@ mod tests {
 
     #[test]
     fn repeated_results_are_not_progress() {
+        let dir = empty_workspace();
         let mut progress = RunProgress::new(limits());
-        progress.record_tool_result("a", "same", "same", false, false, false);
-        for index in 1..6 {
-            progress.record_tool_result(
-                &format!("call-{index}"),
-                "same",
+        for index in 0..6 {
+            record(
+                &mut progress,
+                dir.path(),
+                "bash cat",
+                &format!("bash cat :: cat notes-{index}.txt"),
                 "same",
                 false,
                 false,
@@ -762,12 +1178,24 @@ mod tests {
 
     #[test]
     fn stale_progress_does_not_renew() {
+        let dir = empty_workspace();
         let mut progress = RunProgress::new(limits());
-        progress_with_one_result(&mut progress, "useful");
+        record(
+            &mut progress,
+            dir.path(),
+            "bash cat",
+            "bash cat :: cat notes.txt",
+            "useful",
+            false,
+            false,
+            false,
+        );
         for index in 0..6 {
-            progress.record_tool_result(
-                &format!("noise-{index}"),
-                &format!("noise-{index}"),
+            record(
+                &mut progress,
+                dir.path(),
+                &format!("bash probe-{index}"),
+                &format!("bash probe-{index} :: probe {index}"),
                 &format!("noise-{index}"),
                 true,
                 false,
@@ -785,9 +1213,19 @@ mod tests {
 
     #[test]
     fn tool_checkpoint_renews_for_a_productive_batch() {
+        let dir = empty_workspace();
         let mut progress = RunProgress::new(limits());
         for calls in 0..9 {
-            progress_with_one_result(&mut progress, &format!("result {calls}"));
+            record(
+                &mut progress,
+                dir.path(),
+                "bash cat",
+                &format!("bash cat :: cat notes-{calls}.txt"),
+                &format!("result {calls}"),
+                false,
+                false,
+                false,
+            );
         }
         assert_eq!(
             progress.tool_checkpoint(2),
@@ -803,8 +1241,18 @@ mod tests {
 
     #[test]
     fn file_change_is_progress_even_when_the_result_repeats() {
+        let dir = empty_workspace();
         let mut progress = RunProgress::new(limits());
-        progress.record_tool_result("f", "f", "ok", false, true, false);
+        record(
+            &mut progress,
+            dir.path(),
+            "bash cat",
+            "bash cat :: cat notes.txt",
+            "ok",
+            false,
+            true,
+            false,
+        );
         for _ in 0..4 {
             progress.model_call_started();
         }
@@ -816,32 +1264,73 @@ mod tests {
 
     #[test]
     fn stall_needs_consecutive_identical_fingerprints() {
+        let dir = empty_workspace();
         let mut progress = RunProgress::new(limits());
-        progress.record_tool_result("same", "same", "r", false, false, false);
-        progress.record_tool_result("same", "same", "r", false, false, false);
-        progress.record_tool_result("same", "same", "r", false, false, false);
+        for _ in 0..3 {
+            record(
+                &mut progress,
+                dir.path(),
+                "bash cat",
+                "bash cat :: cat notes.txt",
+                "r",
+                false,
+                false,
+                false,
+            );
+        }
         assert!(progress.stalled());
-        progress.record_tool_result("different", "different", "r", false, false, false);
+        record(
+            &mut progress,
+            dir.path(),
+            "bash cat",
+            "bash cat :: cat other.txt",
+            "r",
+            false,
+            false,
+            false,
+        );
         assert!(!progress.stalled());
     }
 
     #[test]
     fn file_change_resets_stall() {
+        let dir = empty_workspace();
         let mut progress = RunProgress::new(limits());
         for _ in 0..2 {
-            progress.record_tool_result("same", "same", "r", false, false, false);
+            record(
+                &mut progress,
+                dir.path(),
+                "bash cat",
+                "bash cat :: cat notes.txt",
+                "r",
+                false,
+                false,
+                false,
+            );
         }
-        progress.record_tool_result("same", "same", "r", false, true, false);
+        record(
+            &mut progress,
+            dir.path(),
+            "bash cat",
+            "bash cat :: cat notes.txt",
+            "r",
+            false,
+            true,
+            false,
+        );
         assert!(!progress.stalled());
     }
 
     #[test]
     fn failed_results_are_never_progress() {
+        let dir = empty_workspace();
         let mut progress = RunProgress::new(limits());
         for index in 0..6 {
-            progress.record_tool_result(
-                &format!("call-{index}"),
+            record(
+                &mut progress,
+                dir.path(),
                 &format!("family-{index}"),
+                &format!("family-{index} :: call {index}"),
                 &format!("distinct failure {index}"),
                 true,
                 false,
@@ -859,11 +1348,14 @@ mod tests {
 
     #[test]
     fn failing_calls_of_one_family_trip_the_family_guard() {
+        let dir = empty_workspace();
         let mut progress = RunProgress::new(limits());
         for index in 0..8 {
-            progress.record_tool_result(
-                &format!("bash-{index}"),
+            record(
+                &mut progress,
+                dir.path(),
                 "bash tesseract",
+                &format!("bash tesseract :: tesseract receipt-{index}.png"),
                 &format!("[exit 1] cannot read receipt-{index}.png"),
                 true,
                 false,
@@ -879,19 +1371,24 @@ mod tests {
 
     #[test]
     fn family_repeats_count_across_interleaved_calls() {
+        let dir = empty_workspace();
         let mut progress = RunProgress::new(limits());
         for index in 0..7 {
-            progress.record_tool_result(
-                &format!("a-{index}"),
+            record(
+                &mut progress,
+                dir.path(),
                 "bash tesseract",
+                &format!("bash tesseract :: tesseract receipt-{index}.png"),
                 "failed",
                 true,
                 false,
                 false,
             );
-            progress.record_tool_result(
-                &format!("b-{index}"),
+            record(
+                &mut progress,
+                dir.path(),
                 "bash cat",
+                &format!("bash cat :: cat note-{index}.txt"),
                 &format!("content {index}"),
                 false,
                 false,
@@ -902,18 +1399,120 @@ mod tests {
             !progress.stalled(),
             "an interleaved call must not clear the family count"
         );
-        progress.record_tool_result("a-8", "bash tesseract", "failed", true, false, false);
+        record(
+            &mut progress,
+            dir.path(),
+            "bash tesseract",
+            "bash tesseract :: tesseract receipt-8.png",
+            "failed",
+            true,
+            false,
+            false,
+        );
         assert!(progress.stalled());
     }
 
     #[test]
-    fn successful_calls_of_one_family_do_not_trip_the_family_guard() {
+    fn a_same_family_success_does_not_clear_its_failures() {
+        let dir = empty_workspace();
         let mut progress = RunProgress::new(limits());
-        for index in 0..20 {
-            progress.record_tool_result(
-                &format!("cat-{index}"),
+        for index in 0..8 {
+            record(
+                &mut progress,
+                dir.path(),
+                "bash tesseract",
+                &format!("bash tesseract :: tesseract page-{index}.png"),
+                "failed",
+                true,
+                false,
+                false,
+            );
+            // An exit-0 call that changed nothing is not progress either.
+            record(
+                &mut progress,
+                dir.path(),
+                "bash tesseract",
+                &format!("bash tesseract :: tesseract page-{index}.png out-{index}.txt"),
+                &format!("garbage {index}"),
+                false,
+                false,
+                false,
+            );
+        }
+        assert!(progress.stalled());
+        assert!(progress.stall_message().contains("failing calls"));
+    }
+
+    #[test]
+    fn identical_successful_calls_trip_the_repeat_guard() {
+        let dir = empty_workspace();
+        let mut progress = RunProgress::new(limits());
+        for index in 0..8 {
+            record(
+                &mut progress,
+                dir.path(),
+                "bash python3",
+                "bash python3 :: python3 probe.py",
+                &format!("slightly different garbage {index}"),
+                false,
+                false,
+                false,
+            );
+            if index < 7 {
+                assert!(!progress.stalled(), "call {} is below the limit", index + 1);
+            }
+        }
+        assert!(progress.stalled());
+        assert!(progress.stall_message().contains("same call was repeated"));
+    }
+
+    #[test]
+    fn unproductive_successes_trip_at_their_own_limit() {
+        let dir = empty_workspace();
+        let mut progress = RunProgress::new(limits());
+        for index in 0..24 {
+            record(
+                &mut progress,
+                dir.path(),
+                "bash python3",
+                &format!("bash python3 :: probe {index}"),
+                &format!("garbage {index}"),
+                false,
+                false,
+                false,
+            );
+            if index < 23 {
+                assert!(!progress.stalled(), "call {} is below the limit", index + 1);
+            }
+        }
+        assert!(progress.stalled());
+        assert!(progress.stall_message().contains("24 successful calls"));
+    }
+
+    #[test]
+    fn read_only_successes_never_trip_the_success_budget() {
+        let dir = empty_workspace();
+        for index in 0..40 {
+            std::fs::write(dir.path().join(format!("note-{index}.txt")), "x").unwrap();
+        }
+        let mut progress = RunProgress::new(limits());
+        for index in 0..40 {
+            record(
+                &mut progress,
+                dir.path(),
                 "bash cat",
-                &format!("content {index}"),
+                &format!("bash cat :: cat note-{index}.txt"),
+                &format!("line {index}"),
+                false,
+                false,
+                false,
+            );
+            record(
+                &mut progress,
+                dir.path(),
+                &format!("read path=note-{index}.txt"),
+                &format!("read path=note-{index}.txt"),
+                &format!("line {index}"),
                 false,
                 false,
                 false,
@@ -924,14 +1523,17 @@ mod tests {
 
     #[test]
     fn failing_reads_of_different_files_are_different_families() {
+        let dir = empty_workspace();
         let mut progress = RunProgress::new(limits());
         for index in 0..20 {
             let family = tool_family(
                 "read",
                 &serde_json::json!({"path": format!("missing-{index}.txt")}).to_string(),
             );
-            progress.record_tool_result(
-                &format!("read-{index}"),
+            record(
+                &mut progress,
+                dir.path(),
+                &family,
                 &family,
                 "missing",
                 true,
@@ -943,8 +1545,109 @@ mod tests {
     }
 
     #[test]
+    fn progress_in_the_same_batch_clears_a_family_trip() {
+        let dir = empty_workspace();
+        let mut progress = RunProgress::new(limits());
+        for index in 0..8 {
+            record(
+                &mut progress,
+                dir.path(),
+                "bash tesseract",
+                &format!("bash tesseract :: tesseract page-{index}.png"),
+                "failed",
+                true,
+                false,
+                false,
+            );
+        }
+        assert!(progress.stalled());
+        record(
+            &mut progress,
+            dir.path(),
+            "edit path=receipt.txt",
+            "edit path=receipt.txt",
+            "edited",
+            false,
+            true,
+            false,
+        );
+        assert!(
+            !progress.stalled(),
+            "a real file change in the same batch is progress, not a stall"
+        );
+    }
+
+    #[test]
+    fn a_workspace_change_at_trip_time_restarts_the_counter() {
+        let dir = empty_workspace();
+        let mut progress = RunProgress::new(limits());
+        for index in 0..8 {
+            record(
+                &mut progress,
+                dir.path(),
+                "bash sed",
+                &format!("bash sed :: sed -i s/{index}/x/ receipt.txt"),
+                "failed",
+                true,
+                false,
+                false,
+            );
+            if index == 3 {
+                // A bash `sed -i` changes the file without the harness seeing
+                // it; the trip is checked against the workspace the counter
+                // started in, so real work restarts it instead of stopping.
+                std::fs::write(dir.path().join("receipt.txt"), "fixed\n").unwrap();
+            }
+        }
+        assert!(!progress.stalled());
+    }
+
+    #[test]
+    fn recheck_clears_a_trip_after_a_later_workspace_change() {
+        let dir = empty_workspace();
+        let mut progress = RunProgress::new(limits());
+        for index in 0..8 {
+            record(
+                &mut progress,
+                dir.path(),
+                "bash sed",
+                &format!("bash sed :: sed -i s/{index}/x/ receipt.txt"),
+                "no such file",
+                true,
+                false,
+                false,
+            );
+        }
+        assert!(progress.stalled(), "the trip fired during the batch");
+        std::fs::write(dir.path().join("receipt.txt"), "fixed\n").unwrap();
+        progress.recheck_workspace(dir.path());
+        assert!(
+            !progress.stalled(),
+            "the workspace changed after the trip, so the batch made progress"
+        );
+    }
+
+    #[test]
+    fn zero_disables_both_family_budgets() {
+        let dir = empty_workspace();
+        let mut progress = RunProgress::new(disabled());
+        for index in 0..40 {
+            record(
+                &mut progress,
+                dir.path(),
+                "bash python3",
+                "bash python3 :: python3 probe.py",
+                &format!("garbage {index}"),
+                index % 2 == 0,
+                false,
+                false,
+            );
+        }
+        assert!(!progress.stalled());
+    }
+
+    #[test]
     fn bash_families_ignore_paths_numbers_and_code_bodies() {
-        let args = |command: &str| serde_json::json!({"command": command}).to_string();
         assert_eq!(
             tool_family(
                 "bash",
@@ -999,6 +1702,43 @@ mod tests {
     }
 
     #[test]
+    fn bash_families_skip_flag_values() {
+        let family = |command: &str| tool_family("bash", &args(command));
+        assert_eq!(family("git -C repo status"), "bash git status");
+        assert_eq!(family("git -c user.name=x status"), "bash git status");
+        assert_eq!(family("sudo -u deploy cargo test"), "bash cargo test");
+        assert_eq!(family("nice -n 5 cargo test"), "bash cargo test");
+        assert_eq!(family("kubectl -n ns get pods"), "bash kubectl get");
+        assert_eq!(family("timeout 30 cargo test"), "bash cargo test");
+        assert_eq!(family("timeout -s KILL 30 cargo test"), "bash cargo test");
+        // A here-doc without a space after `<<` is still a here-doc.
+        assert_eq!(family("python3 <<\"EOF\"\nprint(1)\nEOF"), "bash python3");
+        assert_eq!(family("cat<<'EOF'\nhello\nEOF"), "bash cat");
+    }
+
+    #[test]
+    fn bash_signatures_hide_temp_paths_numbers_and_heredoc_bodies() {
+        let signature = |command: &str| tool_signature("bash", &args(command));
+        assert_eq!(
+            signature("tesseract /tmp/a/receipt.png out.txt --psm 6"),
+            signature("tesseract /tmp/b/receipt.png out.txt --psm 3")
+        );
+        assert_eq!(
+            signature("python3 <<'EOF'\nprint(1)\nEOF"),
+            signature("python3 <<'EOF'\nprint(2); print(3)\nEOF")
+        );
+        assert_ne!(
+            signature("tesseract receipt-a.png"),
+            signature("tesseract receipt-b.png")
+        );
+        assert_ne!(
+            signature("cat note-1.txt"),
+            signature("cat note-2.txt"),
+            "digits inside a name are part of the target, not a counter"
+        );
+    }
+
+    #[test]
     fn other_tool_families_keep_targets_and_drop_bodies() {
         let family = |value: serde_json::Value| tool_family("tests", &value.to_string());
         assert_ne!(
@@ -1019,7 +1759,7 @@ mod tests {
                 &serde_json::json!({"path": "a.rs", "old": "three", "new": "four"}).to_string()
             )
         );
-        assert_eq!(
+        assert_ne!(
             tool_family(
                 "write",
                 &serde_json::json!({"path": "/tmp/scratch-1/x.txt", "content": "a"}).to_string()
@@ -1027,7 +1767,19 @@ mod tests {
             tool_family(
                 "write",
                 &serde_json::json!({"path": "/tmp/scratch-2/x.txt", "content": "b"}).to_string()
-            )
+            ),
+            "temporary-path normalization is for bash families only"
+        );
+        assert_ne!(
+            tool_signature(
+                "write",
+                &serde_json::json!({"path": "a.txt", "content": "one"}).to_string()
+            ),
+            tool_signature(
+                "write",
+                &serde_json::json!({"path": "a.txt", "content": "two"}).to_string()
+            ),
+            "different content is a different call, not a repeat"
         );
     }
 }

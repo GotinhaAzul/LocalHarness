@@ -76,12 +76,25 @@ max_tool_calls = 120
 max_model_calls = 40
 max_wall_minutes = 30
 stall_calls = 12
-# Failing calls of one tool family allowed in a turn before it stops as
-# stalled. A family is `bash`'s program and subcommand (temporary paths,
-# numbers, quoted code and here-doc bodies ignored), or another tool's name
-# plus its key arguments. Interleaving does not reset the count; a successful
-# call of the family, a file change, or a passing verify does.
+# Repeated or failing calls of one tool family allowed in a turn before it
+# stops as stalled. A family is `bash`'s program and subcommand, or another
+# tool's name plus its key arguments (a body argument such as `content` does
+# not create a new family). Temporary-path and number normalization apply to
+# bash families only: `tesseract /tmp/a/r.png --psm 6` and
+# `tesseract /tmp/b/r.png --psm 3` are one family, while two `read` calls for
+# different paths are two. Interleaving, an exit-0 call of the family, and a
+# success that changes nothing do not reset the count; a workspace change or a
+# passing verify does. 0 disables the guard.
 max_same_tool_family = 8
+# Successful calls of one family that changed no workspace file and passed no
+# verify, allowed in a turn. A same-family success does not reset it, so a
+# model that reruns OCR or conversion probes forever is stopped even when every
+# probe exits 0. Read-only bash programs (cat, head, tail, ls, stat, wc, rg,
+# grep, find, file, du, tree, pwd, echo, which) and read-only tools (read,
+# grep, glob, recall, repo_map, lsp, evidence, fetch, skill) are exempt.
+# Writes outside the session directory, including temporary paths, do not
+# count as progress. 0 disables the guard.
+max_same_tool_family_success = 24
 verify_attempts = 2
 
 [prompt]

@@ -24,7 +24,9 @@ use crate::tools::{ToolResult, display_path};
 
 use super::calls::CallLedger;
 use super::gates::{self, LoopDecision, LoopGuard, SettleDecision};
-use super::limits::{BudgetCheck, RunProgress, StopReason, tool_family};
+use super::limits::{
+    BudgetCheck, RunProgress, StopReason, ToolOutcome, tool_family, tool_signature,
+};
 use super::{AgentEvent, AgentState, Core};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3229,7 +3231,13 @@ async fn execute_batch(
             if matches!(call.name.as_str(), "write" | "edit" | "patch" | "undo")
                 && let Some(path) = &args_path
             {
-                changed = true;
+                // A write to a path outside the session directory (including
+                // a temporary root) is scratch: it neither counts as progress
+                // nor clears the loop guard's counts.
+                changed = ctx
+                    .resolve(path)
+                    .map(|resolved| inside_workspace(&ctx.cwd, &resolved))
+                    .unwrap_or(false);
                 inferred_mutations += 1;
                 inferred_files.insert(path.clone());
                 let display = repaired
@@ -3244,13 +3252,19 @@ async fn execute_batch(
         }
 
         let fingerprint = fingerprint(&call.name, &raw, &tool_result.content);
+        let family = tool_family(&call.name, &raw);
+        let signature = tool_signature(&call.name, &raw);
         progress.record_tool_result(
-            &fingerprint,
-            &tool_family(&call.name, &raw),
-            &tool_result.content,
-            tool_result.is_error,
-            changed,
-            verified_ok,
+            &ctx.cwd,
+            ToolOutcome {
+                fingerprint: &fingerprint,
+                family: &family,
+                signature: &signature,
+                result: &tool_result.content,
+                is_error: tool_result.is_error,
+                changed_file: changed,
+                verified_ok,
+            },
         );
         if changed || verified_ok {
             // A file change or a passing verification is real progress; the
@@ -3311,6 +3325,11 @@ async fn execute_batch(
             }
         }
     }
+
+    // The batch may have changed the workspace after the family guard fired
+    // (a `sed -i`, a script writing a file the harness never saw). Only a trip
+    // that survived the whole batch ends the turn.
+    progress.recheck_workspace(&ctx.cwd);
 
     let guard = guard_trip.map(|(code, reason)| {
         (
@@ -3448,7 +3467,9 @@ async fn finish_review(
                             }
                         }
                         if outcome.changed {
-                            changed = true;
+                            // A write outside the workspace is scratch, not
+                            // progress the guards should credit.
+                            changed |= inside_workspace(&ctx.cwd, &write.path);
                             applied += outcome.accepted;
                         }
                         if let Some(final_content) = &outcome.final_content {
@@ -3609,13 +3630,20 @@ async fn finish_review(
             }
         }
         let raw = arguments_raw(&call.call.arguments);
+        let family = tool_family(&call.call.name, &raw);
+        let signature = tool_signature(&call.call.name, &raw);
+        let fingerprint = fingerprint(&call.call.name, &raw, &tool_result.content);
         progress.record_tool_result(
-            &fingerprint(&call.call.name, &raw, &tool_result.content),
-            &tool_family(&call.call.name, &raw),
-            &tool_result.content,
-            tool_result.is_error,
-            changed,
-            false,
+            &ctx.cwd,
+            ToolOutcome {
+                fingerprint: &fingerprint,
+                family: &family,
+                signature: &signature,
+                result: &tool_result.content,
+                is_error: tool_result.is_error,
+                changed_file: changed,
+                verified_ok: false,
+            },
         );
         if changed {
             loop_guard.record_progress();
@@ -3722,6 +3750,20 @@ fn fingerprint(name: &str, args: &str, content: &str) -> String {
     args.hash(&mut hasher);
     content.hash(&mut hasher);
     format!("{name}:{:016x}", hasher.finish())
+}
+
+/// Whether a write target belongs to the workspace. Absolute paths outside the
+/// session directory — a temporary root, a scratch file in another tree — are
+/// not progress: changing them does not advance the task, so they neither renew
+/// the stall guard's counts nor clear the loop guard's.
+fn inside_workspace(cwd: &std::path::Path, target: &std::path::Path) -> bool {
+    let root = cwd
+        .canonicalize()
+        .unwrap_or_else(|_| crate::tools::normalize(cwd));
+    let path = target
+        .canonicalize()
+        .unwrap_or_else(|_| crate::tools::normalize(target));
+    path.starts_with(&root)
 }
 
 fn append_user(session: &crate::tools::SessionHandle, text: &str) -> anyhow::Result<()> {
