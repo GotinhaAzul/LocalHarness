@@ -656,15 +656,10 @@ fn reject_noops(tool: &str, value: &Value) -> Result<(), RepairError> {
             }
         }
         "write" => {
-            if let Some(content) = value.get("content").and_then(|v| v.as_str())
-                && content.is_empty()
-                && value.get("allow_empty").and_then(|v| v.as_bool()) != Some(true)
-            {
-                return Err(RepairError::new(
-                    "empty_content",
-                    "write content is empty; to truncate a file intentionally pass \"allow_empty\": true",
-                ));
-            }
+            // Empty content is a valid write when it creates a file or
+            // replaces one that is already empty. This layer has no working
+            // directory to stat the target, so the tool decides whether the
+            // write would truncate existing content.
         }
         _ => {}
     }
@@ -1209,6 +1204,16 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.code, "noop_edit");
+    }
+
+    #[test]
+    fn empty_write_content_passes_repair() {
+        let schema = schema_for("write");
+        // Whether an empty write truncates anything depends on the target, so
+        // the tool decides; repair only shapes the arguments.
+        let value = repair("write", r#"{"path":"__init__.py","content":""}"#, &schema).unwrap();
+        assert_eq!(value["path"], "__init__.py");
+        assert_eq!(value["content"], "");
     }
 
     #[test]
