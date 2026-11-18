@@ -62,7 +62,7 @@ PASS  cargo  42 passed (3.1 s)
 - **Read before edit.** `edit`, `write`, and `patch` require a prior read of the same file. A changed file must be read again.
 - **Plan before the third mutation.** `todo` is free for two edits or two files, then a plan is required.
 - **Verify before settle.** After changes, configured steps run; a real failure blocks the turn.
-- **Review after verify.** The `review` pass checks the diff for secrets, debug statements, lockfiles, deletion-heavy changes, and source changes without tests.
+- **Review after verify.** The `review` pass checks the diff for secrets, debug statements, lockfiles, deletion-heavy changes, and source changes whose module has no test.
 - **Stop the loop, not the work.** Loop and stall guards end a repeating run with a status, not a silent bill. Budget checkpoints renew while the run is still producing new results.
 - **Name the next action.** Every error tells the model what to do instead of leaving it to guess.
 

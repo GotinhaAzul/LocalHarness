@@ -933,6 +933,8 @@ form. `tot doctor` prints both sizes.
   diff is capped and truncation names the follow-up call. Every read is scoped
   to the session root: a workspace without a `.git` of its own reports only the
   files under it, never the enclosing repository's changes or `../` paths.
+  deletion-heavy changes, binary files, and source changes whose module has no
+  test. The diff is capped and truncation names the follow-up call.
 - `finding` supports `add`, `update`, `list`, `report`, `verify`. Severities:
   critical, high, medium, low, info. Statuses: open, fixed, accepted,
   false-positive. `add` requires title, severity, target, and evidence.
