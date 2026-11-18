@@ -1148,37 +1148,109 @@ async fn endless_repetition_stops_the_turn() {
 }
 
 #[tokio::test]
-async fn output_limit_cut_tool_call_does_not_run() {
+async fn output_limit_cut_tool_call_is_nudged_and_the_turn_continues() {
     let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.rs"), "fn main() {}\n").unwrap();
     let harness = harness(
         dir.path(),
-        vec![Script::Events(vec![
-            StreamEvent::ToolCallDelta {
-                index: 0,
-                id: Some("call_1".into()),
-                name: Some("write".into()),
-                arguments: Some("{\"path\":\"big.rs\",\"content\":\"fn a() {}\\nfn b".into()),
-            },
-            StreamEvent::Finish("length".into()),
-        ])],
-        &["write"],
+        vec![
+            Script::Events(vec![
+                StreamEvent::Delta("Writing it.".into()),
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call_1".into()),
+                    name: Some("write".into()),
+                    arguments: Some("{\"path\":\"big.rs\",\"content\":\"fn a() {}\\nfn b".into()),
+                },
+                StreamEvent::Finish("length".into()),
+            ]),
+            // The retry splits the work: one small call, then the answer.
+            call_script("call_2", "read", json!({"path": "a.rs"})),
+            text_script("Done."),
+        ],
+        &["read", "write"],
     );
     let (outcome, events) = run(&harness, "write big.rs").await;
-    assert_eq!(outcome.status, TurnStatus::Error);
-    let (code, message) = outcome.error.expect("typed truncation error");
-    assert_eq!(code, "tool_call_truncated");
-    assert!(message.contains("incomplete"), "{message}");
+    assert_eq!(outcome.status, TurnStatus::Done, "{:?}", outcome.error);
     assert!(!dir.path().join("big.rs").exists());
-    assert!(tool_results(&harness.session).is_empty());
     assert_eq!(
         harness.provider.requests.lock().unwrap().len(),
-        1,
-        "a truncated call must not be retried or dispatched"
+        3,
+        "the cut call is retried after one nudge"
+    );
+    let results = tool_results(&harness.session);
+    assert_eq!(results.len(), 1, "{results:?}");
+    assert!(results[0].contains("fn main() {}"), "{}", results[0]);
+    assert_eq!(last_assistant(&harness.session), "Done.");
+    let nudges = user_messages(&harness.session);
+    assert!(
+        nudges
+            .iter()
+            .any(|m| m.starts_with("[totality]") && m.contains("cut off")),
+        "{nudges:?}"
     );
     assert!(
         events
             .iter()
-            .any(|e| matches!(e, AgentEvent::Error { code, .. } if code == "tool_call_truncated"))
+            .any(|e| matches!(e, AgentEvent::Notice(n) if n.contains("cut off")))
+    );
+    // The prose that streamed before the cut is kept with the real stop
+    // reason; the unusable call is not.
+    let first = &assistants(&harness.session)[0];
+    assert_eq!(first.content.as_deref(), Some("Writing it."));
+    assert_eq!(first.stop_reason.as_deref(), Some("length"));
+    assert!(first.tool_calls.is_none());
+}
+
+#[tokio::test]
+async fn repeated_truncated_tool_calls_end_the_turn_as_stalled() {
+    let dir = tempfile::tempdir().unwrap();
+    let scripts = (0..5)
+        .map(|_| {
+            Script::Events(vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call_1".into()),
+                    name: Some("write".into()),
+                    arguments: Some("{\"path\":\"big.rs\",\"content\":\"fn a".into()),
+                },
+                StreamEvent::Finish("length".into()),
+            ])
+        })
+        .collect();
+    let harness = harness(dir.path(), scripts, &["write"]);
+    let (outcome, events) = run(&harness, "write big.rs").await;
+    assert_eq!(outcome.status, TurnStatus::Stalled);
+    assert!(outcome.error.is_none(), "{:?}", outcome.error);
+    assert!(!dir.path().join("big.rs").exists());
+    assert!(tool_results(&harness.session).is_empty());
+    assert_eq!(
+        harness.provider.requests.lock().unwrap().len(),
+        4,
+        "3 nudges, then a non-error stop"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Guard { code, .. } if code == "tool_call_truncated")),
+        "{events:?}"
+    );
+    let errors: Vec<String> = harness
+        .session
+        .lock()
+        .unwrap()
+        .branch_entries()
+        .into_iter()
+        .filter_map(|entry| match &entry.kind {
+            EntryKind::Error(data) => Some(data.message.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        errors
+            .iter()
+            .any(|message| message.contains("max_output_tokens")),
+        "{errors:?}"
     );
 }
 

@@ -103,6 +103,13 @@ release may change defaults when the change is called out below.
   `max_same_tool_family_success` (default 24) set the limits, and 0 disables
   either
   ([#138](https://github.com/GotinhaAzul/LocalHarness/issues/138)).
+- A tool call cut off by the output token limit no longer ends the turn as
+  `Error`. The partial call is still never executed, but the model is now told
+  to split it into smaller calls and the loop continues, sharing the three
+  output-recovery nudges; after those it stops as `stalled` with
+  `tool_call_truncated` and names `max_output_tokens` as the next action. The
+  prose streamed before the cut is kept with `stop_reason: length`
+  ([#140](https://github.com/GotinhaAzul/LocalHarness/issues/140)).
 - A compaction in the middle of one long agentic turn no longer sends a
   conversation without a user message. The kept tail started at an assistant
   entry, so the request was `system, assistant, tool, ...`, and Qwen-family

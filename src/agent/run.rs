@@ -824,6 +824,37 @@ async fn run_loop(
                 )));
                 continue;
             }
+            // The output limit cut a tool call before its JSON closed, so the
+            // call was dropped and nothing ran. It has no id to pair with a
+            // result, so the recovery step is a user nudge that asks for
+            // smaller calls; the allowance is shared with the other output
+            // repairs.
+            Err(err) if err.class == ErrorClass::ToolCallTruncated => {
+                if let Some(partial) = partial.take()
+                    && let Err(error) = append_assistant(&core.session, partial)
+                {
+                    tracing::warn!(%error, "cannot persist partial assistant output");
+                }
+                let code = err.class.code().to_string();
+                if progress.output_recoveries < MAX_OUTPUT_RECOVERIES {
+                    progress.output_recoveries += 1;
+                    append_error(&core.session, &code, &err.message, true);
+                    let _ = tx.send(AgentEvent::Notice(format!(
+                        "the model's tool call was cut off by the output token limit; asking it to split the call into smaller steps ({}/{MAX_OUTPUT_RECOVERIES})",
+                        progress.output_recoveries
+                    )));
+                    if let Err(error) = append_user(&core.session, TRUNCATED_CALL_NUDGE) {
+                        return TurnOutcome::error("session_write", error.to_string());
+                    }
+                    continue;
+                }
+                let message = format!(
+                    "the model's tool call was cut off by the output token limit on {MAX_OUTPUT_RECOVERIES} recovery attempts; nothing was executed. Raise [model] max_output_tokens or split the task into smaller steps."
+                );
+                append_error(&core.session, &code, &message, false);
+                let _ = tx.send(AgentEvent::Guard { code, message });
+                return TurnOutcome::ok(TurnStatus::Stalled);
+            }
             Err(err) => {
                 if let Some(partial) = partial.take()
                     && let Err(error) = append_assistant(&core.session, partial)
@@ -1641,6 +1672,11 @@ const REPETITION_STOP: &str = "repetition";
 /// Nudges for broken output (loops, cut-offs, empty replies) per turn.
 const MAX_OUTPUT_RECOVERIES: u32 = 3;
 
+/// Fed back as a user message when the output limit cut a tool call before
+/// its JSON closed. The call is never dispatched, so no result can be paired
+/// with it; the message is the recovery step.
+const TRUNCATED_CALL_NUDGE: &str = "[totality] your tool call was cut off by the output token limit, so nothing ran. Send smaller calls: one short step per call instead of one long script or one large write, then continue.";
+
 #[derive(Default)]
 struct OutputRecovery {
     /// One line for the user.
@@ -1777,7 +1813,7 @@ struct StreamAccum {
 impl StreamAccum {
     /// Content streamed so far, without tool calls, for a cancelled or failed
     /// generation. Keeps the branch useful after an interruption.
-    fn partial(&self) -> Option<AssistantData> {
+    fn partial(&self, stop_reason: &str) -> Option<AssistantData> {
         let keep_reasoning = !self.strip_reasoning && !self.reasoning.is_empty();
         if self.content.trim().is_empty() && !keep_reasoning {
             return None;
@@ -1791,7 +1827,7 @@ impl StreamAccum {
             reasoning: keep_reasoning.then(|| self.reasoning.clone()),
             tool_calls: None,
             usage: self.usage.clone(),
-            stop_reason: Some("cancelled".into()),
+            stop_reason: Some(stop_reason.to_string()),
         })
     }
 
@@ -2040,15 +2076,16 @@ async fn stream_assistant(
         let _ = tx.send(AgentEvent::Usage(usage.clone()));
     }
     if let Err(err) = accum.validate_calls() {
-        *partial = accum.partial();
+        // A truncated call was cut by the output limit, not cancelled.
+        *partial = accum.partial("length");
         return Err(err);
     }
     if let Some(err) = failure {
-        *partial = accum.partial();
+        *partial = accum.partial("cancelled");
         return Err(err);
     }
     if cancel.is_cancelled() {
-        *partial = accum.partial();
+        *partial = accum.partial("cancelled");
         return Err(ProviderError::new(
             ErrorClass::Cancelled,
             "generation cancelled",

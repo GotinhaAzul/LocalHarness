@@ -107,8 +107,10 @@ Streaming:
   object, or a different engine id). Handles SGLang fragments, vLLM whole
   calls, Ollama calls without `id` or `index`, and object-valued `arguments`.
 - JSON is validated at close. When `finish_reason` is `length` (or
-  `max_tokens`) and a call's arguments are empty or incomplete, the turn fails
-  with `tool_call_truncated` and the call is never executed.
+  `max_tokens`) and a call's arguments are empty or incomplete, the
+  completion fails with `tool_call_truncated` and the call is never returned;
+  the loop feeds the cut back to the model as a user nudge (3.7) instead of
+  ending the turn.
 - An in-stream `error` object (`{"error":{...}}` or `{"error":"..."}`) aborts
   the turn with the server's message, even after an HTTP 200.
 - A server that ignores `stream: true` and answers `application/json` is
@@ -419,7 +421,7 @@ continues. Nudges are capped at three per turn.
 | `<think>` / `<thinking>` in content | Split out while streaming (tags may straddle deltas) and stored as reasoning; text before a lone `</think>` too. |
 | Tool calls written as text | With `tool_mode` `repair` or `auto`, parsed into native calls before gates run (formats in `docs/model-setup.md`). Fenced/bare JSON must name an active tool and end the reply. |
 | Exact repetition | The stream is checked as it grows; a tail of one unit repeated at least 5 times and 600 bytes stops generation, keeps one copy, and nudges. Repeated loops end the turn as `stalled`. |
-| `finish_reason = length` | A cut tool call (arguments not valid JSON) does not run; the model is told to send smaller calls. Cut prose is continued. A reply that spent the budget thinking is told to act. |
+| `finish_reason = length` | A cut tool call (arguments not valid JSON) does not run and is not replayed; the model is told to split it into smaller calls, spending the output-recovery allowance. After three cuts the turn ends as `stalled` with `tool_call_truncated`. The prose that streamed before the cut is kept with `stop_reason: length`. Cut prose is continued. A reply that spent the budget thinking is told to act. |
 | Empty reply | One nudge to call a tool or answer. |
 | Silent prompt truncation | The engine's `truncated` flag and context-shift count are proof and end the turn. Arithmetic signals need a second witness: `prompt_tokens + cached_tokens` covering the prompt means an uncached-only report; `/tokenize` decides between a cut prompt (it exceeds the window) and a wrong report (it fits); a count under 512 tokens is a broken usage field; impossible characters per token with a plausible count is a confirmed cut; a plain shortfall must repeat on the next call. A wrong report keeps the reply, warns once, stops calibrating from usage on that endpoint, and is recorded for `tot doctor`, which reports it without sending a chat completion. |
 
