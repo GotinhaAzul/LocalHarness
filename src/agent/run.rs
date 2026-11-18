@@ -830,9 +830,17 @@ async fn run_loop(
             // smaller calls; the allowance is shared with the other output
             // repairs.
             Err(err) if err.class == ErrorClass::ToolCallTruncated => {
-                if let Some(partial) = partial.take()
-                    && let Err(error) = append_assistant(&core.session, partial)
-                {
+                // Record the cut reply even when it carried no prose, so the
+                // nudge below follows an assistant turn and roles keep
+                // alternating for templates that require it.
+                let cut = partial.take().unwrap_or_else(|| AssistantData {
+                    content: None,
+                    reasoning: None,
+                    tool_calls: None,
+                    usage: None,
+                    stop_reason: Some("length".into()),
+                });
+                if let Err(error) = append_assistant(&core.session, cut) {
                     tracing::warn!(%error, "cannot persist partial assistant output");
                 }
                 let code = err.class.code().to_string();
@@ -848,9 +856,8 @@ async fn run_loop(
                     }
                     continue;
                 }
-                let message = format!(
-                    "the model's tool call was cut off by the output token limit on {MAX_OUTPUT_RECOVERIES} recovery attempts; nothing was executed. Raise [model] max_output_tokens or split the task into smaller steps."
-                );
+                let message = "the model's tool call was cut off by the output token limit after the output-recovery allowance ran out; nothing was executed. Raise [model] max_output_tokens or split the task into smaller steps."
+                    .to_string();
                 append_error(&core.session, &code, &message, false);
                 let _ = tx.send(AgentEvent::Guard { code, message });
                 return TurnOutcome::ok(TurnStatus::Stalled);

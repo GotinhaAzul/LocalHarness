@@ -1248,10 +1248,19 @@ async fn repeated_truncated_tool_calls_end_the_turn_as_stalled() {
         .collect();
     assert!(
         errors
-            .iter()
-            .any(|message| message.contains("max_output_tokens")),
+            .last()
+            .is_some_and(|message| message.contains("allowance ran out")),
         "{errors:?}"
     );
+    // A cut with no prose still records an assistant turn, so no request
+    // carries two user messages in a row.
+    for request in harness.provider.requests.lock().unwrap().iter() {
+        let users_in_a_row = request.messages.windows(2).any(|pair| {
+            matches!(pair[0], ChatMessage::User { .. })
+                && matches!(pair[1], ChatMessage::User { .. })
+        });
+        assert!(!users_in_a_row, "{:?}", request.messages);
+    }
 }
 
 #[tokio::test]
