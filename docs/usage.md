@@ -89,7 +89,9 @@ Tool results are capped, archived, and retrievable. The model never has to guess
 
 ## Sessions are a tree, not a log
 
-One append-only JSONL file per session tree under `~/.local/share/totality/sessions/<project-id>/`. Branches, checkouts, and forks are non-destructive.
+One append-only JSONL file per session tree under the data directory,
+`sessions/<project-id>/` ([configuration](configuration.md#paths)). Branches,
+checkouts, and forks are non-destructive.
 
 ```text
 /tree       show branches and switch

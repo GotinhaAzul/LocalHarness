@@ -167,10 +167,11 @@ there. `--sandbox` remains the process boundary.
 ## Findings
 
 Findings are engagement-global and stored in
-`~/.local/share/totality/engagements/<engagement>/findings.jsonl`
-(directory `0700`, file `0600`). Each finding records id, title, severity,
-status, target, evidence, impact, remediation, timestamps, and the session and
-entry that produced it.
+`<data dir>/engagements/<engagement>/findings.jsonl`
+(directory `0700`, file `0600`), where the data directory is the one `tot`
+resolved (see [configuration](configuration.md#paths)). Each finding records
+id, title, severity, status, target, evidence, impact, remediation, timestamps,
+and the session and entry that produced it.
 
 ```text
 finding {action:"add", title:"...", severity:"high", target:"https://app.test", evidence:"..."}

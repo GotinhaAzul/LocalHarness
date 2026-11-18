@@ -168,7 +168,9 @@ TOML. See [themes](docs/themes.md).
 
 Upgrading from LocalHarness? The binary is now `tot`, environment variables use
 `TOT_` (the `LH_` names still work), and your existing config and sessions are
-picked up where they are.
+picked up where they are; the legacy `localharness` directories stay in use
+until you move them. See
+[configuration](docs/configuration.md#data-and-config-directories).
 
 ## Contributing
 

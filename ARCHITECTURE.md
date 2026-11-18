@@ -757,6 +757,10 @@ only the marker and the `rewind` entry are appended.
       surface.json
 ```
 
+`~/.local/share` is `$XDG_DATA_HOME`, and `totality` is replaced by the
+pre-0.3 `localharness` while that is the only one of the two present
+(`named_dir` in `src/paths.rs`). `TOT_DATA_DIR` replaces the whole root.
+
 - Evidence artifacts are append-only and `0600`; each ledger entry carries the
   SHA-256 of the artifact. The surface inventory is rewritten atomically after
   each command that produces observations.
@@ -1909,6 +1913,10 @@ non-read-only tool call.
 | Sessions | `~/.local/share/totality/sessions/` |
 | Engagements | `~/.local/share/totality/engagements/` |
 | Project config | `<cwd>/.harness/` |
+
+`~/.config` and `~/.local/share` are `$XDG_CONFIG_HOME` and `$XDG_DATA_HOME`.
+In each, `totality` gives way to the pre-0.3 `localharness` while only that
+exists. `TOT_CONFIG_DIR` and `TOT_DATA_DIR` replace the roots outright.
 
 ### 10.2 Precedence
 

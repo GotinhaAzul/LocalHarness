@@ -5,23 +5,66 @@ defaults. Environment variables fill the gaps.
 
 ## Paths
 
+Defaults use the XDG bases: `$XDG_CONFIG_HOME` (default `~/.config`) and
+`$XDG_DATA_HOME` (default `~/.local/share`). Each holds a `totality/`
+directory, or an existing pre-0.3 `localharness/` one — see
+[Data and config directories](#data-and-config-directories).
+
 | Purpose | Default |
 |---|---|
-| Global config | `~/.config/totality/config.toml` |
-| Profiles | `~/.config/totality/profiles/` |
-| Skills | `~/.config/totality/skills/<name>/SKILL.md` |
-| Skills lockfile | `~/.config/totality/skills.lock` |
-| Skills trash | `~/.config/totality/skills-trash/` |
-| Workflows | `~/.config/totality/workflows/` |
-| External tools | `~/.config/totality/tools/*.toml` |
+| Global config | `<config dir>/config.toml` |
+| Profiles | `<config dir>/profiles/` |
+| Skills | `<config dir>/skills/<name>/SKILL.md` |
+| Skills lockfile | `<config dir>/skills.lock` |
+| Skills trash | `<config dir>/skills-trash/` |
+| Workflows | `<config dir>/workflows/` |
+| External tools | `<config dir>/tools/*.toml` |
 | MCP servers | `[mcp.<name>]` tables in `config.toml` ([docs/mcp.md](mcp.md)) |
-| Themes | `~/.config/totality/themes/*.toml` |
-| Data | `~/.local/share/totality/` |
-| Sessions | `~/.local/share/totality/sessions/<project-id>/` |
-| Engagements | `~/.local/share/totality/engagements/<name>/` |
+| Themes | `<config dir>/themes/*.toml` |
+| Data | `<data dir>/` |
+| Sessions | `<data dir>/sessions/<project-id>/` |
+| Engagements | `<data dir>/engagements/<name>/` |
 | Project config | `<cwd>/.harness/` (requires `--trust`) |
 
-`TOT_CONFIG_DIR` and `TOT_DATA_DIR` override the roots.
+The full paths, with no override and no legacy directory present, are
+`~/.config/totality/config.toml` and `~/.local/share/totality/`.
+
+### Data and config directories
+
+`TOT_CONFIG_DIR` and `TOT_DATA_DIR` set the roots outright; when unset, each
+root is resolved on its own in this order:
+
+1. `<XDG base>/totality`, unless it does not exist and the legacy directory
+   does.
+2. `<XDG base>/localharness`, when it exists as a directory and `totality`
+   does not.
+
+So a fresh install uses `~/.config/totality` and `~/.local/share/totality`,
+while an install upgraded from a pre-0.3 release keeps reading and writing
+`~/.config/localharness` and `~/.local/share/localharness`, with its config
+and sessions intact. If both exist, `totality` wins; if neither exists, it is
+created.
+
+To migrate, stop every `tot` process, then either move the directories or point
+the variables at the old paths:
+
+```sh
+# Stop `tot` first, then rename while the new name does not exist yet:
+mv ~/.local/share/localharness ~/.local/share/totality
+mv ~/.config/localharness ~/.config/totality
+
+# Or leave them in place and pin the roots:
+export TOT_DATA_DIR=~/.local/share/localharness
+export TOT_CONFIG_DIR=~/.config/localharness
+```
+
+If a `totality` directory already exists, merge the two by hand; `mv` would put
+the old directory inside the existing one.
+
+The pre-0.3 `LH_DATA_DIR` and `LH_CONFIG_DIR` names are still read when the
+`TOT_` ones are unset. Scripts that need a fixed path should not assume either
+directory name: `tot serve` prints its token file's path on the startup line,
+and `TOT_DATA_DIR` pins the root outright.
 
 ## Example
 
@@ -617,7 +660,7 @@ Steps run sequentially without a shell and stop at the first failure.
 | `TOT_NO_SESSION` | Disable persistence |
 | `TOT_TRUST` | Trust project config |
 | `TOT_AGENTS_MD` | Set to `0` to skip the AGENTS.md chain |
-| `TOT_CONFIG_DIR`, `TOT_DATA_DIR` | Override roots |
+| `TOT_CONFIG_DIR`, `TOT_DATA_DIR` | Override roots (pre-0.3 `LH_CONFIG_DIR`, `LH_DATA_DIR` still work) |
 | `TOT_HOME` | Home used for `~/.claude/skills` and `~/.agents/skills` discovery |
 | `TOT_SKIP_TOOL_PROBE` | Skip the one-shot tool-call conformance probe |
 | `NO_COLOR` | Disable color |

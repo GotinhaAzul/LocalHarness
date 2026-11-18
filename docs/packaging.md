@@ -164,15 +164,21 @@ data:
 ```sh
 docker run --rm -it \
   -v "$PWD:/workspace" \
-  -v "$HOME/.config/totality:/home/nonroot/.config/totality" \
-  -v "$HOME/.local/share/totality:/home/nonroot/.local/share/totality" \
+  -v "$HOME/.config/totality:/config" \
+  -v "$HOME/.local/share/totality:/data" \
+  -e TOT_CONFIG_DIR=/config \
+  -e TOT_DATA_DIR=/data \
   --network host \
   totality
 ```
 
-`HOME` is `/home/nonroot`, so config and sessions resolve under the mounted
-paths. The TUI needs a terminal (`-it`); use `--print` for one-shot headless
-runs.
+`HOME` is `/home/nonroot`, so the two variables pin the container's config and
+data roots to the mounted directories instead of resolving them from `HOME`.
+Mount whichever host directories `tot` uses there: on an install upgraded from
+a pre-0.3 release that is `~/.config/localharness` and
+`~/.local/share/localharness`, and the variables keep the container path the
+same either way ([configuration](configuration.md#paths)). The TUI needs a
+terminal (`-it`); use `--print` for one-shot headless runs.
 
 ## What is and is not exercised
 
