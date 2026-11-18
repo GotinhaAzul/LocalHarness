@@ -103,15 +103,20 @@ impl App {
         }
 
         if ctrl && matches!(key.code, KeyCode::Char('r') | KeyCode::Char('R')) {
-            self.config.ui.show_reasoning = !self.config.ui.show_reasoning;
-            self.transcript
-                .set_show_reasoning(self.config.ui.show_reasoning);
-            let state = if self.config.ui.show_reasoning {
+            let show = !self.config.ui.show_reasoning;
+            self.config.ui.show_reasoning = show;
+            self.transcript.set_show_reasoning(show);
+            let state = if show {
                 "reasoning expanded"
             } else {
                 "reasoning collapsed"
             };
-            self.set_notice(state, Role::Muted);
+            match self.persist_ui_setting("show_reasoning", toml::Value::Boolean(show)) {
+                Ok(_) => self.set_notice(format!("{state} (saved)"), Role::Muted),
+                Err(error) => {
+                    self.set_notice(format!("{state}; not saved: {error}"), Role::Warning)
+                }
+            }
             return;
         }
 

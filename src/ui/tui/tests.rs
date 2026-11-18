@@ -1392,3 +1392,48 @@ fn ask_text_includes_the_diff_preview() {
     assert!(text.starts_with("edit: src/lib.rs"), "{text}");
     assert!(text.contains("-a") && text.contains("+b"), "{text}");
 }
+
+#[tokio::test]
+async fn applying_theme_profile_and_reasoning_persists_them() {
+    let (_dir, mut app) = test_app().await;
+    let config_path = app.core().unwrap().paths.config_file();
+    let saved = || -> toml::Value {
+        toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap()
+    };
+
+    // A typed `/theme <name>` applies and writes `[ui] theme`.
+    app.run_command("/theme hati").await;
+    assert_eq!(app.theme.name, "hati");
+    assert_eq!(saved()["ui"]["theme"].as_str(), Some("hati"));
+
+    // Picker preview navigation changes the theme on screen but saves nothing.
+    app.input.set_text("/theme");
+    app.handle_key(key(KeyCode::Enter)).await;
+    app.handle_modal_key(key(KeyCode::Down)).await;
+    assert_ne!(app.theme.name, "hati", "moving previews the theme");
+    assert_eq!(
+        saved()["ui"]["theme"].as_str(),
+        Some("hati"),
+        "a preview must not touch the config"
+    );
+    app.handle_modal_key(key(KeyCode::Esc)).await;
+    assert_eq!(app.theme.name, "hati", "Esc restores the saved theme");
+
+    // Ctrl+R toggles and persists the reasoning visibility.
+    app.input.set_text("");
+    app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL))
+        .await;
+    assert!(app.config.ui.show_reasoning);
+    assert_eq!(saved()["ui"]["show_reasoning"].as_bool(), Some(true));
+
+    // A successful profile switch saves it as the next run's default.
+    app.run_command("/profile minimal").await;
+    app.settle().await;
+    assert_eq!(app.config.profile_name(), "minimal");
+    assert_eq!(saved()["default_profile"].as_str(), Some("minimal"));
+    assert_eq!(
+        saved()["ui"]["theme"].as_str(),
+        Some("hati"),
+        "the profile write keeps unrelated keys"
+    );
+}

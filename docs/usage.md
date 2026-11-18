@@ -134,13 +134,13 @@ The terminal interface is the default. It speaks in two voices: the model in Sko
 | `Ctrl+D` | quit when the input is empty |
 | `Up`/`Down` | history when input is empty; otherwise cursor |
 | `PgUp`/`PgDn`, `Home`/`End` | scroll transcript |
-| `Ctrl+R` | toggle reasoning |
+| `Ctrl+R` | toggle reasoning (`[ui] show_reasoning` is saved) |
 | `Ctrl+L` | redraw the whole screen |
 | `/` | slash-command completion |
 | `Tab` / `Shift+Tab` | complete commands, arguments, and paths; move back through choices |
 | Review: `a` / `r` / `e` | accept, reject, or edit the selected hunk (`A`/`R` all, `Enter` apply, `Esc` reject all) |
 
-Tab completes the token at the cursor: commands, arguments (themes, profiles, skills, workflows, session ids, models, `/login` endpoints, `/help` topics, `/sec` subcommands), and file paths. Ambiguous matches first extend to their shared prefix, then open a picker. Every command that chooses from a list — `/model`, `/profile`, `/theme` (with live preview), `/permissions`, `/skill`, `/workflow`, `/sec`, `/resume` — opens a filterable menu when run without an argument: type to filter, arrows to move, Enter to pick. Model and profile switches load in the background, so the TUI stays responsive while the server swaps models.
+Tab completes the token at the cursor: commands, arguments (themes, profiles, skills, workflows, session ids, models, `/login` endpoints, `/help` topics, `/sec` subcommands), and file paths. Ambiguous matches first extend to their shared prefix, then open a picker. Every command that chooses from a list — `/model`, `/profile`, `/theme` (with live preview), `/permissions`, `/skill`, `/workflow`, `/sec`, `/resume` — opens a filterable menu when run without an argument: type to filter, arrows to move, Enter to pick. Model and profile switches load in the background, so the TUI stays responsive while the server swaps models. `/theme <name>` and a confirmed theme picker selection apply the theme and write `[ui] theme` to the global config at once; moving through the preview writes nothing. `/theme save` re-writes the current theme and reports the path, and `Ctrl+R` saves `[ui] show_reasoning` the same way.
 
 Write `@path` in a prompt to attach a file: `fix the panic in @src/parser.rs`. Typing `@` opens a live picker over the project's files (gitignored files excluded): it matches names fuzzily, shows each file's folder, and ranks paths under a typed directory first; Tab or Enter inserts the path. The file is read through the same path as the `read` tool and appended to your message, so the model can edit it without another read. Up to eight files per prompt, within a quarter of the usable context. `@shot.png` attaches a screenshot: a model with vision input sees the image, and a text-only model can get a description from a local vision model; the `read` tool opens images too. Images are checked by content, stripped of EXIF, and sent only to local endpoints unless you opt in. See [images.md](images.md).
 
@@ -193,7 +193,7 @@ The session root is the `cwd` the editor declares, and the path jail is always o
 
 ## Security, when you ask for it
 
-Security is opt-in. The default `coding` profile has no security tools or posture. `--profile security` adds core plus security; `--profile full` adds coding plus security. `/profile` switches during a session.
+Security is opt-in. The default `coding` profile has no security tools or posture. `--profile security` adds core plus security; `--profile full` adds coding plus security. `/profile` switches during a session and saves the pick as `default_profile` for the next run; `--profile` and `TOT_PROFILE` still win this run, whenever they set it.
 
 Security work is for authorized labs, CTFs, and engagements only. Scope is set by the user with `/sec scope add|remove|clear`; there is no model tool for it. The scope gate blocks a known set of active-testing tools when no scope is set or when an extracted target is outside it. It is a speed bump; `--sandbox` is the process boundary.
 
@@ -218,7 +218,7 @@ Everything at the edge is configurable; the loop itself stays small and auditabl
 - **External tools** are any executable speaking one JSON object in, one JSON object out. No plugin ABI, no second runtime.
 - **Lifecycle hooks** run your command at `session_start`, `user_prompt`, `pre_tool`, `post_tool`, `pre_compact`, and `stop`. They can add context or block; a missing hook is visible and `pre_tool` fails closed. `tot hooks test <name>` exercises one.
 - **MCP servers** plug in over stdio or Streamable HTTP with one `[mcp.<name>]` table. Their tools join the profile as `<server>__<tool>`; `tot mcp list` and `/mcp` show what connected.
-- **Themes** are TOML files of semantic color tokens. `default` (dusk) is bundled with `hati`, `skoll`, `classic`, and four more; `omarchy` is an alias for existing configs.
+- **Themes** are TOML files of semantic color tokens. `default` (dusk) is bundled with `hati`, `skoll`, `classic`, and four more; `omarchy` is an alias for existing configs. `/theme <name>` applies one and saves it as `[ui] theme`.
 
 ```toml
 default_profile = "coding"

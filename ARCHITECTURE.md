@@ -1719,8 +1719,10 @@ cursor = "#c0caf5"
   `indexed:0..255`, and `default`.
 - `color_mode = "auto" | "truecolor" | "256" | "16"`. Auto detects
   `COLORTERM`/`TERM`; `NO_COLOR` disables color.
-- `/theme` lists; `/theme <name>` applies for the session; `/theme save`
-  persists the default. Unknown theme names return the available list.
+- `/theme` lists; a picker previews without writing. `/theme <name>` and a
+  confirmed pick apply the theme and write `[ui] theme` at once; `/theme save`
+  re-writes the current theme and reports the path. Unknown theme names return
+  the available list.
 - Status is never conveyed by color alone: labels and glyphs accompany every
   color.
 
@@ -1737,7 +1739,7 @@ cursor = "#c0caf5"
 - Diff fences and diff-like tool output: added lines green, removed red, hunk
   headers accent, context muted.
 - Reasoning: muted block, collapsed by default, token count shown.
-  `Ctrl+R` toggles.
+  `Ctrl+R` toggles and writes `[ui] show_reasoning`.
 - Tool cards: border by status, tool name, one-line argument summary, duration,
   output preview, expand key.
 - Errors: red card with code, message, and next action.
@@ -1799,6 +1801,13 @@ cursor = "#c0caf5"
   diff without a model. `/login` validates and saves
   the endpoint/model/key; `/model` lists endpoint models and switches the
   session.
+- Settings changed from the TUI persist to the global config:
+  `/theme <name>` and a confirmed theme pick write `[ui] theme`, a successful
+  `/profile` switch writes `default_profile`, and `Ctrl+R` writes
+  `[ui] show_reasoning`. `config::save_setting` merges into the existing TOML,
+  replaces the file atomically, keeps its mode, and creates a new file `0600`.
+  A failed save warns and keeps the in-memory change. `/permissions` stays
+  session-only and is never written.
 - Slash completion shows a filtered popup with descriptions. `Tab` completes
   the token at the cursor (`ui/complete.rs`): command names, command
   arguments (themes, profiles, skills, workflows, sessions, probed models,
@@ -1955,7 +1964,7 @@ Environment variables: `TOT_ENDPOINT`, `TOT_MODEL`, `TOT_API_KEY`, `TOT_PROFILE`
 ### 10.3 Example config
 
 ```toml
-default_profile = "coding"      # overridden by --profile / TOT_PROFILE
+default_profile = "coding"      # overridden by --profile / TOT_PROFILE; /profile writes it
 
 [model]
 endpoint = "http://127.0.0.1:8080"
@@ -1970,9 +1979,9 @@ connect_timeout_secs = 5
 first_token_timeout_secs = 120
 
 [ui]
-theme = "default"
+theme = "default"               # /theme <name> writes it
 color_mode = "auto"
-show_reasoning = false
+show_reasoning = false          # Ctrl+R writes it
 show_token_counts = true
 
 [session]

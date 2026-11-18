@@ -65,6 +65,15 @@ release may change defaults when the change is called out below.
   load without `--trust`. The header shows `verify: not configured`, and
   `lh doctor` reports what is configured or detected
   ([#128](https://github.com/GotinhaAzul/LocalHarness/issues/128)).
+- TUI settings now persist: `/theme <name>` and a confirmed theme pick write
+  `[ui] theme` at once, `Ctrl+R` writes `[ui] show_reasoning`, and a successful
+  `/profile` switch writes `default_profile` for the next run (`--profile` and
+  `TOT_PROFILE` still win the current one). Every write preserves unrelated
+  TOML keys, replaces the file atomically, keeps an existing file's mode, and
+  creates a new file `0600`; a failed save keeps the in-memory change and
+  shows a warning. This also fixes `/theme save` replacing a private (`0600`)
+  config that may hold an API key with a group- or world-readable file.
+  `/permissions` remains session-only and is never written.
 
 ### Fixed
 

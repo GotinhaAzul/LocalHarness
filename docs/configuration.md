@@ -100,7 +100,7 @@ stream_idle_timeout_secs = 120
 [ui]
 theme = "default"               # default | catppuccin-mocha | gruvbox-dark | light | high-contrast
 color_mode = "auto"             # auto | truecolor | 256 | 16
-show_reasoning = false
+show_reasoning = false          # Ctrl+R toggles and rewrites this key
 show_token_counts = true
 mouse = true                    # wheel scrolls the conversation; Shift+drag selects text
 
@@ -239,7 +239,14 @@ extra_body = { chat_template_kwargs = { enable_thinking = true } }
 ```
 
 `default_profile` picks the profile used at startup; `--profile` and
-`TOT_PROFILE` still override it. The built-in default is `coding`.
+`TOT_PROFILE` still override it. The built-in default is `coding`. A successful
+`/profile` switch writes this key.
+
+`/theme <name>`, `Ctrl+R`, and a successful `/profile` switch update the global
+config in place: the write is atomic, every unrelated key is preserved, an
+existing file keeps its mode, and a new file is created `0600`. A failed write
+leaves the change active for the session and shows a warning. These commands
+never write permissions; `/permissions` remains session-only.
 
 `model_profile = "auto"` matches by model-name prefix declared in `match`; the
 `default` model profile is the fallback. `[model] context_window` is used only
