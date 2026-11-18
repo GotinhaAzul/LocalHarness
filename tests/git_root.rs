@@ -13,6 +13,7 @@ use totality::paths::Paths;
 use totality::security::SecurityState;
 use totality::session::{Session, SessionData};
 use totality::tools::git::GitTool;
+use totality::tools::pr::PrTool;
 use totality::tools::review::ReviewTool;
 use totality::tools::{BgRegistry, ReadTracker, Tool, ToolContext};
 
@@ -215,4 +216,78 @@ async fn a_read_action_rejects_a_path_outside_the_root() {
         diff.content
     );
     assert!(!diff.content.contains("DIRTY"), "{}", diff.content);
+}
+
+#[tokio::test]
+async fn pathspec_magic_cannot_reach_the_parent_history() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    run_git(
+        &fixture.parent,
+        &["commit", "-q", "-m", "parent only subject", "unrelated.md"],
+    );
+    let tool = GitTool::new(GitConfig::default());
+
+    for path in [":/", ":(top)", ":/unrelated.md"] {
+        let log = tool
+            .call(&fixture.ctx, json!({"action": "log", "path": path}))
+            .await;
+        assert!(log.is_error, "{path}: {}", log.content);
+        assert!(
+            log.content.contains("GIT_OUTSIDE_WORKSPACE"),
+            "{path}: {}",
+            log.content
+        );
+        assert!(
+            !log.content.contains("parent only subject"),
+            "{path}: {}",
+            log.content
+        );
+    }
+}
+
+#[tokio::test]
+async fn commit_message_samples_only_commits_inside_the_root() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    run_git(
+        &fixture.parent,
+        &["commit", "-q", "-m", "parent only subject", "unrelated.md"],
+    );
+    run_git(&fixture.parent, &["add", "workspace/note.txt"]);
+    let tool = GitTool::new(GitConfig::default());
+
+    let message = tool
+        .call(&fixture.ctx, json!({"action": "commit_message"}))
+        .await;
+    assert!(message.content.contains("note.txt"), "{}", message.content);
+    assert!(
+        !message.content.contains("parent only subject"),
+        "{}",
+        message.content
+    );
+}
+
+#[tokio::test]
+async fn pr_draft_refuses_a_parent_repository() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let tool = PrTool::new(GitConfig::default());
+
+    let draft = tool
+        .call(
+            &fixture.ctx,
+            json!({"action": "draft", "title": "t", "body": "b"}),
+        )
+        .await;
+    assert!(draft.is_error, "{}", draft.content);
+    assert!(
+        draft.content.contains("GIT_REPO_OUTSIDE_ROOT"),
+        "{}",
+        draft.content
+    );
+    assert!(!draft.content.contains("unrelated"), "{}", draft.content);
 }

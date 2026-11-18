@@ -979,7 +979,9 @@ form. `tot doctor` prints both sizes.
   `commit_message` are scoped to it and paths that leave it are dropped or
   refused; `stage`, `unstage`, `commit`, `undo`, and `branch`/`worktree`
   creation, switching or removal return `GIT_REPO_OUTSIDE_ROOT`, `/commit`
-  refuses for the same reason, and nothing changes. `branch list` and
+  and `pr draft` refuse for the same reason, and nothing changes. Paths that
+  start with `:` (git pathspec magic such as `:/`) are refused, since git
+  resolves them from the repository top. `branch list` and
   `worktree list` stay read-only, and starting the session at the work-tree
   root restores the full surface.
 - Read-only actions (`status`, `diff`, `log`, `blame`, `commit_message`, `pr

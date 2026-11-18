@@ -368,6 +368,17 @@ fn enclosing_repo(cwd: &Path) -> Option<PathBuf> {
 
 /// Reject a diff/log/blame path that resolves outside the session root.
 fn ensure_inside_root(ctx: &ToolContext, raw: &str) -> Result<(), ToolResult> {
+    // A leading `:` is pathspec magic (`:/`, `:(top)`), which git resolves
+    // from the repository top rather than the session root.
+    if raw.trim_start().starts_with(':') {
+        return Err(ToolResult::err(
+            "GIT_OUTSIDE_WORKSPACE",
+            format!(
+                "{raw} is a git pathspec with magic; pass a plain path under the session root {}",
+                ctx.cwd.display()
+            ),
+        ));
+    }
     let resolved = super::normalize(&ctx.resolve(raw)?);
     let root = ctx.cwd.canonicalize().unwrap_or_else(|_| ctx.cwd.clone());
     if !resolved.starts_with(&root) && !resolved.starts_with(&ctx.cwd) {
@@ -953,7 +964,13 @@ fn capitalize(text: &str) -> String {
 
 fn recent_subjects(cwd: &Path) -> Vec<String> {
     let count = STYLE_SAMPLE.to_string();
-    let run = git(cwd, &["log", "--no-merges", "--format=%s", "-n", &count]);
+    let mut args = vec!["log", "--no-merges", "--format=%s", "-n", count.as_str()];
+    // Inside an enclosing repository, sample only commits that touched the
+    // session root, so unrelated subjects from the parent never show.
+    if enclosing_repo(cwd).is_some() {
+        args.extend(["--", "."]);
+    }
+    let run = git(cwd, &args);
     if !run.ok {
         return Vec::new();
     }
@@ -1256,12 +1273,12 @@ pub fn resolve(session: &mut Session, action: &str, outcome: &str) -> anyhow::Re
 
 /// The same boundary for the user's `/commit` path, which calls the helpers
 /// below directly instead of going through [`dispatch`].
-fn refuse_outside_root(cwd: &Path) -> Result<(), String> {
+pub(crate) fn refuse_outside_root(cwd: &Path) -> Result<(), String> {
     let Some(top) = enclosing_repo(cwd) else {
         return Ok(());
     };
     Err(format!(
-        "{} is inside the git work tree at {}, not at its root, so the harness will not commit in that repository. Run \"git init\" here with the user's agreement, or start the session at {}.",
+        "{} is inside the git work tree at {}, not at its root, so the harness will not commit or publish in that repository. Run \"git init\" here with the user's agreement, or start the session at {}.",
         cwd.display(),
         top.display(),
         top.display()

@@ -89,7 +89,10 @@ fn dispatch(ctx: &ToolContext, config: &GitConfig, args: &Value) -> ToolResult {
         );
     }
     match optional_str(args, "action").unwrap_or_default().as_str() {
-        "draft" => draft(ctx, config, args),
+        "draft" => match git::refuse_outside_root(&ctx.cwd) {
+            Ok(()) => draft(ctx, config, args),
+            Err(message) => ToolResult::err("GIT_REPO_OUTSIDE_ROOT", message),
+        },
         "checks" => checks(ctx, args),
         "review" => review(ctx, args),
         "comment" => comment(ctx, config, args),
@@ -553,6 +556,7 @@ pub fn execute(cwd: &Path, payload: &Map<String, Value>) -> Result<String, Strin
             }
         }
         "draft" => {
+            git::refuse_outside_root(cwd)?;
             let branch = text("branch");
             if git::current_branch(cwd).as_deref() != Some(branch.as_str())
                 || git::head(cwd).unwrap_or_default() != text("head")
