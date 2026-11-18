@@ -1021,6 +1021,9 @@ pub struct BudgetConfig {
     /// Consecutive identical calls and the no-progress window used by the
     /// checkpoints.
     pub stall_calls: u32,
+    /// Failing calls of one tool family (same program and operation, or same
+    /// tool and key arguments) allowed in a turn before it stops as stalled.
+    pub max_same_tool_family: u32,
     pub verify_attempts: u32,
     /// Characters one tool result may occupy in context. Unset scales with
     /// the usable prompt (4%, clamped to 2500..16000).
@@ -1039,6 +1042,7 @@ impl Default for BudgetConfig {
             max_model_calls: 40,
             max_wall_minutes: 30,
             stall_calls: 12,
+            max_same_tool_family: 8,
             verify_attempts: 2,
             result_cap_chars: None,
             batch_cap_chars: None,

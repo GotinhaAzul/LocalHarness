@@ -24,7 +24,7 @@ use crate::tools::{ToolResult, display_path};
 
 use super::calls::CallLedger;
 use super::gates::{self, LoopDecision, LoopGuard, SettleDecision};
-use super::limits::{BudgetCheck, RunProgress, StopReason};
+use super::limits::{BudgetCheck, RunProgress, StopReason, tool_family};
 use super::{AgentEvent, AgentState, Core};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -475,15 +475,11 @@ async fn run_loop(
             }
         }
         if progress.stalled() {
-            append_error(
-                &core.session,
-                StopReason::Stalled.code(),
-                StopReason::Stalled.message(),
-                true,
-            );
+            let message = progress.stall_message();
+            append_error(&core.session, StopReason::Stalled.code(), &message, true);
             let _ = tx.send(AgentEvent::Guard {
                 code: "stalled".into(),
-                message: StopReason::Stalled.message().into(),
+                message,
             });
             return TurnOutcome::ok(TurnStatus::Stalled);
         }
@@ -1288,15 +1284,11 @@ async fn run_loop(
             return TurnOutcome::ok(TurnStatus::Done);
         }
         if progress.stalled() {
-            append_error(
-                &core.session,
-                StopReason::Stalled.code(),
-                StopReason::Stalled.message(),
-                true,
-            );
+            let message = progress.stall_message();
+            append_error(&core.session, StopReason::Stalled.code(), &message, true);
             let _ = tx.send(AgentEvent::Guard {
                 code: "stalled".into(),
-                message: StopReason::Stalled.message().into(),
+                message,
             });
             return TurnOutcome::ok(TurnStatus::Stalled);
         }
@@ -3254,6 +3246,7 @@ async fn execute_batch(
         let fingerprint = fingerprint(&call.name, &raw, &tool_result.content);
         progress.record_tool_result(
             &fingerprint,
+            &tool_family(&call.name, &raw),
             &tool_result.content,
             tool_result.is_error,
             changed,
@@ -3618,6 +3611,7 @@ async fn finish_review(
         let raw = arguments_raw(&call.call.arguments);
         progress.record_tool_result(
             &fingerprint(&call.call.name, &raw, &tool_result.content),
+            &tool_family(&call.call.name, &raw),
             &tool_result.content,
             tool_result.is_error,
             changed,

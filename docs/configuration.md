@@ -76,6 +76,12 @@ max_tool_calls = 120
 max_model_calls = 40
 max_wall_minutes = 30
 stall_calls = 12
+# Failing calls of one tool family allowed in a turn before it stops as
+# stalled. A family is `bash`'s program and subcommand (temporary paths,
+# numbers, quoted code and here-doc bodies ignored), or another tool's name
+# plus its key arguments. Interleaving does not reset the count; a successful
+# call of the family, a file change, or a passing verify does.
+max_same_tool_family = 8
 verify_attempts = 2
 
 [prompt]

@@ -1713,6 +1713,87 @@ async fn loop_guard_blocks_the_fourth_identical_call() {
 }
 
 #[tokio::test]
+async fn near_identical_failing_calls_end_the_turn_as_stalled() {
+    let dir = tempfile::tempdir().unwrap();
+    // Every call differs in arguments and output, so neither the loop guard
+    // nor the consecutive-fingerprint stall guard fires. Only the operation is
+    // the same, which is what the tool-family guard has to catch.
+    let scripts: Vec<Script> = (0..20)
+        .map(|index| {
+            call_script(
+                &format!("probe_{index}"),
+                "bash",
+                json!({"command": format!("cat missing-receipt-{index}.txt")}),
+            )
+        })
+        .chain(std::iter::once(text_script("done")))
+        .collect();
+    let harness = harness(dir.path(), scripts, &["bash"]);
+    let (outcome, events) = run(&harness, "ocr").await;
+    // Not `Cancelled` by a client deadline, and not `Done`: the guard ends it.
+    assert_eq!(outcome.status, TurnStatus::Stalled);
+    assert_eq!(
+        harness.provider.requests.lock().unwrap().len(),
+        8,
+        "the turn stops after eight failing calls of one family"
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::Guard { code, message }
+            if code == "stalled" && message.contains("bash cat")
+    )));
+    let session = harness.session.lock().unwrap();
+    let results: Vec<_> = session
+        .branch_entries()
+        .into_iter()
+        .filter_map(|entry| match &entry.kind {
+            EntryKind::ToolResult(result) => Some(result.content.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(results.len(), 8, "later calls must not run");
+    assert!(
+        results.iter().all(|result| result.contains("[exit")),
+        "{results:?}"
+    );
+}
+
+#[tokio::test]
+async fn successful_commands_of_one_family_are_not_a_loop() {
+    let dir = tempfile::tempdir().unwrap();
+    for index in 0..12 {
+        std::fs::write(
+            dir.path().join(format!("note-{index}.txt")),
+            format!("line {index}\n"),
+        )
+        .unwrap();
+    }
+    let scripts: Vec<Script> = (0..12)
+        .map(|index| {
+            call_script(
+                &format!("read_{index}"),
+                "bash",
+                json!({"command": format!("cat note-{index}.txt")}),
+            )
+        })
+        .chain(std::iter::once(text_script("done")))
+        .collect();
+    let harness = harness(dir.path(), scripts, &["bash"]);
+    let (outcome, _) = run(&harness, "read them").await;
+    assert_eq!(outcome.status, TurnStatus::Done);
+    let session = harness.session.lock().unwrap();
+    let results = session
+        .branch_entries()
+        .into_iter()
+        .filter(|entry| matches!(entry.kind, EntryKind::ToolResult(_)))
+        .count();
+    assert_eq!(
+        results, 12,
+        "successful calls of one family are ordinary work"
+    );
+}
+
+#[tokio::test]
 async fn model_budget_stops_before_another_call() {
     let dir = tempfile::tempdir().unwrap();
     let mut harness = harness(
