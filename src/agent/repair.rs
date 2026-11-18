@@ -907,13 +907,11 @@ fn database_runs_batch(program: &str, args: &[&str], command: &str) -> bool {
     }
 }
 
-/// `sqlite3 [options] DB [SQL]` runs the trailing operand and exits; the help,
-/// version, and `-cmd` options never reach the prompt either.
+/// `sqlite3 [options] DB [SQL]` runs the trailing operand and exits; the help
+/// and version options never reach the prompt either. `-cmd` does: it runs its
+/// command and then reads stdin, so it needs a SQL operand like any other call.
 fn sqlite3_runs_batch(args: &[&str]) -> bool {
-    if has_flag(
-        args,
-        &["-help", "--help", "-version", "--version", "-cmd", "--cmd"],
-    ) {
+    if has_flag(args, &["-help", "--help", "-version", "--version"]) {
         return true;
     }
     if positional_args(
@@ -1233,7 +1231,7 @@ mod tests {
             r#"sqlite3 db "select 1;""#,
             "sqlite3 -help",
             "sqlite3 --version",
-            "sqlite3 db -cmd '.tables'",
+            "sqlite3 -cmd '.mode csv' db 'select 1;'",
             "sqlite3 <schema.sql",
             "psql -c 'select 1'",
             "psql -f query.sql",
@@ -1253,6 +1251,7 @@ mod tests {
         for command in [
             "sqlite3",
             "sqlite3 db",
+            "sqlite3 -cmd '.tables' db",
             "psql mydb",
             "psql",
             "mysql mydb",
