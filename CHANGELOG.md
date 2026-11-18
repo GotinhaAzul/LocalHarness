@@ -68,6 +68,13 @@ release may change defaults when the change is called out below.
 
 ### Fixed
 
+- `review` and the `git` tool stop at the session root. A workspace without a
+  `.git` of its own no longer inherits the repository that contains it:
+  `review`, `status`, `diff`, `log`, `blame` and `commit_message` report only
+  files under the workspace and paths that leave it are refused, while
+  `stage`, `unstage`, `commit`, `undo`, `branch`/`worktree` mutations and
+  `/commit` return `GIT_REPO_OUTSIDE_ROOT` and change nothing in the parent
+  repository ([#136](https://github.com/GotinhaAzul/LocalHarness/issues/136)).
 - A compaction in the middle of one long agentic turn no longer sends a
   conversation without a user message. The kept tail started at an assistant
   entry, so the request was `system, assistant, tool, ...`, and Qwen-family

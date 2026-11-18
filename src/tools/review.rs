@@ -169,27 +169,97 @@ struct FileStat {
 
 async fn collect_snapshot(cwd: &Path, staged: bool) -> Result<Snapshot, ToolResult> {
     ensure_repo(cwd).await?;
+    // The session root, not the enclosing repository, is the scope. A root
+    // without a `.git` of its own must not report a parent's changes.
+    let prefix = repo_prefix(cwd).await?;
 
-    let status_raw = git(cwd, &["status", "--porcelain=v1", "-z"]).await?;
+    let status_raw = git(
+        cwd,
+        &[
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--",
+            ".",
+        ],
+    )
+    .await?;
     let numstat_args: &[&str] = if staged {
-        &["diff", "--cached", "--numstat"]
+        &["diff", "--cached", "--numstat", "--relative", "--", "."]
     } else {
-        &["diff", "--numstat"]
+        &["diff", "--numstat", "--relative", "--", "."]
     };
     let numstat_raw = git(cwd, numstat_args).await?;
     let diff_args: &[&str] = if staged {
-        &["diff", "--cached", "--", "."]
+        &[
+            "diff",
+            "--cached",
+            "--relative",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+            "--",
+            ".",
+        ]
     } else {
-        &["diff", "--", "."]
+        &[
+            "diff",
+            "--relative",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+            "--",
+            ".",
+        ]
     };
     let diff = git(cwd, diff_args).await?;
 
     Ok(Snapshot {
         staged,
-        status: parse_status(&status_raw),
+        status: parse_status(&status_raw)
+            .into_iter()
+            .filter_map(|entry| scope_status(entry, &prefix))
+            .collect(),
         file_stats: parse_numstat(&numstat_raw),
         diff,
     })
+}
+
+/// The session root relative to the work-tree root, without a trailing slash.
+async fn repo_prefix(cwd: &Path) -> Result<String, ToolResult> {
+    let raw = git(cwd, &["rev-parse", "--show-prefix"]).await?;
+    Ok(raw.trim().trim_matches('/').to_string())
+}
+
+/// Rewrite a work-tree-relative status path as session-root-relative, dropping
+/// anything outside the root. `git status -z` reports paths from the work-tree
+/// root even when git runs in a subdirectory.
+fn scope_status(entry: StatusEntry, prefix: &str) -> Option<StatusEntry> {
+    let path = scope_path(&entry.path, prefix)?;
+    Some(StatusEntry { path, ..entry })
+}
+
+fn scope_path(path: &str, prefix: &str) -> Option<String> {
+    if escapes_root(path) {
+        return None;
+    }
+    if prefix.is_empty() {
+        return Some(path.to_string());
+    }
+    let rest = path.strip_prefix(prefix)?;
+    if rest.is_empty() {
+        return Some(".".to_string());
+    }
+    let rest = rest.strip_prefix('/')?;
+    if rest.is_empty() {
+        return Some(".".to_string());
+    }
+    Some(rest.to_string())
+}
+
+/// Whether a reported path leaves the session root.
+fn escapes_root(path: &str) -> bool {
+    let path = path.trim_matches('"');
+    Path::new(path).is_absolute() || path.split('/').any(|part| part == "..")
 }
 
 async fn ensure_repo(cwd: &Path) -> Result<(), ToolResult> {
@@ -770,6 +840,21 @@ mod tests {
         run_git(dir.path(), &["add", "."]);
         run_git(dir.path(), &["commit", "-q", "-m", "base"]);
         dir
+    }
+
+    #[test]
+    fn session_paths_drop_the_enclosing_repository() {
+        assert_eq!(
+            scope_path("workspace/note.txt", "workspace").as_deref(),
+            Some("note.txt")
+        );
+        assert_eq!(scope_path("workspace/", "workspace").as_deref(), Some("."));
+        assert_eq!(scope_path("workspace", "workspace").as_deref(), Some("."));
+        assert_eq!(scope_path("workspace-other/x", "workspace"), None);
+        assert_eq!(scope_path("outside.md", "workspace"), None);
+        assert_eq!(scope_path("../unrelated.md", "workspace"), None);
+        assert_eq!(scope_path("/etc/passwd", "workspace"), None);
+        assert_eq!(scope_path("src/lib.rs", "").as_deref(), Some("src/lib.rs"));
     }
 
     #[test]

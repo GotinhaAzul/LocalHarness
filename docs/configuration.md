@@ -389,7 +389,9 @@ session and stops; the user reviews it in the TUI and approves with
 message; `\n` starts a new line; `cancel` drops either). A commit is made only
 while the staged diff still matches the preview. `allow` runs the action at
 once and suits unattended runs; headless `--print` has no way to approve, so
-`normal` leaves the preview unapplied there.
+`normal` leaves the preview unapplied there. When the session root sits inside
+a larger git work tree instead of at its root, `/commit` and the `git` tool's
+mutating actions refuse and change nothing.
 
 ## Permissions
 

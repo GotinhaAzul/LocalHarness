@@ -927,7 +927,9 @@ form. `tot doctor` prints both sizes.
 - `review` reads `git status --porcelain=v1 -z`, numstat, and the diff. It scans
   added lines for secrets, debug statements, TODOs, lockfiles, config files,
   deletion-heavy changes, binary files, and source changes without tests. The
-  diff is capped and truncation names the follow-up call.
+  diff is capped and truncation names the follow-up call. Every read is scoped
+  to the session root: a workspace without a `.git` of its own reports only the
+  files under it, never the enclosing repository's changes or `../` paths.
 - `finding` supports `add`, `update`, `list`, `report`, `verify`. Severities:
   critical, high, medium, low, info. Statuses: open, fixed, accepted,
   false-positive. `add` requires title, severity, target, and evidence.
@@ -972,6 +974,14 @@ form. `tot doctor` prints both sizes.
 
 `git` and `pr` (coding pack) replace improvised `git`/`gh` in `bash`:
 
+- The session root is the boundary. When it sits inside a larger work tree (a
+  workspace with no `.git` of its own), `status`, `diff`, `log`, `blame` and
+  `commit_message` are scoped to it and paths that leave it are dropped or
+  refused; `stage`, `unstage`, `commit`, `undo`, and `branch`/`worktree`
+  creation, switching or removal return `GIT_REPO_OUTSIDE_ROOT`, `/commit`
+  refuses for the same reason, and nothing changes. `branch list` and
+  `worktree list` stay read-only, and starting the session at the work-tree
+  root restores the full surface.
 - Read-only actions (`status`, `diff`, `log`, `blame`, `commit_message`, `pr
   checks`, `pr review`) run directly. With `--sandbox read-only` they are all
   `git` can do.
