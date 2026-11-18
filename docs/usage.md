@@ -60,10 +60,10 @@ PASS  cargo  42 passed (3.1 s)
 ```
 
 - **Read before edit.** `edit`, `write`, and `patch` require a prior read of the same file. A changed file must be read again.
-- **Plan before the third mutation.** `todo` is free for two edits or two files, then a plan is required.
+- **Plan before the third file.** `todo` is free for a run that touches one or two files; repeated edits to the same file are one change. From the third distinct file, an edit needs a plan. A finished turn is never reopened for one.
 - **Verify before settle.** After changes, configured steps run; a real failure blocks the turn.
 - **Review after verify.** The `review` pass checks the diff for secrets, debug statements, lockfiles, deletion-heavy changes, and source changes whose module has no test.
-- **Stop the loop, not the work.** Loop and stall guards end a repeating run with a status, not a silent bill. Budget checkpoints renew while the run is still producing new results.
+- **Stop the loop, not the work.** Loop and stall guards end a repeating run with a status, not a silent bill. A guard or budget stop gives the model one tool-less step to summarize what it changed and what is left. Budget checkpoints renew on the same progress the stall tracker counts: a file change or a passing verification.
 - **Name the next action.** Every error tells the model what to do instead of leaving it to guess.
 
 ## Tools that know the codebase
@@ -76,11 +76,12 @@ Twenty-four built-ins in three packs. `coding` (core + coding) is the default; `
 | Coding | `repo_map` `lsp` `test` `review` |
 | Security | `surface` `evidence` `detect` `attack_path` `finding` `iocs` |
 
-- **`repo_map`** returns a cached, budget-capped outline of files and top-level symbols; a compact version ships in the system prompt.
+- **`grep`** searches text, gitignore-aware, and `path=artifact:out-3` searches a stored tool result such as a fetched page.
+- **`repo_map`** returns a cached, budget-capped outline of files and top-level symbols; a compact version ships in the system prompt. Every non-ignored file appears: non-code and outline-less files are listed by directory (`inbox/ (26 files: 6 .txt, 5 .html, …)`) with a closing count for anything the budget left out. `vendor/`, `dist/`, `build/`, and `target/` are only skipped when `.gitignore` excludes them.
 - **`lsp`** adds language-server diagnostics after edits when a supported server is installed and the file belongs to a real project. A missing or cold server never fails an edit.
 - **`test`** detects vitest, jest, go, cargo, pytest, Python unittest, or an npm test script and returns only the first failure.
 - **`review`** reads the working tree and checks the diff before the session settles. It is scoped to the session root: a workspace inside a larger repository reports only its own changes, and `git` mutations refuse to touch the enclosing repository.
-- **`undo`** reverts the last `edit`, `patch`, or `write` from session snapshots, and refuses when the file changed after the harness wrote it. Changes made through `bash` are not tracked.
+- **`undo`** reverts the last `edit`, `patch`, or `write` from session snapshots, and refuses when the file changed after the harness wrote it. Before a destructive `bash` command (`rm`, `mv`, `find -delete`, `truncate`, or `>` over a file), the harness snapshots the named files, so `undo` and `/rewind` can bring them back; each such result names the snapshot. `git clean` is not parsed.
 - **Hunk review.** `review = "multi_file"` (the default) pauses before a turn's second file mutation, shows the proposed hunks in the TUI, and writes only what you accept. Rejected hunks are reported back to the model with their ranges, accepted hunks land atomically, and `undo` still steps back over them. `always` reviews every mutation; `off` restores immediate writes. Headless `--print` has no reviewer, so it auto-accepts and never blocks.
 - **`read`/`grep`/`glob`** respect ignore files and keep results small; oversized output is archived and available through `recall`.
 - **Hash edits (opt-in)** — `edit_mode = "hash"` makes `read` print content hashes and lets `patch` apply `PUT`/`CUT`/`REM`/`MV` line anchors from `path#snapshot`; stale anchors write nothing and return fresh ones. Exact-text `edit` remains the default. See [configuration](configuration.md#hash-anchored-edits).
@@ -133,13 +134,13 @@ The terminal interface is the default. It speaks in two voices: the model in Sko
 | `Ctrl+D` | quit when the input is empty |
 | `Up`/`Down` | history when input is empty; otherwise cursor |
 | `PgUp`/`PgDn`, `Home`/`End` | scroll transcript |
-| `Ctrl+R` | toggle reasoning |
+| `Ctrl+R` | toggle reasoning (`[ui] show_reasoning` is saved) |
 | `Ctrl+L` | redraw the whole screen |
 | `/` | slash-command completion |
 | `Tab` / `Shift+Tab` | complete commands, arguments, and paths; move back through choices |
 | Review: `a` / `r` / `e` | accept, reject, or edit the selected hunk (`A`/`R` all, `Enter` apply, `Esc` reject all) |
 
-Tab completes the token at the cursor: commands, arguments (themes, profiles, skills, workflows, session ids, models, `/login` endpoints, `/help` topics, `/sec` subcommands), and file paths. Ambiguous matches first extend to their shared prefix, then open a picker. Every command that chooses from a list — `/model`, `/profile`, `/theme` (with live preview), `/permissions`, `/skill`, `/workflow`, `/sec`, `/resume` — opens a filterable menu when run without an argument: type to filter, arrows to move, Enter to pick. Model and profile switches load in the background, so the TUI stays responsive while the server swaps models.
+Tab completes the token at the cursor: commands, arguments (themes, profiles, skills, workflows, session ids, models, `/login` endpoints, `/help` topics, `/sec` subcommands), and file paths. Ambiguous matches first extend to their shared prefix, then open a picker. Every command that chooses from a list — `/model`, `/profile`, `/theme` (with live preview), `/permissions`, `/skill`, `/workflow`, `/sec`, `/resume` — opens a filterable menu when run without an argument: type to filter, arrows to move, Enter to pick. Model and profile switches load in the background, so the TUI stays responsive while the server swaps models. `/theme <name>` and a confirmed theme picker selection apply the theme and write `[ui] theme` to the global config at once; moving through the preview writes nothing. `/theme save` re-writes the current theme and reports the path, and `Ctrl+R` saves `[ui] show_reasoning` the same way.
 
 Write `@path` in a prompt to attach a file: `fix the panic in @src/parser.rs`. Typing `@` opens a live picker over the project's files (gitignored files excluded): it matches names fuzzily, shows each file's folder, and ranks paths under a typed directory first; Tab or Enter inserts the path. The file is read through the same path as the `read` tool and appended to your message, so the model can edit it without another read. Up to eight files per prompt, within a quarter of the usable context. `@shot.png` attaches a screenshot: a model with vision input sees the image, and a text-only model can get a description from a local vision model; the `read` tool opens images too. Images are checked by content, stripped of EXIF, and sent only to local endpoints unless you opt in. See [images.md](images.md).
 
@@ -192,7 +193,7 @@ The session root is the `cwd` the editor declares, and the path jail is always o
 
 ## Security, when you ask for it
 
-Security is opt-in. The default `coding` profile has no security tools or posture. `--profile security` adds core plus security; `--profile full` adds coding plus security. `/profile` switches during a session.
+Security is opt-in. The default `coding` profile has no security tools or posture. `--profile security` adds core plus security; `--profile full` adds coding plus security. `/profile` switches during a session and saves the pick as `default_profile` for the next run; `--profile` and `TOT_PROFILE` still win this run, whenever they set it.
 
 Security work is for authorized labs, CTFs, and engagements only. Scope is set by the user with `/sec scope add|remove|clear`; there is no model tool for it. The scope gate blocks a known set of active-testing tools when no scope is set or when an extracted target is outside it. It is a speed bump; `--sandbox` is the process boundary.
 
@@ -217,7 +218,7 @@ Everything at the edge is configurable; the loop itself stays small and auditabl
 - **External tools** are any executable speaking one JSON object in, one JSON object out. No plugin ABI, no second runtime.
 - **Lifecycle hooks** run your command at `session_start`, `user_prompt`, `pre_tool`, `post_tool`, `pre_compact`, and `stop`. They can add context or block; a missing hook is visible and `pre_tool` fails closed. `tot hooks test <name>` exercises one.
 - **MCP servers** plug in over stdio or Streamable HTTP with one `[mcp.<name>]` table. Their tools join the profile as `<server>__<tool>`; `tot mcp list` and `/mcp` show what connected.
-- **Themes** are TOML files of semantic color tokens. `default` (dusk) is bundled with `hati`, `skoll`, `classic`, and four more; `omarchy` is an alias for existing configs.
+- **Themes** are TOML files of semantic color tokens. `default` (dusk) is bundled with `hati`, `skoll`, `classic`, and four more; `omarchy` is an alias for existing configs. `/theme <name>` applies one and saves it as `[ui] theme`.
 
 ```toml
 default_profile = "coding"

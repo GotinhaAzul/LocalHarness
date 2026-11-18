@@ -231,6 +231,7 @@ impl Turn {
             (None, Err(error)) => TurnOutcome {
                 status: TurnStatus::Error,
                 error: Some(("turn_panicked".into(), error.to_string())),
+                gate_errors: Default::default(),
             },
         }
     }

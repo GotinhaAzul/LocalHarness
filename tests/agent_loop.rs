@@ -427,6 +427,7 @@ fn build_core_in_mode(
         approver: None,
         reviewer: Default::default(),
         permissions,
+        gate_errors: Default::default(),
     };
     (Arc::new(core), session)
 }
@@ -1226,8 +1227,8 @@ async fn repeated_truncated_tool_calls_end_the_turn_as_stalled() {
     assert!(tool_results(&harness.session).is_empty());
     assert_eq!(
         harness.provider.requests.lock().unwrap().len(),
-        4,
-        "3 nudges, then a non-error stop"
+        5,
+        "3 nudges, a non-error stop, then the tool-less summary request"
     );
     assert!(
         events
@@ -1289,6 +1290,105 @@ async fn cut_off_prose_and_empty_replies_continue() {
         "{nudges:?}"
     );
     assert_eq!(last_assistant(&harness.session), ", second, and third.");
+}
+
+#[tokio::test]
+async fn a_length_stop_raises_the_output_reservation_before_nudging() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness(
+        dir.path(),
+        vec![finish_script(&[], "length"), text_script("Done.")],
+        &["read"],
+    );
+    let (outcome, events) = run(&harness, "explain").await;
+    assert_eq!(outcome.status, TurnStatus::Done);
+    let requests = harness.provider.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests[1].max_tokens > requests[0].max_tokens,
+        "a cut reply retries with a bigger reservation: {} -> {}",
+        requests[0].max_tokens,
+        requests[1].max_tokens
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::Notice(note) if note.contains("raised the output limit"))),
+        "{events:?}"
+    );
+}
+
+#[tokio::test]
+async fn reasoning_only_length_stops_end_as_budget_never_done() {
+    let dir = tempfile::tempdir().unwrap();
+    let scripts = (0..6)
+        .map(|_| {
+            Script::Events(vec![
+                StreamEvent::ReasoningDelta("deliberating without producing a call".into()),
+                StreamEvent::Finish("length".into()),
+            ])
+        })
+        .collect();
+    let harness = harness(dir.path(), scripts, &["read"]);
+    let (outcome, events) = run(&harness, "implement it").await;
+    assert_eq!(outcome.status, TurnStatus::Budget, "{outcome:?}");
+    assert_eq!(
+        outcome.error.as_ref().map(|(code, _)| code.as_str()),
+        Some("output_limit")
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Error { code, .. } if code == "output_limit"
+        )),
+        "{events:?}"
+    );
+    // Every assistant entry is an empty, cut reply: no answer was produced.
+    assert!(
+        assistants(&harness.session).iter().all(|entry| entry
+            .content
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .is_empty()),
+        "the turn must not report a partial answer as final"
+    );
+}
+
+#[tokio::test]
+async fn a_stalled_turn_ends_with_a_tool_less_summary() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness(
+        dir.path(),
+        vec![
+            call_script("call_1", "read", json!({"path": "missing-a.txt"})),
+            call_script("call_2", "read", json!({"path": "missing-a.txt"})),
+            call_script("call_3", "read", json!({"path": "missing-a.txt"})),
+            // The guard stops the run here; the harness then asks for a
+            // summary in a tool-less request.
+            text_script("I read a missing file three times; nothing changed."),
+        ],
+        &["read"],
+    );
+    let (outcome, _) = run(&harness, "look").await;
+    assert_eq!(outcome.status, TurnStatus::Stalled);
+    assert_eq!(
+        last_assistant(&harness.session),
+        "I read a missing file three times; nothing changed."
+    );
+    let requests = harness.provider.requests.lock().unwrap();
+    let summary = requests.last().expect("a summary request");
+    assert!(
+        summary.tools.is_empty(),
+        "the summary request carries no tools"
+    );
+    assert!(
+        summary.messages.iter().any(|message| matches!(
+            message,
+            ChatMessage::User { content, .. } if content.contains("the harness ended this turn")
+        )),
+        "the summary request explains why the turn stopped"
+    );
 }
 
 #[tokio::test]
@@ -1769,6 +1869,7 @@ async fn loop_guard_blocks_the_fourth_identical_call() {
             tool_script("bash", json!({"command":"sed -n 1p a.rs"})),
             tool_script("bash", json!({"command":"sed -n 1p a.rs"})),
             tool_script("bash", json!({"command":"sed -n 1p a.rs"})),
+            text_script("the loop guard stopped me; nothing changed."),
         ],
         &["bash"],
     );
@@ -1791,7 +1892,11 @@ async fn loop_guard_blocks_the_fourth_identical_call() {
         .collect();
     assert_eq!(results.len(), 4);
     assert!(results[3].contains("loop_guard"), "{results:?}");
-    assert_eq!(harness.provider.requests.lock().unwrap().len(), 4);
+    assert_eq!(
+        harness.provider.requests.lock().unwrap().len(),
+        5,
+        "four tool calls, then the tool-less summary request"
+    );
 }
 
 #[tokio::test]
@@ -1816,8 +1921,8 @@ async fn near_identical_failing_calls_end_the_turn_as_stalled() {
     assert_eq!(outcome.status, TurnStatus::Stalled);
     assert_eq!(
         harness.provider.requests.lock().unwrap().len(),
-        8,
-        "the turn stops after eight failing calls of one family"
+        9,
+        "eight failing calls, then the tool-less summary request"
     );
     assert!(events.iter().any(|event| matches!(
         event,
@@ -1925,8 +2030,8 @@ async fn repeated_successful_calls_between_probes_end_the_turn_as_stalled() {
     );
     assert_eq!(
         harness.provider.requests.lock().unwrap().len(),
-        16,
-        "eight repeats of the same call, interleaved with eight probes"
+        17,
+        "eight repeats of the same call, interleaved with eight probes, then the summary"
     );
     assert!(events.iter().any(|event| matches!(
         event,
@@ -1979,8 +2084,8 @@ async fn a_scratch_write_does_not_reset_the_family_count() {
     );
     assert_eq!(
         harness.provider.requests.lock().unwrap().len(),
-        9,
-        "the scratch write is the fifth call, so the eighth failing probe is the ninth"
+        10,
+        "the scratch write is the fifth call, so the eighth failing probe is the ninth, plus the summary"
     );
 }
 
@@ -2220,7 +2325,11 @@ async fn model_budget_stops_before_another_call() {
     harness.core = Arc::new(core);
     let (outcome, _) = run(&harness, "one call").await;
     assert_eq!(outcome.status, TurnStatus::Budget);
-    assert_eq!(harness.provider.requests.lock().unwrap().len(), 1);
+    assert_eq!(
+        harness.provider.requests.lock().unwrap().len(),
+        2,
+        "the one budgeted call, then the tool-less summary"
+    );
 }
 
 #[tokio::test]
@@ -2232,12 +2341,12 @@ async fn productive_long_task_renews_a_checkpoint_and_finishes() {
     let mut harness = harness(
         dir.path(),
         vec![
-            tool_script("read", json!({"path":"a.rs"})),
-            tool_script("read", json!({"path":"b.rs"})),
-            tool_script("read", json!({"path":"c.rs"})),
+            tool_script("write", json!({"path":"a.txt","content":"a"})),
+            tool_script("write", json!({"path":"b.txt","content":"b"})),
+            tool_script("write", json!({"path":"c.txt","content":"c"})),
             text_script("done"),
         ],
-        &["read"],
+        &["write"],
     );
     let mut config = harness.core.config.clone();
     // Two calls per allowance: the third read must renew, not stop.
@@ -2287,7 +2396,11 @@ async fn long_task_without_progress_stops_at_the_checkpoint() {
 
     let (outcome, _) = run(&harness, "loop on missing files").await;
     assert_eq!(outcome.status, TurnStatus::Budget);
-    assert_eq!(harness.provider.requests.lock().unwrap().len(), 3);
+    assert_eq!(
+        harness.provider.requests.lock().unwrap().len(),
+        4,
+        "three calls and the tool-less summary"
+    );
     let results = tool_results(&harness.session);
     assert_eq!(results.len(), 3);
     assert!(
@@ -2677,16 +2790,49 @@ async fn todo_gate_blocks_the_third_mutation() {
         &["write", "todo"],
     );
     let (outcome, _) = run(&harness, "make three files").await;
-    assert_eq!(outcome.status, TurnStatus::Blocked);
+    // The third distinct file is refused. The turn settles rather than
+    // blocking: the gate has already stopped the edit it was protecting.
+    assert_eq!(outcome.status, TurnStatus::Done);
     assert!(dir.path().join("a.txt").exists());
     assert!(dir.path().join("b.txt").exists());
     assert!(
         !dir.path().join("c.txt").exists(),
         "third write must be gated"
     );
-    let result = last_tool_result(&harness.session);
-    assert!(result.contains("TODO_PLAN"), "{result}");
-    assert!(result.contains("todo"), "{result}");
+    let results = tool_results(&harness.session);
+    assert!(
+        results.iter().any(|result| result.contains("TODO_PLAN")),
+        "{results:?}"
+    );
+}
+
+#[tokio::test]
+async fn re_editing_a_changed_file_does_not_trip_the_plan_gate() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness(
+        dir.path(),
+        vec![
+            tool_script("write", json!({"path":"a.txt","content":"one"})),
+            tool_script("write", json!({"path":"a.txt","content":"two"})),
+            tool_script("write", json!({"path":"b.txt","content":"b"})),
+            text_script("done"),
+        ],
+        &["write", "todo"],
+    );
+    let (outcome, _) = run(&harness, "fix two files").await;
+    assert_eq!(outcome.status, TurnStatus::Done, "{:?}", outcome.error);
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+        "two"
+    );
+    assert!(dir.path().join("b.txt").exists());
+    assert!(
+        tool_results(&harness.session)
+            .iter()
+            .all(|result| !result.contains("TODO_PLAN")),
+        "two edits to one file are one logical change: {:?}",
+        tool_results(&harness.session)
+    );
 }
 
 #[tokio::test]
@@ -5421,7 +5567,8 @@ async fn uncached_only_usage_reports_are_not_truncation() {
     );
 }
 
-const TODO_NOTICE: &str = "the next edit needs a plan: call todo action=\"plan\" first";
+const TODO_NOTICE: &str =
+    "the next edit to a new file needs a plan: call todo action=\"plan\" first";
 
 #[tokio::test]
 async fn the_mutation_before_the_todo_gate_carries_an_advance_notice() {

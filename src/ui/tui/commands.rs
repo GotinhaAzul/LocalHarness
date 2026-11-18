@@ -385,6 +385,33 @@ impl App {
         Ok(path)
     }
 
+    /// Persist one `[ui]` setting to the global config.
+    pub(super) fn persist_ui_setting(&self, key: &str, value: toml::Value) -> Result<PathBuf> {
+        let core = self.core().context("no runtime")?;
+        let path = core.paths.config_file();
+        Config::save_ui_setting(&path, key, value)?;
+        Ok(path)
+    }
+
+    /// Persist the profile a later run starts with; `--profile` and
+    /// `TOT_PROFILE` still win for this run.
+    pub(super) fn persist_default_profile(&self, name: &str) -> Result<PathBuf> {
+        let core = self.core().context("no runtime")?;
+        let path = core.paths.config_file();
+        Config::save_default_profile(&path, name)?;
+        Ok(path)
+    }
+
+    /// Success notice for a saved `default_profile`, naming a startup
+    /// override that still applies to this run.
+    pub(super) fn profile_saved_notice(&self, name: &str) -> String {
+        if self.profile_override {
+            format!("profile: {name} (saved; --profile/TOT_PROFILE wins this run)")
+        } else {
+            format!("profile: {name} (saved)")
+        }
+    }
+
     pub(super) async fn command_profile(&mut self, name: &str) {
         if name.is_empty() {
             let items = self
@@ -418,7 +445,17 @@ impl App {
             return;
         }
         if self.config.profile_name() == name {
-            self.set_notice(format!("profile: {name} (unchanged)"), Role::Muted);
+            match self.persist_default_profile(name) {
+                Ok(_) => {
+                    self.config.default_profile = name.to_string();
+                    let notice = self.profile_saved_notice(name);
+                    self.set_notice(notice, Role::Success);
+                }
+                Err(error) => self.set_notice(
+                    format!("profile: {name}; not saved: {error}"),
+                    Role::Warning,
+                ),
+            }
             return;
         }
         let mut config = self.config.clone();
@@ -713,7 +750,15 @@ impl App {
                     return;
                 }
                 self.apply_theme_named(name);
-                self.set_notice(format!("theme: {name}"), Role::Success);
+                // An explicit pick (a typed `/theme <name>` or a confirmed
+                // picker selection) becomes the saved default; preview
+                // navigation never reaches here.
+                match save_theme(&paths.config_file(), name) {
+                    Ok(()) => self.set_notice(format!("theme: {name} (saved)"), Role::Success),
+                    Err(error) => {
+                        self.set_notice(format!("theme: {name}; not saved: {error}"), Role::Warning)
+                    }
+                }
             }
         }
     }

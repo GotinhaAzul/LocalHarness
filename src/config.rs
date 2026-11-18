@@ -634,6 +634,47 @@ impl Config {
             Some(parts.join("\n\n"))
         }
     }
+
+    /// Write one setting under `[section]` in a config file, preserving every
+    /// unrelated key. The file is replaced atomically; its mode is kept, and a
+    /// new file is created `0600` on Unix.
+    pub fn save_setting(path: &Path, section: &str, key: &str, value: toml::Value) -> Result<()> {
+        let mut file = read_config_value(path)?;
+        {
+            let root = file.as_table_mut().context("config root is not a table")?;
+            let table = root
+                .entry(section.to_string())
+                .or_insert_with(|| toml::Value::Table(Default::default()));
+            let table = table
+                .as_table_mut()
+                .with_context(|| format!("[{section}] is not a table"))?;
+            table.insert(key.to_string(), value);
+        }
+        write_config_value(path, &file)
+    }
+
+    /// Persist one `[ui]` setting, used by `/theme` and `Ctrl+R`.
+    pub fn save_ui_setting(path: &Path, key: &str, value: toml::Value) -> Result<()> {
+        Self::save_setting(path, "ui", key, value)
+    }
+
+    /// Persist the startup profile `default_profile`, preserving every other
+    /// key. `--profile` and `TOT_PROFILE` still win for the current run.
+    pub fn save_default_profile(path: &Path, name: &str) -> Result<()> {
+        let name = name.trim();
+        if name.is_empty() {
+            bail!("default profile name is empty");
+        }
+        let mut file = read_config_value(path)?;
+        {
+            let root = file.as_table_mut().context("config root is not a table")?;
+            root.insert(
+                "default_profile".into(),
+                toml::Value::String(name.to_string()),
+            );
+        }
+        write_config_value(path, &file)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -726,63 +767,27 @@ impl ModelConfig {
     /// Persist endpoint, model, and API key under `[model]` in `path`,
     /// preserving every other setting. Used by `/login` and `/model`.
     pub fn save_connection(&self, path: &Path) -> Result<()> {
-        use std::io::Write as _;
-
-        let mut value = if path.exists() {
-            let raw = std::fs::read_to_string(path)
-                .with_context(|| format!("cannot read {}", path.display()))?;
-            toml::from_str::<toml::Value>(&raw)
-                .with_context(|| format!("invalid TOML in {}", path.display()))?
-        } else {
-            toml::Value::Table(Default::default())
-        };
-        let root = value.as_table_mut().context("config root is not a table")?;
-        let model = root
-            .entry("model".to_string())
-            .or_insert_with(|| toml::Value::Table(Default::default()));
-        let model = model.as_table_mut().context("[model] is not a table")?;
-        model.insert(
-            "endpoint".to_string(),
-            toml::Value::String(self.endpoint.trim().to_string()),
-        );
-        model.insert(
-            "model".to_string(),
-            toml::Value::String(self.model.trim().to_string()),
-        );
-        model.insert(
-            "api_key".to_string(),
-            toml::Value::String(self.api_key.clone()),
-        );
-        let raw = toml::to_string_pretty(&value).context("cannot serialize config")?;
-
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("cannot create {}", parent.display()))?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
-            }
-        }
-        let temporary = path.with_extension("toml.tmp");
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        #[cfg(unix)]
+        let mut value = read_config_value(path)?;
         {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
+            let root = value.as_table_mut().context("config root is not a table")?;
+            let model = root
+                .entry("model".to_string())
+                .or_insert_with(|| toml::Value::Table(Default::default()));
+            let model = model.as_table_mut().context("[model] is not a table")?;
+            model.insert(
+                "endpoint".to_string(),
+                toml::Value::String(self.endpoint.trim().to_string()),
+            );
+            model.insert(
+                "model".to_string(),
+                toml::Value::String(self.model.trim().to_string()),
+            );
+            model.insert(
+                "api_key".to_string(),
+                toml::Value::String(self.api_key.clone()),
+            );
         }
-        let mut file = options
-            .open(&temporary)
-            .with_context(|| format!("cannot write {}", temporary.display()))?;
-        file.write_all(raw.as_bytes())
-            .with_context(|| format!("cannot write {}", temporary.display()))?;
-        file.sync_all()
-            .with_context(|| format!("cannot flush {}", temporary.display()))?;
-        drop(file);
-        std::fs::rename(&temporary, path)
-            .with_context(|| format!("cannot replace {}", path.display()))?;
-        Ok(())
+        write_private_config_value(path, &value)
     }
 }
 
@@ -1383,6 +1388,24 @@ impl ModelProfile {
         }
     }
 
+    /// The request's `extra_body` with the thinking control merged in even
+    /// when the policy would leave thinking on. Used for one retry after a
+    /// length stop spent the whole output budget thinking. `None` when the
+    /// profile configures no control.
+    pub fn request_extra_body_thinking_off(&self) -> Option<serde_json::Value> {
+        let control = self
+            .thinking_control
+            .as_ref()
+            .and_then(|value| serde_json::to_value(value).ok())?;
+        let mut base = self
+            .extra_body
+            .as_ref()
+            .and_then(|value| serde_json::to_value(value).ok())
+            .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
+        merge_json(&mut base, control);
+        Some(base)
+    }
+
     /// The request's `extra_body`: the profile's, with `thinking_control`
     /// merged on top when thinking is off. Refuses when thinking must be off
     /// but the profile names no control, since sending the request anyway
@@ -1593,6 +1616,87 @@ fn read_toml(path: &Path) -> Result<toml::Value> {
     let value: toml::Value =
         toml::from_str(&raw).with_context(|| format!("invalid TOML in {}", path.display()))?;
     Ok(value)
+}
+
+/// Read a config file for editing; a missing file is an empty table.
+fn read_config_value(path: &Path) -> Result<toml::Value> {
+    if !path.exists() {
+        return Ok(toml::Value::Table(Default::default()));
+    }
+    read_toml(path)
+}
+
+/// Serialize `value` and replace `path` atomically.
+fn write_config_value(path: &Path, value: &toml::Value) -> Result<()> {
+    write_config_with_mode(path, value, None)
+}
+
+/// Write a config that may carry a secret: the result is always private
+/// (`0600`), matching the old `save_connection` behavior.
+fn write_private_config_value(path: &Path, value: &toml::Value) -> Result<()> {
+    write_config_with_mode(path, value, Some(0o600))
+}
+
+fn write_config_with_mode(path: &Path, value: &toml::Value, mode: Option<u32>) -> Result<()> {
+    let raw = toml::to_string_pretty(value).context("cannot serialize config")?;
+    write_config_atomic(path, &raw, mode)
+}
+
+/// Replace `path` with `raw` atomically. An existing file keeps its mode
+/// unless `mode` forces one; a new file is created `0600` on Unix. The
+/// temporary file lives beside the target so the rename cannot cross
+/// filesystems.
+fn write_config_atomic(path: &Path, raw: &str, mode: Option<u32>) -> Result<()> {
+    use std::io::Write as _;
+
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("cannot create {}", parent.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+    #[cfg(unix)]
+    let mode = mode
+        .or_else(|| {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::metadata(path)
+                .map(|metadata| metadata.permissions().mode() & 0o777)
+                .ok()
+        })
+        .unwrap_or(0o600);
+    #[cfg(not(unix))]
+    let _ = mode;
+    let temporary = path.with_extension(format!("toml.{}.tmp", std::process::id()));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(mode);
+    }
+    let mut file = options
+        .open(&temporary)
+        .with_context(|| format!("cannot write {}", temporary.display()))?;
+    file.write_all(raw.as_bytes())
+        .with_context(|| format!("cannot write {}", temporary.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // A leftover temporary may carry another mode; force the target's.
+        file.set_permissions(std::fs::Permissions::from_mode(mode))
+            .with_context(|| format!("cannot set permissions on {}", temporary.display()))?;
+    }
+    file.sync_all()
+        .with_context(|| format!("cannot flush {}", temporary.display()))?;
+    drop(file);
+    std::fs::rename(&temporary, path)
+        .with_context(|| format!("cannot replace {}", path.display()))?;
+    Ok(())
 }
 
 /// Remove and return `permissions.rules` from one config file's table.
@@ -2024,5 +2128,82 @@ thinking_control = { chat_template_kwargs = { enable_thinking = false } }
         };
         model.save_connection(&path).unwrap();
         assert!(path.is_file());
+    }
+
+    #[test]
+    fn save_setting_preserves_unrelated_keys_and_the_file_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "default_profile = \"full\"\n\n[model]\napi_key = \"secret\"\n\n[ui]\ntheme = \"light\"\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        Config::save_setting(&path, "ui", "show_reasoning", toml::Value::Boolean(true)).unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let parsed: toml::Value = toml::from_str(&raw).unwrap();
+        assert_eq!(parsed["ui"]["show_reasoning"].as_bool(), Some(true));
+        assert_eq!(parsed["ui"]["theme"].as_str(), Some("light"));
+        assert_eq!(parsed["model"]["api_key"].as_str(), Some("secret"));
+        assert_eq!(parsed["default_profile"].as_str(), Some("full"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "the existing private mode is kept");
+        }
+    }
+
+    #[test]
+    fn save_setting_creates_a_private_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested/config.toml");
+
+        Config::save_ui_setting(&path, "theme", toml::Value::String("hati".into())).unwrap();
+
+        assert!(path.is_file());
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let parsed: toml::Value = toml::from_str(&raw).unwrap();
+        assert_eq!(parsed["ui"]["theme"].as_str(), Some("hati"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "a new config must be private");
+        }
+    }
+
+    #[test]
+    fn default_profile_persists_and_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[ui]\ntheme = \"light\"\n").unwrap();
+
+        Config::save_default_profile(&path, "full").unwrap();
+
+        let cfg = Config::load(&path, None).unwrap();
+        assert_eq!(cfg.default_profile, "full");
+        assert_eq!(cfg.profile_name(), "full");
+        assert_eq!(cfg.ui.theme, "light", "unrelated keys survive the write");
+    }
+
+    #[test]
+    fn show_reasoning_persists_and_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "default_profile = \"coding\"\n").unwrap();
+
+        Config::save_ui_setting(&path, "show_reasoning", toml::Value::Boolean(true)).unwrap();
+
+        let cfg = Config::load(&path, None).unwrap();
+        assert!(cfg.ui.show_reasoning);
+        assert_eq!(cfg.default_profile, "coding");
     }
 }

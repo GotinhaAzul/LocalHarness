@@ -178,6 +178,11 @@ pub struct SessionContextWindow {
     /// Where each value came from, keyed `trained`, `allocated`, `per_slot`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sources: Option<std::collections::BTreeMap<String, String>>,
+    /// The output reservation this session runs with, and why.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_source: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -494,6 +499,8 @@ mod tests {
             per_slot: Some(4096),
             effective: 4096,
             sources: Some(sources),
+            output: None,
+            output_source: None,
         }));
         let json = serde_json::to_value(&entry).unwrap();
         assert_eq!(json["data"]["context"]["trained"], 131_072);
@@ -514,6 +521,8 @@ mod tests {
                         allocated: Some(8192),
                         per_slot: Some(4096),
                         effective: 4096,
+                        output: None,
+                        output_source: None,
                         sources: Some(
                             [
                                 (

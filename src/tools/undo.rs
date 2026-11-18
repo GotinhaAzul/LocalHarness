@@ -24,13 +24,14 @@ const MAX_SNAPSHOT_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_DIFF_LINES: usize = 200;
 
 /// `fs-change` payload keys that tools report in their result details.
-const CHANGE_KEYS: [&str; 9] = [
+const CHANGE_KEYS: [&str; 10] = [
     "added",
     "removed",
     "created",
     "snapshot",
     "snapshot_error",
     "after_sha256",
+    "encoding",
     "undo",
     "reverts",
     "deleted",
@@ -41,9 +42,11 @@ pub(crate) fn content_hash(bytes: &[u8]) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// Read a file's current text for a snapshot. `Ok(None)` means it does not
-/// exist; `Err` names why it cannot be snapshotted.
-pub(crate) fn previous_text(path: &std::path::Path) -> Result<Option<String>, String> {
+/// Read a file's text and encoding for a snapshot. `Ok(None)` means it does
+/// not exist; `Err` names why it cannot be snapshotted.
+pub(crate) fn previous_snapshot(
+    path: &std::path::Path,
+) -> Result<Option<(String, crate::tools::encoding::Encoding)>, String> {
     let meta = match std::fs::metadata(path) {
         Ok(meta) => meta,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -54,9 +57,12 @@ pub(crate) fn previous_text(path: &std::path::Path) -> Result<Option<String>, St
     }
     let bytes =
         std::fs::read(path).map_err(|err| format!("cannot read the previous file: {err}"))?;
-    String::from_utf8(bytes)
-        .map(Some)
-        .map_err(|_| "the previous file was not UTF-8 text".into())
+    match crate::tools::encoding::decode(&bytes) {
+        crate::tools::encoding::Decoded::Text { text, encoding } => Ok(Some((text, encoding))),
+        crate::tools::encoding::Decoded::Binary => {
+            Err("the previous file was binary, not text".into())
+        }
+    }
 }
 
 /// Save what a file held before a change and describe the change for undo.
@@ -67,19 +73,41 @@ pub(crate) fn record_change(
     before: Result<Option<&str>, String>,
     after: &str,
 ) -> Map<String, Value> {
+    record_change_encoded(
+        ctx,
+        before.map(|before| before.map(|text| (text, crate::tools::encoding::Encoding::Utf8))),
+        after.as_bytes(),
+        crate::tools::encoding::Encoding::Utf8,
+    )
+}
+
+/// [`record_change`] for a file with a non-UTF-8 encoding: the snapshot keeps
+/// the text, the payload keeps the encoding, and the hash covers the exact
+/// bytes that land on disk.
+pub(crate) fn record_change_encoded(
+    ctx: &ToolContext,
+    before: Result<Option<(&str, crate::tools::encoding::Encoding)>, String>,
+    after_bytes: &[u8],
+    after_encoding: crate::tools::encoding::Encoding,
+) -> Map<String, Value> {
     let mut out = Map::new();
     match before {
-        Ok(Some(text)) => match ctx.artifacts.write(text) {
-            Ok(artifact) => {
-                out.insert("snapshot".into(), json!(artifact.id));
+        Ok(Some((text, encoding))) => {
+            if !encoding.is_utf8() {
+                out.insert("encoding".into(), json!(encoding.label()));
             }
-            Err(err) => {
-                out.insert(
-                    "snapshot_error".into(),
-                    json!(format!("snapshot could not be saved: {err}")),
-                );
+            match ctx.artifacts.write(text) {
+                Ok(artifact) => {
+                    out.insert("snapshot".into(), json!(artifact.id));
+                }
+                Err(err) => {
+                    out.insert(
+                        "snapshot_error".into(),
+                        json!(format!("snapshot could not be saved: {err}")),
+                    );
+                }
             }
-        },
+        }
         Ok(None) => {
             out.insert("created".into(), json!(true));
         }
@@ -87,7 +115,10 @@ pub(crate) fn record_change(
             out.insert("snapshot_error".into(), json!(reason));
         }
     }
-    out.insert("after_sha256".into(), json!(content_hash(after.as_bytes())));
+    if !after_encoding.is_utf8() {
+        out.insert("encoding".into(), json!(after_encoding.label()));
+    }
+    out.insert("after_sha256".into(), json!(content_hash(after_bytes)));
     out
 }
 
@@ -97,6 +128,410 @@ pub(crate) fn merge_details(mut details: Value, change: Map<String, Value>) -> V
         object.extend(change);
     }
     details
+}
+
+/// One path a destructive bash command may change, captured before it runs.
+#[derive(Debug, Clone)]
+pub(crate) struct BashSnapshot {
+    pub display: String,
+    pub path: std::path::PathBuf,
+    pub snapshot: Option<String>,
+    pub snapshot_error: Option<String>,
+    pub encoding: crate::tools::encoding::Encoding,
+    /// The command removes this path (`rm`, `mv` source, `find -delete`).
+    pub removed: bool,
+    /// The path existed before the command. A missing one can only have been
+    /// created by it (a redirection or an `mv` destination).
+    pub existed: bool,
+    pub before_sha256: String,
+}
+
+/// Bound on files captured for one destructive command.
+pub(crate) const MAX_BASH_SNAPSHOTS: usize = 200;
+
+/// Snapshot the files a destructive `bash` command will change, before it
+/// runs. Parsing the plain-path cases is deliberate: `rm`, `mv`, `find
+/// -delete`, shell redirection, and `truncate`. `git clean` is not parsed
+/// because the ignored set is only known by running git.
+pub(crate) fn bash_snapshots(ctx: &ToolContext, command: &str) -> Vec<BashSnapshot> {
+    let mut targets: Vec<(std::path::PathBuf, bool)> = Vec::new();
+    for (word, removed) in destructive_targets(command) {
+        let Ok(path) = ctx.resolve(&word) else {
+            continue;
+        };
+        if path.is_dir() {
+            // `rm -rf dir`: snapshot the regular files below it, bounded.
+            let mut stack = vec![path.clone()];
+            let mut seen = 0usize;
+            while let Some(dir) = stack.pop() {
+                let Ok(entries) = std::fs::read_dir(&dir) else {
+                    continue;
+                };
+                for entry in entries.flatten() {
+                    if targets.len() >= MAX_BASH_SNAPSHOTS {
+                        break;
+                    }
+                    let name = entry.file_name();
+                    if matches!(
+                        name.to_string_lossy().as_ref(),
+                        ".git" | ".hg" | ".svn" | "node_modules" | "target" | ".venv"
+                    ) {
+                        continue;
+                    }
+                    let Ok(kind) = entry.file_type() else {
+                        continue;
+                    };
+                    if kind.is_dir() {
+                        stack.push(entry.path());
+                    } else if kind.is_file() {
+                        targets.push((entry.path(), removed));
+                        seen += 1;
+                    }
+                }
+                if seen >= MAX_BASH_SNAPSHOTS {
+                    break;
+                }
+            }
+        } else if path.is_file() {
+            targets.push((path, removed));
+        } else if !removed {
+            // An overwrite or `mv` destination that does not exist yet may be
+            // created by the command; record it so undo can delete it.
+            targets.push((path, false));
+        }
+    }
+    targets.sort();
+    targets.dedup();
+
+    let mut snapshots = Vec::new();
+    let mut total_bytes = 0u64;
+    for (path, removed) in targets {
+        if snapshots.len() >= MAX_BASH_SNAPSHOTS {
+            break;
+        }
+        let existed = path.is_file();
+        let meta = std::fs::metadata(&path).ok();
+        let before_sha256 = if existed {
+            std::fs::read(&path)
+                .map(|bytes| content_hash(&bytes))
+                .unwrap_or_else(|_| content_hash(b""))
+        } else {
+            content_hash(b"")
+        };
+        let mut snapshot_error = None;
+        if existed
+            && (meta
+                .as_ref()
+                .is_some_and(|meta| meta.len() > MAX_SNAPSHOT_BYTES)
+                || total_bytes >= MAX_SNAPSHOT_BYTES * 8)
+        {
+            snapshot_error =
+                Some("the file exceeded the snapshot size bound, so undo cannot restore it".into());
+        }
+        total_bytes += meta.map(|meta| meta.len()).unwrap_or(0);
+        let display = display_path(&ctx.cwd, &path);
+        let (snapshot, encoding) = if snapshot_error.is_some() || !existed {
+            (None, crate::tools::encoding::Encoding::Utf8)
+        } else {
+            match previous_snapshot(&path) {
+                Ok(Some((text, encoding))) => {
+                    let snapshot = match ctx.artifacts.write(&text) {
+                        Ok(artifact) => Some(artifact.id),
+                        Err(err) => {
+                            snapshot_error = Some(format!("snapshot could not be saved: {err}"));
+                            None
+                        }
+                    };
+                    (snapshot, encoding)
+                }
+                Ok(None) => (None, crate::tools::encoding::Encoding::Utf8),
+                Err(reason) => {
+                    snapshot_error = Some(reason);
+                    (None, crate::tools::encoding::Encoding::Utf8)
+                }
+            }
+        };
+        snapshots.push(BashSnapshot {
+            display,
+            path,
+            snapshot,
+            snapshot_error,
+            encoding,
+            removed,
+            existed,
+            before_sha256,
+        });
+    }
+    snapshots
+}
+
+/// The `details.session` entries for one bash command's snapshots. `after` is
+/// read after the command ran, so `undo` and `/rewind` can prove the file
+/// still matches what the command left. Files the command did not actually
+/// change are left out, which keeps `find -delete` snapshots of untouched
+/// files from filling the undo stack.
+pub(crate) fn bash_change_entries(snapshots: &[BashSnapshot]) -> Vec<Value> {
+    snapshots
+        .iter()
+        .filter_map(|snapshot| {
+            let after = std::fs::read(&snapshot.path)
+                .map(|bytes| content_hash(&bytes))
+                .unwrap_or_else(|_| content_hash(b""));
+            if !snapshot.existed && after == snapshot.before_sha256 {
+                // The command never created it.
+                return None;
+            }
+            if snapshot.existed && after == snapshot.before_sha256 {
+                // Untouched (a `find` predicate matched only some files).
+                return None;
+            }
+            let mut entry = json!({
+                "kind": "fs-change",
+                "path": snapshot.display,
+                "bash": true,
+                "removed": snapshot.removed,
+                "after_sha256": after,
+            });
+            if let Some(object) = entry.as_object_mut() {
+                if !snapshot.existed {
+                    object.insert("created".into(), json!(true));
+                }
+                if let Some(id) = &snapshot.snapshot {
+                    object.insert("snapshot".into(), json!(id));
+                }
+                if let Some(error) = &snapshot.snapshot_error {
+                    object.insert("snapshot_error".into(), json!(error));
+                }
+                if !snapshot.encoding.is_utf8() {
+                    object.insert("encoding".into(), json!(snapshot.encoding.label()));
+                }
+            }
+            Some(entry)
+        })
+        .collect()
+}
+
+/// Paths a command names after a deleting or truncating program. `(path,
+/// removed)`; `removed == false` means overwritten, not deleted.
+fn destructive_targets(command: &str) -> Vec<(String, bool)> {
+    let mut targets = Vec::new();
+    for segment in shell_segments(command) {
+        let words = shell_words(&segment);
+        if words.is_empty() {
+            continue;
+        }
+        // Redirection first: `> f`, `>>f`, `2>f`, `&>f`, and `word>f` all
+        // name a file that may be truncated or created.
+        let mut index = 0;
+        while index < words.len() {
+            if let Some(after) = redirect_target(&words[index]) {
+                if after.is_empty() {
+                    if let Some(next) = words.get(index + 1) {
+                        targets.push((next.clone(), false));
+                        index += 2;
+                        continue;
+                    }
+                } else if !after.starts_with(['&', '=']) {
+                    targets.push((after.to_string(), false));
+                }
+            }
+            index += 1;
+        }
+        let (program, args) = program_and_args(&words);
+        let Some(program) = program else {
+            continue;
+        };
+        let paths = path_args(args);
+        match program {
+            "rm" | "shred" | "unlink" => {
+                for word in paths {
+                    targets.push((word.clone(), true));
+                }
+            }
+            "mv" => {
+                if let Some((destination, sources)) = paths.split_last() {
+                    for source in sources {
+                        targets.push(((*source).clone(), true));
+                    }
+                    targets.push(((*destination).clone(), false));
+                }
+            }
+            "truncate" => {
+                for word in paths {
+                    targets.push((word.clone(), false));
+                }
+            }
+            "find" if args.iter().any(|word| word == "-delete") => {
+                for word in args
+                    .iter()
+                    .take_while(|word| !word.starts_with('-'))
+                    .filter(|word| !word.is_empty())
+                {
+                    targets.push((word.clone(), true));
+                }
+            }
+            _ => {}
+        }
+    }
+    targets
+}
+
+/// The path named by one redirection word, or `Some("")` when the path is the
+/// next word. `None` when the word has no redirection.
+fn redirect_target(word: &str) -> Option<&str> {
+    let position = word.find('>')?;
+    let prefix = &word[..position];
+    if !prefix.is_empty()
+        && !prefix
+            .chars()
+            .all(|character| character.is_ascii_digit() || character == '&')
+    {
+        // `make>build.log`: everything before `>` is the command/argument.
+        return Some(&word[position + 1..]);
+    }
+    Some(word[position..].trim_start_matches('>'))
+}
+
+/// Positional arguments, honouring `--` so `rm -- -file` still names `-file`.
+fn path_args(args: &[String]) -> Vec<&String> {
+    let mut paths = Vec::new();
+    let mut literal = false;
+    for word in args {
+        if !literal && word == "--" {
+            literal = true;
+            continue;
+        }
+        if !literal && word.starts_with('-') {
+            continue;
+        }
+        paths.push(word);
+    }
+    paths
+}
+
+/// Split a command into simple commands at unquoted separators.
+fn shell_segments(command: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    let mut chars = command.chars().peekable();
+    while let Some(character) = chars.next() {
+        match quote {
+            Some(open) => {
+                current.push(character);
+                if character == open {
+                    quote = None;
+                }
+            }
+            None => match character {
+                '\'' | '"' => {
+                    quote = Some(character);
+                    current.push(character);
+                }
+                '&' | ';' | '\n' => {
+                    segments.push(std::mem::take(&mut current));
+                    if character == '&' && chars.peek() == Some(&'&') {
+                        chars.next();
+                    }
+                }
+                '|' => {
+                    segments.push(std::mem::take(&mut current));
+                    if chars.peek() == Some(&'|') {
+                        chars.next();
+                    }
+                }
+                _ => current.push(character),
+            },
+        }
+    }
+    if !current.trim().is_empty() {
+        segments.push(current);
+    }
+    segments
+}
+
+/// The words of one simple command, quotes removed.
+fn shell_words(command: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    let mut chars = command.chars();
+    while let Some(character) = chars.next() {
+        match quote {
+            Some(open) => {
+                if character == open {
+                    quote = None;
+                } else {
+                    current.push(character);
+                }
+            }
+            None => match character {
+                '\'' | '"' => quote = Some(character),
+                '\\' => {
+                    if let Some(next) = chars.next() {
+                        current.push(next);
+                    }
+                }
+                character if character.is_whitespace() => {
+                    if !current.is_empty() {
+                        words.push(std::mem::take(&mut current));
+                    }
+                }
+                character => current.push(character),
+            },
+        }
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    words
+}
+
+/// The program and its arguments, skipping wrappers and `VAR=value` prefixes.
+fn program_and_args(words: &[String]) -> (Option<&str>, &[String]) {
+    let mut index = 0;
+    while index < words.len() {
+        let word = words[index].as_str();
+        if word.contains('=') && !word.starts_with('-') {
+            index += 1;
+            continue;
+        }
+        if matches!(word, "sudo" | "doas") {
+            index += 1;
+            while index < words.len() && words[index].starts_with('-') {
+                let flag = words[index].as_str();
+                index += 1;
+                if matches!(
+                    flag,
+                    "-u" | "-g" | "-p" | "-C" | "-t" | "-U" | "-r" | "-D" | "--user" | "--group"
+                ) {
+                    index += 1;
+                }
+            }
+            continue;
+        }
+        if word == "env" {
+            index += 1;
+            while index < words.len() && words[index].starts_with('-') {
+                index += 1;
+            }
+            continue;
+        }
+        if matches!(word, "time" | "command" | "nohup" | "exec") {
+            index += 1;
+            continue;
+        }
+        if word == "timeout" {
+            index += 2;
+            continue;
+        }
+        break;
+    }
+    let Some(program) = words.get(index) else {
+        return (None, &[]);
+    };
+    let program = program.rsplit('/').next().unwrap_or(program);
+    (Some(program), &words[index + 1..])
 }
 
 /// The `fs-change` session entry for a successful mutation. `display` is the
@@ -166,7 +601,7 @@ impl Tool for UndoTool {
     }
 
     fn description(&self) -> &'static str {
-        "Revert the last edit, patch, or write to a file; call again to step further back. Changes made by bash are not tracked."
+        "Revert the last edit, patch, write, or snapshotted bash change to a file; call again to step further back."
     }
 
     fn schema(&self) -> Value {
@@ -196,7 +631,7 @@ fn run(ctx: &ToolContext, args: &Value) -> Result<ToolResult, ToolResult> {
         return Err(ToolResult::err(
             "NOTHING_TO_UNDO",
             format!(
-                "no edit, patch, or write to {display} on this branch to undo. Changes made with bash are not tracked; fix those with edit."
+                "no snapshotted change to {display} on this branch to undo. A bash command is snapshotted only when it names a file with `rm`, `mv`, `find -delete`, `truncate`, or a redirection; fix other changes with edit."
             ),
         ));
     };
@@ -209,16 +644,23 @@ fn run(ctx: &ToolContext, args: &Value) -> Result<ToolResult, ToolResult> {
         ));
     };
 
-    // Only revert what the harness itself wrote.
+    // Only revert what the harness (or the snapshotted bash command) itself
+    // changed. A file the command deleted is compared against the hash of
+    // "missing", so an undo can restore it; a file something recreated is a
+    // conflict like any other.
     let current = match std::fs::read(&path) {
         Ok(bytes) => bytes,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return Err(ToolResult::err(
-                "UNDO_CONFLICT",
-                format!(
-                    "{display} no longer exists; something deleted it after the harness wrote it. Recreate it with write if needed."
-                ),
-            ));
+            if expected == content_hash(b"") {
+                Vec::new()
+            } else {
+                return Err(ToolResult::err(
+                    "UNDO_CONFLICT",
+                    format!(
+                        "{display} no longer exists; something deleted it after the harness wrote it. Recreate it with write if needed."
+                    ),
+                ));
+            }
         }
         Err(err) => {
             return Err(ToolResult::err(
@@ -281,28 +723,49 @@ fn run(ctx: &ToolContext, args: &Value) -> Result<ToolResult, ToolResult> {
             ),
         )
     })?;
+    let encoding = change
+        .payload
+        .get("encoding")
+        .and_then(Value::as_str)
+        .map(crate::tools::encoding::Encoding::from_label)
+        .unwrap_or(crate::tools::encoding::Encoding::Utf8);
+    let restored_bytes = crate::tools::encoding::encode(&restored, encoding).ok_or_else(|| {
+        ToolResult::err(
+            "UNDO_FAILED",
+            format!(
+                "the snapshot of {display} is {0} text that cannot be encoded back as {0}; fix it with edit",
+                encoding.label()
+            ),
+        )
+    })?;
     // A raw in-process snapshot is the exact pre-change text, even when the
     // file legitimately contained a redaction-shaped string. A copy read back
     // from disk is redacted and must still pass the placeholder guard.
     let written = if trusted {
-        crate::tools::write::atomic_restore(&path, restored.as_bytes(), file_mode(&path))
+        crate::tools::write::atomic_restore(&path, &restored_bytes, file_mode(&path))
     } else {
-        atomic_write(&path, restored.as_bytes(), file_mode(&path))
+        atomic_write(&path, &restored_bytes, file_mode(&path))
     };
     written
         .map_err(|err| ToolResult::err("UNDO_FAILED", format!("cannot write {display}: {err}")))?;
     record_own_write(ctx, &path);
     let (diff, added, removed) = diff_report(&current, &restored, MAX_DIFF_LINES);
-    let text = format!(
-        "restored {display} to its state before the last change (+{added} -{removed}); {more}\n{diff}"
-    );
+    let text = if change.payload.get("bash").and_then(Value::as_bool) == Some(true) {
+        format!(
+            "restored {display}, which a bash command had changed (+{added} -{removed}); the snapshot was taken before the command ran. {more}\n{diff}"
+        )
+    } else {
+        format!(
+            "restored {display} to its state before the last change (+{added} -{removed}); {more}\n{diff}"
+        )
+    };
     Ok(ToolResult::ok(text).with_details(json!({
         "path": display,
         "undo": true,
         "reverts": change.seq,
         "added": added,
         "removed": removed,
-        "after_sha256": content_hash(restored.as_bytes()),
+        "after_sha256": content_hash(&restored_bytes),
     })))
 }
 
@@ -531,7 +994,7 @@ mod tests {
         let ctx = test_context(dir.path());
         let result = mutate(&ctx, &UndoTool, json!({"path": "a.rs"})).await;
         assert!(
-            result.content.contains("bash are not tracked"),
+            result.content.contains("snapshotted change"),
             "{}",
             result.content
         );

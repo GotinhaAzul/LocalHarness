@@ -117,6 +117,10 @@ pub struct Core {
     /// Permission mode, rules, and session approvals, shared across core
     /// rebuilds. Consulted before every dispatch (see [`authorize`]).
     pub permissions: Arc<crate::policy::Permissions>,
+    /// Harness gate errors in the current turn, by code (`TODO_PLAN`,
+    /// `NO_VERIFY`, `READ_FIRST`, `gate_block`). Reported in the `--json`
+    /// `done` event so harness overhead can be measured.
+    pub gate_errors: Arc<Mutex<std::collections::BTreeMap<String, u32>>>,
 }
 
 /// One-time endpoint bring-up that outlives the launch path. The TUI opens

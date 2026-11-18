@@ -13,6 +13,47 @@ const TRUNCATION_CHARS_PER_TOKEN: f64 = 6.0;
 /// Below this size a prompt is too small to judge.
 const TRUNCATION_MIN_CHARS: usize = 12_000;
 
+/// Ceiling for the automatic output reservation of a thinking model. Reasoning
+/// tokens count against `max_output_tokens`, so a 4096 default can be spent
+/// entirely on thinking before the first tool call.
+pub const THINKING_OUTPUT_CAP: u32 = 32_768;
+
+/// The effective output reservation and why it has that value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutputReservation {
+    pub tokens: u32,
+    pub source: &'static str,
+}
+
+/// The output reservation for a turn. A thinking model gets
+/// `min(window / 4, 32768)`, which stays inside the quarter-of-window rule and
+/// leaves room for the prompt. Everything else keeps the configured value.
+pub fn output_reservation(
+    context_window: u32,
+    configured: u32,
+    thinking: bool,
+) -> OutputReservation {
+    let configured = configured.max(1);
+    let quarter = (context_window / 4).max(1);
+    let thinking_cap = quarter.min(THINKING_OUTPUT_CAP);
+    if thinking && thinking_cap > configured {
+        OutputReservation {
+            tokens: thinking_cap,
+            source: "raised for a thinking model",
+        }
+    } else if configured > quarter {
+        OutputReservation {
+            tokens: quarter,
+            source: "capped at a quarter of the window",
+        }
+    } else {
+        OutputReservation {
+            tokens: configured,
+            source: "configured",
+        }
+    }
+}
+
 /// Token estimate for the part of the prompt that exists before the user
 /// types anything: system prompt, tool schemas, and repository brief.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -283,6 +324,20 @@ mod tests {
     }
 
     #[test]
+    fn thinking_models_reserve_a_larger_output_budget() {
+        let big = output_reservation(131_072, 4096, true);
+        assert_eq!(big.tokens, 32_768);
+        assert_eq!(big.source, "raised for a thinking model");
+        assert_eq!(output_reservation(32_768, 4096, true).tokens, 8192);
+        assert_eq!(output_reservation(131_072, 4096, false).tokens, 4096);
+        // The quarter-of-window rule still wins on a small server.
+        assert_eq!(
+            TokenBudget::new(4096, output_reservation(4096, 4096, true).tokens).max_output_tokens,
+            1024
+        );
+    }
+
+    #[test]
     fn output_reservation_never_takes_the_whole_window() {
         // The default 4096 output tokens against a 4096-token server.
         let budget = TokenBudget::new(4096, 4096);
@@ -290,6 +345,24 @@ mod tests {
         assert_eq!(budget.usable_prompt(), 2560);
         // Large windows keep the configured reservation.
         assert_eq!(TokenBudget::new(131_072, 4096).max_output_tokens, 4096);
+    }
+
+    #[test]
+    fn a_thinking_model_gets_the_quarter_of_the_window_reservation() {
+        assert_eq!(output_reservation(131_072, 4096, true).tokens, 32_768);
+        assert_eq!(output_reservation(65_536, 4096, true).tokens, 16_384);
+        assert_eq!(output_reservation(32_768, 4096, true).tokens, 8192);
+        // The quarter-of-window rule wins on a small server.
+        assert_eq!(output_reservation(4096, 4096, true).tokens, 1024);
+        assert_eq!(output_reservation(131_072, 48_000, true).tokens, 32_768);
+        // A model that does not think keeps the configured cap.
+        let plain = output_reservation(131_072, 4096, false);
+        assert_eq!(plain.tokens, 4096);
+        assert_eq!(plain.source, "configured");
+        assert_eq!(
+            output_reservation(131_072, 4096, true).source,
+            "raised for a thinking model"
+        );
     }
 
     #[test]

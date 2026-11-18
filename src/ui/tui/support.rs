@@ -87,31 +87,10 @@ pub(super) fn short_session_id(id: &str) -> String {
     chars[chars.len() - 8..].iter().collect()
 }
 
+/// Persist the applied theme to the global config, preserving unrelated keys
+/// and the file mode. `Config::save_ui_setting` does the atomic write.
 pub(super) fn save_theme(path: &Path, theme: &str) -> Result<()> {
-    let mut value = if path.exists() {
-        toml::from_str::<toml::Value>(&std::fs::read_to_string(path)?)
-            .context("existing config is not valid TOML")?
-    } else {
-        toml::Value::Table(Default::default())
-    };
-    let root = value
-        .as_table_mut()
-        .ok_or_else(|| anyhow!("config root is not a table"))?;
-    let ui = root
-        .entry("ui".to_string())
-        .or_insert_with(|| toml::Value::Table(Default::default()));
-    let ui_table = ui
-        .as_table_mut()
-        .ok_or_else(|| anyhow!("[ui] is not a table"))?;
-    ui_table.insert("theme".to_string(), toml::Value::String(theme.to_string()));
-    let raw = toml::to_string_pretty(&value).context("cannot serialize config")?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let temporary = path.with_extension("toml.tmp");
-    std::fs::write(&temporary, raw)?;
-    std::fs::rename(&temporary, path)?;
-    Ok(())
+    Config::save_ui_setting(path, "theme", toml::Value::String(theme.to_string()))
 }
 
 pub(super) fn available_theme_names(paths: &crate::paths::Paths) -> Vec<String> {
@@ -263,6 +242,42 @@ pub(super) fn match_session(items: &[SessionItem], needle: &str) -> Result<PathB
                 .collect::<Vec<_>>()
                 .join("\n")
         )),
+    }
+}
+
+#[cfg(test)]
+mod theme_tests {
+    use super::save_theme;
+
+    #[test]
+    fn save_theme_preserves_the_file_mode_and_unrelated_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "default_profile = \"full\"\n\n[model]\napi_key = \"secret\"\n\n[ui]\ntheme = \"light\"\ncolor_mode = \"256\"\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        save_theme(&path, "hati").unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let parsed: toml::Value = toml::from_str(&raw).unwrap();
+        assert_eq!(parsed["ui"]["theme"].as_str(), Some("hati"));
+        assert_eq!(parsed["ui"]["color_mode"].as_str(), Some("256"));
+        assert_eq!(parsed["model"]["api_key"].as_str(), Some("secret"));
+        assert_eq!(parsed["default_profile"].as_str(), Some("full"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "the private config stays private");
+        }
     }
 }
 

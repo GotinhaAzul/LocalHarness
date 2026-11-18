@@ -5,6 +5,7 @@ pub mod bash;
 pub mod bg;
 pub mod detect;
 pub mod edit;
+pub mod encoding;
 pub mod evidence;
 pub mod fetch;
 pub mod finding;

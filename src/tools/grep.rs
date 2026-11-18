@@ -18,7 +18,6 @@ use crate::tools::{
 const MAX_MATCHES: usize = 200;
 const MAX_CONTEXT: usize = 5;
 const MAX_LINE_CHARS: usize = 400;
-const BINARY_SNIFF: usize = 8 * 1024;
 
 pub struct GrepTool;
 
@@ -155,76 +154,126 @@ fn run(ctx: &ToolContext, args: &Value) -> Result<ToolResult, ToolResult> {
     };
 
     let raw = optional_str(args, "path").unwrap_or_else(|| ".".to_string());
-    let root = ctx.resolve(&raw)?;
-    let root_display = rel_display(&ctx.cwd, &root);
-    let metadata = std::fs::metadata(&root).map_err(|err| {
-        ToolResult::err(
-            "NO_SUCH_PATH",
-            format!("cannot search {root_display}: {err}. Pass an existing file or directory."),
-        )
-    })?;
 
     let mut out: Vec<OutLine> = Vec::new();
     let mut matches = 0usize;
     let mut files_with_matches = 0usize;
     let mut truncated = false;
+    let mut skipped: Vec<String> = Vec::new();
+    let root_display;
 
-    if metadata.is_file() {
-        let label = rel_display(&ctx.cwd, &root);
-        let outcome = scan_file(&root, &label, &regex, context, max_matches, &mut out);
+    // `artifact:out-3` searches a stored tool result without a file, so a
+    // fetched page can be searched after the fact.
+    if let Some(id) = raw.strip_prefix("artifact:") {
+        let id = id.trim();
+        let text = ctx.artifacts.read_all(id).map_err(|err| {
+            ToolResult::err(
+                "NO_ARTIFACT",
+                format!("cannot read artifact {id:?}: {err}; pass an artifact id named by a result or fetch"),
+            )
+        })?;
+        root_display = format!("artifact:{id}");
+        let label = root_display.clone();
+        let outcome = scan_text(&label, &text, &regex, context, max_matches, &mut out);
         matches = outcome.matches;
         truncated = outcome.truncated;
         if outcome.had_hit {
             files_with_matches = 1;
         }
     } else {
-        let mut walker = WalkBuilder::new(&root);
-        crate::tools::configure_walker(&mut walker, include_hidden);
+        let root = ctx.resolve(&raw)?;
+        root_display = rel_display(&ctx.cwd, &root);
+        let metadata = std::fs::metadata(&root).map_err(|err| {
+            ToolResult::err(
+                "NO_SUCH_PATH",
+                format!("cannot search {root_display}: {err}. Pass an existing file or directory."),
+            )
+        })?;
 
-        for entry in walker.build() {
-            if ctx.is_cancelled() {
-                return Err(ToolResult::err("cancelled", "grep was cancelled"));
-            }
-            if matches >= max_matches {
-                truncated = true;
-                break;
-            }
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(_) => continue,
-            };
-            let is_file = entry
-                .file_type()
-                .map(|file_type| file_type.is_file())
-                .unwrap_or(false);
-            if !is_file {
-                continue;
-            }
-            let path = entry.path();
-            if let Some(matcher) = &matcher {
-                let rel_root = path.strip_prefix(&root).unwrap_or(path);
-                let rel_cwd = path.strip_prefix(&ctx.cwd).unwrap_or(rel_root);
-                if !matcher.is_match(rel_root) && !matcher.is_match(rel_cwd) {
-                    continue;
-                }
-            }
-            let label = rel_display(&ctx.cwd, path);
+        if metadata.is_file() {
+            let label = rel_display(&ctx.cwd, &root);
             let outcome = scan_file(
-                path,
+                &root,
                 &label,
                 &regex,
                 context,
-                max_matches - matches,
+                max_matches,
                 &mut out,
+                &mut skipped,
             );
-            matches += outcome.matches;
+            matches = outcome.matches;
+            truncated = outcome.truncated;
             if outcome.had_hit {
-                files_with_matches += 1;
+                files_with_matches = 1;
             }
-            if outcome.truncated {
-                truncated = true;
+        } else {
+            let mut walker = WalkBuilder::new(&root);
+            crate::tools::configure_walker(&mut walker, include_hidden);
+
+            for entry in walker.build() {
+                if ctx.is_cancelled() {
+                    return Err(ToolResult::err("cancelled", "grep was cancelled"));
+                }
+                if matches >= max_matches {
+                    truncated = true;
+                    break;
+                }
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(_) => continue,
+                };
+                let is_file = entry
+                    .file_type()
+                    .map(|file_type| file_type.is_file())
+                    .unwrap_or(false);
+                if !is_file {
+                    continue;
+                }
+                let path = entry.path();
+                if let Some(matcher) = &matcher {
+                    let rel_root = path.strip_prefix(&root).unwrap_or(path);
+                    let rel_cwd = path.strip_prefix(&ctx.cwd).unwrap_or(rel_root);
+                    if !matcher.is_match(rel_root) && !matcher.is_match(rel_cwd) {
+                        continue;
+                    }
+                }
+                let label = rel_display(&ctx.cwd, path);
+                let outcome = scan_file(
+                    path,
+                    &label,
+                    &regex,
+                    context,
+                    max_matches - matches,
+                    &mut out,
+                    &mut skipped,
+                );
+                matches += outcome.matches;
+                if outcome.had_hit {
+                    files_with_matches += 1;
+                }
+                if outcome.truncated {
+                    truncated = true;
+                }
             }
         }
+    }
+
+    // Say what was not searched. A UTF-16 file now decodes and is searched, so
+    // only real binary is skipped, and silence about it reads as "no match".
+    let mut prefix = prefix;
+    if !skipped.is_empty() {
+        let shown: Vec<&str> = skipped.iter().take(5).map(String::as_str).collect();
+        let more = skipped.len().saturating_sub(shown.len());
+        let more = if more > 0 {
+            format!(", and {more} more")
+        } else {
+            String::new()
+        };
+        prefix.push_str(&format!(
+            "[skipped {} unreadable binary file(s): {}{more}; they were not searched]\n",
+            skipped.len(),
+            shown.join(", ")
+        ));
     }
 
     if matches == 0 {
@@ -233,6 +282,7 @@ fn run(ctx: &ToolContext, args: &Value) -> Result<ToolResult, ToolResult> {
             "matches": 0,
             "files": 0,
             "truncated": false,
+            "skipped": skipped.len(),
             "literal_fallback": fallback.is_some(),
         })));
     }
@@ -277,6 +327,7 @@ fn run(ctx: &ToolContext, args: &Value) -> Result<ToolResult, ToolResult> {
         "matches": matches,
         "shown": shown,
         "files": files_with_matches,
+        "skipped": skipped.len(),
         "truncated": truncated || shown < matches,
         "literal_fallback": fallback.is_some(),
     })))
@@ -289,6 +340,7 @@ fn scan_file(
     context: usize,
     budget: usize,
     out: &mut Vec<OutLine>,
+    skipped: &mut Vec<String>,
 ) -> ScanOutcome {
     if budget == 0 {
         return ScanOutcome::none();
@@ -300,12 +352,33 @@ fn scan_file(
     if bytes.is_empty() {
         return ScanOutcome::none();
     }
-    if bytes[..bytes.len().min(BINARY_SNIFF)].contains(&0) {
+    let text = match crate::tools::encoding::decode(&bytes) {
+        crate::tools::encoding::Decoded::Text { text, .. } => text,
+        crate::tools::encoding::Decoded::Binary => {
+            // A tree of binaries must not grow this list without bound;
+            // the trailer shows the first few and the count.
+            if skipped.len() < 200 {
+                skipped.push(label.to_string());
+            }
+            return ScanOutcome::none();
+        }
+    };
+    scan_text(label, &text, regex, context, budget, out)
+}
+
+/// Search already-decoded text (a file or an artifact).
+fn scan_text(
+    label: &str,
+    text: &str,
+    regex: &Regex,
+    context: usize,
+    budget: usize,
+    out: &mut Vec<OutLine>,
+) -> ScanOutcome {
+    if budget == 0 {
         return ScanOutcome::none();
     }
-
-    let text = String::from_utf8_lossy(&bytes);
-    let lines = split_lines(&text);
+    let lines = split_lines(text);
     if lines.is_empty() {
         return ScanOutcome::none();
     }
@@ -517,6 +590,61 @@ mod tests {
         );
         assert!(result.content.contains("a.rs:1"), "{}", result.content);
         assert_eq!(result.details.unwrap()["literal_fallback"], true);
+    }
+
+    #[tokio::test]
+    async fn utf16_files_are_searched_and_binary_files_are_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut utf16 = vec![0xff, 0xfe];
+        for unit in "app.title=Nimbus\r\n".encode_utf16() {
+            utf16.extend(unit.to_le_bytes());
+        }
+        std::fs::write(dir.path().join("strings_en.txt"), utf16).unwrap();
+        std::fs::write(dir.path().join("blob.bin"), [0u8, 1, 2, 3]).unwrap();
+        let ctx = test_context(dir.path());
+
+        let result = GrepTool.call(&ctx, json!({"pattern": "Nimbus"})).await;
+        assert!(!result.is_error, "{}", result.content);
+        assert!(
+            result.content.contains("strings_en.txt:1:app.title=Nimbus"),
+            "{}",
+            result.content
+        );
+        assert!(
+            result.content.contains("skipped 1 unreadable binary file"),
+            "{}",
+            result.content
+        );
+        assert!(result.content.contains("blob.bin"), "{}", result.content);
+    }
+
+    #[tokio::test]
+    async fn an_artifact_is_searchable_by_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_context(dir.path());
+        let artifact = ctx
+            .artifacts
+            .write("first line\nneedle 9110 lives here\nlast line\n")
+            .unwrap();
+        let result = GrepTool
+            .call(
+                &ctx,
+                json!({"pattern": "needle 9110", "context": 1, "path": format!("artifact:{}", artifact.id)}),
+            )
+            .await;
+        assert!(!result.is_error, "{}", result.content);
+        assert!(
+            result
+                .content
+                .contains(&format!("artifact:{}:2:needle 9110", artifact.id)),
+            "{}",
+            result.content
+        );
+        assert!(
+            result.content.contains("first line"),
+            "context lines come from the artifact: {}",
+            result.content
+        );
     }
 
     #[tokio::test]

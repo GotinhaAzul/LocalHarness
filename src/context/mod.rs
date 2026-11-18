@@ -16,7 +16,10 @@ pub use archive::{
     BATCH_CAP_CHARS, CappedContent, Preview, RECALL_CAP_CHARS, RESULT_CAP_CHARS, ResultCaps,
     cap_batch, cap_result, cap_result_limited, cap_result_with,
 };
-pub use budget::{JSON_CHARS_PER_TOKEN, StaticPrompt, TokenBudget, ToolSpecCost};
+pub use budget::{
+    JSON_CHARS_PER_TOKEN, OutputReservation, StaticPrompt, THINKING_OUTPUT_CAP, TokenBudget,
+    ToolSpecCost, output_reservation,
+};
 pub use compact::{CompactionSummary, FindingSummary, build_summary};
 
 #[derive(Debug, Clone)]

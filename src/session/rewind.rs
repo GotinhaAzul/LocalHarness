@@ -34,6 +34,8 @@ pub struct FileRestore {
     pub path: PathBuf,
     /// Content at the target. `None` means the file did not exist there.
     pub content: Option<String>,
+    /// How the target content is stored on disk.
+    pub encoding: crate::tools::encoding::Encoding,
     /// What the newest harness write left on disk.
     pub expected_sha256: String,
     /// `fs-change` seqs this restore undoes.
@@ -221,6 +223,12 @@ pub fn plan(session: &Session, target: &str) -> Result<RewindPlan> {
             display: display.clone(),
             path,
             content,
+            encoding: oldest
+                .payload
+                .get("encoding")
+                .and_then(Value::as_str)
+                .map(crate::tools::encoding::Encoding::from_label)
+                .unwrap_or(crate::tools::encoding::Encoding::Utf8),
             expected_sha256: expected.to_string(),
             changes: post.iter().map(|change| change.seq).collect(),
         });
@@ -280,7 +288,9 @@ pub fn apply(session: &mut Session, plan: &RewindPlan, force: bool) -> Result<Re
             Some(bytes) if content_hash(bytes) != file.expected_sha256 => {
                 conflicts.push(file.display.clone());
             }
-            None if file.content.is_some() => {
+            // A file the recorded change left missing is not a conflict; the
+            // restore puts the snapshot back.
+            None if file.content.is_some() && file.expected_sha256 != content_hash(b"") => {
                 conflicts.push(format!("{} (deleted outside the harness)", file.display));
             }
             _ => {}
@@ -348,7 +358,15 @@ pub fn apply(session: &mut Session, plan: &RewindPlan, force: bool) -> Result<Re
                         )
                     })?;
                 }
-                atomic_write(&file.path, content.as_bytes(), file_mode(&file.path))
+                let bytes =
+                    crate::tools::encoding::encode(content, file.encoding).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "cannot encode the restored text of {} as {}",
+                            file.display,
+                            file.encoding.label()
+                        )
+                    })?;
+                atomic_write(&file.path, &bytes, file_mode(&file.path))
                     .map_err(|err| anyhow::anyhow!("cannot restore {}: {err}", file.display))
             }
             None => match std::fs::remove_file(&file.path) {

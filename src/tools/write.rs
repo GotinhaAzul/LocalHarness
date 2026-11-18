@@ -143,45 +143,91 @@ fn run(ctx: &ToolContext, args: &Value) -> Result<ToolResult, ToolResult> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
-        let parent_existed = parent.exists();
+        // `create_dir_all` applies the process umask, exactly like editors and
+        // `mkdir -p`; a private 0700 directory would hide new assets from a
+        // web server or another uid.
         std::fs::create_dir_all(parent).map_err(|err| {
             ToolResult::err(
                 "WRITE_FAILED",
                 format!("cannot create {}: {err}", parent.display()),
             )
         })?;
-        if !parent_existed {
-            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
-        }
     }
 
-    let mode = if existed { file_mode(&path) } else { 0o600 };
-    let previous = crate::tools::undo::previous_text(&path);
-    // A read failure (not UTF-8, or over 4 MB) cannot be diffed for review;
+    let mode = if existed {
+        file_mode(&path)
+    } else {
+        new_file_mode()
+    };
+    let target_encoding = if existed {
+        match crate::tools::encoding::decode(&std::fs::read(&path).map_err(|err| {
+            ToolResult::err("WRITE_FAILED", format!("cannot read {display}: {err}"))
+        })?) {
+            crate::tools::encoding::Decoded::Text { encoding, .. } => encoding,
+            crate::tools::encoding::Decoded::Binary => {
+                return Err(ToolResult::err(
+                    "ENCODING",
+                    format!(
+                        "{display} is binary (NUL bytes without a UTF-16 shape or BOM); write only replaces text. Delete it with bash and create it again, or edit it with a tool that understands the format."
+                    ),
+                ));
+            }
+        }
+    } else {
+        crate::tools::encoding::Encoding::Utf8
+    };
+    let bytes = crate::tools::encoding::encode(content, target_encoding).ok_or_else(|| {
+        ToolResult::err(
+            "ENCODING",
+            format!(
+                "{display} is {}; the new content has characters that encoding cannot represent. Keep the text inside its character set, or convert the file deliberately: `iconv -f {0} -t UTF-8` through bash, then rewrite it as UTF-8.",
+                target_encoding.label()
+            ),
+        )
+    })?;
+    let previous = crate::tools::undo::previous_snapshot(&path);
+    // A read failure (not text, or over 4 MB) cannot be diffed for review;
     // keep the lossy text so `mutation_write` knows the file exists.
     let before_text = match &previous {
-        Ok(text) => text.clone(),
-        Err(_) => std::fs::read(&path)
+        Ok(Some((text, _))) => Some(text.clone()),
+        _ => std::fs::read(&path)
             .ok()
             .map(|bytes| String::from_utf8_lossy(&bytes).into_owned()),
     };
-    let change = crate::tools::undo::record_change(
+    let change = crate::tools::undo::record_change_encoded(
         ctx,
         previous
             .as_ref()
-            .map(Option::as_deref)
+            .map(|snapshot| {
+                snapshot
+                    .as_ref()
+                    .map(|(text, encoding)| (text.as_str(), *encoding))
+            })
             .map_err(Clone::clone),
-        content,
+        &bytes,
+        target_encoding,
     );
-    crate::tools::hunk::mutation_write(&path, before_text.as_deref(), content, mode)
-        .map_err(|err| ToolResult::err("WRITE_FAILED", format!("cannot write {display}: {err}")))?;
+    crate::tools::hunk::mutation_write_encoded(
+        &path,
+        before_text.as_deref(),
+        content,
+        &bytes,
+        mode,
+        target_encoding,
+    )
+    .map_err(|err| ToolResult::err("WRITE_FAILED", format!("cannot write {display}: {err}")))?;
 
     record_own_write(ctx, &path);
 
     let added = crate::tools::read::line_count(content);
     let text = format!(
-        "wrote {display} ({} bytes, {added} lines){}",
-        content.len(),
+        "wrote {display} ({} bytes, {added} lines{}){}",
+        bytes.len(),
+        if target_encoding == crate::tools::encoding::Encoding::Utf8 {
+            String::new()
+        } else {
+            format!(", {}", target_encoding.label())
+        },
         if existed { ", replaced" } else { ", created" }
     );
     Ok(
@@ -191,6 +237,7 @@ fn run(ctx: &ToolContext, args: &Value) -> Result<ToolResult, ToolResult> {
                 "created": !existed,
                 "added": added,
                 "bytes": content.len(),
+                "encoding": target_encoding.label(),
             }),
             change,
         )),
@@ -271,6 +318,28 @@ pub(crate) fn file_mode(path: &Path) -> u32 {
     std::fs::metadata(path)
         .map(|meta| meta.permissions().mode() & 0o7777)
         .unwrap_or(0o600)
+}
+
+/// The process umask, from `/proc/self/status` on Linux. Reading it from the
+/// kernel avoids the race of calling `umask` twice in a multi-threaded
+/// process; the conventional 022 is used when the file cannot be read.
+pub(crate) fn process_umask() -> u32 {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| {
+            status.lines().find_map(|line| {
+                line.strip_prefix("Umask:")
+                    .and_then(|value| u32::from_str_radix(value.trim(), 8).ok())
+            })
+        })
+        .unwrap_or(0o022)
+}
+
+/// Mode for a newly created file: what `std::fs::write` and an editor get,
+/// `0o666` minus the umask. A private 0600 file breaks web roots, shared
+/// checkouts, and `docker build`, and git does not record it.
+pub(crate) fn new_file_mode() -> u32 {
+    0o666 & !process_umask()
 }
 
 /// Replace `path` atomically: write a sibling temp file, fsync, then rename.
@@ -437,7 +506,88 @@ mod tests {
             .permissions()
             .mode()
             & 0o777;
-        assert_eq!(mode, 0o600);
+        // New files follow the process umask, like `std::fs::write`; they are
+        // not private 0600, which breaks web roots and other uids.
+        assert_eq!(mode, new_file_mode());
+        let dir_mode = std::fs::metadata(dir.path().join("fresh"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dir_mode, 0o777 & !process_umask(), "directory umask");
+        assert!(
+            mode & 0o400 != 0 && mode & 0o040 != 0,
+            "the owner and group can read a new file: {mode:o}"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_keeps_an_existing_files_encoding_or_refuses_a_lossy_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = b"Sobre o Nimbus \xe9 vers\xe3o 2\n";
+        std::fs::write(dir.path().join("strings_pt.properties"), original).unwrap();
+        let ctx = test_context(dir.path());
+        let _ = ReadTool
+            .call(&ctx, json!({"path": "strings_pt.properties"}))
+            .await;
+
+        // A representable change keeps latin-1: `ã` is one byte e3, not UTF-8
+        // c3 a3.
+        let written = WriteTool
+            .call(
+                &ctx,
+                json!({"path": "strings_pt.properties", "content": "Sobre o Stratus versão 3\n"}),
+            )
+            .await;
+        assert!(!written.is_error, "{}", written.content);
+        let bytes = std::fs::read(dir.path().join("strings_pt.properties")).unwrap();
+        assert_eq!(bytes, b"Sobre o Stratus vers\xe3o 3\n");
+        assert!(written.content.contains("latin-1"), "{}", written.content);
+        let details = written.details.clone().unwrap();
+        assert_eq!(details["encoding"], "latin-1");
+
+        // Undo restores the original Latin-1 bytes, not a UTF-8 copy of them.
+        let entry =
+            crate::tools::undo::fs_change_entry("strings_pt.properties".into(), Some(&details));
+        ctx.session
+            .lock()
+            .unwrap()
+            .append(crate::session::EntryKind::Custom(entry))
+            .unwrap();
+        let undone = crate::tools::undo::UndoTool
+            .call(&ctx, json!({"path": "strings_pt.properties"}))
+            .await;
+        assert!(!undone.is_error, "{}", undone.content);
+        assert_eq!(
+            std::fs::read(dir.path().join("strings_pt.properties")).unwrap(),
+            original
+        );
+
+        // A character latin-1 cannot represent is refused with a next step,
+        // never silently written as UTF-8.
+        let restored = WriteTool
+            .call(
+                &ctx,
+                json!({"path": "strings_pt.properties", "content": "Sobre o Stratus versão 3\n"}),
+            )
+            .await;
+        assert!(!restored.is_error, "{}", restored.content);
+        let refused = WriteTool
+            .call(
+                &ctx,
+                json!({"path": "strings_pt.properties", "content": "日本語\n"}),
+            )
+            .await;
+        assert!(refused.is_error, "{}", refused.content);
+        assert!(
+            refused.content.starts_with("[ENCODING]"),
+            "{}",
+            refused.content
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("strings_pt.properties")).unwrap(),
+            b"Sobre o Stratus vers\xe3o 3\n"
+        );
     }
 
     fn placeholder_for(value: &str) -> String {

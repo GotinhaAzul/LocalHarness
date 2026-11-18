@@ -360,7 +360,7 @@ observable.
 | Budget checkpoint | Tool calls, model calls, and wall clock are checked at 120 calls, 40 model calls, and 30 minutes. A checkpoint that finds a new result, a file change, or a passing verify within the last `stall_calls` calls renews the allowance and the turn continues. A checkpoint with no recent progress ends the turn and reports why. |
 | Stall | Twelve consecutive calls with no new result fingerprint, no file change, and no successful verify. Ends the turn with the last known state. |
 | Tool-family guard | Calls are grouped into a family: `bash` by program and operation, other tools by name plus key arguments (body arguments are ignored; temporary-path and number normalization is for bash families only). Three cumulative counters run across the turn: repeated calls of one family (successful or not), failing calls of one family, and successful calls of one family that changed no workspace file and passed no verify. They stop the turn as `stalled` at `[budgets] max_same_tool_family` (8; repeated and failing calls) and `max_same_tool_family_success` (24; unproductive successes). Interleaving another call, a success of the same family, and writes outside the session directory do not reset them; a workspace change or a passing verify does. 0 disables either budget. Read-only calls never count as repeats or as idle successes — read-only tools, the reading actions of mixed tools, and bash commands that only read (`cat`, `git show`, `curl` without a writing flag, `gh pr view`, ...) — though a failing read-only call still counts as a failure; a read repeated with the same output is caught by the stall guard. The workspace is fingerprinted lazily: the first counter that needs a baseline reads it, every later counter reuses that reading, a fresh reading is taken only to decide a trip and once at the end of the batch, and a call that reports a file change invalidates it. In a repository the fingerprint is `git status --porcelain=v1 -z --untracked-files=all -- .` from the session directory plus HEAD and the size and mtime of each listed path (nothing is written to the object store); elsewhere it is a bounded mtime/size walk. So a `sed -i` fix loop that really changes files is not a stall. |
-| Todo gate | After two mutations or edits touching two files, the run is multi-step and requires a plan. The final task requires a fresh passing verify when verification is configured. |
+| Todo gate | After changes to three distinct files, an edit requires a plan; repeated edits to one file are one change. Settlement never reopens a finished turn for a plan. The final task requires a fresh passing verify when verification is configured. |
 | Verify gate | Successful mutations newer than the last passing verify are unverified. Continue up to two times with a verify instruction, then record the unverified state and allow settle. |
 | Review nudge | One continuation per run after mutations, asking for `review`. Never fights verify or todo gates. |
 
@@ -421,7 +421,7 @@ continues. Nudges are capped at three per turn.
 | `<think>` / `<thinking>` in content | Split out while streaming (tags may straddle deltas) and stored as reasoning; text before a lone `</think>` too. |
 | Tool calls written as text | With `tool_mode` `repair` or `auto`, parsed into native calls before gates run (formats in `docs/model-setup.md`). Fenced/bare JSON must name an active tool and end the reply. |
 | Exact repetition | The stream is checked as it grows; a tail of one unit repeated at least 5 times and 600 bytes stops generation, keeps one copy, and nudges. Repeated loops end the turn as `stalled`. |
-| `finish_reason = length` | A cut tool call (arguments not valid JSON) does not run and is not replayed; the model is told to split it into smaller calls, spending the output-recovery allowance. When the allowance (shared with the other output repairs) runs out, the turn ends as `stalled` with `tool_call_truncated`. The cut reply is kept as an assistant entry with `stop_reason: length` (with its prose, if any), so roles keep alternating. Cut prose is continued. A reply that spent the budget thinking is told to act. |
+| `finish_reason = length` | A cut tool call (arguments not valid JSON) does not run and is not replayed; the model is told to split it into smaller calls, spending the output-recovery allowance. The first cut doubles the output reservation, and a later one retries once with the profile's `thinking_control` applied. When the allowance runs out with an empty or length-truncated reply, the turn ends as `budget` (`max_tokens`) with an `output_limit`/`empty_reply` error, never `Done`. Cut prose is continued. |
 | Empty reply | One nudge to call a tool or answer. |
 | Silent prompt truncation | The engine's `truncated` flag and context-shift count are proof and end the turn. Arithmetic signals need a second witness: `prompt_tokens + cached_tokens` covering the prompt means an uncached-only report; `/tokenize` decides between a cut prompt (it exceeds the window) and a wrong report (it fits); a count under 512 tokens is a broken usage field; impossible characters per token with a plausible count is a confirmed cut; a plain shortfall must repeat on the next call. A wrong report keeps the reply, warns once, stops calibrating from usage on that endpoint, and is recorded for `tot doctor`, which reports it without sending a chat completion. |
 
@@ -436,8 +436,12 @@ usable_prompt = context_window - max_output_tokens - safety_margin
 ```
 
 - `max_output_tokens` defaults to 4096 and is capped at a quarter of the
-  window, so a small server window always leaves room for the prompt. The
-  request's `max_tokens` uses the capped value.
+  window, so a small server window always leaves room for the prompt. A
+  thinking model (`thinking = "on"`, a `reasoning_field`, or a usage report
+  with `reasoning_tokens`) reserves `min(window / 4, 32768)`; `tot doctor`
+  prints the effective value as `output: N tokens (…)` and the session header
+  records `output`/`output_source`. The request's `max_tokens` uses the
+  effective value.
 - `safety_margin` is 5% of the context window, minimum 512 tokens.
 - Tool schemas, system prompt, skills index, and state blocks count toward the
   prompt. The serialized `tools` array is measured once when the core is built:
@@ -884,14 +888,18 @@ form. `tot doctor` prints both sizes.
   the recorded one, so edits by the user, a formatter, or `bash` are never
   discarded; content hashing, unlike stat stamps, keeps chained undos working.
   Undo records its own `fs-change`, so verify and review gates see it. Previous
-  files over 4 MB or not UTF-8 are not snapshotted and undo says why. Changes
-  made through `bash` are not tracked.
+  files over 4 MB or not text are not snapshotted and undo says why. Before a
+  destructive `bash` command (`rm`, `mv`, `find -delete`, `truncate`, a `>`
+  redirection) the named files are snapshotted into the same store, and the
+  command's result lists them; undo and `/rewind` restore them even though the
+  command ran outside the write path. `git clean` is not parsed.
 - `bash` uses `bash -lc`, captures stdout/stderr separately, caps output, and
   kills the process group on timeout. Interactive-only commands are blocked.
 - `bg` starts a process in its own group, captures output to an artifact, and
   exposes `status`, `logs`, and `stop`. At most four live processes per session.
-- `todo` uses an adaptive gate: free for two mutations or two files, then a plan
-  is required. `plan` auto-starts task 1. `done` accepts a note or harness-
+- `todo` uses an adaptive gate: free for a run that touches one or two files,
+  then a plan is required from the third distinct file. Settlement never asks
+  for a plan as the last action. `plan` auto-starts task 1. `done` accepts a note or harness-
   derived evidence. The final task requires a fresh passing `verify` when
   verification is configured.
 - `verify` runs configured steps sequentially without a shell, caps combined
@@ -905,10 +913,13 @@ form. `tot doctor` prints both sizes.
 - `fetch` GETs one public http(s) URL and returns readable text: HTML is
   converted (scripts, navigation, and page chrome dropped; code blocks
   fenced), while text, Markdown, and JSON pass through. The body is capped at
-  2 MB and 20 s, and pages by character offset within the result budget. It
-  refuses loopback, private, link-local, CGNAT, and metadata addresses on
-  every hop, unless `[fetch] allow_private` names the host. Results carry
-  external provenance.
+  2 MB and 20 s, and pages by character offset within the result budget;
+  `find` searches the whole page and returns matching lines with their
+  character offsets. Each page is cached per session and stored as an
+  artifact (`recall` can read it), and a second fetch at an offset already
+  delivered returns a pointer instead of the same bytes. It refuses loopback,
+  private, link-local, CGNAT, and metadata addresses on every hop, unless
+  `[fetch] allow_private` names the host. Results carry external provenance.
 - `recall` reads an archived artifact range and names the artifact in the
   result.
 - `thread` has `split`, `note`, `close`, `status`; `split` requires a title or
@@ -919,9 +930,13 @@ form. `tot doctor` prints both sizes.
   `publishDiagnostics` after `didOpen`/`didChange`, or 2.5 s. Clients are
   disposed after 10 minutes idle or on session shutdown.
 - `repo_map` walks the tree with gitignore rules, caches per-file symbols by
-  mtime and size, and returns a character-budgeted map. It skips binary files,
-  files above 256 KB, and build/vendor directories. A compact map is injected
-  into the system prompt at startup.
+  mtime and size, and returns a character-budgeted map. Every non-ignored file
+  appears: files without an outline are grouped per directory with a count by
+  extension, and anything the budget or the 5000-file cap left out is counted
+  in a closing line. `vendor`, `dist`, `build`, and `target` are only skipped
+  when git ignores them. Files above 256 KB and binary files are listed
+  without symbols. A compact map is injected into the system prompt at
+  startup.
 - `write`, `edit`, and `patch` snapshot diagnostics through the shared LSP
   service before a mutation when `[lsp] gate` is not `off`. Only new
   severity-error diagnostics count: `warn` appends them, `block` restores the
@@ -1704,8 +1719,10 @@ cursor = "#c0caf5"
   `indexed:0..255`, and `default`.
 - `color_mode = "auto" | "truecolor" | "256" | "16"`. Auto detects
   `COLORTERM`/`TERM`; `NO_COLOR` disables color.
-- `/theme` lists; `/theme <name>` applies for the session; `/theme save`
-  persists the default. Unknown theme names return the available list.
+- `/theme` lists; a picker previews without writing. `/theme <name>` and a
+  confirmed pick apply the theme and write `[ui] theme` at once; `/theme save`
+  re-writes the current theme and reports the path. Unknown theme names return
+  the available list.
 - Status is never conveyed by color alone: labels and glyphs accompany every
   color.
 
@@ -1722,7 +1739,7 @@ cursor = "#c0caf5"
 - Diff fences and diff-like tool output: added lines green, removed red, hunk
   headers accent, context muted.
 - Reasoning: muted block, collapsed by default, token count shown.
-  `Ctrl+R` toggles.
+  `Ctrl+R` toggles and writes `[ui] show_reasoning`.
 - Tool cards: border by status, tool name, one-line argument summary, duration,
   output preview, expand key.
 - Errors: red card with code, message, and next action.
@@ -1784,6 +1801,13 @@ cursor = "#c0caf5"
   diff without a model. `/login` validates and saves
   the endpoint/model/key; `/model` lists endpoint models and switches the
   session.
+- Settings changed from the TUI persist to the global config:
+  `/theme <name>` and a confirmed theme pick write `[ui] theme`, a successful
+  `/profile` switch writes `default_profile`, and `Ctrl+R` writes
+  `[ui] show_reasoning`. `config::save_setting` merges into the existing TOML,
+  replaces the file atomically, keeps its mode, and creates a new file `0600`.
+  A failed save warns and keeps the in-memory change. `/permissions` stays
+  session-only and is never written.
 - Slash completion shows a filtered popup with descriptions. `Tab` completes
   the token at the cursor (`ui/complete.rs`): command names, command
   arguments (themes, profiles, skills, workflows, sessions, probed models,
@@ -1940,7 +1964,7 @@ Environment variables: `TOT_ENDPOINT`, `TOT_MODEL`, `TOT_API_KEY`, `TOT_PROFILE`
 ### 10.3 Example config
 
 ```toml
-default_profile = "coding"      # overridden by --profile / TOT_PROFILE
+default_profile = "coding"      # overridden by --profile / TOT_PROFILE; /profile writes it
 
 [model]
 endpoint = "http://127.0.0.1:8080"
@@ -1955,9 +1979,9 @@ connect_timeout_secs = 5
 first_token_timeout_secs = 120
 
 [ui]
-theme = "default"
+theme = "default"               # /theme <name> writes it
 color_mode = "auto"
-show_reasoning = false
+show_reasoning = false          # Ctrl+R writes it
 show_token_counts = true
 
 [session]

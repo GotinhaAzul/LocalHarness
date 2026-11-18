@@ -33,6 +33,8 @@ pub struct PendingWrite {
     pub path: PathBuf,
     pub before: Option<String>,
     pub after: String,
+    /// The existing file's encoding, so a reviewed write keeps it.
+    pub encoding: crate::tools::encoding::Encoding,
     /// Permission bits to use if the file is created.
     pub mode: u32,
 }
@@ -70,12 +72,34 @@ pub(crate) fn mutation_write(
     after: &str,
     mode: u32,
 ) -> std::io::Result<()> {
-    // A file that exists but has no readable text (not UTF-8, or over 4 MB)
-    // cannot be diffed; write it as before rather than failing the review.
+    mutation_write_encoded(
+        path,
+        before,
+        after,
+        after.as_bytes(),
+        mode,
+        crate::tools::encoding::Encoding::Utf8,
+    )
+}
+
+/// [`mutation_write`] for a file with its own encoding: the bytes are the
+/// encoded `after` text, kept so a reviewed write never converts the file.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn mutation_write_encoded(
+    path: &Path,
+    before: Option<&str>,
+    after: &str,
+    bytes: &[u8],
+    mode: u32,
+    encoding: crate::tools::encoding::Encoding,
+) -> std::io::Result<()> {
+    // A file that exists but has no readable text (not text at all, or over
+    // 4 MB) cannot be diffed; write it as before rather than failing the
+    // review.
     if current_capture().is_some() && (before.is_some() || !path.exists()) {
         // Refuse a redaction placeholder now, as an uncaptured write would,
         // instead of showing it for review and failing the whole apply.
-        crate::tools::write::refuse_new_placeholders(path, after.as_bytes())?;
+        crate::tools::write::refuse_new_placeholders(path, bytes)?;
         let capture = current_capture().expect("checked above");
         let mut writes = capture.lock().map_err(|_| {
             std::io::Error::other("the review buffer is poisoned; restart the turn")
@@ -84,11 +108,12 @@ pub(crate) fn mutation_write(
             path: path.to_path_buf(),
             before: before.map(str::to_string),
             after: after.to_string(),
+            encoding,
             mode,
         });
         return Ok(());
     }
-    atomic_write(path, after.as_bytes(), mode)
+    atomic_write(path, bytes, mode)
 }
 
 /// A hunk as the reviewer sees it. `end_line < start_line` is an insertion at
@@ -331,7 +356,16 @@ impl HunkSet {
                     proposal.display
                 ));
             }
-            match atomic_write(&proposal.write.path, content.as_bytes(), mode) {
+            let encoded = crate::tools::encoding::encode(content, proposal.write.encoding);
+            let Some(encoded) = encoded else {
+                rollback(&written);
+                return Err(format!(
+                    "cannot encode the reviewed change to {} as {}; a hunk edit introduced a character that encoding cannot represent",
+                    proposal.display,
+                    proposal.write.encoding.label()
+                ));
+            };
+            match atomic_write(&proposal.write.path, &encoded, mode) {
                 Ok(()) => written.push((proposal.write.path.clone(), previous, mode)),
                 Err(err) => {
                     rollback(&written);
@@ -547,6 +581,7 @@ mod tests {
             path: path.to_path_buf(),
             before: before.map(str::to_string),
             after: after.to_string(),
+            encoding: crate::tools::encoding::Encoding::Utf8,
             mode: 0o600,
         }
     }

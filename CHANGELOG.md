@@ -65,8 +65,84 @@ release may change defaults when the change is called out below.
   load without `--trust`. The header shows `verify: not configured`, and
   `lh doctor` reports what is configured or detected
   ([#128](https://github.com/GotinhaAzul/LocalHarness/issues/128)).
+- TUI settings now persist: `/theme <name>` and a confirmed theme pick write
+  `[ui] theme` at once, `Ctrl+R` writes `[ui] show_reasoning`, and a successful
+  `/profile` switch writes `default_profile` for the next run (`--profile` and
+  `TOT_PROFILE` still win the current one). Every write preserves unrelated
+  TOML keys, replaces the file atomically, keeps an existing file's mode, and
+  creates a new file `0600`; a failed save keeps the in-memory change and
+  shows a warning. This also fixes `/theme save` replacing a private (`0600`)
+  config that may hold an API key with a group- or world-readable file.
+  `/permissions` remains session-only and is never written.
 
 ### Fixed
+
+- The repository brief now lists every non-ignored file, not only extensions
+  the symbol scanner knows. Non-code and outline-less files are grouped per
+  directory with a count by extension, a closing line counts anything the
+  budget left out, and `vendor/`, `dist/`, `build/`, and `target/` are only
+  skipped when `.gitignore` excludes them. A data or docs task no longer reads
+  a partial listing as complete
+  ([#147](https://github.com/GotinhaAzul/LocalHarness/issues/147)).
+- A turn whose output-recovery allowance runs out with an empty or
+  length-truncated reply now ends as a budget stop (`max_tokens` in ACP), with
+  an error that names the reason, instead of settling as `Done`. Before
+  repeating the same nudge the harness doubles the output reservation once,
+  and retries one request with the profile's `thinking_control` when reasoning
+  spent the whole budget
+  ([#148](https://github.com/GotinhaAzul/LocalHarness/issues/148)).
+- A thinking model reserves `min(window / 4, 32768)` output tokens instead of
+  the 4096 default: the raise applies when the profile declares thinking or a
+  `reasoning_field`, when `usage.reasoning_tokens` first reports reasoning, and
+  after a length stop. The effective value is recorded in the session header
+  and printed by `tot doctor` as `output: N tokens (…)`
+  ([#149](https://github.com/GotinhaAzul/LocalHarness/issues/149)).
+- `grep` searches UTF-16 files (BOM or BOM-less) and reports binary files it
+  skipped instead of returning silent `no matches`; `read` decodes UTF-16 and
+  Latin-1 and labels an assumed encoding rather than showing U+FFFD; `write`
+  re-encodes an existing Latin-1 or UTF-16 file, keeps its BOM, and refuses a
+  character the encoding cannot represent with the `iconv` next step
+  ([#150](https://github.com/GotinhaAzul/LocalHarness/issues/150)).
+- New files and directories created by `write` follow the process umask
+  (`0666 & ~umask`, `0777 & ~umask`) instead of `0600`/`0700`, so a served web
+  root, a shared checkout, or a container build can read them
+  ([#151](https://github.com/GotinhaAzul/LocalHarness/issues/151)).
+- The provenance scanner catches HTML-comment injections, "you must run" and
+  backticked commands, "do not mention this", addresses to the AI assistant,
+  and upload shapes (`curl -d @file`, `--upload-file`, `| nc`), and matches
+  credential paths (including `.env` and `secrets.env`) near the verb that
+  reads or sends them
+  ([#152](https://github.com/GotinhaAzul/LocalHarness/issues/152)).
+- ACP sends harness notices as `agent_thought_chunk` with a `[harness]` prefix
+  on their own lines, never merged into `agent_message_chunk`, so a client can
+  separate diagnostics from the model's answer
+  ([#153](https://github.com/GotinhaAzul/LocalHarness/issues/153)).
+- The todo gate counts distinct files, not edits: re-editing a file the run
+  already changed never trips it, and it starts at the third distinct file. The
+  settle path no longer reopens a finished turn for a plan. `NO_VERIFY` names
+  the command detected from `Cargo.toml`, `package.json`, a Python project, or
+  `go.mod`, and the `--json` `done` event counts gate errors by code
+  ([#154](https://github.com/GotinhaAzul/LocalHarness/issues/154)).
+- `fetch` takes `find` and returns matching line windows with character
+  offsets, caches each page per session and returns its artifact id (readable
+  with `recall` or `grep path=artifact:<id>`), and a repeat at the same offset
+  gets a pointer instead of the same bytes, and `refresh=true` revalidates a
+  page that changed. The stall guard stops a call whose arguments and result
+  repeat three times even when other calls interleave
+  ([#155](https://github.com/GotinhaAzul/LocalHarness/issues/155)).
+- Stalled and budget-stopped turns ask the model for one tool-less summary of
+  what changed and what is left, so the person gets a handoff instead of a
+  mid-thought sentence. Budget checkpoints renew on the same progress the
+  stall guard counts (a file change, a passing verify, or new information from
+  a read-only call), and exact-duplicate failing calls stop at the third
+  repeat with the error quoted
+  ([#156](https://github.com/GotinhaAzul/LocalHarness/issues/156)).
+- Before a destructive `bash` command (`rm`, `mv`, `find -delete`, `truncate`,
+  or a `>` redirection over an existing file) the named files are snapshotted
+  into the session artifact store, and the result names them (also when the
+  command exits non-zero after removing some files). `undo` and `/rewind`
+  restore them, including files deleted outside the harness write path, and
+  remove files the command created ([#157](https://github.com/GotinhaAzul/LocalHarness/issues/157)).
 
 - `review` and the `git` tool stop at the session root. A workspace without a
   `.git` of its own no longer inherits the repository that contains it:

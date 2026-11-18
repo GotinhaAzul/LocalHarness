@@ -8,7 +8,9 @@
 //! pinned to the address that was checked, so a second DNS answer cannot
 //! swap in an internal one (DNS rebinding).
 
+use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -16,7 +18,10 @@ use reqwest::Url;
 use serde_json::{Value, json};
 
 use crate::config::FetchConfig;
-use crate::tools::{Tool, ToolContext, ToolPack, ToolResult, optional_u64, required_str};
+use crate::tools::{
+    Tool, ToolContext, ToolPack, ToolResult, optional_bool, optional_str, optional_u64,
+    required_str,
+};
 
 /// Most redirects followed.
 const MAX_REDIRECTS: usize = 5;
@@ -24,14 +29,44 @@ const MAX_REDIRECTS: usize = 5;
 const MAX_BYTES: usize = 2 * 1024 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(20);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Pages kept per process; one tool instance serves every session.
+const CACHE_PAGES: usize = 32;
+/// Matching lines one `find` returns.
+const FIND_MATCHES: usize = 40;
+/// A cached page older than this is fetched again, so a status or log URL
+/// cannot serve stale content for the whole session.
+const CACHE_TTL: Duration = Duration::from_secs(600);
+
+/// One fetched page, kept so a repeat does not hit the network again and a
+/// page can be searched without paging through it.
+#[derive(Clone)]
+struct CachedPage {
+    text: String,
+    content_type: String,
+    status: u16,
+    artifact: Option<String>,
+    /// The body was cut at [`MAX_BYTES`].
+    clipped: bool,
+    /// When the page was fetched, for [`CACHE_TTL`].
+    fetched: std::time::Instant,
+    /// Offsets already delivered in this session. A second delivery of the
+    /// same offset is a repeat, not new information.
+    offsets: Vec<usize>,
+}
 
 pub struct FetchTool {
     config: FetchConfig,
+    cache: Mutex<HashMap<String, CachedPage>>,
+    order: Mutex<VecDeque<String>>,
 }
 
 impl FetchTool {
     pub fn new(config: FetchConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            cache: Mutex::new(HashMap::new()),
+            order: Mutex::new(VecDeque::new()),
+        }
     }
 }
 
@@ -48,14 +83,16 @@ impl Tool for FetchTool {
     }
 
     fn description(&self) -> &'static str {
-        "GET a public http(s) URL and return its readable text (HTML converted), paged by character offset."
+        "GET a public http(s) URL and return its readable text (HTML converted), paged by character offset. A repeated URL is served from the session cache (refresh=true revalidates), and find= searches the whole page."
     }
 
     fn schema(&self) -> Value {
         crate::tools::object_schema(
             json!({
                 "url": {"type": "string", "description": "Absolute http or https URL."},
-                "offset": {"type": "integer", "description": "Character offset to continue from (from a previous next offset=)."}
+                "offset": {"type": "integer", "description": "Character offset to continue from (from a previous next offset=)."},
+                "find": {"type": "string", "description": "Regex or literal to search the whole page; returns matching lines with their offsets instead of a page."},
+                "refresh": {"type": "boolean", "description": "Fetch the URL again instead of using the session cache (for pages that change, such as status or logs)."}
             }),
             &["url"],
         )
@@ -74,21 +111,193 @@ impl Tool for FetchTool {
     }
 
     async fn call(&self, ctx: &ToolContext, args: Value) -> ToolResult {
-        match run(&self.config, ctx, &args).await {
+        match run(self, ctx, &args).await {
             Ok(result) | Err(result) => result,
         }
     }
 }
 
-async fn run(
+/// Cache key: one session's view of one URL. The cwd separates ephemeral
+/// sessions, which otherwise share the id "ephemeral".
+fn cache_key(ctx: &ToolContext, url: &Url) -> String {
+    let session = ctx
+        .session
+        .lock()
+        .map(|session| session.id.clone())
+        .unwrap_or_default();
+    format!("{}\n{}\n{url}", ctx.cwd.display(), session)
+}
+
+fn cached_page(tool: &FetchTool, key: &str) -> Option<CachedPage> {
+    let cache = tool
+        .cache
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    cache.get(key).cloned()
+}
+
+fn store_page(tool: &FetchTool, key: &str, page: CachedPage) {
+    let mut cache = tool
+        .cache
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let mut order = tool
+        .order
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    if !cache.contains_key(key) {
+        order.push_back(key.to_string());
+        while order.len() > CACHE_PAGES {
+            if let Some(oldest) = order.pop_front() {
+                cache.remove(&oldest);
+            }
+        }
+    }
+    cache.insert(key.to_string(), page);
+}
+
+fn note_offset(tool: &FetchTool, key: &str, offset: usize) {
+    let mut cache = tool
+        .cache
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    if let Some(page) = cache.get_mut(key) {
+        page.offsets.push(offset);
+    }
+}
+
+async fn run(tool: &FetchTool, ctx: &ToolContext, args: &Value) -> Result<ToolResult, ToolResult> {
+    let raw = required_str(args, "url")?;
+    let mailbox = optional_str(args, "find");
+    let url = parse_url(&raw)?;
+    let key = cache_key(ctx, &url);
+
+    let refresh = optional_bool(args, "refresh").unwrap_or(false);
+    let cached = if refresh {
+        None
+    } else {
+        cached_page(tool, &key).filter(|page| page.fetched.elapsed() < CACHE_TTL)
+    };
+    if let Some(page) = cached {
+        let total = page.text.chars().count();
+        let offset = optional_u64(args, "offset").unwrap_or(0) as usize;
+        if offset > total {
+            return Err(ToolResult::err(
+                "invalid_args",
+                format!("offset={offset} is past the end ({total} chars)"),
+            ));
+        }
+        if let Some(query) = mailbox.as_deref() {
+            return Ok(find_in_page(
+                ctx,
+                &url,
+                &page.text,
+                query,
+                page.artifact.as_deref(),
+            ));
+        }
+        if let Some(artifact) = &page.artifact
+            && page.offsets.contains(&offset)
+        {
+            // The same page at the same offset, again. Hand back a pointer
+            // instead of re-sending thousands of characters the model already
+            // has; the offset list is only kept for this session's cache.
+            return Ok(ToolResult::ok(format!(
+                "you already fetched {url} at offset {offset} (artifact {artifact}); the text is unchanged. Search it with {{\"url\":\"{url}\",\"find\":\"term\"}} or grep path=artifact:{artifact}, page from another offset, or read it with recall {artifact} 1-120. Pass refresh=true to fetch it again."
+            ))
+            .with_details(json!({
+                "url": url.as_str(),
+                "status": page.status,
+                "content_type": page.content_type,
+                "chars": total,
+                "offset": offset,
+                "repeat": true,
+                "artifact": artifact,
+                "cached": true,
+            })));
+        }
+        note_offset(tool, &key, offset);
+        return Ok(render_page(
+            ctx,
+            &url,
+            &page.text,
+            &page.content_type,
+            page.status,
+            offset,
+            page.artifact.as_deref(),
+            page.clipped,
+            true,
+        ));
+    }
+
+    let (url, response, content_type) = fetch_response(&tool.config, ctx, url).await?;
+    let status = response.status();
+    let (body, clipped) = read_capped(response, ctx).await?;
+    if !status.is_success() {
+        let excerpt = crate::text::clip(&String::from_utf8_lossy(&body), 300);
+        return Err(ToolResult::err(
+            "FETCH_FAILED",
+            format!("GET {url} returned {status}: {excerpt}"),
+        ));
+    }
+    let text = to_text(&content_type, &body).ok_or_else(|| {
+        ToolResult::err(
+            "FETCH_UNSUPPORTED",
+            format!(
+                "{url} is {content_type:?}, not text; fetch returns HTML, plain text, Markdown, and JSON only"
+            ),
+        )
+    })?;
+    let artifact = ctx.artifacts.write(&text).ok().map(|artifact| artifact.id);
+    let total = text.chars().count();
+    let offset = optional_u64(args, "offset").unwrap_or(0) as usize;
+    if mailbox.is_none() && offset > total {
+        return Err(ToolResult::err(
+            "invalid_args",
+            format!("offset={offset} is past the end ({total} chars)"),
+        ));
+    }
+    store_page(
+        tool,
+        &key,
+        CachedPage {
+            text: text.clone(),
+            content_type: content_type.clone(),
+            status: status.as_u16(),
+            artifact: artifact.clone(),
+            clipped,
+            fetched: std::time::Instant::now(),
+            // A find-only request never showed the page, and a rejected
+            // offset was never delivered, so neither counts as a repeat.
+            offsets: if mailbox.is_some() || offset > total {
+                Vec::new()
+            } else {
+                vec![offset]
+            },
+        },
+    );
+    if let Some(query) = mailbox.as_deref() {
+        return Ok(find_in_page(ctx, &url, &text, query, artifact.as_deref()));
+    }
+    Ok(render_page(
+        ctx,
+        &url,
+        &text,
+        &content_type,
+        status.as_u16(),
+        offset,
+        artifact.as_deref(),
+        clipped,
+        false,
+    ))
+}
+
+/// One request plus its redirects, with every hop's address checked.
+async fn fetch_response(
     config: &FetchConfig,
     ctx: &ToolContext,
-    args: &Value,
-) -> Result<ToolResult, ToolResult> {
-    let raw = required_str(args, "url")?;
-    let offset = optional_u64(args, "offset").unwrap_or(0) as usize;
-    let mut url = parse_url(&raw)?;
-    let mut response = None;
+    mut url: Url,
+) -> Result<(Url, reqwest::Response, String), ToolResult> {
     for _ in 0..=MAX_REDIRECTS {
         let addrs = resolve_checked(config, &url).await?;
         let host = url.host_str().unwrap_or_default().to_string();
@@ -130,59 +339,65 @@ async fn run(
             url = parse_url(next.as_str())?;
             continue;
         }
-        response = Some(reply);
-        break;
+        let content_type = reply
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        return Ok((url, reply, content_type));
     }
-    let Some(response) = response else {
-        return Err(ToolResult::err(
-            "FETCH_FAILED",
-            format!("more than {MAX_REDIRECTS} redirects; last was {url}"),
-        ));
-    };
-    let status = response.status();
-    let content_type = response
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    let (body, clipped) = read_capped(response, ctx).await?;
-    if !status.is_success() {
-        let excerpt = crate::text::clip(&String::from_utf8_lossy(&body), 300);
-        return Err(ToolResult::err(
-            "FETCH_FAILED",
-            format!("GET {url} returned {status}: {excerpt}"),
-        ));
-    }
-    let text = to_text(&content_type, &body).ok_or_else(|| {
-        ToolResult::err(
-            "FETCH_UNSUPPORTED",
-            format!(
-                "{url} is {content_type:?}, not text; fetch returns HTML, plain text, Markdown, and JSON only"
-            ),
-        )
-    })?;
+    Err(ToolResult::err(
+        "FETCH_FAILED",
+        format!("more than {MAX_REDIRECTS} redirects; last was {url}"),
+    ))
+}
+
+/// Render one page of `text` at `offset`, with the artifact id and the next
+/// offset in the trailer.
+#[allow(clippy::too_many_arguments)]
+fn render_page(
+    ctx: &ToolContext,
+    url: &Url,
+    text: &str,
+    content_type: &str,
+    status: u16,
+    offset: usize,
+    artifact: Option<&str>,
+    clipped: bool,
+    cached: bool,
+) -> ToolResult {
     let total = text.chars().count();
     if offset > total {
-        return Err(ToolResult::err(
+        return ToolResult::err(
             "invalid_args",
             format!("offset={offset} is past the end ({total} chars)"),
-        ));
+        );
     }
-    let header = format!(
-        "{url} ({}; {total} chars{})\n",
+    let mut header = format!(
+        "{url} ({}; {total} chars{}{})\n",
         if content_type.is_empty() {
             "unknown type"
         } else {
             content_type.split(';').next().unwrap_or("").trim()
         },
-        if clipped { ", body capped at 2 MB" } else { "" }
+        if clipped { ", body capped at 2 MB" } else { "" },
+        artifact
+            .map(|artifact| format!(", artifact {artifact}"))
+            .unwrap_or_default(),
     );
+    if offset == 0
+        && let Some(artifact) = artifact
+    {
+        header.push_str(&format!(
+            "search this page with find=<term>, or grep path=artifact:{artifact}; recall {artifact} 1-120 reads it\n"
+        ));
+    }
     let budget = ctx
         .caps
         .tool_budget()
         .saturating_sub(header.chars().count() + 80);
-    let (page, next) = crate::html_text::page_text(&text, offset, budget);
+    let (page, next) = crate::html_text::page_text(text, offset, budget);
     let end = next.unwrap_or(total);
     let mut content = header;
     content.push_str(page.trim_end_matches('\n'));
@@ -190,15 +405,88 @@ async fn run(
         content.push_str(&format!(
             "\n\n[chars {offset}-{end} of {total}; next offset={next}]"
         ));
+    } else {
+        content.push_str(&format!("\n\n[chars {offset}-{end} of {total}]"));
     }
-    Ok(ToolResult::ok(content).with_details(json!({
+    ToolResult::ok(content).with_details(json!({
         "url": url.as_str(),
-        "status": status.as_u16(),
+        "status": status,
         "content_type": content_type,
         "chars": total,
         "offset": offset,
         "next_offset": next,
-    })))
+        "artifact": artifact,
+        "cached": cached,
+    }))
+}
+
+/// Search the whole fetched text. Returns matching line windows with their
+/// character offsets, so the model can jump straight to the right page.
+fn find_in_page(
+    ctx: &ToolContext,
+    url: &Url,
+    text: &str,
+    query: &str,
+    artifact: Option<&str>,
+) -> ToolResult {
+    let regex = regex::RegexBuilder::new(query)
+        .case_insensitive(true)
+        .build()
+        .unwrap_or_else(|_| {
+            regex::RegexBuilder::new(&regex::escape(query))
+                .case_insensitive(true)
+                .build()
+                .expect("escaped literal is a valid regex")
+        });
+    let mut content = String::new();
+    let mut offset = 0usize;
+    let mut matches = 0usize;
+    let mut hit_lines: Vec<(usize, usize, String)> = Vec::new();
+    for (number, line) in text.split_inclusive('\n').enumerate() {
+        let body = line.trim_end_matches(['\n', '\r']);
+        if regex.is_match(body) {
+            matches += 1;
+            if hit_lines.len() < FIND_MATCHES {
+                hit_lines.push((number + 1, offset, crate::text::clip(body.trim(), 300)));
+            }
+        }
+        offset += line.chars().count();
+    }
+    let total = text.chars().count();
+    let budget = ctx.caps.tool_budget().saturating_sub(160);
+    content.push_str(&format!(
+        "{url} ({} chars{}): {} matching line(s) for {query:?}\n",
+        total,
+        artifact
+            .map(|artifact| format!(", artifact {artifact}"))
+            .unwrap_or_default(),
+        matches
+    ));
+    let mut shown = 0usize;
+    for (number, at, line) in &hit_lines {
+        let rendered = format!("line {number} at {at}: {line}\n");
+        if content.chars().count() + rendered.chars().count() > budget {
+            break;
+        }
+        content.push_str(&rendered);
+        shown += 1;
+    }
+    if matches == 0 {
+        content.push_str("(no line matched; try a shorter term or check the spelling)\n");
+    } else if shown < matches {
+        content.push_str(&format!(
+            "[{shown} of {matches} matching lines shown; narrow the query]\n"
+        ));
+    }
+    content.push_str("[read a region with offset=<at>; the page is cached for this session]");
+    ToolResult::ok(content).with_details(json!({
+        "url": url.as_str(),
+        "find": query,
+        "matches": matches,
+        "chars": total,
+        "artifact": artifact,
+        "cached": true,
+    }))
 }
 
 /// An absolute http(s) URL with no credentials in it.
@@ -556,6 +844,161 @@ mod tests {
             "{}",
             result.content
         );
+    }
+
+    #[tokio::test]
+    async fn a_page_is_cached_and_searchable_without_another_request() {
+        let body = format!(
+            "{}{}needle 9110 lives here{}\n",
+            "filler line for paging tests\n".repeat(40),
+            "another line\n".repeat(20),
+            "tail line\n".repeat(30)
+        );
+        // One response only: a second network call would fail, so the cached
+        // path is what the test proves.
+        let addr = serve(vec![http(
+            "200 OK",
+            "Content-Type: text/plain; charset=utf-8\r\n",
+            &body,
+        )])
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_context(dir.path());
+        let tool = FetchTool::new(FetchConfig {
+            allow_private: vec!["127.0.0.1".into()],
+        });
+        let url = format!("http://{addr}/rfc.txt");
+
+        let first = tool.call(&ctx, json!({"url": url})).await;
+        assert!(!first.is_error, "{}", first.content);
+        let artifact = first.details.as_ref().unwrap()["artifact"]
+            .as_str()
+            .expect("the page is stored as an artifact")
+            .to_string();
+        assert!(first.content.contains(&artifact), "{}", first.content);
+
+        let repeat = tool.call(&ctx, json!({"url": url, "offset": 0})).await;
+        assert!(!repeat.is_error, "{}", repeat.content);
+        assert!(
+            repeat.content.contains("already fetched"),
+            "{}",
+            repeat.content
+        );
+        assert_eq!(repeat.details.unwrap()["repeat"], true);
+
+        let found = tool
+            .call(&ctx, json!({"url": url, "find": "needle 9110"}))
+            .await;
+        assert!(!found.is_error, "{}", found.content);
+        assert!(
+            found.content.contains("1 matching line"),
+            "{}",
+            found.content
+        );
+        assert!(
+            found.content.contains("at ") && found.content.contains("needle 9110"),
+            "the match carries its character offset: {}",
+            found.content
+        );
+    }
+
+    #[tokio::test]
+    async fn a_repeated_fetch_is_cached_and_find_searches_the_whole_page() {
+        let body = format!(
+            "{}the needle is on this line\n{}",
+            "filler line\n".repeat(400),
+            "more filler\n".repeat(400)
+        );
+        // One connection: the second call must not hit the network.
+        let addr = serve(vec![http("200 OK", "Content-Type: text/plain\r\n", &body)]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_context(dir.path());
+        let tool = FetchTool::new(FetchConfig {
+            allow_private: vec!["127.0.0.1".into()],
+        });
+        let url = format!("http://{addr}/page.txt");
+
+        let first = tool.call(&ctx, json!({"url": url})).await;
+        assert!(!first.is_error, "{}", first.content);
+        let details = first.details.clone().unwrap();
+        let artifact = details["artifact"].as_str().expect("artifact id");
+        assert!(
+            first.content.contains(&format!("artifact {artifact}")),
+            "{}",
+            first.content
+        );
+
+        let again = tool.call(&ctx, json!({"url": url})).await;
+        assert!(!again.is_error, "{}", again.content);
+        assert!(
+            again.content.contains("already fetched"),
+            "a repeat must not resend the page: {}",
+            again.content
+        );
+        assert_eq!(again.details.unwrap()["repeat"], true);
+
+        let found = tool.call(&ctx, json!({"url": url, "find": "needle"})).await;
+        assert!(!found.is_error, "{}", found.content);
+        assert!(
+            found.content.contains("the needle is on this line"),
+            "{}",
+            found.content
+        );
+        assert!(found.content.contains("line 401 at "), "{}", found.content);
+        assert_eq!(found.details.unwrap()["matches"], 1);
+    }
+
+    #[tokio::test]
+    async fn another_offset_is_not_a_repeat() {
+        let body = "a".repeat(20_000);
+        let addr = serve(vec![http("200 OK", "Content-Type: text/plain\r\n", &body)]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_context(dir.path());
+        let tool = FetchTool::new(FetchConfig {
+            allow_private: vec!["127.0.0.1".into()],
+        });
+        let url = format!("http://{addr}/page.txt");
+        let first = tool.call(&ctx, json!({"url": url})).await;
+        let next = first.details.unwrap()["next_offset"].as_u64().unwrap();
+        let second = tool.call(&ctx, json!({"url": url, "offset": next})).await;
+        assert!(!second.is_error, "{}", second.content);
+        assert!(
+            !second.content.contains("already fetched"),
+            "{}",
+            second.content
+        );
+        assert_eq!(second.details.unwrap()["offset"], next);
+    }
+
+    #[tokio::test]
+    async fn refresh_fetches_a_changed_page_again() {
+        let addr = serve(vec![
+            http("200 OK", "Content-Type: text/plain\r\n", "version one\n"),
+            http("200 OK", "Content-Type: text/plain\r\n", "version two\n"),
+        ])
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_context(dir.path());
+        let tool = FetchTool::new(FetchConfig {
+            allow_private: vec!["127.0.0.1".into()],
+        });
+        let url = format!("http://{addr}/status.txt");
+        let first = tool.call(&ctx, json!({"url": url})).await;
+        assert!(first.content.contains("version one"), "{}", first.content);
+        let cached = tool.call(&ctx, json!({"url": url})).await;
+        assert!(
+            cached.content.contains("already fetched"),
+            "{}",
+            cached.content
+        );
+        let refreshed = tool.call(&ctx, json!({"url": url, "refresh": true})).await;
+        assert!(!refreshed.is_error, "{}", refreshed.content);
+        assert!(
+            refreshed.content.contains("version two"),
+            "{}",
+            refreshed.content
+        );
+        assert_eq!(refreshed.details.unwrap()["cached"], false);
     }
 
     #[tokio::test]

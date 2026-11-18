@@ -401,6 +401,9 @@ struct App {
     options: UiOptions,
     config: Config,
     theme: Theme,
+    /// True when `--profile` or `TOT_PROFILE` chose the startup profile; that
+    /// override keeps winning this run even after `/profile` saves a default.
+    profile_override: bool,
     no_color: bool,
     header: HeaderData,
     transcript: Transcript,
@@ -514,11 +517,13 @@ impl App {
             verify_off: config.verify.steps.is_empty(),
         };
         let (bg_tx, bg_rx) = mpsc::unbounded_channel();
+        let profile_override = !config.profile_name.trim().is_empty();
         let mut app = App {
             runtime: Some(runtime),
             options,
             config,
             theme,
+            profile_override,
             no_color: false,
             header,
             transcript: Transcript::new(false),
@@ -746,9 +751,17 @@ impl App {
                             .unwrap_or_default();
                         self.set_notice(format!("model: {name}{window}"), Role::Success);
                     }
-                    Switch::Profile(name) => {
-                        self.set_notice(format!("profile: {name}"), Role::Success);
-                    }
+                    Switch::Profile(name) => match self.persist_default_profile(&name) {
+                        Ok(_) => {
+                            self.config.default_profile = name.clone();
+                            let notice = self.profile_saved_notice(&name);
+                            self.set_notice(notice, Role::Success);
+                        }
+                        Err(error) => self.set_notice(
+                            format!("profile: {name}; not saved: {error}"),
+                            Role::Warning,
+                        ),
+                    },
                 }
             }
         }

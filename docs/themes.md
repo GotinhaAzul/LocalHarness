@@ -50,7 +50,9 @@ Values: `#rgb`, `#rrggbb`, ANSI names (`red`, `bright_blue`, ...),
 `color_mode = "auto" | "truecolor" | "256" | "16"` controls conversion. Auto
 detects `COLORTERM` and `TERM`; `NO_COLOR` disables color. `/theme` opens a
 picker that previews each theme as you move (Esc restores the previous one);
-`/theme <name>` applies for the session; `/theme save` writes `[ui] theme` to
-the global config.
+moving through the preview saves nothing. `/theme <name>` and a confirmed pick
+apply the theme and write `[ui] theme` to the global config at once; `/theme save`
+re-writes the current theme and reports the path. A failed write leaves the
+theme applied for this session and shows a warning.
 Status is never conveyed by color alone: labels and glyphs accompany every
 color.

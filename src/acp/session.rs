@@ -409,9 +409,13 @@ impl Server {
                     "content": {"type": "text", "text": text},
                 })
             }
+            // Harness diagnostics are not the model's answer. ACP v1 clients
+            // render `agent_thought_chunk` separately from the message, so a
+            // notice can never merge into the reply. The newlines keep
+            // consecutive notices apart in clients that join chunks.
             AgentEvent::Notice(message) => json!({
-                "sessionUpdate": "agent_message_chunk",
-                "content": {"type": "text", "text": format!("[notice] {}", sanitize::display(&message))},
+                "sessionUpdate": "agent_thought_chunk",
+                "content": {"type": "text", "text": format!("\n[harness] {}\n", sanitize::display(&message))},
             }),
             _ => return,
         };

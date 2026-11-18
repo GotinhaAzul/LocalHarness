@@ -798,6 +798,19 @@ async fn run_doctor(config: &Config, paths: &Paths, json: bool, fix: bool) -> Re
         .unwrap_or(0);
     let samplers = crate::provider::SamplerSettings::resolve(&config.model, &profile);
     let mut manifest = crate::doctor::DoctorManifest::probe(&provider, configured).await;
+    // The effective output reservation: a thinking model needs room for
+    // reasoning before its first token reaches the tool call.
+    let window = if manifest.context.effective > 0 {
+        manifest.context.effective
+    } else {
+        configured.max(8192)
+    };
+    let thinking =
+        profile.thinking == crate::config::ThinkingPolicy::On || profile.reasoning_field.is_some();
+    let reservation =
+        crate::context::output_reservation(window, config.model.max_output_tokens, thinking);
+    manifest.output_tokens = Some(reservation.tokens);
+    manifest.output_source = Some(reservation.source.to_string());
     let engine = diagnostic_engine(&config.model.engine, &manifest.engine);
     manifest.warn_unsupported_samplers(&profile_name, engine, &samplers);
     // `tot doctor` never sends a chat completion. Show the last conformance

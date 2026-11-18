@@ -14,8 +14,6 @@ use crate::tools::{
 pub(crate) const MAX_BYTES: u64 = 4 * 1024 * 1024;
 const DEFAULT_LINES: u64 = 150;
 const MAX_LINES: u64 = 800;
-/// NUL bytes in this prefix mark a file as binary.
-const BINARY_SNIFF: usize = 8 * 1024;
 /// Characters kept free for the `[lines a-b of n; next start=c]` trailer.
 const TRAILER_RESERVE: usize = 80;
 
@@ -288,17 +286,18 @@ fn run_one(ctx: &ToolContext, args: &Value, budget: usize) -> Result<ToolResult,
 
     let bytes = std::fs::read(&path)
         .map_err(|err| ToolResult::err("READ_FAILED", format!("cannot read {display}: {err}")))?;
-    let sniff = &bytes[..bytes.len().min(BINARY_SNIFF)];
-    if sniff.contains(&0) {
-        return Err(ToolResult::err(
-            "BINARY",
-            format!(
-                "{display} looks binary (NUL byte in the first 8 KiB); read only returns text. Use bash with `file` or `xxd` instead."
-            ),
-        ));
-    }
-
-    let content = String::from_utf8_lossy(&bytes);
+    let (content, encoding) = match crate::tools::encoding::decode(&bytes) {
+        crate::tools::encoding::Decoded::Text { text, encoding } => (text, encoding),
+        crate::tools::encoding::Decoded::Binary => {
+            return Err(ToolResult::err(
+                "BINARY",
+                format!(
+                    "{display} looks binary (NUL bytes without a UTF-16 shape or BOM); read only returns text. Use bash with `file` or `xxd` instead."
+                ),
+            ));
+        }
+    };
+    let encoding_note = encoding.note().map(|note| format!("{note}\n"));
     let lines = split_lines(&content);
     let total = lines.len();
     let snapshot = (ctx.edit_mode == EditMode::Hash).then(|| snapshot_hash(&bytes));
@@ -326,9 +325,10 @@ fn run_one(ctx: &ToolContext, args: &Value, budget: usize) -> Result<ToolResult,
 
     if total == 0 {
         record_read(ctx, &path, 0, None);
+        let note = encoding_note.clone().unwrap_or_default();
         let text = match &snapshot {
-            Some(snapshot) => format!("[{display}#{snapshot}]\n{display} is empty (0 lines)"),
-            None => format!("{display} is empty (0 lines)"),
+            Some(snapshot) => format!("[{display}#{snapshot}]\n{note}{display} is empty (0 lines)"),
+            None => format!("{note}{display} is empty (0 lines)"),
         };
         return Ok(ToolResult::ok(text).with_details(with_snapshot(
             json!({
@@ -337,6 +337,7 @@ fn run_one(ctx: &ToolContext, args: &Value, budget: usize) -> Result<ToolResult,
                 "end": 0,
                 "total_lines": 0,
                 "capped": false,
+                "encoding": encoding.label(),
             }),
             &snapshot,
         )));
@@ -345,7 +346,8 @@ fn run_one(ctx: &ToolContext, args: &Value, budget: usize) -> Result<ToolResult,
     let first = start.saturating_sub(1);
     if first >= total {
         record_read(ctx, &path, total, None);
-        let body = format!("{display} has {total} lines; start={start} is past the end");
+        let note = encoding_note.clone().unwrap_or_default();
+        let body = format!("{note}{display} has {total} lines; start={start} is past the end");
         let text = match &snapshot {
             Some(snapshot) => format!("[{display}#{snapshot}]\n{body}"),
             None => body,
@@ -357,6 +359,7 @@ fn run_one(ctx: &ToolContext, args: &Value, budget: usize) -> Result<ToolResult,
                 "end": total,
                 "total_lines": total,
                 "capped": false,
+                "encoding": encoding.label(),
             }),
             &snapshot,
         )));
@@ -372,6 +375,9 @@ fn run_one(ctx: &ToolContext, args: &Value, budget: usize) -> Result<ToolResult,
     let mut text = String::new();
     if let Some(snapshot) = &snapshot {
         text.push_str(&format!("[{display}#{snapshot}]\n"));
+    }
+    if let Some(note) = &encoding_note {
+        text.push_str(note);
     }
     // Whole lines within the result budget, so the loop never cuts the
     // output and the trailer names exactly the lines the model saw.
@@ -419,6 +425,7 @@ fn run_one(ctx: &ToolContext, args: &Value, budget: usize) -> Result<ToolResult,
             "end": last,
             "total_lines": total,
             "capped": capped,
+            "encoding": encoding.label(),
         }),
         &snapshot,
     )))
@@ -806,6 +813,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn utf16_and_latin1_files_decode_with_an_encoding_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut utf16 = vec![0xff, 0xfe];
+        for unit in "app.title=Nimbus\r\n".encode_utf16() {
+            utf16.extend(unit.to_le_bytes());
+        }
+        std::fs::write(dir.path().join("strings_en.txt"), utf16).unwrap();
+        std::fs::write(
+            dir.path().join("strings_pt.properties"),
+            b"Sobre o Nimbus \xe9 vers\xe3o 2\n",
+        )
+        .unwrap();
+        let ctx = test_context(dir.path());
+
+        let english = ReadTool.call(&ctx, json!({"path": "strings_en.txt"})).await;
+        assert!(!english.is_error, "{}", english.content);
+        assert!(
+            english.content.contains("app.title=Nimbus"),
+            "{}",
+            english.content
+        );
+        assert!(english.content.contains("utf-16le"), "{}", english.content);
+        assert_eq!(english.details.unwrap()["encoding"], "utf-16le");
+
+        let portuguese = ReadTool
+            .call(&ctx, json!({"path": "strings_pt.properties"}))
+            .await;
+        assert!(!portuguese.is_error, "{}", portuguese.content);
+        assert!(
+            portuguese.content.contains("versão 2"),
+            "{}",
+            portuguese.content
+        );
+        assert!(
+            portuguese.content.contains("latin-1"),
+            "{}",
+            portuguese.content
+        );
+        assert!(
+            !portuguese.content.contains('\u{fffd}'),
+            "{}",
+            portuguese.content
+        );
+    }
+
+    #[tokio::test]
     async fn refuses_binary() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("blob.bin"), b"\x00\x01\x02binary").unwrap();
@@ -814,6 +867,55 @@ mod tests {
         let result = ReadTool.call(&ctx, json!({"path": "blob.bin"})).await;
         assert!(result.is_error);
         assert!(result.content.starts_with("[BINARY]"), "{}", result.content);
+    }
+
+    #[tokio::test]
+    async fn decodes_utf16_and_says_when_an_encoding_was_assumed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut bytes = vec![0xff, 0xfe];
+        for unit in "app.title=Nimbus\r\nsecond=line\r\n".encode_utf16() {
+            bytes.extend(unit.to_le_bytes());
+        }
+        std::fs::write(dir.path().join("strings_en.txt"), bytes).unwrap();
+        std::fs::write(
+            dir.path().join("strings_pt.properties"),
+            b"Sobre o Nimbus \xe9 vers\xe3o 2\n",
+        )
+        .unwrap();
+        let ctx = test_context(dir.path());
+
+        let utf16_read = ReadTool.call(&ctx, json!({"path": "strings_en.txt"})).await;
+        assert!(!utf16_read.is_error, "{}", utf16_read.content);
+        assert!(
+            utf16_read.content.contains("app.title=Nimbus"),
+            "{}",
+            utf16_read.content
+        );
+        assert!(
+            utf16_read.content.contains("[encoding] utf-16le"),
+            "{}",
+            utf16_read.content
+        );
+        assert_eq!(
+            utf16_read.details.unwrap()["encoding"].as_str(),
+            Some("utf-16le")
+        );
+
+        let latin = ReadTool
+            .call(&ctx, json!({"path": "strings_pt.properties"}))
+            .await;
+        assert!(!latin.is_error, "{}", latin.content);
+        assert!(
+            latin.content.contains("versão 2"),
+            "latin-1 must decode, not show U+FFFD: {}",
+            latin.content
+        );
+        assert!(
+            latin.content.contains("latin-1 assumed"),
+            "{}",
+            latin.content
+        );
+        assert!(!latin.content.contains('\u{fffd}'), "{}", latin.content);
     }
 
     #[tokio::test]
