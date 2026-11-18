@@ -13,6 +13,7 @@
 //! [`destructive_git`] refuses it in `bash` and `bg` too.
 
 use std::collections::BTreeMap;
+use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -318,6 +319,71 @@ pub fn content_tree(cwd: &Path) -> Option<String> {
     let tree = tree?;
     let tree = tree.stdout.trim();
     (!tree.is_empty()).then(|| tree.to_string())
+}
+
+/// A cheap identity of the working tree that writes nothing to the object
+/// store: `git status --porcelain=v1 -z --untracked-files=all -- .` from
+/// `cwd`, plus HEAD, plus the size and modification time of every path the
+/// status lists. `content_tree` hashes file *content* by adding it to a
+/// throwaway index, which writes a blob per untracked file into the real
+/// `.git/objects` (a 64 MB file becomes a 69 MB loose object); the loop guard
+/// fingerprints on many distinct calls, so it uses this instead. Scoping the
+/// status to `.` keeps a workspace nested in a larger repository from reading
+/// the whole parent. `None` outside a repository or when git fails.
+pub fn working_state(cwd: &Path) -> Option<String> {
+    if !is_repo(cwd) {
+        return None;
+    }
+    let top = git_line(cwd, &["rev-parse", "--show-toplevel"])?;
+    let top = Path::new(&top);
+    let status = git(
+        cwd,
+        &[
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--",
+            ".",
+        ],
+    );
+    if !status.ok {
+        return None;
+    }
+    let head = git_line(cwd, &["rev-parse", "--verify", "--quiet", "HEAD"]).unwrap_or_default();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    head.hash(&mut hasher);
+    // Porcelain paths are repository-root relative even when run from a
+    // subdirectory, so they resolve against the top level.
+    for entry in status.stdout.split('\0').filter(|entry| !entry.is_empty()) {
+        // `XY path`; a rename or copy names the original path in the next
+        // entry, which the loop reaches on its own.
+        if entry.len() <= 3 {
+            continue;
+        }
+        hash_path_metadata(&top.join(&entry[3..]), &mut hasher);
+    }
+    Some(format!("{:016x}", hasher.finish()))
+}
+
+/// Hash a path's size and modification time, not its content: enough to see a
+/// `sed -i` or a new file without reading or storing the bytes.
+fn hash_path_metadata(path: &Path, hasher: &mut impl Hasher) {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => {
+            meta.len().hash(hasher);
+            let modified = meta
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |elapsed| elapsed.as_nanos());
+            modified.hash(hasher);
+        }
+        Err(_) => {
+            // A deleted path: stable, and different from any existing file.
+            u8::MAX.hash(hasher);
+        }
+    }
 }
 
 /// Whether HEAD holds exactly the content recorded in `tree`. Files present
@@ -1837,6 +1903,82 @@ mod tests {
 
     fn call(ctx: &ToolContext, config: &GitConfig, args: Value) -> ToolResult {
         dispatch(ctx, config, &args)
+    }
+
+    /// Every entry under `.git/objects`, so a test can prove nothing was
+    /// written there.
+    fn object_count(dir: &Path) -> usize {
+        fn walk(path: &Path) -> usize {
+            let Ok(entries) = std::fs::read_dir(path) else {
+                return 0;
+            };
+            entries
+                .flatten()
+                .map(|entry| {
+                    let path = entry.path();
+                    if path.is_dir() { walk(&path) } else { 1 }
+                })
+                .sum()
+        }
+        walk(&dir.join(".git/objects"))
+    }
+
+    #[test]
+    fn working_state_writes_no_objects_for_untracked_files() {
+        let dir = tempfile::tempdir().unwrap();
+        repo(dir.path());
+        std::fs::write(dir.path().join("tracked.txt"), "one\n").unwrap();
+        commit_all(dir.path(), "one");
+        // Big enough that a content hash would leave a visible loose object.
+        std::fs::write(dir.path().join("untracked.bin"), vec![7u8; 256 * 1024]).unwrap();
+        let before = object_count(dir.path());
+        let state = working_state(dir.path()).expect("a repository has a state");
+        assert!(!state.is_empty());
+        assert_eq!(
+            object_count(dir.path()),
+            before,
+            "the fingerprint must not add blobs to the object store"
+        );
+    }
+
+    #[test]
+    fn working_state_sees_a_working_tree_change() {
+        let dir = tempfile::tempdir().unwrap();
+        repo(dir.path());
+        std::fs::write(dir.path().join("tracked.txt"), "one\n").unwrap();
+        commit_all(dir.path(), "one");
+        let first = working_state(dir.path()).expect("state");
+        // Same status line, different size and mtime: only the stat sees it.
+        std::fs::write(dir.path().join("tracked.txt"), "one\ntwo\n").unwrap();
+        let second = working_state(dir.path()).expect("state");
+        assert_ne!(first, second);
+        // A new untracked file is a change too.
+        std::fs::write(dir.path().join("new.txt"), "new\n").unwrap();
+        let third = working_state(dir.path()).expect("state");
+        assert_ne!(second, third);
+    }
+
+    #[test]
+    fn working_state_is_scoped_to_the_working_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        repo(dir.path());
+        let nested = dir.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::write(nested.join("inside.txt"), "one\n").unwrap();
+        std::fs::write(dir.path().join("outside.txt"), "one\n").unwrap();
+        commit_all(dir.path(), "one");
+        let first = working_state(&nested).expect("state");
+        // A change beside the nested workspace is not part of its state.
+        std::fs::write(dir.path().join("outside.txt"), "two, longer\n").unwrap();
+        assert_eq!(first, working_state(&nested).expect("state"));
+        std::fs::write(nested.join("inside.txt"), "two, longer\n").unwrap();
+        assert_ne!(first, working_state(&nested).expect("state"));
+    }
+
+    #[test]
+    fn working_state_is_none_outside_a_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(working_state(dir.path()), None);
     }
 
     #[test]

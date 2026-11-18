@@ -1035,11 +1035,14 @@ pub struct BudgetConfig {
     pub stall_calls: u32,
     /// Failing or repeated calls of one tool family (same program and
     /// operation, or same tool and key arguments) allowed in a turn before it
-    /// stops as stalled. Zero disables the guard.
+    /// stops as stalled. Zero disables the guard. Read-only calls are not
+    /// counted as repeats; a read repeated with the same output is caught by
+    /// `stall_calls`.
     pub max_same_tool_family: u32,
     /// Successful calls of one tool family that changed no workspace file and
     /// passed no verify allowed in a turn before it stops as stalled. A
-    /// same-family success does not reset the count. Zero disables the guard.
+    /// same-family success does not reset the count. Read-only calls are
+    /// exempt. Zero disables the guard.
     pub max_same_tool_family_success: u32,
     pub verify_attempts: u32,
     /// Characters one tool result may occupy in context. Unset scales with

@@ -84,9 +84,22 @@ release may change defaults when the change is called out below.
   and successful calls that changed no workspace file and passed no verify.
   Interleaving a different call, a same-family success, and writes outside the
   session directory do not reset them; a workspace change or a passing verify
-  does. A counter fingerprints the workspace when it starts and re-checks it
-  when it is about to trip, so a `sed -i` fix loop that really changes files is
-  not a stall. `[budgets] max_same_tool_family` (default 8) and
+  does. Read-only calls never count as repeats or idle successes: read-only
+  tools, the reading actions of mixed tools (`bg logs`, `todo list`,
+  `pr checks`, ...), and bash commands that only read (`cat`, `git show`,
+  `git status`, `curl`/`wget` without a writing flag, `gh pr view`, ...), so
+  polling a build or reading forty pages is not a loop; the identical-call
+  cycle guard records them without tripping, and a read repeated with the same
+  output is still caught by the stall guard. A counter
+  fingerprinted the workspace by building a git content tree, which wrote a
+  blob per untracked file into `.git/objects` and cost about a second on a
+  large file; the identity is now `git status --untracked-files=all` from the
+  session directory plus HEAD and each listed path's size and mtime, which
+  writes nothing, and it is memoized: read once for the first counter, reused
+  by later counters, re-read only to decide a trip and once at the end of the
+  batch, and invalidated by a reported file change. So a `sed -i` fix loop that
+  really changes files is not a stall. `[budgets] max_same_tool_family`
+  (default 8) and
   `max_same_tool_family_success` (default 24) set the limits, and 0 disables
   either
   ([#138](https://github.com/GotinhaAzul/LocalHarness/issues/138)).

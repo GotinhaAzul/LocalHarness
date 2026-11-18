@@ -9,7 +9,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -341,6 +341,77 @@ pub struct ToolOutcome<'a> {
     pub is_error: bool,
     pub changed_file: bool,
     pub verified_ok: bool,
+    /// The call only inspects the workspace, the repository, or the network:
+    /// a read-only tool, a read-only action of a mixed tool, or a `bash`
+    /// command with no write in it. Never a repeat or an idle success.
+    pub read_only: bool,
+}
+
+/// Tools whose every call only reads. The list is the registry's read-only
+/// half (`Tool::read_only`), named here because the guard sees a tool name,
+/// not a handle: `read`, `grep`, `glob`, `recall`, `repo_map`, `lsp`,
+/// `evidence`, `fetch`, `skill`, `review`, `iocs`, `surface`, `attack_path`.
+/// `symbol` is `read` with `symbol`, and `project`/`hunk` are helpers, not
+/// tools.
+const READ_ONLY_TOOLS: &[&str] = &[
+    "read",
+    "grep",
+    "glob",
+    "recall",
+    "repo_map",
+    "lsp",
+    "evidence",
+    "fetch",
+    "skill",
+    "review",
+    "iocs",
+    "surface",
+    "attack_path",
+];
+
+/// Tools whose calls read only for some actions. The rest of each schema is
+/// there to change something: `bg start`/`stop` runs and kills a process,
+/// `todo plan`/`start`/`done` rewrite the plan, `thread split`/`note`/`close`
+/// rewrite the thread, `finding add`/`update`/`report`/`verify` writes the
+/// ledger, `detect run` creates findings, and `pr draft`/`comment` creates or
+/// writes a pull request.
+const READ_ONLY_ACTIONS: &[(&str, &[&str])] = &[
+    // `status` lists every process when no id is given; `list` is the same
+    // read under its clearer name.
+    ("bg", &["logs", "status", "list"]),
+    ("todo", &["list"]),
+    ("thread", &["status"]),
+    ("finding", &["list"]),
+    ("detect", &["validate"]),
+    ("pr", &["checks", "review"]),
+];
+
+/// `git` tool actions that only read. `branch` and `worktree` read in their
+/// `op = "list"` form.
+const GIT_READ_ACTIONS: &[&str] = &["status", "diff", "log", "blame", "commit_message"];
+
+/// Whether a call only inspects. `bash` is classified by its command, `git`
+/// and the mixed tools by their action, and the rest by the tool's own
+/// declaration. A tool this does not know (an MCP or external tool) is not
+/// read-only here; its own `Tool::read_only` is consulted by the caller.
+pub fn call_read_only(name: &str, arguments: &str) -> bool {
+    let args: Value = serde_json::from_str(arguments).unwrap_or(Value::Null);
+    let action = args.get("action").and_then(Value::as_str).unwrap_or("");
+    match name {
+        "bash" => args
+            .get("command")
+            .and_then(Value::as_str)
+            .is_some_and(crate::policy::command::reads_only),
+        "git" => {
+            let op = args.get("op").and_then(Value::as_str).unwrap_or("");
+            GIT_READ_ACTIONS.contains(&action)
+                || (matches!(action, "branch" | "worktree") && op == "list")
+        }
+        _ => match READ_ONLY_ACTIONS.iter().find(|(tool, _)| *tool == name) {
+            Some((_, actions)) => actions.contains(&action),
+            None => READ_ONLY_TOOLS.contains(&name),
+        },
+    }
 }
 
 /// Detects a turn that repeats itself. One counter watches consecutive
@@ -350,7 +421,8 @@ pub struct ToolOutcome<'a> {
 ///
 /// Only a file change, a passing verification, or a workspace that changed
 /// since the counter started clears a family counter. A different call in
-/// between, or a success of the same family, does not.
+/// between, or a success of the same family, does not. Read-only calls are
+/// watched by the consecutive-identical counter only.
 #[derive(Debug)]
 pub struct StallTracker {
     needed: u32,
@@ -364,6 +436,11 @@ pub struct StallTracker {
     repeats: HashMap<String, Counter>,
     idle_successes: HashMap<String, Counter>,
     trip: Option<Trip>,
+    /// Workspace identity, read lazily and reused by every counter.
+    workspace: WorkspaceMemo,
+    /// How the workspace is identified. A field so a test can count reads
+    /// instead of timing them.
+    fingerprint: Fingerprint,
 }
 
 impl StallTracker {
@@ -378,15 +455,20 @@ impl StallTracker {
             repeats: HashMap::new(),
             idle_successes: HashMap::new(),
             trip: None,
+            workspace: WorkspaceMemo::default(),
+            fingerprint: workspace_state,
         }
     }
 
     pub fn observe(&mut self, cwd: &Path, outcome: ToolOutcome<'_>) {
+        self.workspace.begin_call();
         if outcome.changed_file || outcome.verified_ok {
             self.strikes = 0;
             self.last = Some(outcome.fingerprint.to_string());
-            // Real progress clears every counter: the run is not looping.
+            // Real progress clears every counter and the memo: the workspace
+            // is read again when the next counter starts.
             self.clear();
+            self.workspace.invalidate();
             return;
         }
         if self.last.as_deref() == Some(outcome.fingerprint) {
@@ -396,55 +478,67 @@ impl StallTracker {
             self.last = Some(outcome.fingerprint.to_string());
         }
 
-        let mut workspace = Workspace::new(cwd);
-        if let Some(count) = bump(
-            &mut self.repeats,
-            outcome.signature,
-            self.family_limit,
-            &mut workspace,
-        ) {
-            self.set_trip(TripKind::Repeated, outcome.signature, count, &mut workspace);
-        }
-        if outcome.is_error {
-            if let Some(count) = bump(
-                &mut self.failures,
-                outcome.family,
-                self.family_limit,
-                &mut workspace,
-            ) {
-                self.set_trip(TripKind::Failed, outcome.family, count, &mut workspace);
-            }
-            return;
-        }
-        if is_read_only(outcome.family) {
-            return;
-        }
-        let coarse = coarse_family(outcome.family);
-        if let Some(count) = bump(
-            &mut self.idle_successes,
-            &coarse,
-            self.success_limit,
-            &mut workspace,
-        ) {
-            self.set_trip(TripKind::Unproductive, &coarse, count, &mut workspace);
-        }
-    }
-
-    fn set_trip(
-        &mut self,
-        kind: TripKind,
-        family: &str,
-        count: u32,
-        workspace: &mut Workspace<'_>,
-    ) {
+        // A counter that already tripped ended the guard's work for the turn.
+        // Further calls are not counted and take no fingerprint; only a
+        // reported file change (above) or the end-of-batch re-check clears it.
         if self.trip.is_some() {
             return;
         }
+        if outcome.is_error {
+            if let Some(count) = self.bump(cwd, Counted::Failure, outcome.family) {
+                self.set_trip(TripKind::Failed, outcome.family, count);
+            }
+            return;
+        }
+        // Reading a file, polling a job, or fetching a URL is inspection, not
+        // an attempt to do the work: a `bg logs` poll that shows a build
+        // advancing is new information every time, and a chain of distinct
+        // `curl`, `git show`, or `gh pr view` calls is exploration. Only the
+        // consecutive-identical counter watches read loops, and it needs the
+        // same result twice. Failing reads still count above: a broken read
+        // retried forever is a loop.
+        if outcome.read_only {
+            return;
+        }
+        if let Some(count) = self.bump(cwd, Counted::Repeat, outcome.signature) {
+            self.set_trip(TripKind::Repeated, outcome.signature, count);
+        }
+        let coarse = coarse_family(outcome.family);
+        if let Some(count) = self.bump(cwd, Counted::Success, &coarse) {
+            self.set_trip(TripKind::Unproductive, &coarse, count);
+        }
+    }
+
+    fn bump(&mut self, cwd: &Path, counted: Counted, key: &str) -> Option<u32> {
+        let limit = counted.limit(self.family_limit, self.success_limit);
+        if limit == 0 {
+            return None;
+        }
+        let counters = match counted {
+            Counted::Failure => &mut self.failures,
+            Counted::Repeat => &mut self.repeats,
+            Counted::Success => &mut self.idle_successes,
+        };
+        bump(
+            counters,
+            key,
+            limit,
+            &mut self.workspace,
+            cwd,
+            self.fingerprint,
+        )
+    }
+
+    fn set_trip(&mut self, kind: TripKind, family: &str, count: u32) {
+        if self.trip.is_some() {
+            return;
+        }
+        let workspace = self.workspace.state().map(str::to_string);
         self.trip = Some(Trip {
             kind,
             family: family.to_string(),
             count,
-            workspace: workspace.current().map(str::to_string),
+            workspace,
         });
     }
 
@@ -462,7 +556,8 @@ impl StallTracker {
         let Some(trip) = self.trip.take() else {
             return;
         };
-        let now = workspace_state(cwd);
+        self.workspace.begin_call();
+        let now = self.workspace.fresh(cwd, self.fingerprint);
         let changed = matches!(
             (trip.workspace.as_deref(), now.as_deref()),
             (Some(before), Some(after)) if before != after
@@ -529,6 +624,27 @@ struct Counter {
     baseline: Option<String>,
 }
 
+/// Which counter a call feeds.
+#[derive(Debug, Clone, Copy)]
+enum Counted {
+    Failure,
+    Repeat,
+    Success,
+}
+
+impl Counted {
+    fn limit(self, family_limit: u32, success_limit: u32) -> u32 {
+        match self {
+            Counted::Failure | Counted::Repeat => family_limit,
+            Counted::Success => success_limit,
+        }
+    }
+}
+
+/// How the workspace is identified. A function pointer rather than a closure
+/// so a test can replace it with a counter.
+type Fingerprint = fn(&Path) -> Option<String>;
+
 /// Count one call for `key`. Returns the count once it reaches `limit`, unless
 /// the workspace changed since the counter started: then the calls did real
 /// work and the counter restarts instead of stopping the turn.
@@ -536,20 +652,25 @@ fn bump(
     counters: &mut HashMap<String, Counter>,
     key: &str,
     limit: u32,
-    workspace: &mut Workspace<'_>,
+    workspace: &mut WorkspaceMemo,
+    cwd: &Path,
+    fingerprint: Fingerprint,
 ) -> Option<u32> {
     if limit == 0 {
         return None;
     }
     let counter = counters.entry(key.to_string()).or_default();
     if counter.count == 0 {
-        counter.baseline = workspace.current().map(str::to_string);
+        counter.baseline = workspace.baseline(cwd, fingerprint);
     }
     counter.count += 1;
     if counter.count < limit {
         return None;
     }
-    let changed = match (counter.baseline.as_deref(), workspace.current()) {
+    let changed = match (
+        counter.baseline.as_deref(),
+        workspace.fresh(cwd, fingerprint).as_deref(),
+    ) {
         (Some(before), Some(now)) => before != now,
         // Without a readable workspace the guard keeps its stop: the call did
         // not report a file change either.
@@ -563,38 +684,70 @@ fn bump(
     None
 }
 
-/// Workspace state read at most once per call, so a call that starts or trips
-/// several counters reads it once.
-struct Workspace<'a> {
-    cwd: &'a Path,
+/// The workspace identity, read lazily and memoized across calls.
+///
+/// Reading it costs a `git status` plus a stat per listed path, or a bounded
+/// walk outside a repository, so it is taken once and reused: the first
+/// counter that needs a baseline reads it, every later counter reuses it, and
+/// only a reported file change clears it. A trip decision takes one fresh
+/// reading — a `sed -i` through `bash` changes files without the harness
+/// seeing it — and that reading becomes the new baseline. Two counters that
+/// trip on the same call share the reading.
+#[derive(Debug, Default)]
+struct WorkspaceMemo {
+    cwd: Option<PathBuf>,
     state: Option<String>,
-    read: bool,
+    /// Whether `state` is current for `cwd`.
+    valid: bool,
+    /// Whether this call already took a fresh reading for a trip decision.
+    fresh_taken: bool,
 }
 
-impl<'a> Workspace<'a> {
-    fn new(cwd: &'a Path) -> Self {
-        Self {
-            cwd,
-            state: None,
-            read: false,
-        }
+impl WorkspaceMemo {
+    fn begin_call(&mut self) {
+        self.fresh_taken = false;
     }
 
-    fn current(&mut self) -> Option<&str> {
-        if !self.read {
-            self.state = workspace_state(self.cwd);
-            self.read = true;
+    /// The cached identity, read now only if the memo is empty or invalid.
+    fn baseline(&mut self, cwd: &Path, fingerprint: Fingerprint) -> Option<String> {
+        if !self.valid || self.cwd.as_deref() != Some(cwd) {
+            self.read(cwd, fingerprint);
         }
+        self.state.clone()
+    }
+
+    /// The identity as it is now, for a trip decision. One reading per call.
+    fn fresh(&mut self, cwd: &Path, fingerprint: Fingerprint) -> Option<String> {
+        if !self.fresh_taken || self.cwd.as_deref() != Some(cwd) {
+            self.read(cwd, fingerprint);
+        }
+        self.state.clone()
+    }
+
+    fn read(&mut self, cwd: &Path, fingerprint: Fingerprint) {
+        self.state = fingerprint(cwd);
+        self.cwd = Some(cwd.to_path_buf());
+        self.valid = true;
+        self.fresh_taken = true;
+    }
+
+    fn state(&self) -> Option<&str> {
         self.state.as_deref()
     }
+
+    fn invalidate(&mut self) {
+        self.valid = false;
+    }
 }
 
-/// Identity of the working tree, used to tell real work from a loop: the git
-/// content tree in a repository, otherwise a bounded walk of paths, sizes, and
-/// modification times. `None` when it cannot be read.
+/// Identity of the working tree, used to tell real work from a loop: `git
+/// status` plus the size and mtime of every changed or untracked path in a
+/// repository (nothing is written to the object store), otherwise a bounded
+/// walk of paths, sizes, and modification times. `None` when it cannot be
+/// read.
 pub fn workspace_state(cwd: &Path) -> Option<String> {
-    if let Some(tree) = crate::tools::git::content_tree(cwd) {
-        return Some(tree);
+    if let Some(state) = crate::tools::git::working_state(cwd) {
+        return Some(state);
     }
     if !cwd.is_dir() {
         return None;
@@ -741,30 +894,6 @@ const VALUE_FLAGS: &[&str] = &[
     "--target",
     "--profile",
 ];
-
-/// Bash programs that only read. A successful call that changed nothing is
-/// ordinary inspection, not a stall.
-const READ_ONLY_PROGRAMS: &[&str] = &[
-    "cat", "head", "tail", "ls", "stat", "wc", "rg", "grep", "find", "file", "du", "tree", "pwd",
-    "echo", "which",
-];
-
-/// Tools that only read. Their successful calls never count against the
-/// unproductive-success budget.
-const READ_ONLY_TOOLS: &[&str] = &[
-    "read", "grep", "glob", "recall", "repo_map", "lsp", "evidence", "fetch", "skill",
-];
-
-/// Whether a family only reads, as `tool_family` renders it: `bash cat`, or a
-/// read-only tool's name and arguments.
-fn is_read_only(family: &str) -> bool {
-    if let Some(rest) = family.strip_prefix("bash ") {
-        let program = rest.split(' ').next().unwrap_or(rest);
-        return READ_ONLY_PROGRAMS.contains(&program);
-    }
-    let name = family.split(' ').next().unwrap_or(family);
-    READ_ONLY_TOOLS.contains(&name)
-}
 
 /// The family without its subcommand, for the unproductive-success counter:
 /// `bash cargo test` and `bash cargo build` are both `bash cargo`, and every
@@ -1080,6 +1209,9 @@ mod tests {
         tempfile::tempdir().unwrap()
     }
 
+    /// Record a call whose family and signature are hand-built. Read-only
+    /// classification is a property of the call, not of the family string, so
+    /// the read-only cases below go through [`call`] instead.
     #[allow(clippy::too_many_arguments)]
     fn record(
         progress: &mut RunProgress,
@@ -1090,6 +1222,43 @@ mod tests {
         is_error: bool,
         changed: bool,
         verified: bool,
+    ) {
+        record_reading(
+            progress, cwd, family, signature, result, is_error, changed, verified, false,
+        );
+    }
+
+    /// Record a real call: the family, signature, and read-only flag come from
+    /// the same functions the agent loop uses.
+    fn call(
+        progress: &mut RunProgress,
+        cwd: &Path,
+        name: &str,
+        arguments: &serde_json::Value,
+        result: &str,
+        is_error: bool,
+        changed: bool,
+    ) {
+        let raw = arguments.to_string();
+        let family = tool_family(name, &raw);
+        let signature = tool_signature(name, &raw);
+        let read_only = call_read_only(name, &raw);
+        record_reading(
+            progress, cwd, &family, &signature, result, is_error, changed, false, read_only,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_reading(
+        progress: &mut RunProgress,
+        cwd: &Path,
+        family: &str,
+        signature: &str,
+        result: &str,
+        is_error: bool,
+        changed: bool,
+        verified: bool,
+        read_only: bool,
     ) {
         let fingerprint = format!("{signature} | {result}");
         progress.record_tool_result(
@@ -1102,6 +1271,7 @@ mod tests {
                 is_error,
                 changed_file: changed,
                 verified_ok: verified,
+                read_only,
             },
         );
     }
@@ -1497,28 +1667,345 @@ mod tests {
         }
         let mut progress = RunProgress::new(limits());
         for index in 0..40 {
-            record(
+            call(
                 &mut progress,
                 dir.path(),
-                "bash cat",
-                &format!("bash cat :: cat note-{index}.txt"),
+                "bash",
+                &serde_json::json!({"command": format!("cat note-{index}.txt")}),
                 &format!("line {index}"),
-                false,
                 false,
                 false,
             );
-            record(
+            call(
                 &mut progress,
                 dir.path(),
-                &format!("read path=note-{index}.txt"),
-                &format!("read path=note-{index}.txt"),
+                "read",
+                &serde_json::json!({"path": format!("note-{index}.txt")}),
                 &format!("line {index}"),
-                false,
                 false,
                 false,
             );
         }
         assert!(!progress.stalled());
+    }
+
+    #[test]
+    fn read_only_classification_follows_the_registry() {
+        let reads = |name: &str, args: serde_json::Value| call_read_only(name, &args.to_string());
+        // Whole tools that only read.
+        for tool in READ_ONLY_TOOLS {
+            assert!(reads(tool, serde_json::json!({})), "{tool} only reads");
+        }
+        // Mixed tools: only the reading actions are exempt.
+        for (tool, args) in [
+            ("bg", serde_json::json!({"action": "logs", "id": "bg-1"})),
+            ("bg", serde_json::json!({"action": "status"})),
+            ("bg", serde_json::json!({"action": "list"})),
+            ("todo", serde_json::json!({"action": "list"})),
+            ("thread", serde_json::json!({"action": "status"})),
+            ("finding", serde_json::json!({"action": "list"})),
+            ("detect", serde_json::json!({"action": "validate"})),
+            ("pr", serde_json::json!({"action": "checks"})),
+            ("pr", serde_json::json!({"action": "review"})),
+            ("git", serde_json::json!({"action": "status"})),
+            ("git", serde_json::json!({"action": "log"})),
+            ("git", serde_json::json!({"action": "branch", "op": "list"})),
+        ] {
+            assert!(reads(tool, args.clone()), "{tool} {args} reads");
+        }
+        for (tool, args) in [
+            (
+                "bg",
+                serde_json::json!({"action": "start", "command": "make"}),
+            ),
+            ("bg", serde_json::json!({"action": "stop", "id": "bg-1"})),
+            (
+                "todo",
+                serde_json::json!({"action": "plan", "tasks": ["a"]}),
+            ),
+            ("thread", serde_json::json!({"action": "note", "note": "x"})),
+            (
+                "finding",
+                serde_json::json!({"action": "add", "title": "x"}),
+            ),
+            ("finding", serde_json::json!({"action": "report"})),
+            (
+                "detect",
+                serde_json::json!({"action": "run", "target": "x"}),
+            ),
+            ("pr", serde_json::json!({"action": "draft"})),
+            ("pr", serde_json::json!({"action": "comment", "body": "x"})),
+            ("git", serde_json::json!({"action": "commit"})),
+            (
+                "git",
+                serde_json::json!({"action": "branch", "op": "create"}),
+            ),
+            ("write", serde_json::json!({"path": "a", "content": "x"})),
+            ("verify", serde_json::json!({})),
+            ("bash", serde_json::json!({"command": "cargo test"})),
+            (
+                "bash",
+                serde_json::json!({"command": "curl -X POST http://x/y"}),
+            ),
+        ] {
+            assert!(!reads(tool, args.clone()), "{tool} {args} changes things");
+        }
+    }
+
+    /// A job being polled with new output is a build advancing, not a loop:
+    /// `bg` polls are read-only, and the coarse family no longer lumps them in
+    /// with the `bg start` that produced the work.
+    #[test]
+    fn background_polls_with_new_output_are_not_a_stop() {
+        let dir = empty_workspace();
+        let mut progress = RunProgress::new(limits());
+        for index in 0..30 {
+            call(
+                &mut progress,
+                dir.path(),
+                "bg",
+                &serde_json::json!({"action": "logs", "id": "bg-1", "lines": 40}),
+                &format!("[{index}/600] Compiling crate_{index}"),
+                false,
+                false,
+            );
+            assert!(!progress.stalled(), "poll {} stopped the turn", index + 1);
+        }
+    }
+
+    /// The success budget counts work that changed nothing; a turn that starts
+    /// jobs and polls them is one unit of work, not 24 idle calls.
+    #[test]
+    fn mixed_background_actions_do_not_trip_the_success_budget() {
+        let dir = empty_workspace();
+        let mut progress = RunProgress::new(limits());
+        for index in 0..24 {
+            let (name, args, result) = match index % 3 {
+                0 => (
+                    "bg",
+                    serde_json::json!({"action": "start", "command": format!("job-{index}")}),
+                    format!("started bg-{}", index / 3),
+                ),
+                1 => (
+                    "bg",
+                    serde_json::json!({"action": "status", "id": format!("bg-{}", index / 3)}),
+                    format!("bg-{} running", index / 3),
+                ),
+                _ => (
+                    "bg",
+                    serde_json::json!({"action": "logs", "id": format!("bg-{}", index / 3)}),
+                    format!("line {index}"),
+                ),
+            };
+            call(
+                &mut progress,
+                dir.path(),
+                name,
+                &args,
+                &result,
+                false,
+                false,
+            );
+        }
+        assert!(!progress.stalled());
+    }
+
+    /// A long thread of distinct GETs is exploration, not an idle loop.
+    #[test]
+    fn distinct_curl_reads_are_not_idle_successes() {
+        let dir = empty_workspace();
+        let mut progress = RunProgress::new(limits());
+        for index in 0..40 {
+            call(
+                &mut progress,
+                dir.path(),
+                "bash",
+                &serde_json::json!({"command": format!("curl -s https://docs.example/{index}.html")}),
+                &format!("<html>page {index}</html>"),
+                false,
+                false,
+            );
+            assert!(!progress.stalled(), "GET {} stopped the turn", index + 1);
+        }
+    }
+
+    /// A `curl` that uploads, posts, or writes a file is work, so it still
+    /// counts against the family that changed nothing.
+    #[test]
+    fn a_curl_that_writes_still_counts_against_the_success_budget() {
+        let dir = empty_workspace();
+        let mut progress = RunProgress::new(limits());
+        for index in 0..24 {
+            call(
+                &mut progress,
+                dir.path(),
+                "bash",
+                &serde_json::json!({"command": format!("curl -X POST -d item={index} https://api.example/items")}),
+                &format!("created {index}"),
+                false,
+                false,
+            );
+            if index < 23 {
+                assert!(!progress.stalled(), "call {} is below the limit", index + 1);
+            }
+        }
+        assert!(progress.stalled());
+        assert!(
+            progress
+                .stall_message()
+                .contains("24 successful calls of bash curl"),
+            "{}",
+            progress.stall_message()
+        );
+    }
+
+    /// Reading history is inspection: forty distinct `git show` calls are not
+    /// forty idle successes.
+    #[test]
+    fn git_history_reads_are_not_idle_successes() {
+        let dir = empty_workspace();
+        let mut progress = RunProgress::new(limits());
+        for index in 0..25 {
+            call(
+                &mut progress,
+                dir.path(),
+                "bash",
+                &serde_json::json!({"command": format!("git show HEAD~{index}:src/main.rs")}),
+                &format!("commit {index} content"),
+                false,
+                false,
+            );
+            assert!(!progress.stalled(), "show {} stopped the turn", index + 1);
+        }
+    }
+
+    /// A read of a pull request is inspection too.
+    #[test]
+    fn github_reads_are_not_idle_successes() {
+        let dir = empty_workspace();
+        let mut progress = RunProgress::new(limits());
+        for index in 0..30 {
+            call(
+                &mut progress,
+                dir.path(),
+                "bash",
+                &serde_json::json!({"command": format!("gh pr view {index} --json title,state")}),
+                &format!("PR {index}"),
+                false,
+                false,
+            );
+        }
+        assert!(!progress.stalled());
+    }
+
+    #[test]
+    fn fingerprint_reads_are_memoized_across_counters_and_calls() {
+        static COMPUTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        fn counted(cwd: &Path) -> Option<String> {
+            COMPUTED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            workspace_state(cwd)
+        }
+        let dir = empty_workspace();
+        let mut progress = RunProgress::new(limits());
+        progress.stall.fingerprint = counted;
+        // Distinct families, a few calls each: every counter needs a baseline
+        // for the same unchanged workspace, so all of them share one reading.
+        for family in 0..10 {
+            for index in 0..3 {
+                call(
+                    &mut progress,
+                    dir.path(),
+                    "bash",
+                    &serde_json::json!({"command": format!("probe-{family} {index}")}),
+                    &format!("probe {family}/{index}"),
+                    false,
+                    false,
+                );
+            }
+        }
+        assert!(!progress.stalled());
+        assert_eq!(
+            COMPUTED.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "one workspace reading serves every counter"
+        );
+    }
+
+    #[test]
+    fn fingerprint_reads_are_bounded_at_a_trip_decision() {
+        static COMPUTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        fn counted(cwd: &Path) -> Option<String> {
+            COMPUTED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            workspace_state(cwd)
+        }
+        let dir = empty_workspace();
+        let mut progress = RunProgress::new(limits());
+        progress.stall.fingerprint = counted;
+        for index in 0..30 {
+            call(
+                &mut progress,
+                dir.path(),
+                "bash",
+                &serde_json::json!({"command": format!("python3 probe-{index}.py")}),
+                &format!("garbage {index}"),
+                false,
+                false,
+            );
+        }
+        assert!(progress.stalled(), "24 idle successes stop the turn");
+        progress.recheck_workspace(dir.path());
+        // One reading for the baseline, one to decide the trip, and one at the
+        // batch re-check; the calls after the trip take none.
+        assert!(
+            COMPUTED.load(std::sync::atomic::Ordering::SeqCst) <= 3,
+            "expected at most 3 workspace readings, got {}",
+            COMPUTED.load(std::sync::atomic::Ordering::SeqCst)
+        );
+    }
+
+    #[test]
+    fn a_reported_change_invalidates_the_memoized_fingerprint() {
+        static COMPUTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        fn counted(cwd: &Path) -> Option<String> {
+            COMPUTED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            workspace_state(cwd)
+        }
+        let dir = empty_workspace();
+        let mut progress = RunProgress::new(limits());
+        progress.stall.fingerprint = counted;
+        call(
+            &mut progress,
+            dir.path(),
+            "bash",
+            &serde_json::json!({"command": "python3 a.py"}),
+            "one",
+            false,
+            false,
+        );
+        std::fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+        call(
+            &mut progress,
+            dir.path(),
+            "bash",
+            &serde_json::json!({"command": "python3 b.py"}),
+            "two",
+            false,
+            true,
+        );
+        call(
+            &mut progress,
+            dir.path(),
+            "bash",
+            &serde_json::json!({"command": "python3 c.py"}),
+            "three",
+            false,
+            false,
+        );
+        assert_eq!(
+            COMPUTED.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the reported change forces a new reading on the next call"
+        );
     }
 
     #[test]

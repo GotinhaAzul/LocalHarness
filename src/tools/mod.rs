@@ -1043,4 +1043,21 @@ mod tests {
         assert!(registry.get("attack_path").unwrap().read_only());
         assert!(!registry.get("detect").unwrap().read_only());
     }
+
+    /// The loop guard keeps its own name-and-action table; a tool that declares
+    /// itself read-only must be in it, so a new read-only tool is never counted
+    /// as an unproductive success by accident.
+    #[test]
+    fn the_loop_guard_knows_every_read_only_tool() {
+        let registry = ToolRegistry::builtin();
+        for tool in registry.all() {
+            if tool.read_only() {
+                assert!(
+                    crate::agent::limits::call_read_only(tool.name(), "{}"),
+                    "{} declares itself read-only but the loop guard counts it",
+                    tool.name()
+                );
+            }
+        }
+    }
 }

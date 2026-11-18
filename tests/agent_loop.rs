@@ -1680,15 +1680,16 @@ async fn unknown_tool_suggests_the_nearest_name() {
 #[tokio::test]
 async fn loop_guard_blocks_the_fourth_identical_call() {
     let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.rs"), "fn a() {}\n").unwrap();
     let harness = harness(
         dir.path(),
         vec![
-            tool_script("read", json!({"path":"a.rs"})),
-            tool_script("read", json!({"path":"a.rs"})),
-            tool_script("read", json!({"path":"a.rs"})),
-            tool_script("read", json!({"path":"a.rs"})),
+            tool_script("bash", json!({"command":"sed -n 1p a.rs"})),
+            tool_script("bash", json!({"command":"sed -n 1p a.rs"})),
+            tool_script("bash", json!({"command":"sed -n 1p a.rs"})),
+            tool_script("bash", json!({"command":"sed -n 1p a.rs"})),
         ],
-        &["read"],
+        &["bash"],
     );
     let (outcome, events) = run(&harness, "repeat").await;
     // Not `Done`: a script or workflow must be able to tell a stopped loop
@@ -1806,7 +1807,9 @@ fn init_repo(dir: &std::path::Path) {
 
 /// The D09 run from the issue: one command is repeated for real, every call
 /// exits 0, and near-identical probes run in between. No result is an error,
-/// so only the repeated call shows the loop.
+/// so only the repeated call shows the loop. `sed` stands in for the OCR
+/// probes because reading through `cat` is inspection and exempt.
+
 #[tokio::test]
 async fn repeated_successful_calls_between_probes_end_the_turn_as_stalled() {
     let dir = tempfile::tempdir().unwrap();
@@ -1823,12 +1826,12 @@ async fn repeated_successful_calls_between_probes_end_the_turn_as_stalled() {
         scripts.push(call_script(
             &format!("probe_{index}"),
             "bash",
-            json!({"command": format!("cat receipt-{index}.txt")}),
+            json!({"command": format!("sed -n 1p receipt-{index}.txt")}),
         ));
         scripts.push(call_script(
             &format!("again_{index}"),
             "bash",
-            json!({"command": "cat receipt.txt"}),
+            json!({"command": "sed -n 1p receipt.txt"}),
         ));
     }
     scripts.push(text_script("done"));
@@ -1969,6 +1972,152 @@ async fn successful_reads_and_status_checks_do_not_trip() {
         .filter(|entry| matches!(entry.kind, EntryKind::ToolResult(_)))
         .count();
     assert_eq!(results, 33, "every read and status check ran");
+}
+
+/// Polling a background job that keeps producing output is a build advancing,
+/// not a repeated call: `bg logs` is read-only, and the coarse `bg` family must
+/// not lump the poll in with the `start` that began the work.
+#[tokio::test]
+async fn polling_a_background_job_does_not_stop_the_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut scripts = vec![call_script(
+        "start",
+        "bg",
+        json!({"action": "start", "command": "while true; do echo $RANDOM$RANDOM; sleep 0.001; done"}),
+    )];
+    // Let the shell start and write before the first poll: a real turn polls a
+    // job that has been running, not one that has not spawned yet.
+    scripts.push(call_script(
+        "settle",
+        "bash",
+        json!({"command": "sleep 0.3"}),
+    ));
+    for index in 0..30 {
+        scripts.push(call_script(
+            &format!("poll_{index}"),
+            "bg",
+            json!({"action": "logs", "id": "bg-1", "lines": 20}),
+        ));
+    }
+    scripts.push(call_script(
+        "stop",
+        "bg",
+        json!({"action": "stop", "id": "bg-1"}),
+    ));
+    scripts.push(text_script("done"));
+    let harness = harness(dir.path(), scripts, &["bg", "bash"]);
+    let (outcome, events) = run(&harness, "watch the build").await;
+    assert_eq!(
+        outcome.status,
+        TurnStatus::Done,
+        "thirty polls of a running job are progress"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::Guard { .. })),
+        "no guard may fire while the job keeps writing"
+    );
+}
+
+/// Forty distinct GETs are a long piece of exploration, not an idle loop.
+/// `file://` keeps the test offline; the rule is the same for http.
+#[tokio::test]
+async fn distinct_curl_get_calls_do_not_stop_the_turn() {
+    if std::process::Command::new("curl")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        // No curl here; the unit test covers the classification.
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let mut scripts = Vec::new();
+    for index in 0..40 {
+        let page = dir.path().join(format!("page-{index}.html"));
+        std::fs::write(&page, format!("<html>page {index}</html>")).unwrap();
+        scripts.push(call_script(
+            &format!("get_{index}"),
+            "bash",
+            json!({"command": format!("curl -s file://{}", page.display())}),
+        ));
+    }
+    scripts.push(text_script("done"));
+    let harness = harness(dir.path(), scripts, &["bash"]);
+    let (outcome, _) = run(&harness, "read the docs").await;
+    assert_eq!(
+        outcome.status,
+        TurnStatus::Done,
+        "distinct curl reads are exploration"
+    );
+    assert_eq!(
+        harness.provider.requests.lock().unwrap().len(),
+        41,
+        "all forty HTTP-shaped calls ran"
+    );
+}
+
+/// Twenty-five distinct `git show` calls walk history; only the consecutive
+/// identical guard watches a read, so they must not count as idle successes.
+#[tokio::test]
+async fn git_history_reads_do_not_stop_the_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    init_repo(dir.path());
+    for index in 0..26 {
+        std::fs::write(
+            dir.path().join("history.txt"),
+            format!("revision {index}\n"),
+        )
+        .unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir.path())
+                .args(["add", "-A"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir.path())
+            .args([
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-q",
+                "-m",
+                &format!("revision {index}"),
+            ])
+            .status()
+            .expect("run git commit");
+        assert!(status.success());
+    }
+    let scripts: Vec<Script> = (0..25)
+        .map(|index| {
+            call_script(
+                &format!("show_{index}"),
+                "bash",
+                json!({"command": format!("git show HEAD~{index}:history.txt")}),
+            )
+        })
+        .chain(std::iter::once(text_script("done")))
+        .collect();
+    let harness = harness(dir.path(), scripts, &["bash"]);
+    let (outcome, _) = run(&harness, "trace the change").await;
+    assert_eq!(
+        outcome.status,
+        TurnStatus::Done,
+        "reading history is inspection"
+    );
+    assert_eq!(
+        harness.provider.requests.lock().unwrap().len(),
+        26,
+        "all twenty-five history reads ran"
+    );
 }
 
 #[tokio::test]

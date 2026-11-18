@@ -25,7 +25,7 @@ use crate::tools::{ToolResult, display_path};
 use super::calls::CallLedger;
 use super::gates::{self, LoopDecision, LoopGuard, SettleDecision};
 use super::limits::{
-    BudgetCheck, RunProgress, StopReason, ToolOutcome, tool_family, tool_signature,
+    BudgetCheck, RunProgress, StopReason, ToolOutcome, call_read_only, tool_family, tool_signature,
 };
 use super::{AgentEvent, AgentState, Core};
 
@@ -2867,7 +2867,8 @@ async fn execute_batch(
                                 call.name,
                                 super::repair::canonical_json(&guard_args(&call.name, &args))
                             );
-                            match loop_guard.check_and_record(signature) {
+                            let read_only = reads_only(core, &call.name, &raw);
+                            match loop_guard.check_and_record(signature, read_only) {
                                 LoopDecision::Tripped { reason } => {
                                     result = ToolResult::err("loop_guard", reason.clone());
                                     guard_trip = Some(("loop_guard".into(), reason));
@@ -3254,6 +3255,7 @@ async fn execute_batch(
         let fingerprint = fingerprint(&call.name, &raw, &tool_result.content);
         let family = tool_family(&call.name, &raw);
         let signature = tool_signature(&call.name, &raw);
+        let read_only = reads_only(core, &call.name, &raw);
         progress.record_tool_result(
             &ctx.cwd,
             ToolOutcome {
@@ -3264,6 +3266,7 @@ async fn execute_batch(
                 is_error: tool_result.is_error,
                 changed_file: changed,
                 verified_ok,
+                read_only,
             },
         );
         if changed || verified_ok {
@@ -3633,6 +3636,7 @@ async fn finish_review(
         let family = tool_family(&call.call.name, &raw);
         let signature = tool_signature(&call.call.name, &raw);
         let fingerprint = fingerprint(&call.call.name, &raw, &tool_result.content);
+        let read_only = reads_only(core, &call.call.name, &raw);
         progress.record_tool_result(
             &ctx.cwd,
             ToolOutcome {
@@ -3643,6 +3647,7 @@ async fn finish_review(
                 is_error: tool_result.is_error,
                 changed_file: changed,
                 verified_ok: false,
+                read_only,
             },
         );
         if changed {
@@ -3750,6 +3755,17 @@ fn fingerprint(name: &str, args: &str, content: &str) -> String {
     args.hash(&mut hasher);
     content.hash(&mut hasher);
     format!("{name}:{:016x}", hasher.finish())
+}
+
+/// Whether a call only inspects: the tool's own read-only declaration, or the
+/// loop guard's per-action table for a tool whose actions mix reads and writes
+/// (`bg logs` against `bg start`, `git status` against `git commit`).
+fn reads_only(core: &Core, name: &str, arguments: &str) -> bool {
+    core.tools
+        .iter()
+        .find(|tool| tool.name() == name)
+        .is_some_and(|tool| tool.read_only())
+        || call_read_only(name, arguments)
 }
 
 /// Whether a write target belongs to the workspace. Absolute paths outside the

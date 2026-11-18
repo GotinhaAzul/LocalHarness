@@ -84,16 +84,26 @@ stall_calls = 12
 # `tesseract /tmp/b/r.png --psm 3` are one family, while two `read` calls for
 # different paths are two. Interleaving, an exit-0 call of the family, and a
 # success that changes nothing do not reset the count; a workspace change or a
-# passing verify does. 0 disables the guard.
+# passing verify does. Read-only calls are not counted as repeats (and a
+# failing read-only call still counts as a failure); a read repeated with the
+# same output is caught by `stall_calls` instead. 0 disables the guard.
 max_same_tool_family = 8
 # Successful calls of one family that changed no workspace file and passed no
 # verify, allowed in a turn. A same-family success does not reset it, so a
 # model that reruns OCR or conversion probes forever is stopped even when every
-# probe exits 0. Read-only bash programs (cat, head, tail, ls, stat, wc, rg,
-# grep, find, file, du, tree, pwd, echo, which) and read-only tools (read,
-# grep, glob, recall, repo_map, lsp, evidence, fetch, skill) are exempt.
-# Writes outside the session directory, including temporary paths, do not
-# count as progress. 0 disables the guard.
+# probe exits 0. Inspection is exempt: read-only tools (read, grep, glob,
+# recall, repo_map, lsp, evidence, fetch, skill, review, iocs, surface,
+# attack_path); the reading actions of mixed tools (bg logs/status, todo list,
+# thread status, finding list, detect validate, pr checks/review,
+# git status/diff/log/blame/commit_message, git branch|worktree op = "list");
+# and bash commands that only read (cat, ls, rg, git show, git ls-files,
+# curl/wget without a writing flag, gh pr view|list|diff|checks,
+# gh issue view|list, and a gh api GET).
+# A long exploratory analysis turn with many distinct `python3 -c` probes and
+# no file writes can reach this limit, because each probe exits 0 and changed
+# nothing. Raise `max_same_tool_family_success` for that kind of work, or set it
+# to 0 to disable the guard. Writes outside the session directory, including
+# temporary paths, do not count as progress.
 max_same_tool_family_success = 24
 verify_attempts = 2
 
