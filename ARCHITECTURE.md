@@ -1826,7 +1826,11 @@ cursor = "#c0caf5"
   entry (`UserData.attachments`), read through the `read` tool so the jail,
   caps, and read stamp apply. The model sees them after the prompt; the
   transcript shows the prompt only. At most eight files, within a quarter of
-  the usable prompt.
+  the usable prompt. A path written without `@` (`src/a.rs:12:5`, a pasted
+  stack trace, `File "pkg/mod.py", line 3`) is attached the same way when it
+  names an existing text file under the working directory: at most three,
+  after the `@` mentions, never reported when skipped
+  (`[prompt] attach_named_files`).
 - Paste is bracketed and inserted literally. Large pastes are accepted; the
   model sees them as user content.
 

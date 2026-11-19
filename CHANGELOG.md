@@ -9,6 +9,12 @@ release may change defaults when the change is called out below.
 
 ### Added
 
+- Files named in a prompt without `@` are attached like `@` mentions:
+  `the panic at src/parser.rs:88:5`, a pasted stack trace, or
+  `File "pkg/mod.py", line 3` attaches up to three existing text files under
+  the working directory, after the `@` mentions and within the same budget.
+  Words that only look like paths are ignored silently
+  (`[prompt] attach_named_files`, default `true`).
 - `/permissions` gathers the permission levels in one TUI command. With no
   argument it opens the filterable picker over `normal`, `accept-edits`,
   `deny-all`, and `yolo`, marking the current level and describing each one;

@@ -1089,6 +1089,9 @@ pub struct PromptConfig {
     /// Load the hierarchical `AGENTS.md` chain into the system prompt.
     /// `--no-agents-md` and `TOT_AGENTS_MD=0` disable it.
     pub agents_md: bool,
+    /// Attach files a prompt names without `@` (`src/a.rs:12`, a pasted
+    /// stack trace), like `@` mentions; see `agent::mentions`.
+    pub attach_named_files: bool,
 }
 
 impl Default for PromptConfig {
@@ -1098,6 +1101,7 @@ impl Default for PromptConfig {
             instructions: String::new(),
             file: PathBuf::new(),
             agents_md: true,
+            attach_named_files: true,
         }
     }
 }
