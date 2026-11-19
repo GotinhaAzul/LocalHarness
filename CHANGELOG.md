@@ -9,6 +9,12 @@ release may change defaults when the change is called out below.
 
 ### Added
 
+- `edit`, exact-text `patch`, and `write` run the project's formatter on the
+  new content before writing it (`[format] on_edit`, default `true`):
+  `rustfmt`, `gofmt`, `ruff`/`black`, or `prettier`. A file is formatted only
+  when it was already formatter-clean, so an unformatted project never gets
+  churn. A failing or missing formatter writes the content as given, and a
+  project's own `node_modules/.bin/prettier` runs only in a trusted project.
 - A failing `verify` attaches the first three `file:line` locations its
   output names (rustc, Rust panics, tsc, Python tracebacks, pytest, Go, gcc,
   eslint) with three lines of context each, and records them as read. Only

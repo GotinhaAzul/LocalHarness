@@ -119,6 +119,7 @@ impl Fixture {
             sandbox: None,
             vision: Default::default(),
             caps: Default::default(),
+            format_on_edit: false,
             edit_mode: totality::config::EditMode::Text,
         };
         Some(Fixture {

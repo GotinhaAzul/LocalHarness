@@ -36,6 +36,8 @@ pub struct Config {
     pub review: ReviewMode,
     /// Settle gates (`[gates]`).
     pub gates: GatesConfig,
+    /// Formatting of edited files (`[format]`).
+    pub format: FormatConfig,
     /// Skill index in the system prompt (`[skills]`).
     pub skills: SkillsConfig,
     /// The opt-in `fetch` tool (`[fetch]`).
@@ -102,6 +104,22 @@ impl Default for GatesConfig {
             auto_settle: true,
             verify_detected: true,
         }
+    }
+}
+
+/// `[format]`: run the project's formatter on content `edit`, `patch`, and
+/// `write` produce, before it is written.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FormatConfig {
+    /// Format a file the project already keeps formatted (see
+    /// [`crate::tools::format`]).
+    pub on_edit: bool,
+}
+
+impl Default for FormatConfig {
+    fn default() -> Self {
+        Self { on_edit: true }
     }
 }
 

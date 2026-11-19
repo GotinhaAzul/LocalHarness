@@ -9,6 +9,7 @@ pub mod encoding;
 pub mod evidence;
 pub mod fetch;
 pub mod finding;
+pub mod format;
 pub mod git;
 pub mod glob;
 pub mod grep;
@@ -195,6 +196,8 @@ pub struct ToolContext {
     /// Result caps for this turn. Tools that size their own output fit it
     /// within [`crate::context::ResultCaps::tool_budget`].
     pub caps: crate::context::ResultCaps,
+    /// Format edited content with the project's formatter (`[format] on_edit`).
+    pub format_on_edit: bool,
 }
 
 impl ToolContext {
