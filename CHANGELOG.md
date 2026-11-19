@@ -81,6 +81,12 @@ release may change defaults when the change is called out below.
 
 ### Fixed
 
+- Agent-run commands start a new session through the `setsid` utility
+  (util-linux or busybox) instead of a `pre_exec` hook. The hook made every
+  spawn `fork` instead of `posix_spawn`, so a child could briefly hold another
+  thread's just-written script open and that script failed to start with
+  "Text file busy"; the hook remains the fallback when `setsid` is missing.
+
 - The repository brief now lists every non-ignored file, not only extensions
   the symbol scanner knows. Non-code and outline-less files are grouped per
   directory with a count by extension, a closing line counts anything the
