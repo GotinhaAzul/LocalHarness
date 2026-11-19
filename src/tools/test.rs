@@ -361,8 +361,7 @@ async fn run_invocation(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    #[cfg(unix)]
-    command.process_group(0);
+    crate::tools::procenv::detach(&mut command);
 
     let mut child = command.spawn().map_err(|error| {
         ToolResult::err(

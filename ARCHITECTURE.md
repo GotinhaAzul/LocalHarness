@@ -895,8 +895,14 @@ form. `tot doctor` prints both sizes.
   redirection) the named files are snapshotted into the same store, and the
   command's result lists them; undo and `/rewind` restore them even though the
   command ran outside the write path. `git clean` is not parsed.
-- `bash` uses `bash -lc`, captures stdout/stderr separately, caps output, and
-  kills the process group on timeout. Interactive-only commands are blocked.
+- `bash` uses `bash -c` (not a login shell: the user's profile is not sourced;
+  set `BASH_ENV` to source a file), captures stdout/stderr separately, caps
+  output, and kills the process group on timeout. Every agent-run command
+  (`bash`, `bg`, `verify`, `test`) starts a new session with no controlling
+  terminal and gets `GIT_TERMINAL_PROMPT=0`, `GIT_EDITOR`/`EDITOR`/`VISUAL=true`,
+  `PAGER`/`GIT_PAGER=cat`, and `DEBIAN_FRONTEND=noninteractive`, so a prompt
+  fails at once instead of waiting on a human. Interactive-only commands are
+  blocked.
 - `bg` starts a process in its own group, captures output to an artifact, and
   exposes `status`, `logs`, and `stop`. At most four live processes per session.
 - `todo` uses an adaptive gate: free for a run that touches one or two files,
@@ -1575,12 +1581,12 @@ input characters. Missing input and unreadable files return prescriptive errors.
   picks a backend: bubblewrap when `bwrap` (or `TOT_BWRAP`) is executable,
   otherwise Landlock. If neither is usable the constructor returns a
   fail-closed error, and `detect` exposes the same check to the CLI.
-- Bubblewrap wraps `bash -lc` with `--unshare-all`, `--cap-drop ALL`, a
+- Bubblewrap wraps `bash -c` with `--unshare-all`, `--cap-drop ALL`, a
   read-only `/`, private tmpfs mounts for `/tmp`, `/home`, and `/root`, the
   workspace re-bound read-only or writable, `.git` re-bound read-only in
   `workspace-write`, `--clearenv` plus an allowlisted environment,
-  `HOME=/nonexistent`, `TMPDIR=/tmp`, and a classic-BPF seccomp filter passed
-  through `--seccomp`. The filter returns `EPERM` for mount, namespace, module,
+  `HOME=/nonexistent`, `TMPDIR=/tmp`, the non-interactive variables above,
+  and a classic-BPF seccomp filter passed through `--seccomp`. The filter returns `EPERM` for mount, namespace, module,
   keyring, BPF, perf, ptrace, and `process_vm_*` syscalls.
 - The Landlock fallback builds a ruleset with read/execute on `/`, write rights
   under the workspace (`workspace-write`) and `TMPDIR`, and TCP bind/connect
