@@ -285,7 +285,7 @@ repository's own instructions.
 Every workflow carries an explicit tool allowlist. The list is exact: starting a
 workflow derives a profile that drops the base profile's packs, so a tool not in
 the list stays unavailable even when its pack is part of the base profile. The
-security workflows include `finding`, `verify`, `test`, `review`, `surface`,
+security workflows include `finding`, `verify`, `review`, `surface`,
 `evidence`, `bash`, and `bg`; their prompts require bounded, non-destructive
 validation: the reproduction is the proof, and destructive or third-party
 testing stops and asks. `general-assistance` has no write, edit, shell, or

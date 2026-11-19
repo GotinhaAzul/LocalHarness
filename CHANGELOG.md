@@ -354,6 +354,39 @@ release may change defaults when the change is called out below.
   of `done`: `lh -p` exits 2 instead of 0, a workflow step is no longer marked
   succeeded, and ACP reports `max_turn_requests`.
 
+### Changed
+
+- `edit` takes `occurrence` (1-based) to replace one named match; it cannot be
+  combined with `replace_all`, and the ambiguous-match error names both. This
+  is the single text-mode editor: `patch` is now the hash-anchored editor and
+  is selected only with `edit_mode = "hash"`
+  ([#170](https://github.com/GotinhaAzul/Totality/issues/170)).
+- `verify` takes `path` and `test`. With one, it runs the detected runner for
+  that file or test and returns the first failure, the way the old `test` tool
+  did; without one it runs the configured steps exactly as before. A targeted
+  result is recorded with `targeted: true` and never clears the verify gate,
+  satisfies the final todo task, or counts for `pr draft`
+  ([#170](https://github.com/GotinhaAzul/Totality/issues/170)).
+- `git` keeps only its gated actions: `stage`, `unstage`, `commit_message`,
+  `commit`, `branch`, `worktree`, and `undo`. `status`, `diff`, `log`, and
+  `blame` are read through `bash`, where they are still classified read-only;
+  calling them through `git` returns the equivalent command in the error
+  ([#170](https://github.com/GotinhaAzul/Totality/issues/170)).
+- A profile that still lists `test`, or `patch` in text mode, loads with a
+  deprecation warning naming the replacement for one release instead of
+  failing. The built-in `strict` and `shell` profiles are unchanged
+  ([#170](https://github.com/GotinhaAzul/Totality/issues/170)).
+
+### Removed
+
+- The `test` tool. Use `verify` with `path` or `test`; a call to `test` from an
+  older session or a model trained on another harness is routed there by the
+  repair layer, with its target intact
+  ([#170](https://github.com/GotinhaAzul/Totality/issues/170)).
+- The `git` read actions (`status`, `diff`, `log`, `blame`). Use `bash` and the
+  equivalent git command, which the error spells out
+  ([#170](https://github.com/GotinhaAzul/Totality/issues/170)).
+
 ## [0.2.0] - 2026-11-15
 
 A large feature release covering the engine, permissions, context, skills,

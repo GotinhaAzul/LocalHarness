@@ -500,8 +500,9 @@ const READ_ONLY_ACTIONS: &[(&str, &[&str])] = &[
 ];
 
 /// `git` tool actions that only read. `branch` and `worktree` read in their
-/// `op = "list"` form.
-const GIT_READ_ACTIONS: &[&str] = &["status", "diff", "log", "blame", "commit_message"];
+/// `op = "list"` form. `status`, `diff`, `log`, and `blame` are handed to
+/// `bash`, where the command classifier decides they read only.
+const GIT_READ_ACTIONS: &[&str] = &["commit_message"];
 
 /// Whether a call only inspects. `bash` is classified by its command, `git`
 /// and the mixed tools by their action, and the rest by the tool's own
@@ -2133,8 +2134,7 @@ mod tests {
             ("detect", serde_json::json!({"action": "validate"})),
             ("pr", serde_json::json!({"action": "checks"})),
             ("pr", serde_json::json!({"action": "review"})),
-            ("git", serde_json::json!({"action": "status"})),
-            ("git", serde_json::json!({"action": "log"})),
+            ("git", serde_json::json!({"action": "commit_message"})),
             ("git", serde_json::json!({"action": "branch", "op": "list"})),
         ] {
             assert!(reads(tool, args.clone()), "{tool} {args} reads");
@@ -2166,6 +2166,12 @@ mod tests {
                 "git",
                 serde_json::json!({"action": "branch", "op": "create"}),
             ),
+            // Read-only git commands belong to bash now, so the `git` tool
+            // must not claim to read them.
+            ("git", serde_json::json!({"action": "status"})),
+            ("git", serde_json::json!({"action": "diff"})),
+            ("git", serde_json::json!({"action": "log"})),
+            ("git", serde_json::json!({"action": "blame"})),
             ("write", serde_json::json!({"path": "a", "content": "x"})),
             ("verify", serde_json::json!({})),
             ("bash", serde_json::json!({"command": "cargo test"})),

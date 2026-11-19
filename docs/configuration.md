@@ -141,7 +141,7 @@ max_same_tool_family = 8
 # recall, repo_map, lsp, evidence, fetch, skill, review, iocs, surface,
 # attack_path); the reading actions of mixed tools (bg logs/status, todo list,
 # thread status, finding list, detect validate, pr checks/review,
-# git status/diff/log/blame/commit_message, git branch|worktree op = "list");
+# git commit_message, git branch|worktree op = "list");
 # and bash commands that only read (cat, ls, rg, git show, git ls-files,
 # curl/wget without a writing flag, gh pr view|list|diff|checks,
 # gh issue view|list, and a gh api GET).
@@ -415,8 +415,9 @@ validation still uses the full schema.
 ## Hash-anchored edits
 
 `edit_mode = "hash"` is opt-in and defaults to `"text"`. It changes `read` and
-`patch` only: the exact-text `edit` tool and text-mode `patch` are unchanged.
-The bundled `hash` model profile sets it, or add it to your own:
+selects `patch`: in text mode `patch` is not in the tool list at all, and
+exact-text edits use `edit`. The bundled `hash` model profile sets it, or add it
+to your own:
 
 ```toml
 [model_profile.mine]
@@ -432,6 +433,10 @@ content hash before every line:
 1  85ed202b  alpha
 2  954620a7  beta
 ```
+
+A profile that still lists a tool that is now an argument of another one loads
+with a deprecation warning for one release: `test` loads as `verify` with its
+`path`/`test` target, and text-mode `patch` loads as `edit`.
 
 `patch` takes the path with that tag (`PATH#SNAPSHOT` or the bracketed header
 `[PATH#SNAPSHOT]` both work) and an `ops` array. Line numbers are 1-based

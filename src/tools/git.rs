@@ -1,12 +1,11 @@
-//! `git`: structured repository actions with safe defaults.
+//! `git`: gated repository actions with safe defaults.
 //!
-//! The model can run `git` through `bash`, but nothing there constrains it.
-//! This tool gives it explicit actions instead: read-only `status`, `diff`,
-//! `log` and `blame`; `stage`/`unstage` limited to the workspace; `commit`
-//! that previews and, by default, waits for the user (`/commit confirm`);
-//! `branch` and `worktree` that refuse to lose work; and `undo`, a soft reset
-//! of the last commit this harness made. Every mutation returns the exact
-//! command and its output.
+//! The model can run `git status`, `diff`, `log`, and `blame` through `bash`,
+//! where the policy classifies them as read-only. This tool does the rest:
+//! `stage`/`unstage` limited to the workspace; `commit` that previews and, by
+//! default, waits for the user (`/commit confirm`); `branch` and `worktree`
+//! that refuse to lose work; and `undo`, a soft reset of the last commit this
+//! harness made. Every mutation returns the exact command and its output.
 //!
 //! History surgery (`reset --hard`, `clean -f`, `push --force`, `rebase`,
 //! `filter-branch`, tag deletion) is not an action here, and
@@ -61,7 +60,7 @@ impl Tool for GitTool {
     }
 
     fn description(&self) -> &'static str {
-        "Git with safe defaults: status, diff, log, blame, stage, unstage, commit_message (style + draft), commit (user approves), branch, worktree, undo. No reset --hard, force-push or rebase."
+        "Gated git: stage, unstage, commit_message (style + draft), commit (user approves), branch, worktree, undo. Read status/diff/log/blame with bash."
     }
 
     fn schema(&self) -> Value {
@@ -69,15 +68,10 @@ impl Tool for GitTool {
             json!({
                 "action": {
                     "type": "string",
-                    "enum": ["status", "diff", "log", "blame", "stage", "unstage", "commit_message", "commit", "branch", "worktree", "undo"],
+                    "enum": ["stage", "unstage", "commit_message", "commit", "branch", "worktree", "undo"],
                 },
                 "paths": {"type": "array", "items": {"type": "string"}, "description": "stage/unstage: workspace files."},
-                "path": {"type": "string", "description": "diff/log/blame filter; worktree directory."},
-                "staged": {"type": "boolean", "description": "diff: staged changes."},
-                "stat": {"type": "boolean", "description": "diff: summary only."},
-                "count": {"type": "integer", "minimum": 1, "maximum": 200, "description": "log: commits (default 20)."},
-                "start": {"type": "integer", "minimum": 1, "description": "blame: first line."},
-                "end": {"type": "integer", "minimum": 1, "description": "blame: last line."},
+                "path": {"type": "string", "description": "worktree add: directory."},
                 "message": {"type": "string", "description": "commit: subject, blank line, body saying why."},
                 "op": {"type": "string", "enum": ["create", "switch", "list", "add", "remove"], "description": "branch: create|switch|list; worktree: add|remove|list."},
                 "name": {"type": "string", "description": "branch name."},
@@ -128,9 +122,10 @@ fn dispatch(ctx: &ToolContext, config: &GitConfig, args: &Value) -> ToolResult {
         return ToolResult::err(
             "GIT_REPO_OUTSIDE_ROOT",
             format!(
-                "{} is inside the git work tree at {}, not at its root, so the harness will not change that repository from here. Read-only status, diff, log, blame and commit_message stay limited to {}; run \"git init\" here with the user's agreement, or start the session at {}.",
+                "{} is inside the git work tree at {}, not at its root, so the harness will not change that repository from here. commit_message stays limited to {}; read with bash from {} if that is the history you mean, or run \"git init\" here with the user's agreement, or start the session at {}.",
                 ctx.cwd.display(),
                 top.display(),
+                ctx.cwd.display(),
                 ctx.cwd.display(),
                 top.display()
             ),
@@ -139,14 +134,11 @@ fn dispatch(ctx: &ToolContext, config: &GitConfig, args: &Value) -> ToolResult {
     if mutating && read_only_mode(ctx) {
         return ToolResult::err(
             "GIT_READ_ONLY",
-            "the session runs with --sandbox read-only, so git is limited to status, diff, log, blame and commit_message",
+            "the session runs with --sandbox read-only, so git is limited to commit_message",
         );
     }
     match action.as_str() {
-        "status" => status(ctx),
-        "diff" => diff(ctx, args),
-        "log" => log(ctx, args),
-        "blame" => blame(ctx, args),
+        "status" | "diff" | "log" | "blame" => read_action_via_bash(&action, args),
         "stage" => stage(ctx, args, true),
         "unstage" => stage(ctx, args, false),
         "commit_message" => commit_message(ctx, config),
@@ -157,10 +149,79 @@ fn dispatch(ctx: &ToolContext, config: &GitConfig, args: &Value) -> ToolResult {
         other => ToolResult::err(
             "invalid_args",
             format!(
-                "unknown git action {other:?}; use status, diff, log, blame, stage, unstage, commit_message, commit, branch, worktree or undo"
+                "unknown git action {other:?}; use stage, unstage, commit_message, commit, branch, worktree or undo. For status, diff, log, or blame use bash with the git command."
             ),
         ),
     }
+}
+
+/// The `bash` command that replaces a read action this tool no longer runs.
+/// `None` for actions the tool still gates.
+pub fn read_command(action: &str, args: &Value) -> Option<String> {
+    let path = optional_str(args, "path");
+    let command = match action {
+        "status" => "git status --short".to_string(),
+        "diff" => {
+            let mut parts = vec!["git diff".to_string()];
+            if optional_bool(args, "staged").unwrap_or(false) {
+                parts.push("--staged".into());
+            }
+            if optional_bool(args, "stat").unwrap_or(false) {
+                parts.push("--stat".into());
+            }
+            if let Some(path) = &path {
+                parts.push("--".into());
+                parts.push(path.clone());
+            }
+            parts.join(" ")
+        }
+        "log" => {
+            let count = args
+                .get("count")
+                .and_then(Value::as_u64)
+                .unwrap_or(20)
+                .clamp(1, 200);
+            let mut command = format!("git log --oneline -n {count}");
+            if let Some(path) = &path {
+                command.push_str(" -- ");
+                command.push_str(path);
+            }
+            command
+        }
+        "blame" => {
+            let start = args.get("start").and_then(Value::as_u64);
+            let end = args.get("end").and_then(Value::as_u64);
+            let range = match (start, end) {
+                (Some(start), Some(end)) => Some(format!("{start},{end}")),
+                (Some(start), None) => Some(format!("{start},+40")),
+                (None, Some(end)) => Some(format!("1,{end}")),
+                (None, None) => None,
+            };
+            let mut command = "git blame".to_string();
+            if let Some(range) = range {
+                command.push_str(&format!(" -L {range}"));
+            }
+            command.push(' ');
+            command.push_str(path.as_deref().unwrap_or("PATH"));
+            command
+        }
+        _ => return None,
+    };
+    Some(command)
+}
+
+/// `git status|diff|log|blame` are plain reads the model can run through
+/// `bash`; the error names the exact command so the next call is right.
+fn read_action_via_bash(action: &str, args: &Value) -> ToolResult {
+    let Some(command) = read_command(action, args) else {
+        return ToolResult::err("invalid_args", format!("unknown git action {action:?}"));
+    };
+    ToolResult::err(
+        "GIT_READ_VIA_BASH",
+        format!(
+            "git {action} is not an action of this tool; it is a plain read, so run it through bash, for example {{\"command\":\"{command}\"}}. This tool keeps the gated actions: stage, unstage, commit_message, commit, branch, worktree, undo."
+        ),
+    )
 }
 
 fn read_only_mode(ctx: &ToolContext) -> bool {
@@ -432,46 +493,6 @@ fn enclosing_repo(cwd: &Path) -> Option<PathBuf> {
     (top != root).then_some(top)
 }
 
-/// Reject a diff/log/blame path that resolves outside the session root.
-fn ensure_inside_root(ctx: &ToolContext, raw: &str) -> Result<(), ToolResult> {
-    // A leading `:` is pathspec magic (`:/`, `:(top)`), which git resolves
-    // from the repository top rather than the session root.
-    if raw.trim_start().starts_with(':') {
-        return Err(ToolResult::err(
-            "GIT_OUTSIDE_WORKSPACE",
-            format!(
-                "{raw} is a git pathspec with magic; pass a plain path under the session root {}",
-                ctx.cwd.display()
-            ),
-        ));
-    }
-    let resolved = super::normalize(&ctx.resolve(raw)?);
-    let root = ctx.cwd.canonicalize().unwrap_or_else(|_| ctx.cwd.clone());
-    if !resolved.starts_with(&root) && !resolved.starts_with(&ctx.cwd) {
-        return Err(ToolResult::err(
-            "GIT_OUTSIDE_WORKSPACE",
-            format!(
-                "{raw} is outside the session root {}; git actions only touch files under it",
-                ctx.cwd.display()
-            ),
-        ));
-    }
-    Ok(())
-}
-
-/// Whether a status path leaves the session root: absolute, or through `..`.
-fn path_escapes(path: &str) -> bool {
-    let path = path.trim().trim_matches('"');
-    Path::new(path).is_absolute() || path.split('/').any(|part| part == "..")
-}
-
-fn status_line_escapes(line: &str) -> bool {
-    let Some(rest) = line.get(3..) else {
-        return false;
-    };
-    rest.split(" -> ").any(path_escapes)
-}
-
 pub fn head(cwd: &Path) -> Option<String> {
     git_line(cwd, &["rev-parse", "--verify", "--quiet", "HEAD"])
 }
@@ -529,143 +550,6 @@ fn staged_fingerprint(cwd: &Path) -> String {
 
 fn ok_with_session(content: String, entries: Vec<Value>) -> ToolResult {
     ToolResult::ok(content).with_details(json!({ "session": entries }))
-}
-
-// ---------------------------------------------------------------------------
-// Read-only actions
-
-fn status(ctx: &ToolContext) -> ToolResult {
-    // `-- .` keeps the enclosing repository's changes out of a workspace that
-    // has no repository of its own; the filter drops any path that still
-    // leaves the session root (a rename or a pathspec edge case).
-    let run = git(&ctx.cwd, &["status", "--short", "--branch", "--", "."]);
-    if !run.ok {
-        return ToolResult::err("GIT_FAILED", run.error());
-    }
-    let text = run
-        .stdout
-        .lines()
-        .filter(|line| !status_line_escapes(line))
-        .collect::<Vec<_>>()
-        .join("\n");
-    if text.lines().count() <= 1 {
-        return ToolResult::ok(format!("{text}\nworking tree clean"));
-    }
-    ToolResult::ok(text)
-}
-
-fn diff(ctx: &ToolContext, args: &Value) -> ToolResult {
-    let mut argv = vec![
-        "diff",
-        "--no-color",
-        "--relative",
-        "--src-prefix=a/",
-        "--dst-prefix=b/",
-    ];
-    if optional_bool(args, "staged").unwrap_or(false) {
-        argv.push("--cached");
-    }
-    if optional_bool(args, "stat").unwrap_or(false) {
-        argv.push("--stat");
-    }
-    let path = optional_str(args, "path");
-    if let Some(path) = &path {
-        if let Err(err) = ensure_inside_root(ctx, path) {
-            return err;
-        }
-        argv.push("--");
-        argv.push(path);
-    } else {
-        argv.push("--");
-        argv.push(".");
-    }
-    let run = git(&ctx.cwd, &argv);
-    if !run.ok {
-        return ToolResult::err("GIT_FAILED", run.error());
-    }
-    if run.stdout.trim().is_empty() {
-        let which = if argv.contains(&"--cached") {
-            "nothing is staged"
-        } else {
-            "no unstaged changes"
-        };
-        return ToolResult::ok(format!("{which} (try staged: true, or git status)"));
-    }
-    ToolResult::ok(run.stdout)
-}
-
-fn log(ctx: &ToolContext, args: &Value) -> ToolResult {
-    let count = args
-        .get("count")
-        .and_then(Value::as_u64)
-        .unwrap_or(20)
-        .clamp(1, 200)
-        .to_string();
-    let mut argv = vec![
-        "log",
-        "--no-color",
-        "--date=short",
-        "--format=%h %ad %an%d %s",
-        "-n",
-        &count,
-    ];
-    let path = optional_str(args, "path");
-    if let Some(path) = &path {
-        if let Err(err) = ensure_inside_root(ctx, path) {
-            return err;
-        }
-        argv.push("--");
-        argv.push(path);
-    } else if enclosing_repo(&ctx.cwd).is_some() {
-        // A path-limited log skips commits that touch nothing under the root;
-        // at the root itself the unfiltered history is the same and keeps
-        // empty commits visible.
-        argv.push("--");
-        argv.push(".");
-    }
-    let run = git(&ctx.cwd, &argv);
-    if !run.ok {
-        if head(&ctx.cwd).is_none() {
-            return ToolResult::ok("no commits yet");
-        }
-        return ToolResult::err("GIT_FAILED", run.error());
-    }
-    ToolResult::ok(run.stdout)
-}
-
-fn blame(ctx: &ToolContext, args: &Value) -> ToolResult {
-    let Some(path) = optional_str(args, "path") else {
-        return ToolResult::err(
-            "missing_argument",
-            "blame needs path, for example {\"action\":\"blame\",\"path\":\"src/main.rs\",\"start\":10,\"end\":40}",
-        );
-    };
-    if let Err(err) = ensure_inside_root(ctx, &path) {
-        return err;
-    }
-    let start = args.get("start").and_then(Value::as_u64);
-    let end = args.get("end").and_then(Value::as_u64);
-    let range = match (start, end) {
-        (Some(start), Some(end)) if end >= start => Some(format!("{start},{end}")),
-        (Some(start), None) => Some(format!("{start},+40")),
-        (None, Some(end)) => Some(format!("1,{end}")),
-        (Some(_), Some(_)) => {
-            return ToolResult::err("invalid_args", "blame end must be at or after start");
-        }
-        (None, None) => None,
-    };
-    let mut argv = vec!["blame", "--date=short"];
-    if let Some(range) = &range {
-        argv.push("-L");
-        argv.push(range);
-    }
-    argv.push("--");
-    argv.push(&path);
-    let run = git(&ctx.cwd, &argv);
-    if !run.ok {
-        return ToolResult::err("GIT_FAILED", run.error());
-    }
-    ToolResult::ok(run.stdout)
 }
 
 // ---------------------------------------------------------------------------
@@ -2350,6 +2234,8 @@ mod tests {
     fn read_only_sandbox_keeps_git_read_only() {
         let dir = tempfile::tempdir().unwrap();
         repo(dir.path());
+        std::fs::write(dir.path().join("x.txt"), "x\n").unwrap();
+        assert!(git(dir.path(), &["add", "x.txt"]).ok);
         let mut ctx = test_context(dir.path());
         let Ok(sandbox) =
             crate::sandbox::Sandbox::new(SandboxMode::ReadOnly, dir.path().to_path_buf())
@@ -2364,7 +2250,7 @@ mod tests {
             "{}",
             staged.content
         );
-        let status = call(&ctx, &config, json!({"action":"status"}));
-        assert!(!status.is_error, "{}", status.content);
+        let commit_message = call(&ctx, &config, json!({"action":"commit_message"}));
+        assert!(!commit_message.is_error, "{}", commit_message.content);
     }
 }

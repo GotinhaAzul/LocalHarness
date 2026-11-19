@@ -10,7 +10,7 @@ makes the failing behavior correct, not a change that silences the assertion.
 
 ## 1. Reproduce
 
-- Run the exact failing test with `test` (`{"path":"tests/foo.rs","test":"name"}`).
+- Run the exact failing test with `verify` (`{"path":"tests/foo.rs","test":"name"}`).
   If you do not know the file, use `bash` with the project's test command.
 - Copy the first error verbatim into your notes: test name, file and line,
   expected value, actual value, panic or assertion text.
@@ -45,7 +45,7 @@ worked.
 
 ## 4. The smallest fix
 
-- Read the file before `edit` or `patch`; the harness refuses edits to unread
+- Read the file before `edit`; the harness refuses edits to unread
   files for a reason.
 - Change the fewest lines that make the diagnosed cause impossible.
 - Keep the test's intent. If the test is wrong, fix the test and cite the

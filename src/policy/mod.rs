@@ -181,8 +181,10 @@ fn strip_line_range(path: &str) -> &str {
 const SESSION_TOOLS: &[&str] = &["todo", "thread", "finding"];
 /// File tools that `accept-edits` runs unasked.
 const EDIT_TOOLS: &[&str] = &["write", "edit", "patch", "undo"];
-/// `git` tool actions that only read.
-const GIT_READ_ACTIONS: &[&str] = &["status", "diff", "log", "blame", "commit_message"];
+/// `git` tool actions that only read. `branch` and `worktree` read in their
+/// `op = "list"` form. `status`, `diff`, `log`, and `blame` go through
+/// `bash`, whose command classifier marks them read-only.
+const GIT_READ_ACTIONS: &[&str] = &["commit_message"];
 /// Mutating tools kept visible in plan mode; each call is checked instead.
 const PLAN_CHECKED_TOOLS: &[&str] = &["todo", "bash", "git"];
 

@@ -376,10 +376,13 @@ fn build_core_in_mode(
         Policy::compile(&config.permissions.rules).unwrap(),
         mode,
     ));
-    let mut selected = registry.select(config.profile(), &[]).unwrap();
+    let (_, model_profile) = config.model_profile();
+    let selection = registry
+        .select_for(config.profile(), model_profile.edit_mode, &[])
+        .unwrap();
+    let mut selected = selection.tools;
     selected.extend(extra);
     let selected = permissions.filter_tools(selected, &registry);
-    let (_, model_profile) = config.model_profile();
     let tool_specs = ToolRegistry::specs_with(&selected, model_profile.short_tool_schemas());
     let budget = TokenBudget::new(config.context_window(), config.model.max_output_tokens);
     let tool_specs_json = totality::provider::tools_json(&tool_specs);
@@ -2913,6 +2916,210 @@ async fn verify_gate_runs_configured_steps_and_review_settles() {
     assert_eq!(
         verify.payload.get("passed").and_then(|v| v.as_bool()),
         Some(true)
+    );
+}
+
+#[tokio::test]
+async fn a_text_mode_patch_call_from_an_older_model_runs_edit() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+    let harness = harness(
+        dir.path(),
+        vec![
+            tool_script("read", json!({"path": "a.txt"})),
+            tool_script(
+                "patch",
+                json!({"path": "a.txt", "anchor": "one", "replacement": "two"}),
+            ),
+            text_script("done"),
+        ],
+        &["read", "edit", "write"],
+    );
+    let (outcome, _) = run(&harness, "rename one to two").await;
+    assert_eq!(outcome.status, TurnStatus::Done, "{:?}", outcome.error);
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+        "two\n"
+    );
+    let results = tool_results(&harness.session);
+    assert_eq!(results.len(), 2, "{results:#?}");
+    assert!(results[1].contains("edited a.txt"), "{}", results[1]);
+    assert!(
+        results[1].contains("\"patch\" is not a tool here; ran edit"),
+        "the repair note must name the canonical tool: {}",
+        results[1]
+    );
+}
+
+#[tokio::test]
+async fn a_routed_patch_call_still_needs_a_read_first() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+    let harness = harness(
+        dir.path(),
+        vec![
+            tool_script(
+                "patch",
+                json!({"path": "a.txt", "anchor": "one", "replacement": "two"}),
+            ),
+            text_script("blocked"),
+        ],
+        &["read", "edit", "write"],
+    );
+    let (outcome, _) = run(&harness, "edit without reading").await;
+    assert_eq!(outcome.status, TurnStatus::Done, "{:?}", outcome.error);
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+        "one\n"
+    );
+    let result = last_tool_result(&harness.session);
+    assert!(result.contains("READ_FIRST"), "{result}");
+}
+
+/// The Python interpreter that `verify`'s unittest runner would use, if any.
+fn python_available() -> bool {
+    std::process::Command::new("python3")
+        .arg("--version")
+        .output()
+        .is_ok_and(|out| out.status.success())
+}
+
+#[tokio::test]
+async fn a_test_call_from_an_older_model_runs_verify_with_a_target() {
+    if !python_available() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("test_x.py"),
+        "import unittest\n\nclass T(unittest.TestCase):\n    def test_ok(self):\n        self.assertEqual(1, 1)\n",
+    )
+    .unwrap();
+    let harness = harness(
+        dir.path(),
+        vec![
+            tool_script("test", json!({"path": "test_x.py"})),
+            text_script("passed"),
+        ],
+        &["read", "verify"],
+    );
+    let (outcome, _) = run(&harness, "run the one test").await;
+    assert_eq!(outcome.status, TurnStatus::Done, "{:?}", outcome.error);
+    let results = tool_results(&harness.session);
+    assert_eq!(results.len(), 1, "{results:#?}");
+    assert!(results[0].contains("PASS"), "{}", results[0]);
+    assert!(
+        results[0].contains("\"test\" is not a tool here; ran verify"),
+        "the repair note must name the canonical tool: {}",
+        results[0]
+    );
+    let session = harness.session.lock().unwrap();
+    let entry = session
+        .branch_entries()
+        .iter()
+        .find_map(|entry| match &entry.kind {
+            EntryKind::Custom(custom) if custom.kind == "verify-result" => Some(custom),
+            _ => None,
+        })
+        .expect("targeted run records a verify-result");
+    assert_eq!(
+        entry.payload.get("targeted").and_then(|v| v.as_bool()),
+        Some(true)
+    );
+    assert_eq!(
+        entry.payload.get("passed").and_then(|v| v.as_bool()),
+        Some(true)
+    );
+}
+
+#[tokio::test]
+async fn a_targeted_verify_does_not_clear_the_project_verify_gate() {
+    if !python_available() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+    std::fs::write(
+        dir.path().join("test_x.py"),
+        "import unittest\n\nclass T(unittest.TestCase):\n    def test_ok(self):\n        self.assertEqual(1, 1)\n",
+    )
+    .unwrap();
+    let mut config = base_config();
+    config.budgets.verify_attempts = 1;
+    config.profiles.get_mut("test").expect("test profile").tools =
+        ["write", "verify"].iter().map(|s| s.to_string()).collect();
+    config.verify = VerifyConfig {
+        steps: vec![VerifyStep {
+            name: "noop".into(),
+            command: vec!["true".into()],
+            timeout_secs: 5,
+        }],
+        ..Default::default()
+    };
+    let harness = harness_config(
+        dir.path(),
+        vec![
+            tool_script("write", json!({"path":"b.txt","content":"two\n"})),
+            tool_script("verify", json!({"path": "test_x.py"})),
+            text_script("done"),
+            text_script("still done"),
+        ],
+        config,
+    );
+    let (outcome, _) = run(&harness, "change a file and run one test").await;
+    assert_eq!(outcome.status, TurnStatus::Done, "{:?}", outcome.error);
+    // The targeted run is not a project verify, so the settle gate asks again.
+    assert_eq!(harness.provider.requests.lock().unwrap().len(), 4);
+    let session = harness.session.lock().unwrap();
+    assert!(
+        session.branch_entries().iter().any(|entry| {
+            matches!(&entry.kind, EntryKind::User(user) if user.content.contains("verify gate"))
+        }),
+        "the verify gate must still ask for the configured steps"
+    );
+    let project_verify = session.branch_entries().iter().any(|entry| {
+        if let EntryKind::Custom(custom) = &entry.kind {
+            custom.kind == "verify-result"
+                && custom.payload.get("targeted").and_then(|v| v.as_bool()) != Some(true)
+        } else {
+            false
+        }
+    });
+    assert!(
+        !project_verify,
+        "a targeted run must not record a project verify"
+    );
+}
+
+#[tokio::test]
+async fn git_status_through_the_tool_points_at_the_bash_command() {
+    if !std::process::Command::new("git")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+    {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    git(dir.path(), &["init", "-q"]);
+    std::fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+    let harness = harness(
+        dir.path(),
+        vec![
+            tool_script("git", json!({"action": "status"})),
+            text_script("done"),
+        ],
+        &["git"],
+    );
+    let (outcome, _) = run(&harness, "show the status").await;
+    assert_eq!(outcome.status, TurnStatus::Done, "{:?}", outcome.error);
+    let result = last_tool_result(&harness.session);
+    assert!(result.contains("GIT_READ_VIA_BASH"), "{result}");
+    assert!(
+        result.contains("{\"command\":\"git status --short\"}"),
+        "{result}"
     );
 }
 

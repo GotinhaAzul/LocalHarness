@@ -559,7 +559,9 @@ pub fn state_block(
             {
                 changed.push(path.to_string());
             }
-            if custom.kind == "verify-result" {
+            if custom.kind == "verify-result"
+                && crate::session::Session::counts_as_project_verify(&custom.payload)
+            {
                 let passed = custom
                     .payload
                     .get("passed")

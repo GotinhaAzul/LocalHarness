@@ -169,7 +169,7 @@ matches. A deny rule always wins. The mode never widens a harness gate
 | `permission_mode` | Runs | Denied |
 | --- | --- | --- |
 | `normal` (default; alias `ask`) | built-in read-only tools (`read`, `grep`, `glob`, `repo_map`, `recall`, `review`, `lsp`, `skill`, `todo`, `thread`), plus any call an allow rule names | everything else |
-| `accept-edits` | the above plus `write`, `edit`, `patch`, `undo` | `bash`, `bg`, `verify`, `test`, MCP and external tools |
+| `accept-edits` | the above plus `write`, `edit`, `patch`, `undo` | `bash`, `bg`, `verify`, MCP and external tools |
 | `deny-all` (alias `dont-ask`) | same as `normal` over HTTP | same as `normal` |
 | `yolo` | every call the harness gates allow; needs `tot serve --allow-yolo` | nothing beyond the gates |
 

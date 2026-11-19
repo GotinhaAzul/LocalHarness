@@ -695,9 +695,11 @@ pub async fn select_tools(
         }
         true
     });
-    let mut tools = registry
-        .select(&profile, &pool)
+    let selection = registry
+        .select_for(&profile, config.model_profile().1.edit_mode, &pool)
         .map_err(anyhow::Error::msg)?;
+    warnings.extend(selection.warnings);
+    let mut tools = selection.tools;
     let mut push = |tool: &Arc<dyn crate::tools::Tool>| {
         if !tools.iter().any(|t| t.name() == tool.name()) {
             tools.push(tool.clone());

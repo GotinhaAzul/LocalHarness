@@ -43,7 +43,7 @@ message, or a scanner hit. A finding is confirmed only by a reproducible PoC:
 5. Re-read the guard before claiming a bypass. If the check covers the value
    actually used, drop the finding. Recognizing safe code is part of the job.
 
-Use `test` for a regression that encodes the proof, `review` for a source-level
+Use `verify` with a `test` target for a regression that encodes the proof, `review` for a source-level
 second opinion, `bash` for bounded local probes, `surface` to record reachable
 assets, and `evidence` to attach captured artifacts.
 

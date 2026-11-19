@@ -3,4 +3,4 @@ description = "Change an existing repository safely: orient, plan, small edits, 
 profile = "coding"
 prompt = "prompts/coding.md"
 skills = []
-tools = ["read", "write", "edit", "patch", "undo", "bash", "bg", "grep", "glob", "todo", "verify", "recall", "thread", "repo_map", "lsp", "test", "review", "skill"]
+tools = ["read", "write", "edit", "patch", "undo", "bash", "bg", "grep", "glob", "todo", "verify", "recall", "thread", "repo_map", "lsp", "review", "skill"]

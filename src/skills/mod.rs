@@ -1427,7 +1427,7 @@ mod tests {
         ];
         let harness_tools = [
             "read", "write", "edit", "patch", "undo", "bash", "grep", "glob", "todo", "skill",
-            "verify", "recall", "thread", "bg", "repo_map", "lsp", "test", "review",
+            "verify", "recall", "thread", "bg", "repo_map", "lsp", "review",
         ];
         for name in CODING_PACK {
             let skill = index.get(name).unwrap();

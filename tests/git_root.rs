@@ -131,17 +131,58 @@ impl Fixture {
 }
 
 #[tokio::test]
-async fn status_hides_the_enclosing_repository() {
+async fn git_read_actions_name_the_bash_equivalent() {
     let Some(fixture) = Fixture::new() else {
         return;
     };
     let tool = GitTool::new(GitConfig::default());
 
     let status = tool.call(&fixture.ctx, json!({"action": "status"})).await;
-    assert!(!status.is_error, "{}", status.content);
-    assert!(status.content.contains("inside.md"), "{}", status.content);
-    assert!(!status.content.contains("unrelated"), "{}", status.content);
-    assert!(!status.content.contains("../"), "{}", status.content);
+    assert!(status.is_error, "{}", status.content);
+    assert!(
+        status.content.contains("GIT_READ_VIA_BASH"),
+        "{}",
+        status.content
+    );
+    assert!(
+        status.content.contains("git status --short"),
+        "{}",
+        status.content
+    );
+    assert!(status.content.contains("bash"), "{}", status.content);
+
+    let diff = tool
+        .call(&fixture.ctx, json!({"action": "diff", "staged": true}))
+        .await;
+    assert!(diff.is_error, "{}", diff.content);
+    assert!(
+        diff.content.contains("git diff --staged"),
+        "{}",
+        diff.content
+    );
+
+    let log = tool
+        .call(&fixture.ctx, json!({"action": "log", "count": 5}))
+        .await;
+    assert!(log.is_error, "{}", log.content);
+    assert!(
+        log.content.contains("git log --oneline -n 5"),
+        "{}",
+        log.content
+    );
+
+    let blame = tool
+        .call(
+            &fixture.ctx,
+            json!({"action": "blame", "path": "inside.md", "start": 1, "end": 3}),
+        )
+        .await;
+    assert!(blame.is_error, "{}", blame.content);
+    assert!(
+        blame.content.contains("git blame -L 1,3 inside.md"),
+        "{}",
+        blame.content
+    );
 }
 
 #[tokio::test]
@@ -198,7 +239,7 @@ async fn a_mutating_action_refuses_a_parent_repository() {
 }
 
 #[tokio::test]
-async fn a_read_action_rejects_a_path_outside_the_root() {
+async fn a_read_action_never_runs_git_and_points_at_bash() {
     let Some(fixture) = Fixture::new() else {
         return;
     };
@@ -212,15 +253,21 @@ async fn a_read_action_rejects_a_path_outside_the_root() {
         .await;
     assert!(diff.is_error, "{}", diff.content);
     assert!(
-        diff.content.contains("GIT_OUTSIDE_WORKSPACE"),
+        diff.content.contains("GIT_READ_VIA_BASH"),
         "{}",
         diff.content
     );
+    assert!(
+        diff.content.contains("git diff -- ../unrelated.md"),
+        "{}",
+        diff.content
+    );
+    // The tool itself ran nothing, so no repository output reached the model.
     assert!(!diff.content.contains("DIRTY"), "{}", diff.content);
 }
 
 #[tokio::test]
-async fn pathspec_magic_cannot_reach_the_parent_history() {
+async fn pathspec_magic_is_only_a_bash_concern_now() {
     let Some(fixture) = Fixture::new() else {
         return;
     };
@@ -230,13 +277,15 @@ async fn pathspec_magic_cannot_reach_the_parent_history() {
     );
     let tool = GitTool::new(GitConfig::default());
 
+    // The tool never runs a log, so a pathspec cannot reach the parent
+    // history; the error names the bash command instead.
     for path in [":/", ":(top)", ":/unrelated.md"] {
         let log = tool
             .call(&fixture.ctx, json!({"action": "log", "path": path}))
             .await;
         assert!(log.is_error, "{path}: {}", log.content);
         assert!(
-            log.content.contains("GIT_OUTSIDE_WORKSPACE"),
+            log.content.contains("GIT_READ_VIA_BASH"),
             "{path}: {}",
             log.content
         );

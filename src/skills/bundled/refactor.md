@@ -40,7 +40,7 @@ One move at a time:
 - delete now-dead code.
 
 For renames, ask `lsp` for `{"action":"references"}` and
-`{"action":"definition"}` at the symbol, then `read` and `patch` every site it
+`{"action":"definition"}` at the symbol, then `read` and `edit` every site it
 names. There is no rename action: enumeration plus explicit edits is what the
 harness can verify. Use `grep` to confirm no string-based or dynamic
 references remain.

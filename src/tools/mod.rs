@@ -1,4 +1,6 @@
 //! Built-in tool surface: 26 static tools in three packs, plus the registry.
+//! `patch` is the hash-anchored editor and is selected only when the model
+//! profile sets `edit_mode = "hash"`.
 
 pub mod attack_path;
 pub mod bash;
@@ -46,7 +48,7 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
-use crate::config::{ProfileConfig, VerifyConfig};
+use crate::config::{EditMode, ProfileConfig, VerifyConfig};
 use crate::paths::Paths;
 use crate::provider::ToolSpec;
 use crate::security::SecurityState;
@@ -538,6 +540,13 @@ pub struct ToolRegistry {
     repo: Arc<repo_map::RepoIndex>,
 }
 
+/// What a profile selects, plus compatibility warnings for names that are now
+/// an argument of another tool.
+pub struct Selection {
+    pub tools: Vec<Arc<dyn Tool>>,
+    pub warnings: Vec<String>,
+}
+
 impl ToolRegistry {
     pub fn new() -> Self {
         Self::default()
@@ -595,7 +604,6 @@ impl ToolRegistry {
             Arc::new(bg::BgTool),
             Arc::new(repo_map::RepoMapTool::new(repo)),
             Arc::new(lsp::LspTool::with_service(lsp)),
-            Arc::new(test::TestTool),
             Arc::new(review::ReviewTool),
             Arc::new(git::GitTool::default()),
             Arc::new(pr::PrTool::default()),
@@ -622,13 +630,30 @@ impl ToolRegistry {
         self.register(Arc::new(pr::PrTool::new(config.clone())));
     }
 
-    /// Resolve packs plus explicit tool names. Unknown names are errors that
-    /// name the available tools.
+    /// Resolve packs plus explicit tool names for the default text edit mode.
     pub fn select(
         &self,
         profile: &ProfileConfig,
         external: &[Arc<dyn Tool>],
     ) -> Result<Vec<Arc<dyn Tool>>, String> {
+        self.select_for(profile, EditMode::Text, external)
+            .map(|selection| selection.tools)
+    }
+
+    /// Resolve packs plus explicit tool names. Unknown names are errors that
+    /// name the available tools. `edit_mode` decides whether `patch` (the
+    /// hash-anchored editor) joins the surface.
+    ///
+    /// A profile that still lists `test`, or `patch` in text mode, loads with
+    /// a deprecation warning that names the replacement: `verify` with a
+    /// `path`/`test` target, and `edit` with `occurrence`.
+    pub fn select_for(
+        &self,
+        profile: &ProfileConfig,
+        edit_mode: EditMode,
+        external: &[Arc<dyn Tool>],
+    ) -> Result<Selection, String> {
+        let mut warnings: Vec<String> = Vec::new();
         let mut packs = Vec::new();
         for pack in &profile.packs {
             let pack = match pack.as_str() {
@@ -648,6 +673,7 @@ impl ToolRegistry {
             for tool in &self.tools {
                 if tool.pack() == pack
                     && !tool.opt_in()
+                    && !(tool.name() == "patch" && edit_mode != EditMode::Hash)
                     && !selected.iter().any(|t| t.name() == tool.name())
                 {
                     selected.push(tool.clone());
@@ -655,6 +681,23 @@ impl ToolRegistry {
             }
         }
         for name in &profile.tools {
+            let name = match name.as_str() {
+                "test" => {
+                    warnings.push(
+                        "tool `test` is deprecated; it is now `verify` with \"path\" or \"test\" for one file or test"
+                            .to_string(),
+                    );
+                    "verify"
+                }
+                "patch" if edit_mode != EditMode::Hash => {
+                    warnings.push(
+                        "tool `patch` is deprecated in text edit mode; use `edit` (pass \"occurrence\" to replace the nth match). `patch` stays available in hash edit mode"
+                            .to_string(),
+                    );
+                    "edit"
+                }
+                other => other,
+            };
             let found = self
                 .get(name)
                 .or_else(|| external.iter().find(|tool| tool.name() == name).cloned());
@@ -674,7 +717,10 @@ impl ToolRegistry {
                 }
             }
         }
-        Ok(selected)
+        Ok(Selection {
+            tools: selected,
+            warnings,
+        })
     }
 
     pub fn specs(tools: &[Arc<dyn Tool>]) -> Vec<ToolSpec> {
@@ -1027,7 +1073,7 @@ mod tests {
         let registry = ToolRegistry::builtin();
         assert_eq!(
             registry.names().len(),
-            27,
+            26,
             "update docs when the built-in surface changes: {:?}",
             registry.names()
         );
@@ -1048,6 +1094,46 @@ mod tests {
         assert!(registry.get("evidence").unwrap().read_only());
         assert!(registry.get("attack_path").unwrap().read_only());
         assert!(!registry.get("detect").unwrap().read_only());
+    }
+
+    #[test]
+    fn text_mode_selects_one_edit_tool_and_hash_mode_selects_patch() {
+        let registry = ToolRegistry::builtin();
+        let mut profile = ProfileConfig {
+            packs: vec!["core".into(), "coding".into()],
+            ..ProfileConfig::default()
+        };
+        let text = registry
+            .select_for(&profile, EditMode::Text, &[])
+            .expect("text selection");
+        let names: Vec<&str> = text.tools.iter().map(|tool| tool.name()).collect();
+        assert!(names.contains(&"edit"));
+        assert!(!names.contains(&"patch"), "{names:?}");
+        assert!(!names.contains(&"test"), "{names:?}");
+        assert!(text.warnings.is_empty());
+
+        let hash = registry
+            .select_for(&profile, EditMode::Hash, &[])
+            .expect("hash selection");
+        let names: Vec<&str> = hash.tools.iter().map(|tool| tool.name()).collect();
+        assert!(names.contains(&"patch"), "{names:?}");
+        assert!(names.contains(&"edit"), "{names:?}");
+        assert!(!names.contains(&"test"), "{names:?}");
+
+        // A profile that still names a removed tool loads and says what to
+        // use instead.
+        profile.tools = vec!["test".into(), "patch".into()];
+        let legacy = registry
+            .select_for(&profile, EditMode::Text, &[])
+            .expect("legacy profile loads");
+        let names: Vec<&str> = legacy.tools.iter().map(|tool| tool.name()).collect();
+        assert!(names.contains(&"verify"), "{names:?}");
+        assert!(names.contains(&"edit"), "{names:?}");
+        assert_eq!(legacy.warnings.len(), 2, "{:?}", legacy.warnings);
+        assert!(legacy.warnings[0].contains("`test` is deprecated"));
+        assert!(legacy.warnings[0].contains("`verify`"));
+        assert!(legacy.warnings[1].contains("`patch` is deprecated"));
+        assert!(legacy.warnings[1].contains("`edit`"));
     }
 
     /// The loop guard keeps its own name-and-action table; a tool that declares

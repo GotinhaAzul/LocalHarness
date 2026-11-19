@@ -12,7 +12,7 @@ use tokio::io::AsyncReadExt;
 use tokio::task::JoinHandle;
 
 use crate::config::VerifyStep;
-use crate::tools::{Tool, ToolContext, ToolPack, ToolResult, optional_str};
+use crate::tools::{Tool, ToolContext, ToolPack, ToolResult, optional_str, optional_u64};
 
 /// Combined stdout+stderr cap for one verify call.
 const OUTPUT_CAP_BYTES: usize = 1024 * 1024;
@@ -110,13 +110,16 @@ impl Tool for VerifyTool {
     }
 
     fn description(&self) -> &'static str {
-        "Run configured verification steps."
+        "Run configured verification steps, or one test file/test with path or test."
     }
 
     fn schema(&self) -> Value {
         crate::tools::object_schema(
             json!({
-                "step": {"type": "string", "description": "Run only this configured step (e.g. \"test\"); omit to run all."}
+                "step": {"type": "string", "description": "Run only this configured step (e.g. \"test\"); omit to run all."},
+                "path": {"type": "string", "description": "Run the detected runner for this test file instead of the configured steps."},
+                "test": {"type": "string", "description": "Test name filter for a targeted run."},
+                "timeout": {"type": "integer", "minimum": 1, "maximum": 600, "description": "Targeted run: seconds, default and maximum 600."}
             }),
             &[],
         )
@@ -131,6 +134,15 @@ impl Tool for VerifyTool {
     }
 
     async fn call(&self, ctx: &ToolContext, args: Value) -> ToolResult {
+        if args.get("path").is_some() || args.get("test").is_some() {
+            if args.get("step").is_some() {
+                return ToolResult::err(
+                    "invalid_args",
+                    "`step` selects a configured step; omit it when running one file or test with `path` or `test`",
+                );
+            }
+            return targeted(ctx, &args).await;
+        }
         if ctx.verify.steps.is_empty() {
             return no_verify_error(ctx);
         }
@@ -269,6 +281,46 @@ impl Tool for VerifyTool {
         // A failing verify still ran successfully as a tool; keep it a success
         // result so the verify-result entry is persisted for the settle gate.
         ToolResult::ok(content).with_details(details)
+    }
+}
+
+/// One test file or one test through the detected runner. The result carries a
+/// `verify-result` entry marked `targeted`, so the settle gate never reads it
+/// as a project verify.
+async fn targeted(ctx: &ToolContext, args: &Value) -> ToolResult {
+    let path = optional_str(args, "path");
+    let test = optional_str(args, "test");
+    let timeout = optional_u64(args, "timeout");
+    let result = crate::tools::test::run(ctx, path.as_deref(), test.as_deref(), timeout).await;
+    let ToolResult {
+        content,
+        is_error,
+        details,
+    } = result;
+    let passed = !is_error
+        && details
+            .as_ref()
+            .and_then(|details| details.get("exit_code"))
+            .and_then(Value::as_i64)
+            == Some(0);
+    let mut details = details.unwrap_or_else(|| json!({}));
+    if let Some(map) = details.as_object_mut() {
+        map.insert("targeted".into(), Value::Bool(true));
+        map.insert(
+            "session".into(),
+            json!([{
+                "kind": "verify-result",
+                "targeted": true,
+                "passed": passed,
+                "path": path,
+                "test": test,
+            }]),
+        );
+    }
+    ToolResult {
+        content,
+        is_error,
+        details: Some(details),
     }
 }
 
@@ -590,6 +642,55 @@ mod tests {
         assert!(!result.is_error, "{}", result.content);
         assert!(result.content.contains("PASS lint"), "{}", result.content);
         assert!(!result.content.contains("PASS unit"), "{}", result.content);
+    }
+
+    fn python_available() -> bool {
+        std::process::Command::new(crate::tools::project::python_program())
+            .arg("--version")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    #[tokio::test]
+    async fn a_targeted_run_is_marked_and_needs_no_configured_steps() {
+        if !python_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("test_x.py"),
+            "import unittest\n\nclass T(unittest.TestCase):\n    def test_ok(self):\n        self.assertEqual(1, 1)\n",
+        )
+        .unwrap();
+        let ctx = crate::tools::write::test_context(dir.path());
+        assert!(ctx.verify.steps.is_empty());
+        let result = VerifyTool.call(&ctx, json!({"path": "test_x.py"})).await;
+        assert!(!result.is_error, "{}", result.content);
+        assert!(result.content.starts_with("PASS"), "{}", result.content);
+        let details = result.details.as_ref().expect("details");
+        assert_eq!(details["targeted"], true);
+        let entry = &details["session"][0];
+        assert_eq!(entry["kind"], "verify-result");
+        assert_eq!(entry["targeted"], true);
+        assert_eq!(entry["passed"], true);
+        assert!(entry.get("tree").is_none(), "{entry}");
+    }
+
+    #[tokio::test]
+    async fn a_step_filter_and_a_target_are_mutually_exclusive() {
+        let (_dir, ctx) = test_ctx(vec![step("unit", "exit 0")]);
+        let result = VerifyTool
+            .call(&ctx, json!({"step": "unit", "path": "tests/x.rs"}))
+            .await;
+        assert!(result.is_error);
+        assert!(
+            result.content.starts_with("[invalid_args]"),
+            "{}",
+            result.content
+        );
     }
 
     #[tokio::test]

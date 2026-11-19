@@ -406,6 +406,7 @@ fn verify_status(branch: &[&Entry]) -> Option<(bool, usize)> {
     for (index, entry) in branch.iter().enumerate().rev() {
         if let EntryKind::Custom(custom) = &entry.kind
             && custom.kind == "verify-result"
+            && crate::session::Session::counts_as_project_verify(&custom.payload)
         {
             let passed = custom
                 .payload

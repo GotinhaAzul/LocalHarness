@@ -108,7 +108,7 @@ arbitrary directory. Launch `tot acp` in the project root (or pass
 
 Every tool call that can change files or run processes asks the client with
 `session/request_permission`: `write`, `edit`, `patch`, `undo`, `bash`, `bg`,
-`verify`, `test`, and external tools. Only the built-in read and session tools
+`verify`, and external tools. Only the built-in read and session tools
 (`read`, `grep`, `glob`, `repo_map`, `recall`, `review`, `lsp`, `skill`,
 `todo`, `thread`) run without a prompt; a tool that merely declares itself
 read-only, such as an MCP server, still asks.

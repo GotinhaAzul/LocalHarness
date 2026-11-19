@@ -211,8 +211,10 @@ pub fn analyze_turn_since(
                 "review-result" => facts.review_called = true,
                 "verify-result" => {
                     facts.verify_called = true;
-                    facts.last_verify_passed =
-                        custom.payload.get("passed").and_then(|v| v.as_bool());
+                    if crate::session::Session::counts_as_project_verify(&custom.payload) {
+                        facts.last_verify_passed =
+                            custom.payload.get("passed").and_then(|v| v.as_bool());
+                    }
                 }
                 _ => {}
             },
@@ -239,7 +241,9 @@ pub fn analyze_turn_since(
             if custom.kind == "fs-change" {
                 last_mutation = Some(index);
             }
-            if custom.kind == "verify-result" {
+            if custom.kind == "verify-result"
+                && crate::session::Session::counts_as_project_verify(&custom.payload)
+            {
                 last_verify = Some((
                     index,
                     custom

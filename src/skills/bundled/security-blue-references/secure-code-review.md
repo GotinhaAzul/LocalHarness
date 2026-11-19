@@ -19,7 +19,7 @@ effect without a correct control in between. Review the path, not the keyword.
    removes the class of bug, not just the example.
 
 Use `lsp` for definitions/references, `read` for the surrounding code, `review`
-for the diff, and `test` to prove the behavior. Do not report a vulnerability
+for the diff, and `verify` with a `path` or `test` target to prove the behavior. Do not report a vulnerability
 from a single grep hit.
 
 ## Checklist

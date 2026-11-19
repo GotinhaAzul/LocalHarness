@@ -77,7 +77,7 @@ rather than a test-only assertion or an intentional panic? Only then record it.
 2. Keep the change localized to the vulnerable boundary; do not refactor the
    subsystem or add speculative hardening elsewhere.
 3. Add a regression test or a sanitizer reproducer that fails before the fix.
-   Use `test`, or a bounded `bash` run of the reproducer in the project's test
+   Use `verify` with a `path` or `test` target, or a bounded `bash` run of the reproducer in the project's test
    harness.
 4. Run `review` on the diff and confirm the fix does not merely narrow the
    input for the known PoC.

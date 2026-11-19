@@ -320,10 +320,10 @@ observable.
 - Unwrap single-element arrays where the schema expects a scalar.
 - Map alias keys per tool, from the names other harnesses train models on:
   `file_path`/`file`/`filepath` to `path`, `cmd` to `command`,
-  `old_string`/`oldText` to `edit.old` or `patch.anchor`, `new_string`/`newText`
-  to `edit.new` or `patch.replacement`, `query`/`regex` to `grep.pattern`, and
-  similar. An alias applies only when the tool declares the canonical key, and
-  never overwrites a canonical key the model also sent.
+  `old_string`/`oldText` to `edit.old`, `new_string`/`newText` to `edit.new`,
+  `query`/`regex` to `grep.pattern`, and similar. An alias applies only when
+  the tool declares the canonical key, and never overwrites a canonical key
+  the model also sent.
 - Fold enum values: case, surrounding space, and `_` vs `-` are ignored, and a
   few synonyms are accepted (`complete` for `todo` `done`, `kill` for `bg`
   `stop`).
@@ -340,8 +340,11 @@ observable.
 - Resolve tool names before any gate runs: strip `functions.` / `default_api:`
   prefixes and case drift, and route unambiguous foreign names (`read_file`,
   `str_replace`, `shell`, `run_command`, ...) to the active tool with a note
-  naming the canonical tool. Gates see the canonical name, so routing never
-  bypasses the read or scope gates.
+  naming the canonical tool. Names that are now an argument of another tool
+  route too: a text-mode `patch` call (`anchor`/`replacement`/`occurrence`)
+  becomes `edit` (`old`/`new`/`occurrence`), and `test` becomes `verify` with
+  its `path`/`test` target. Arguments are renamed as part of the route. Gates
+  see the canonical name, so routing never bypasses the read or scope gates.
 - Reject any other unknown tool with
   `unknown tool "<name>"; did you mean <nearest>? active tools: ...`.
 - On failure, return `is_error: true` with a prescriptive message, never a
@@ -355,7 +358,7 @@ observable.
 | Read-before-edit | `edit`/`patch` on an existing file require a prior `read` with a matching stat stamp (`mtime`, size). `write` also requires full-line coverage of the existing file, or an explicit `overwrite: true`; a result capped by the result or batch limit marks coverage incomplete. A changed file requires a re-read. Creation is allowed. A successful `edit`/`patch`/`write` re-stamps only the file it wrote, so consecutive edits need no re-read while any outside change still does. |
 | Scope gate | Security-sensitive commands are checked against the user-set engagement scope. No scope blocks with `SEC_SCOPE` and the `/sec scope add` call. Best-effort, not a sandbox. |
 | Sandbox | When `--sandbox` is set, `bash` and `bg` run in a bubblewrap namespace (or the Landlock fallback): read-only root, hidden `$HOME`, private `/tmp`, no network, and `.git` read-only in `workspace-write`. Startup fails closed when no backend exists; a per-command wrap failure returns `SANDBOX_UNAVAILABLE`. Commands never fall back to an unsandboxed run. |
-| Loop guard | Signature is tool name plus canonical arguments. Four identical calls in a row, or an exact 2-8 call cycle repeated four times, blocks the call and ends the turn with a recovery instruction and the `stalled` status (exit code 2 from `tot -p`, never a successful workflow step). A file change or a passing verification clears the history, so long multi-step work does not trip it. A read-only call (a read-only tool, a reading action such as `bg logs`, `todo list`, `pr checks`, `git status` or `git branch op = "list"`, or a bash command that only reads) is recorded in the history but never trips it: the same poll can carry new output every time, and a read with the same output is caught by the stall guard. No automatic session replacement in v1. |
+| Loop guard | Signature is tool name plus canonical arguments. Four identical calls in a row, or an exact 2-8 call cycle repeated four times, blocks the call and ends the turn with a recovery instruction and the `stalled` status (exit code 2 from `tot -p`, never a successful workflow step). A file change or a passing verification clears the history, so long multi-step work does not trip it. A read-only call (a read-only tool, a reading action such as `bg logs`, `todo list`, `pr checks`, `git commit_message` or `git branch op = "list"`, or a bash command that only reads) is recorded in the history but never trips it: the same poll can carry new output every time, and a read with the same output is caught by the stall guard. No automatic session replacement in v1. |
 | Interactive command guard | Blocks `vim`, `less`, `top`, `htop`, `watch`, `nano`, `ssh` without a command, and similar TTY-only invocations. |
 | Budget checkpoint | Tool calls, model calls, and wall clock are checked at 120 calls, 40 model calls, and 30 minutes. The wall clock is measured, not fixed: the allowance is at least six model calls at the slowest of the last five measured calls, and "recent progress" means within half of it or three such calls, so a slow engine or a long thinking model is never stopped for being slow. A checkpoint that finds a new result, a file change, or a passing verify within the last `stall_calls` calls renews the allowance and the turn continues. The first checkpoint with no recent progress in a turn skips the pending batch, tells the model to drop the repeating approach (write a script, use another tool), and grants one more allowance; the second ends the turn with a tool-less summary and reports why. |
 | Stall | Twelve consecutive calls with no new result fingerprint, no file change, and no successful verify. Ends the turn with the last known state. |
@@ -499,7 +502,7 @@ usable_prompt = context_window - max_output_tokens - safety_margin
   line boundary.
 - Larger output is written to an artifact under the session's artifact
   directory. The tool result contains a short preview plus `[out-N]` and the
-  artifact size. Command tools (`bash`, `bg`, `test`, `verify`) preview the
+  artifact size. Command tools (`bash`, `bg`, `verify`) preview the
   first and the last lines, where errors and summaries land, and name the
   omitted range: `… 380 lines omitted (12-391); recall out-3 12-131 …`.
   Other tools preview the start, cut at a line boundary, and name the first
@@ -812,29 +815,30 @@ pre-0.3 `localharness` while that is the only one of the two present
 
 ### 6.1 Built-in tool surface
 
-Twenty-seven tools. Static per model call. The default `coding` profile includes
-core and coding; `full` adds the security pack.
+Twenty-six tools. Static per model call. The default `coding` profile includes
+core and coding; `full` adds the security pack. `patch` joins the surface only
+when the model profile sets `edit_mode = "hash"`; in text mode the one edit tool
+is `edit`.
 
 | Pack | Tool | Purpose |
 |---|---|---|
 | Core | `read` | Read a file with line numbers; `paths` for up to six files or ranges, `symbol` for one declaration |
 | Core | `write` | Create or replace a file |
-| Core | `edit` | Exact-text replacement |
-| Core | `patch` | Exact-anchor edit by default; hash mode takes line anchors with recovery diagnostics |
+| Core | `edit` | Exact-text replacement; `occurrence` picks one match |
+| Core | `patch` | Hash mode only: line anchors with recovery diagnostics |
 | Core | `undo` | Revert the last harness change to a file, one step per call |
 | Core | `bash` | Non-interactive command with timeout |
 | Core | `grep` | Regex search with context, gitignore-aware (hidden paths only when named) |
 | Core | `glob` | File discovery |
 | Core | `todo` | Plan and task state, verify-gated |
-| Core | `verify` | Run project verification steps |
+| Core | `verify` | Run project steps, or one test file/test with `path`/`test` |
 | Core | `recall` | Read archived tool output |
 | Core | `thread` | Split, note, close, status |
 | Core | `bg` | Background process start/status/logs/stop |
 | Coding | `lsp` | outline, definition, references, diagnostics, hover |
 | Coding | `repo_map` | Cached file and symbol outline |
-| Coding | `test` | One file or one test; first failure only |
 | Coding | `review` | Working-tree stats, risks, hunks |
-| Coding | `git` | status, diff, log, blame, stage, commit (preview gate), branch, worktree, undo |
+| Coding | `git` | stage, unstage, commit_message, commit (preview gate), branch, worktree, undo; reads go through `bash` |
 | Coding | `pr` | Draft PR (preview and verify gates), CI checks, review, comment via `gh` |
 | Security | `surface` | Read hosts, ports, services, URLs, technologies |
 | Security | `evidence` | List, show, verify the evidence chain |
@@ -883,7 +887,8 @@ form. `tot doctor` prints both sizes.
   checked before a single atomic write; any mismatch returns `STALE_ANCHOR`
   with fresh anchors and writes nothing. A successful patch returns fresh
   anchors for the changed lines, and untouched lines keep their bytes and line
-  endings. Text-mode `patch` and `edit` are unchanged.
+  endings. `patch` is selected only in hash edit mode; exact-text edits use
+  `edit`.
 - `write` and `edit` are atomic (temp file plus rename) and record `fs-change`.
 - `edit`, exact-text `patch`, and `write` pass new content through the
   project's formatter (`[format] on_edit`) when the file was already
@@ -891,7 +896,9 @@ form. `tot doctor` prints both sizes.
   what landed. Hash-mode `patch` is not formatted.
 - `edit` preflight handles: multiple matches (list line numbers), whitespace-
   only match (show the verbatim excerpt), and no match (show the closest
-  window). It never blocks an edit that would succeed. When the exact text is
+  window). `occurrence` (1-based) replaces one named match and cannot be
+  combined with `replace_all`; one is a count, the other a target. It never
+  blocks an edit that would succeed. When the exact text is
   absent, `edit` and `patch` try lossless fallbacks in order: LF text against a
   CRLF file, a `read` line-number gutter copied into the text, and trailing
   whitespace drift on whole lines when exactly one window fits. The result says
@@ -929,8 +936,13 @@ form. `tot doctor` prints both sizes.
   derived evidence. The final task requires a fresh passing `verify` when
   verification is configured.
 - `verify` runs configured steps sequentially without a shell, caps combined
-  output at 1 MiB, and returns a compact pass/fail summary. It records
-  `verify-result`. With no steps configured, `tot verify [--init]` shows or
+  output at 1 MiB, and returns a compact pass/fail summary. With `path` or
+  `test` it instead runs the detected runner for one file or test and returns
+  the first failure, capped at 2500 characters. Its `verify-result` entry
+  marks a targeted run `targeted: true`, and every consumer of that entry
+  (`gates`, the state block, `pr draft`, workflow conditions, `thread`) treats
+  it as not a project verify, so it never clears the verify gate or satisfies
+  the final todo task. With no steps configured, `tot verify [--init]` shows or
   saves the steps detected from manifest files, and `/verify [accept]` does
   the same in the TUI; nothing from the repository runs before the user
   accepts. Accepted steps live in `verify-steps.json` in the user data
@@ -972,9 +984,8 @@ form. `tot doctor` prints both sizes.
   pre-edit bytes and returns `EDIT_REGRESSION` with a fix hint. Pre-existing
   errors are suppressed, and a clean, cold, or non-project edit adds no text.
   The check never starts a cold server and caps its warm wait at 250 ms.
-- `test` detects vitest, jest, go, cargo, pytest, Python unittest, or an npm
-  test script. It runs one file or one test and returns only the first failure,
-  capped at 2500 characters. Parsers strip ANSI and progress noise.
+- A targeted `verify` detects vitest, jest, go, cargo, pytest, Python unittest,
+  or an npm test script. Parsers strip ANSI and progress noise.
 - `review` reads `git status --porcelain=v1 -z`, numstat, and the diff. It scans
   added lines for secrets, debug statements, TODOs, lockfiles, config files,
   deletion-heavy changes, binary files, and source changes whose module has no
@@ -1026,19 +1037,21 @@ form. `tot doctor` prints both sizes.
 
 `git` and `pr` (coding pack) replace improvised `git`/`gh` in `bash`:
 
-- The session root is the boundary. When it sits inside a larger work tree (a
-  workspace with no `.git` of its own), `status`, `diff`, `log`, `blame` and
-  `commit_message` are scoped to it and paths that leave it are dropped or
-  refused; `stage`, `unstage`, `commit`, `undo`, and `branch`/`worktree`
-  creation, switching or removal return `GIT_REPO_OUTSIDE_ROOT`, `/commit`
-  and `pr draft` refuse for the same reason, and nothing changes. Paths that
-  start with `:` (git pathspec magic such as `:/`) are refused, since git
-  resolves them from the repository top. `branch list` and
+- `status`, `diff`, `log`, and `blame` are not `git` actions: they are plain
+  reads the model runs through `bash`, where the command classifier marks them
+  read-only. A call to one of them returns `GIT_READ_VIA_BASH` and names the
+  equivalent command (`git status --short`, `git diff`, `git log --oneline -n
+  20`, `git blame -L a,b path`), so the next call is right.
+- The session root is the boundary for the actions that remain. When it sits
+  inside a larger work tree (a workspace with no `.git` of its own),
+  `commit_message` is scoped to it and paths that leave it are refused;
+  `stage`, `unstage`, `commit`, `undo`, and `branch`/`worktree` creation,
+  switching or removal return `GIT_REPO_OUTSIDE_ROOT`, `/commit` and `pr
+  draft` refuse for the same reason, and nothing changes. `branch list` and
   `worktree list` stay read-only, and starting the session at the work-tree
   root restores the full surface.
-- Read-only actions (`status`, `diff`, `log`, `blame`, `commit_message`, `pr
-  checks`, `pr review`) run directly. With `--sandbox read-only` they are all
-  `git` can do.
+- Read-only actions (`commit_message`, `pr checks`, `pr review`) run directly.
+  With `--sandbox read-only` `commit_message` is all `git` can do.
 - `stage` takes paths inside the workspace and refuses credential-shaped files
   (`.env`, `*.pem`, `*.key`, token files).
 - `commit` commits only what is staged and never passes `--no-verify`. It
@@ -1125,9 +1138,9 @@ recorded. This is the documented non-blocking auto-accept.
 | `lsp` | 200 outline symbols, 20 references, 5 definitions, 40 diagnostics, 25 hover lines |
 | `repo_map` | 5000 files, 24 symbols per file, 8000 chars per call; 1200-char system-prompt brief |
 | post-edit diagnostics | 8 entries, 1200 chars |
-| `test` | 600 s maximum, 2500-char result |
+| `verify` targeted | 600 s maximum, 2500-char result |
 | `review` | 400 diff lines default, 12 findings |
-| `git` | commit subject 72 chars (`[git] subject_max`), 20 subjects for style, 200 log entries |
+| `git` | commit subject 72 chars (`[git] subject_max`), 20 subjects for style |
 | `finding` | 50 per engagement, 2000-char evidence, 50 PoC steps |
 | `evidence` | 20,000 entries, 4 MiB per artifact |
 | `surface` | 10,000 assets |
@@ -1167,9 +1180,12 @@ tools = ["read", "bash", "verify"]
 - Tool lists are static for a model call. The set may change between calls only
   when a profile changes or an external workflow starts; `todo` stays visible
   in `full` and `coding` and its gate blocks edits rather than hiding the tool.
-- A model profile may set `edit_mode = "hash"` (default `"text"`); it changes
-  only `read` annotations and `patch` operations, and leaves exact-text `edit`
-  and text-mode `patch` byte-identical.
+- A model profile may set `edit_mode = "hash"` (default `"text"`). It changes
+  `read` annotations and selects `patch`, the line-anchored editor; text mode
+  has no `patch`. `edit` stays the exact-text editor in both modes.
+- A profile that lists a tool that is now an argument of another one still
+  loads, with a deprecation warning for one release: `test` becomes `verify`
+  with `path`/`test`, and text-mode `patch` becomes `edit` with `occurrence`.
 - The active tool list is sent to the model and shown in `/tools`.
 
 ### 6.5 Tool result presentation
@@ -2352,7 +2368,7 @@ a new message, and resume the session.
 
 ### M3 - Packs
 
-- Coding: `repo_map`, `lsp`, `test`, `review`.
+- Coding: `repo_map`, `lsp`, `review`, `git`, `pr`.
 - Security: `surface`, `evidence`, `detect`, `attack_path`, `finding`, `iocs`,
   scope gate, evidence capture, report export, bundled red/blue skills.
 - Background shell.
