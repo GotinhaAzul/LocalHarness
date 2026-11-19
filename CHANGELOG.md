@@ -227,6 +227,14 @@ release may change defaults when the change is called out below.
 
 ### Changed
 
+- The system prompt's operating rules no longer restate what the gates
+  enforce (read before edit, the plan from the third file, no interactive
+  programs, `recall` for truncated output) or ask the model to judge its own
+  context size for `thread split`; each gate says what to do when it applies,
+  and compaction runs on the measured budget. "Run verify, then review" is
+  included only with `[gates] auto_settle = false`, and the `bg` and
+  `repo_map` hints only when the profile has those tools. About 450 fewer
+  characters on every request with the default profile.
 - With no configured or accepted verify steps, a session uses the steps
   detected from the project manifest (`[gates] verify_detected`, default
   `true`), so the verify gate and harness-run settle checks are on in an

@@ -366,6 +366,16 @@ observable.
 
 Guards are inert when their required tool is absent from the active profile.
 
+The system prompt does not restate the guards. Read-before-edit, the plan
+from the third changed file, interactive commands, truncated output, and the
+settle checks each produce a prescriptive error or note when they apply. The
+operating rules keep only what no code enforces (inspect before acting, follow
+the error's next action, small arguments, `bg` for long-running processes),
+name only tools the profile has, and ask for verify and review only when
+`[gates] auto_settle = false` leaves them to the model. Context size is the
+harness's job too: compaction runs on the measured budget, so the prompt no
+longer asks the model to judge when to `thread split`.
+
 ### 3.5 Execution and cancellation
 
 - Tools execute sequentially. Parallel read-only tools are a later optimization
