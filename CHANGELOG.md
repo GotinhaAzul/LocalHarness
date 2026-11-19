@@ -217,6 +217,14 @@ release may change defaults when the change is called out below.
 
 ### Changed
 
+- The repository map injected into the system prompt is smaller (at most
+  1200 chars, down from 1800) and says it is an index, not a full listing.
+  The map ranks files (README, manifests, entry points, source, tests, then
+  other docs), summarises code that does not fit by directory, and reserves up
+  to 40% of its budget for data and config files so a large source tree cannot
+  push them out. Data directories with up to 12 files are listed by name;
+  larger ones show name patterns such as `INV-* ×20` (#159).
+
 - Permission levels are named for what they do: `dont-ask` is now `deny-all`
   and `ask` is now `normal`, in the TUI, the docs, and `--mode`. `dont-ask`
   and `ask` are still accepted as deprecated aliases in config files and on

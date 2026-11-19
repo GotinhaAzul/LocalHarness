@@ -22,12 +22,21 @@ use crate::tools::{
 
 pub const DEFAULT_BUDGET: usize = 2200;
 pub const MAX_BUDGET: usize = 8000;
-pub const BRIEF_BUDGET: usize = 1800;
+/// Size of the map injected into every system prompt. It is an index, not a
+/// listing: the `repo_map` tool (2200 chars by default, 8000 at most) gives
+/// the full view on demand, so the brief stays small to spare the context.
+pub const BRIEF_BUDGET: usize = 1200;
 const MIN_BUDGET: usize = 600;
 const MAX_FILES: usize = 5000;
 const MAX_FILE_BYTES: u64 = 256 * 1024;
 const MAX_SYMBOLS_PER_FILE: usize = 24;
-const BRIEF_SYMBOLS_PER_FILE: usize = 6;
+const BRIEF_SYMBOLS_PER_FILE: usize = 4;
+/// Share of the content budget held for files without an outline (data,
+/// config, assets) when the tree also has code, so a deep source tree cannot
+/// push a top-level `inbox/` out of the map. Unused reserve goes back to code.
+const OTHER_SHARE_PERCENT: usize = 40;
+/// A directory with at most this many path-only files is listed by name.
+const LIST_NAMES_UP_TO: usize = 12;
 
 #[derive(Debug, Clone)]
 struct Symbol {
@@ -208,8 +217,8 @@ impl RepoIndex {
             });
         }
         outlined.sort_by(|left, right| {
-            language_rank(left.language)
-                .cmp(&language_rank(right.language))
+            file_rank(root, left)
+                .cmp(&file_rank(root, right))
                 .then_with(|| depth(root, &left.path).cmp(&depth(root, &right.path)))
                 .then_with(|| left.path.cmp(&right.path))
         });
@@ -222,12 +231,75 @@ impl RepoIndex {
     }
 }
 
-fn language_rank(language: &str) -> u8 {
-    match language {
-        "markdown" => 1,
-        "toml" => 2,
-        _ => 0,
+/// Lower ranks render first: the README and manifests orient a reader, entry
+/// points say where execution starts, then ordinary source, tests, and the
+/// remaining docs and config. Ties fall back to depth, then path.
+fn file_rank(root: &Path, file: &FileOutline) -> u8 {
+    let relative = file.path.strip_prefix(root).unwrap_or(&file.path);
+    let top_level = relative.components().count() == 1;
+    let name = relative
+        .file_name()
+        .map(|name| name.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    let stem = name.split('.').next().unwrap_or_default();
+    if top_level && stem == "readme" {
+        return 0;
     }
+    if is_manifest(&name) {
+        return 1;
+    }
+    if is_test_path(relative, &name) {
+        return 5;
+    }
+    match file.language {
+        "markdown" | "toml" => 6,
+        _ if stem == "main" || stem == "__main__" => 2,
+        _ if is_entry_point(relative, stem) => 3,
+        _ => 4,
+    }
+}
+
+fn is_manifest(name: &str) -> bool {
+    matches!(
+        name,
+        "cargo.toml"
+            | "pyproject.toml"
+            | "package.json"
+            | "go.mod"
+            | "makefile"
+            | "justfile"
+            | "cmakelists.txt"
+            | "build.gradle"
+            | "build.gradle.kts"
+            | "pom.xml"
+            | "gemfile"
+            | "setup.py"
+            | "deno.json"
+    )
+}
+
+fn is_entry_point(relative: &Path, stem: &str) -> bool {
+    matches!(stem, "lib" | "app" | "index" | "cli" | "server") && relative.components().count() <= 3
+        || relative
+            .components()
+            .next()
+            .is_some_and(|first| first.as_os_str() == "cmd")
+}
+
+fn is_test_path(relative: &Path, name: &str) -> bool {
+    let in_test_dir = relative.parent().is_some_and(|parent| {
+        parent.components().any(|part| {
+            matches!(
+                part.as_os_str().to_str(),
+                Some("tests" | "test" | "__tests__" | "spec" | "testdata" | "fixtures")
+            )
+        })
+    });
+    in_test_dir
+        || name.starts_with("test_")
+        || name.contains("_test.")
+        || name.contains(".test.")
+        || name.contains(".spec.")
 }
 
 fn depth(root: &Path, path: &Path) -> usize {
@@ -258,28 +330,76 @@ fn render_map(root: &Path, files: &ScanResult, budget: usize, per_file: usize) -
     let reserve = 120usize.min(budget / 4);
     let content_budget = budget.saturating_sub(reserve);
     let mut omitted = 0usize;
+
+    // Path-only files get a guaranteed share so a large code tree cannot
+    // crowd them out; whatever they do not need stays with the code.
+    const HEADING: &str = "\nother files:\n";
+    let groups: Vec<(String, usize)> = group_other(root, &files.other)
+        .into_iter()
+        .map(|(dir, names)| (render_group(&dir, &names), names.len()))
+        .collect();
+    let other_need = if groups.is_empty() {
+        0
+    } else {
+        HEADING.chars().count()
+            + groups
+                .iter()
+                .map(|(line, _)| line.chars().count() + 1)
+                .sum::<usize>()
+    };
+    let available = content_budget.saturating_sub(used);
+    let other_reserve = if files.outlined.is_empty() {
+        other_need
+    } else {
+        other_need.min(available * OTHER_SHARE_PERCENT / 100)
+    };
+    let code_budget = content_budget.saturating_sub(other_reserve);
+    // When not every outline fits, hold part of the code budget for one line
+    // per directory naming the files left without an outline: breadth beats
+    // depth in an index.
+    let summary_need = if files.outlined.is_empty() {
+        0
+    } else {
+        let all = summary_groups(root, &files.outlined);
+        SUMMARY_HEADING.chars().count()
+            + all
+                .iter()
+                .map(|(line, _)| line.chars().count() + 1)
+                .sum::<usize>()
+    };
+    let outline_budget =
+        code_budget.saturating_sub(summary_need.min(code_budget.saturating_sub(used) / 2));
+
+    let mut outlined_count = files.outlined.len();
     for (index, file) in files.outlined.iter().enumerate() {
         let display = display_path(root, &file.path);
         let header = format!("\n{display} ({})", file.language);
         let header_cost = header.chars().count() + 1;
-        if used + header_cost > content_budget {
-            omitted += files.outlined.len() - index;
+        // A header needs room for at least its first symbol.
+        let first_cost = file
+            .symbols
+            .first()
+            .map(|symbol| symbol_line(symbol).chars().count() + 1)
+            .unwrap_or(0);
+        if used + header_cost + first_cost > outline_budget {
+            outlined_count = index;
             break;
         }
         out.push_str(&header);
         out.push('\n');
         used += header_cost;
         let mut written = 0usize;
-        for symbol in file.symbols.iter().take(per_file) {
-            let line = format!(
-                "  {}{} {} (line {})",
-                "  ".repeat(symbol.indent.min(2)),
-                symbol.kind,
-                symbol.name,
-                symbol.line
-            );
+        // Doc headings orient less than declarations; the brief keeps two.
+        let limit =
+            if per_file <= BRIEF_SYMBOLS_PER_FILE && matches!(file.language, "markdown" | "toml") {
+                per_file.min(2)
+            } else {
+                per_file
+            };
+        for symbol in file.symbols.iter().take(limit) {
+            let line = symbol_line(symbol);
             let cost = line.chars().count() + 1;
-            if used + cost > content_budget {
+            if used + cost > outline_budget {
                 break;
             }
             out.push_str(&line);
@@ -291,7 +411,7 @@ fn render_map(root: &Path, files: &ScanResult, budget: usize, per_file: usize) -
         if remaining > 0 {
             let note = format!("  … {remaining} more symbols");
             let cost = note.chars().count() + 1;
-            if used + cost <= content_budget {
+            if used + cost <= outline_budget {
                 out.push_str(&note);
                 out.push('\n');
                 used += cost;
@@ -299,31 +419,46 @@ fn render_map(root: &Path, files: &ScanResult, budget: usize, per_file: usize) -
         }
     }
 
-    // Every non-ignored file appears, either with its own outline above or in
-    // one compact line per directory. A directory is named with its files
-    // when they fit, otherwise with a count by extension, so the model can
-    // tell a complete listing from a summary.
-    if !files.other.is_empty() {
-        let groups = group_other(root, &files.other);
-        let heading = "\nother files:\n";
-        if used + heading.chars().count() > content_budget {
-            omitted += files.other.len();
+    let rest = &files.outlined[outlined_count..];
+    if !rest.is_empty() {
+        if used + SUMMARY_HEADING.chars().count() > code_budget {
+            omitted += rest.len();
         } else {
-            out.push_str(heading);
-            used += heading.chars().count();
-            let mut shown = 0usize;
-            for (dir, paths) in &groups {
-                let rendered = render_group(dir, paths);
+            out.push_str(SUMMARY_HEADING);
+            used += SUMMARY_HEADING.chars().count();
+            for (rendered, count) in summary_groups(root, rest) {
                 let cost = rendered.chars().count() + 1;
-                if used + cost > content_budget {
-                    break;
+                if used + cost > code_budget {
+                    omitted += count;
+                    continue;
                 }
                 out.push_str(&rendered);
                 out.push('\n');
                 used += cost;
-                shown += paths.len();
             }
-            omitted += files.other.len().saturating_sub(shown);
+        }
+    }
+
+    // Every non-ignored file appears, either with its own outline above or in
+    // one compact line per directory, shallow directories first. A directory
+    // that does not fit is skipped and counted, and a smaller one after it
+    // may still fit.
+    if !groups.is_empty() {
+        if used + HEADING.chars().count() > content_budget {
+            omitted += files.other.len();
+        } else {
+            out.push_str(HEADING);
+            used += HEADING.chars().count();
+            for (rendered, count) in &groups {
+                let cost = rendered.chars().count() + 1;
+                if used + cost > content_budget {
+                    omitted += count;
+                    continue;
+                }
+                out.push_str(rendered);
+                out.push('\n');
+                used += cost;
+            }
         }
     }
 
@@ -344,6 +479,40 @@ fn render_map(root: &Path, files: &ScanResult, budget: usize, per_file: usize) -
     out
 }
 
+const SUMMARY_HEADING: &str = "\nmore code (outline with repo_map path=<dir>):\n";
+
+fn symbol_line(symbol: &Symbol) -> String {
+    format!(
+        "  {}{} {} (line {})",
+        "  ".repeat(symbol.indent.min(2)),
+        symbol.kind,
+        clip(&symbol.name, 48),
+        symbol.line
+    )
+}
+
+/// One rendered line per directory for outlined files shown without their
+/// outline, with the number of files each line covers.
+/// Source directories come before docs and config.
+fn summary_groups(root: &Path, files: &[FileOutline]) -> Vec<(String, usize)> {
+    let (docs, code): (Vec<&FileOutline>, Vec<&FileOutline>) = files
+        .iter()
+        .partition(|file| matches!(file.language, "markdown" | "toml"));
+    [code, docs]
+        .into_iter()
+        .flat_map(|part| {
+            let paths: Vec<OtherFile> = part
+                .iter()
+                .map(|file| OtherFile {
+                    path: file.path.clone(),
+                })
+                .collect();
+            group_other(root, &paths)
+        })
+        .map(|(dir, names)| (render_group(&dir, &names), names.len()))
+        .collect()
+}
+
 /// One directory's non-outlined files, in path order.
 fn group_other(root: &Path, files: &[OtherFile]) -> Vec<(String, Vec<String>)> {
     let mut groups: std::collections::BTreeMap<String, Vec<String>> =
@@ -361,13 +530,22 @@ fn group_other(root: &Path, files: &[OtherFile]) -> Vec<(String, Vec<String>)> {
         };
         groups.entry(dir).or_default().push(name);
     }
-    groups.into_iter().collect()
+    let mut groups: Vec<(String, Vec<String>)> = groups.into_iter().collect();
+    groups.sort_by_key(|(dir, _)| {
+        if dir == "./" {
+            0
+        } else {
+            dir.matches('/').count()
+        }
+    });
+    groups
 }
 
-/// `inbox/ (26 files: 5 .eml, 5 .html, …)` for a large directory, or the file
-/// names when there are few.
+/// The file names when a directory has few, otherwise a count by extension
+/// plus the name patterns when they are short:
+/// `inbox/ (26 files: 6 .txt, 5 .html, …; names: INV-* ×20, CN-77.eml, RESENT-* ×5)`.
 fn render_group(dir: &str, names: &[String]) -> String {
-    if names.len() <= 6 {
+    if names.len() <= LIST_NAMES_UP_TO {
         return format!("{dir} ({} file(s): {})", names.len(), names.join(", "));
     }
     let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
@@ -393,11 +571,49 @@ fn render_group(dir: &str, names: &[String]) -> String {
     parts.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
     let shown: Vec<String> = parts.iter().take(6).map(|(_, text)| text.clone()).collect();
     let more = if parts.len() > shown.len() {
-        ",".to_string()
+        ", …".to_string()
     } else {
         String::new()
     };
-    format!("{dir} ({} files: {}{more})", names.len(), shown.join(", "))
+    let patterns = name_patterns(names)
+        .map(|patterns| format!("; names: {patterns}"))
+        .unwrap_or_default();
+    format!(
+        "{dir} ({} files: {}{more}{patterns})",
+        names.len(),
+        shown.join(", ")
+    )
+}
+
+/// Names folded by their prefix up to the first `-` or `_`: `INV-* ×20,
+/// CN-77.eml`. `None` when the folded form is still too long to be useful.
+fn name_patterns(names: &[String]) -> Option<String> {
+    const MAX_PATTERNS: usize = 10;
+    const MAX_CHARS: usize = 160;
+    let mut groups: Vec<(String, Vec<&str>)> = Vec::new();
+    for name in names {
+        let prefix = name
+            .find(['-', '_'])
+            .filter(|&at| at > 0)
+            .map(|at| name[..=at].to_string())
+            .unwrap_or_else(|| name.clone());
+        match groups.iter_mut().find(|(key, _)| *key == prefix) {
+            Some((_, members)) => members.push(name),
+            None => groups.push((prefix, vec![name])),
+        }
+    }
+    if groups.len() > MAX_PATTERNS {
+        return None;
+    }
+    let text = groups
+        .iter()
+        .map(|(prefix, members)| match members.as_slice() {
+            [only] => (*only).to_string(),
+            _ => format!("{prefix}* ×{}", members.len()),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    (text.chars().count() <= MAX_CHARS).then_some(text)
 }
 
 fn language_for(path: &Path) -> Option<&'static str> {
@@ -816,7 +1032,7 @@ impl Tool for RepoMapTool {
     }
 
     fn description(&self) -> &'static str {
-        "Compact repository map: files, symbols, and line numbers. Narrow with a path."
+        "Compact repository map: files, symbols, and line numbers, README and entry points first. The system prompt carries only a short index; call this for the full view and narrow with a path."
     }
 
     fn schema(&self) -> Value {
@@ -1000,6 +1216,19 @@ mod tests {
         }
         let map = RepoIndex::new().map(dir.path(), None, 600);
         assert!(map.chars().count() <= 600, "{} chars", map.chars().count());
+        // Files without room for an outline are still counted by directory.
+        assert!(map.contains("src/ ("), "{map}");
+
+        // Too many directories for even that: the closing line counts them.
+        for index in 0..60 {
+            write(
+                dir.path(),
+                &format!("pkg_{index}/code.rs"),
+                &format!("pub fn function_{index}() {{}}\n"),
+            );
+        }
+        let map = RepoIndex::new().map(dir.path(), None, 600);
+        assert!(map.chars().count() <= 600, "{} chars", map.chars().count());
         assert!(map.contains("more file(s) not shown; use glob or repo_map"));
     }
 
@@ -1040,5 +1269,113 @@ mod tests {
         assert!(result.content.contains("src/lib.rs"));
         assert!(result.content.contains("fn run"));
         assert!(!result.content.contains("tests/other.rs"));
+    }
+
+    #[test]
+    fn a_large_code_tree_does_not_push_data_files_out_of_the_brief() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "README.md", "# Demo\n\n## Usage\n");
+        write(dir.path(), "src/main.rs", "fn main() {}\n");
+        for index in 0..200 {
+            write(
+                dir.path(),
+                &format!("src/deep/nested/module_{index:03}.rs"),
+                &format!("pub fn function_{index}() {{}}\npub struct Type{index};\n"),
+            );
+        }
+        for index in 0..20 {
+            write(
+                dir.path(),
+                &format!("inbox/INV-{index:03}.txt"),
+                "invoice\n",
+            );
+        }
+        write(dir.path(), "inbox/CN-77.eml", "credit note\n");
+        for index in 0..5 {
+            write(
+                dir.path(),
+                &format!("inbox/RESENT-{index}.html"),
+                "<p>x</p>\n",
+            );
+        }
+
+        let brief = RepoIndex::new().brief(dir.path(), BRIEF_BUDGET);
+        assert!(
+            brief.chars().count() <= BRIEF_BUDGET,
+            "{} chars",
+            brief.chars().count()
+        );
+        for wanted in [
+            "README.md",
+            "src/main.rs",
+            "inbox/ (26 files",
+            "INV-* ×20",
+            "CN-77.eml",
+            "RESENT-* ×5",
+        ] {
+            assert!(brief.contains(wanted), "missing {wanted}: {brief}");
+        }
+        // Code without room for an outline is summarised, not dropped.
+        assert!(
+            brief.contains("src/deep/nested/ (") && brief.contains("module_* ×"),
+            "{brief}"
+        );
+    }
+
+    #[test]
+    fn code_gets_the_unused_data_reserve() {
+        let dir = tempfile::tempdir().unwrap();
+        for index in 0..40 {
+            write(
+                dir.path(),
+                &format!("src/module_{index:02}.rs"),
+                &format!("pub fn function_{index}() {{}}\n"),
+            );
+        }
+        write(dir.path(), "notes.txt", "x\n");
+        let map = RepoIndex::new().map(dir.path(), None, 1200);
+        // A one-line data section must not cost the code 40% of the budget.
+        let shown = map.matches("(rust)").count();
+        assert!(shown >= 15, "only {shown} code files: {map}");
+        assert!(map.contains("notes.txt"), "{map}");
+    }
+
+    #[test]
+    fn readme_manifest_and_entry_points_rank_before_other_source() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "src/aaa.rs", "pub fn a() {}\n");
+        write(dir.path(), "tests/alpha.rs", "fn t() {}\n");
+        write(dir.path(), "src/lib.rs", "pub fn lib() {}\n");
+        write(dir.path(), "Cargo.toml", "[package]\nname = \"demo\"\n");
+        write(dir.path(), "README.md", "# Demo\n");
+        write(dir.path(), "docs/guide.md", "# Guide\n");
+        let files = RepoIndex::new().scan(dir.path(), None);
+        let order: Vec<String> = files
+            .outlined
+            .iter()
+            .map(|file| display_path(dir.path(), &file.path))
+            .collect();
+        assert_eq!(
+            order,
+            [
+                "README.md",
+                "Cargo.toml",
+                "src/lib.rs",
+                "src/aaa.rs",
+                "tests/alpha.rs",
+                "docs/guide.md"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_dozen_data_files_are_listed_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        for index in 0..12 {
+            write(dir.path(), &format!("data/file{index}.csv"), "a,b\n");
+        }
+        let map = RepoIndex::new().map(dir.path(), None, 2200);
+        assert!(map.contains("data/ (12 file(s):"), "{map}");
+        assert!(map.contains("file11.csv"), "{map}");
     }
 }

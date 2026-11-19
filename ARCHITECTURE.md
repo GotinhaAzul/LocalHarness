@@ -930,13 +930,16 @@ form. `tot doctor` prints both sizes.
   `publishDiagnostics` after `didOpen`/`didChange`, or 2.5 s. Clients are
   disposed after 10 minutes idle or on session shutdown.
 - `repo_map` walks the tree with gitignore rules, caches per-file symbols by
-  mtime and size, and returns a character-budgeted map. Every non-ignored file
-  appears: files without an outline are grouped per directory with a count by
-  extension, and anything the budget or the 5000-file cap left out is counted
-  in a closing line. `vendor`, `dist`, `build`, and `target` are only skipped
+  mtime and size, and returns a character-budgeted map. Files are ranked
+  (README, manifests, entry points, source, tests, other docs and config),
+  then by depth and path. Outlined files that run out of room are summarised
+  per directory, and up to 40% of the budget is reserved for path-only files
+  (data, config, assets), whose directories are listed by name up to 12 files
+  and otherwise by extension count and name pattern. Anything the budget or
+  the 5000-file cap still left out is counted in a closing line. `vendor`, `dist`, `build`, and `target` are only skipped
   when git ignores them. Files above 256 KB and binary files are listed
-  without symbols. A compact map is injected into the system prompt at
-  startup.
+  without symbols. A 1200-char index (4 symbols per file, 2 for docs) is
+  injected into the system prompt at startup and labelled as non-exhaustive.
 - `write`, `edit`, and `patch` snapshot diagnostics through the shared LSP
   service before a mutation when `[lsp] gate` is not `off`. Only new
   severity-error diagnostics count: `warn` appends them, `block` restores the
@@ -1094,7 +1097,7 @@ recorded. This is the documented non-blocking auto-accept.
 | `verify` | 1 MiB combined output, 1400-char failure excerpt |
 | `recall` | 4000 chars per call |
 | `lsp` | 200 outline symbols, 20 references, 5 definitions, 40 diagnostics, 25 hover lines |
-| `repo_map` | 5000 files, 24 symbols per file, 8000 chars per call |
+| `repo_map` | 5000 files, 24 symbols per file, 8000 chars per call; 1200-char system-prompt brief |
 | post-edit diagnostics | 8 entries, 1200 chars |
 | `test` | 600 s maximum, 2500-char result |
 | `review` | 400 diff lines default, 12 findings |
