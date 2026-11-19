@@ -217,6 +217,25 @@ release may change defaults when the change is called out below.
 
 ### Changed
 
+- The repository map injected into the system prompt is smaller (at most
+  1200 chars, down from 1800) and says it is an index, not a full listing.
+  The map ranks files (README, manifests, entry points, source, tests, then
+  other docs), summarises code that does not fit by directory, and reserves up
+  to 40% of its budget for data and config files so a large source tree cannot
+  push them out. Data directories with up to 12 files are listed by name;
+  larger ones show name patterns such as `INV-* ×20` (#159).
+- The first no-progress stop in a turn (a budget checkpoint or the stall
+  guard) no longer ends it. The model is told to drop the repeating approach
+  and try a different method (a script, another tool), the stall counters
+  reset, and it gets one more allowance; at a tool checkpoint the pending
+  batch is skipped. The second no-progress stop ends the turn with the
+  tool-less summary as before. The session records a `budget-pivot` entry.
+  Found on A04, where the model looped on `git history` and tool hunting.
+- The tool-less summary at the end of a stopped turn gets 6144 output tokens
+  (was 1536) when the profile cannot turn thinking off. A thinking model
+  could spend the whole 1536 on reasoning and leave no summary; an empty one
+  now raises a notice.
+
 - Permission levels are named for what they do: `dont-ask` is now `deny-all`
   and `ask` is now `normal`, in the TUI, the docs, and `--mode`. `dont-ask`
   and `ask` are still accepted as deprecated aliases in config files and on

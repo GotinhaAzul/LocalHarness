@@ -357,7 +357,7 @@ observable.
 | Sandbox | When `--sandbox` is set, `bash` and `bg` run in a bubblewrap namespace (or the Landlock fallback): read-only root, hidden `$HOME`, private `/tmp`, no network, and `.git` read-only in `workspace-write`. Startup fails closed when no backend exists; a per-command wrap failure returns `SANDBOX_UNAVAILABLE`. Commands never fall back to an unsandboxed run. |
 | Loop guard | Signature is tool name plus canonical arguments. Four identical calls in a row, or an exact 2-8 call cycle repeated four times, blocks the call and ends the turn with a recovery instruction and the `stalled` status (exit code 2 from `tot -p`, never a successful workflow step). A file change or a passing verification clears the history, so long multi-step work does not trip it. A read-only call (a read-only tool, a reading action such as `bg logs`, `todo list`, `pr checks`, `git status` or `git branch op = "list"`, or a bash command that only reads) is recorded in the history but never trips it: the same poll can carry new output every time, and a read with the same output is caught by the stall guard. No automatic session replacement in v1. |
 | Interactive command guard | Blocks `vim`, `less`, `top`, `htop`, `watch`, `nano`, `ssh` without a command, and similar TTY-only invocations. |
-| Budget checkpoint | Tool calls, model calls, and wall clock are checked at 120 calls, 40 model calls, and 30 minutes. A checkpoint that finds a new result, a file change, or a passing verify within the last `stall_calls` calls renews the allowance and the turn continues. A checkpoint with no recent progress ends the turn and reports why. |
+| Budget checkpoint | Tool calls, model calls, and wall clock are checked at 120 calls, 40 model calls, and 30 minutes. A checkpoint that finds a new result, a file change, or a passing verify within the last `stall_calls` calls renews the allowance and the turn continues. The first checkpoint with no recent progress in a turn skips the pending batch, tells the model to drop the repeating approach (write a script, use another tool), and grants one more allowance; the second ends the turn with a tool-less summary and reports why. |
 | Stall | Twelve consecutive calls with no new result fingerprint, no file change, and no successful verify. Ends the turn with the last known state. |
 | Tool-family guard | Calls are grouped into a family: `bash` by program and operation, other tools by name plus key arguments (body arguments are ignored; temporary-path and number normalization is for bash families only). Three cumulative counters run across the turn: repeated calls of one family (successful or not), failing calls of one family, and successful calls of one family that changed no workspace file and passed no verify. They stop the turn as `stalled` at `[budgets] max_same_tool_family` (8; repeated and failing calls) and `max_same_tool_family_success` (24; unproductive successes). Interleaving another call, a success of the same family, and writes outside the session directory do not reset them; a workspace change or a passing verify does. 0 disables either budget. Read-only calls never count as repeats or as idle successes — read-only tools, the reading actions of mixed tools, and bash commands that only read (`cat`, `git show`, `curl` without a writing flag, `gh pr view`, ...) — though a failing read-only call still counts as a failure; a read repeated with the same output is caught by the stall guard. The workspace is fingerprinted lazily: the first counter that needs a baseline reads it, every later counter reuses that reading, a fresh reading is taken only to decide a trip and once at the end of the batch, and a call that reports a file change invalidates it. In a repository the fingerprint is `git status --porcelain=v1 -z --untracked-files=all -- .` from the session directory plus HEAD and the size and mtime of each listed path (nothing is written to the object store); elsewhere it is a bounded mtime/size walk. So a `sed -i` fix loop that really changes files is not a stall. |
 | Todo gate | After changes to three distinct files, an edit requires a plan; repeated edits to one file are one change. Settlement never reopens a finished turn for a plan. The final task requires a fresh passing verify when verification is configured. |
@@ -380,8 +380,10 @@ Guards are inert when their required tool is absent from the active profile.
   error entry if useful, and returns the TUI to idle. The session remains
   consistent and resumable.
 - The model loop checks tool, model, and wall-clock checkpoints. A productive
-  run renews each allowance; only a checkpoint with no recent progress, the
-  loop guard, or the stall guard ends the turn.
+  run renews each allowance. The first no-progress stop in a turn (a
+  checkpoint or the stall guard) pivots: one more allowance, clean stall
+  counters, and an instruction to change approach. A second one, or the loop
+  guard, ends the turn.
 
 ### 3.6 Settlement
 
@@ -930,13 +932,16 @@ form. `tot doctor` prints both sizes.
   `publishDiagnostics` after `didOpen`/`didChange`, or 2.5 s. Clients are
   disposed after 10 minutes idle or on session shutdown.
 - `repo_map` walks the tree with gitignore rules, caches per-file symbols by
-  mtime and size, and returns a character-budgeted map. Every non-ignored file
-  appears: files without an outline are grouped per directory with a count by
-  extension, and anything the budget or the 5000-file cap left out is counted
-  in a closing line. `vendor`, `dist`, `build`, and `target` are only skipped
+  mtime and size, and returns a character-budgeted map. Files are ranked
+  (README, manifests, entry points, source, tests, other docs and config),
+  then by depth and path. Outlined files that run out of room are summarised
+  per directory, and up to 40% of the budget is reserved for path-only files
+  (data, config, assets), whose directories are listed by name up to 12 files
+  and otherwise by extension count and name pattern. Anything the budget or
+  the 5000-file cap still left out is counted in a closing line. `vendor`, `dist`, `build`, and `target` are only skipped
   when git ignores them. Files above 256 KB and binary files are listed
-  without symbols. A compact map is injected into the system prompt at
-  startup.
+  without symbols. A 1200-char index (4 symbols per file, 2 for docs) is
+  injected into the system prompt at startup and labelled as non-exhaustive.
 - `write`, `edit`, and `patch` snapshot diagnostics through the shared LSP
   service before a mutation when `[lsp] gate` is not `off`. Only new
   severity-error diagnostics count: `warn` appends them, `block` restores the
@@ -1094,7 +1099,7 @@ recorded. This is the documented non-blocking auto-accept.
 | `verify` | 1 MiB combined output, 1400-char failure excerpt |
 | `recall` | 4000 chars per call |
 | `lsp` | 200 outline symbols, 20 references, 5 definitions, 40 diagnostics, 25 hover lines |
-| `repo_map` | 5000 files, 24 symbols per file, 8000 chars per call |
+| `repo_map` | 5000 files, 24 symbols per file, 8000 chars per call; 1200-char system-prompt brief |
 | post-edit diagnostics | 8 entries, 1200 chars |
 | `test` | 600 s maximum, 2500-char result |
 | `review` | 400 diff lines default, 12 findings |

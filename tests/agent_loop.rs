@@ -1364,8 +1364,12 @@ async fn a_stalled_turn_ends_with_a_tool_less_summary() {
             call_script("call_1", "read", json!({"path": "missing-a.txt"})),
             call_script("call_2", "read", json!({"path": "missing-a.txt"})),
             call_script("call_3", "read", json!({"path": "missing-a.txt"})),
-            // The guard stops the run here; the harness then asks for a
-            // summary in a tool-less request.
+            // The first stall pivots: the model is told to change approach.
+            call_script("call_4", "read", json!({"path": "missing-b.txt"})),
+            call_script("call_5", "read", json!({"path": "missing-b.txt"})),
+            call_script("call_6", "read", json!({"path": "missing-b.txt"})),
+            // The second stops the run; the harness then asks for a summary
+            // in a tool-less request.
             text_script("I read a missing file three times; nothing changed."),
         ],
         &["read"],
@@ -1905,7 +1909,7 @@ async fn near_identical_failing_calls_end_the_turn_as_stalled() {
     // Every call differs in arguments and output, so neither the loop guard
     // nor the consecutive-fingerprint stall guard fires. Only the operation is
     // the same, which is what the tool-family guard has to catch.
-    let scripts: Vec<Script> = (0..20)
+    let scripts: Vec<Script> = (0..30)
         .map(|index| {
             call_script(
                 &format!("probe_{index}"),
@@ -1921,9 +1925,13 @@ async fn near_identical_failing_calls_end_the_turn_as_stalled() {
     assert_eq!(outcome.status, TurnStatus::Stalled);
     assert_eq!(
         harness.provider.requests.lock().unwrap().len(),
-        9,
-        "eight failing calls, then the tool-less summary request"
+        17,
+        "eight failing calls, a pivot, eight more, then the tool-less summary request"
     );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::Notice(message) if message.contains("asked the model to change approach")
+    )));
     assert!(events.iter().any(|event| matches!(
         event,
         AgentEvent::Guard { code, message }
@@ -1938,7 +1946,7 @@ async fn near_identical_failing_calls_end_the_turn_as_stalled() {
             _ => None,
         })
         .collect();
-    assert_eq!(results.len(), 8, "later calls must not run");
+    assert_eq!(results.len(), 16, "later calls must not run");
     assert!(
         results.iter().all(|result| result.contains("[exit")),
         "{results:?}"
@@ -2030,8 +2038,8 @@ async fn repeated_successful_calls_between_probes_end_the_turn_as_stalled() {
     );
     assert_eq!(
         harness.provider.requests.lock().unwrap().len(),
-        17,
-        "eight repeats of the same call, interleaved with eight probes, then the summary"
+        33,
+        "eight repeats interleaved with eight probes, a pivot, the same again, then the summary"
     );
     assert!(events.iter().any(|event| matches!(
         event,
@@ -2066,7 +2074,8 @@ async fn a_scratch_write_does_not_reset_the_family_count() {
         "write",
         json!({"path": scratch.display().to_string(), "content": "scratch\n"}),
     ));
-    scripts.extend((4..8).map(|index| {
+    // The second half runs after the pivot the first stall triggers.
+    scripts.extend((4..16).map(|index| {
         call_script(
             &format!("probe_{index}"),
             "bash",
@@ -2084,8 +2093,8 @@ async fn a_scratch_write_does_not_reset_the_family_count() {
     );
     assert_eq!(
         harness.provider.requests.lock().unwrap().len(),
-        10,
-        "the scratch write is the fifth call, so the eighth failing probe is the ninth, plus the summary"
+        18,
+        "the scratch write is the fifth call, so the eighth failing probe is the ninth; a pivot, eight more probes, then the summary"
     );
 }
 
@@ -2313,7 +2322,8 @@ async fn model_budget_stops_before_another_call() {
         dir.path(),
         vec![
             tool_script("read", json!({"path":"a.rs"})),
-            text_script("nope"),
+            tool_script("read", json!({"path":"b.rs"})),
+            text_script("summary"),
         ],
         &["read"],
     );
@@ -2323,13 +2333,31 @@ async fn model_budget_stops_before_another_call() {
     core.config = config;
     core.limits.max_model_calls = 1;
     harness.core = Arc::new(core);
-    let (outcome, _) = run(&harness, "one call").await;
+    let (outcome, events) = run(&harness, "one call").await;
     assert_eq!(outcome.status, TurnStatus::Budget);
+    let requests = harness.provider.requests.lock().unwrap();
     assert_eq!(
-        harness.provider.requests.lock().unwrap().len(),
-        2,
-        "the one budgeted call, then the tool-less summary"
+        requests.len(),
+        3,
+        "the budgeted call, one more after the pivot, then the tool-less summary"
     );
+    assert!(
+        format!("{:?}", requests[1].messages).contains("switch to a different method"),
+        "the call after the first checkpoint carries the pivot instruction"
+    );
+    assert!(
+        requests[2].max_tokens > 1536,
+        "no thinking control: the summary gets room to reason first ({})",
+        requests[2].max_tokens
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::Notice(message) if message.contains("asked the model to change approach")
+    )));
+    let session = harness.session.lock().unwrap();
+    assert!(session.branch_entries().iter().any(
+        |entry| matches!(&entry.kind, EntryKind::Custom(custom) if custom.kind == "budget-pivot")
+    ));
 }
 
 #[tokio::test]
@@ -2382,7 +2410,10 @@ async fn long_task_without_progress_stops_at_the_checkpoint() {
             tool_script("read", json!({"path":"missing-1.rs"})),
             tool_script("read", json!({"path":"missing-2.rs"})),
             tool_script("read", json!({"path":"missing-3.rs"})),
-            text_script("should not be called"),
+            tool_script("read", json!({"path":"missing-4.rs"})),
+            tool_script("read", json!({"path":"missing-5.rs"})),
+            tool_script("read", json!({"path":"missing-6.rs"})),
+            text_script("summary"),
         ],
         &["read"],
     );
@@ -2398,13 +2429,17 @@ async fn long_task_without_progress_stops_at_the_checkpoint() {
     assert_eq!(outcome.status, TurnStatus::Budget);
     assert_eq!(
         harness.provider.requests.lock().unwrap().len(),
-        4,
-        "three calls and the tool-less summary"
+        7,
+        "three calls, three more after the pivot, then the tool-less summary"
     );
     let results = tool_results(&harness.session);
-    assert_eq!(results.len(), 3);
+    assert_eq!(results.len(), 6);
     assert!(
-        results[2].contains("did not run"),
+        results[2].contains("asked for a different approach"),
+        "the call at the first checkpoint is skipped: {results:?}"
+    );
+    assert!(
+        results[5].contains("did not run"),
         "the blocked call needs a result: {results:?}"
     );
     let session = harness.session.lock().unwrap();

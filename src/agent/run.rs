@@ -483,6 +483,11 @@ async fn run_loop(
         match progress.model_checkpoint() {
             BudgetCheck::Ok => {}
             BudgetCheck::Renewed(reason) => report_renewal(core.as_ref(), tx, &progress, reason),
+            BudgetCheck::Exhausted(reason) if progress.try_pivot() => {
+                if let Err(err) = request_pivot(core.as_ref(), tx, &progress, reason) {
+                    return TurnOutcome::error("session_write", err.to_string());
+                }
+            }
             BudgetCheck::Exhausted(reason) => {
                 let message = progress.checkpoint_message(reason);
                 finish_with_summary(
@@ -503,7 +508,11 @@ async fn run_loop(
                 return TurnOutcome::ok(TurnStatus::Budget);
             }
         }
-        if progress.stalled() {
+        if progress.stalled() && progress.try_pivot() {
+            if let Err(err) = request_pivot(core.as_ref(), tx, &progress, StopReason::Stalled) {
+                return TurnOutcome::error("session_write", err.to_string());
+            }
+        } else if progress.stalled() {
             let message = progress.stall_message();
             finish_with_summary(
                 core,
@@ -1359,6 +1368,26 @@ async fn run_loop(
         match progress.tool_checkpoint(calls.len() as u32) {
             BudgetCheck::Ok => {}
             BudgetCheck::Renewed(reason) => report_renewal(core.as_ref(), tx, &progress, reason),
+            BudgetCheck::Exhausted(reason) if progress.try_pivot() => {
+                // The batch is more of the approach that stopped working:
+                // skip it and let the model choose a different one.
+                for call in &calls {
+                    append_tool_result(
+                        &core.session,
+                        call,
+                        &ToolResult::err(
+                            "budget_tools",
+                            "a no-progress checkpoint asked for a different approach; this call did not run",
+                        ),
+                        None,
+                        Some(crate::provenance::tool_tag(&call.name)),
+                    );
+                }
+                if let Err(err) = request_pivot(core.as_ref(), tx, &progress, reason) {
+                    return TurnOutcome::error("session_write", err.to_string());
+                }
+                continue;
+            }
             BudgetCheck::Exhausted(reason) => {
                 for call in &calls {
                     append_tool_result(
@@ -1498,7 +1527,11 @@ async fn run_loop(
             }
             return TurnOutcome::ok(TurnStatus::Done);
         }
-        if progress.stalled() {
+        if progress.stalled() && progress.try_pivot() {
+            if let Err(err) = request_pivot(core.as_ref(), tx, &progress, StopReason::Stalled) {
+                return TurnOutcome::error("session_write", err.to_string());
+            }
+        } else if progress.stalled() {
             let message = progress.stall_message();
             finish_with_summary(
                 core,
@@ -4064,6 +4097,11 @@ fn tool_body(content: &str) -> &str {
 /// Give the model one tool-less request to say what it did and what is left,
 /// before a stalled or exhausted turn ends. The turn keeps its status; the
 /// summary is what the person sees instead of a mid-thought sentence.
+/// Output cap for the tool-less summary when thinking can be turned off.
+const SUMMARY_TOKENS: u32 = 1536;
+/// Output cap when it cannot: room for the reasoning plus the summary.
+const SUMMARY_TOKENS_THINKING: u32 = 6144;
+
 async fn finish_with_summary(
     core: &Core,
     tx: &UnboundedSender<AgentEvent>,
@@ -4086,9 +4124,15 @@ async fn finish_with_summary(
     let assembled = assemble_context(core, budget, findings.as_ref(), tool_specs_cost);
     // Keep the profile's extra_body even when it has no thinking control: a
     // template flag or sampler there may be required by the engine.
-    let extra_body = core
-        .model_profile
-        .request_extra_body_thinking_off()
+    let thinking_off = core.model_profile.request_extra_body_thinking_off();
+    // Without a way to turn thinking off, a thinking model reasons before it
+    // answers; 1536 tokens can go entirely to reasoning and leave no summary.
+    let summary_tokens = if thinking_off.is_some() {
+        SUMMARY_TOKENS
+    } else {
+        SUMMARY_TOKENS_THINKING
+    };
+    let extra_body = thinking_off
         .or_else(|| core.model_profile.request_extra_body(false).ok().flatten())
         .or_else(|| {
             core.model_profile
@@ -4108,7 +4152,7 @@ async fn finish_with_summary(
         ),
         engine: core.engine,
         response_schema: None,
-        max_tokens: budget.max_output_tokens.min(1536),
+        max_tokens: budget.max_output_tokens.min(summary_tokens),
         stop: core.model_profile.stop.clone(),
         extra_body,
         include_usage: true,
@@ -4138,8 +4182,17 @@ async fn finish_with_summary(
             // with a call anyway must not leave an unpaired tool call in the
             // branch.
             assistant.tool_calls = None;
+            let empty = assistant
+                .content
+                .as_deref()
+                .is_none_or(|text| text.trim().is_empty());
             if let Err(error) = append_assistant(&core.session, assistant) {
                 tracing::warn!(%error, "cannot append the final summary");
+            }
+            if empty {
+                let _ = tx.send(AgentEvent::Notice(
+                    "the final summary came back empty (the reply was reasoning only); check the workspace state directly".into(),
+                ));
             }
         }
         Err(error) => {
@@ -4273,6 +4326,32 @@ fn append_assistant(
 
 /// A productive checkpoint renewed the allowance. This is bookkeeping for the
 /// user, not a message to the model: the turn simply keeps going.
+/// Record a checkpoint pivot and tell the model to change approach.
+fn request_pivot(
+    core: &Core,
+    tx: &UnboundedSender<AgentEvent>,
+    progress: &RunProgress,
+    reason: StopReason,
+) -> anyhow::Result<()> {
+    append_custom(
+        &core.session,
+        "budget-pivot",
+        json!({
+            "trigger": reason.code(),
+            "tool_calls": progress.tool_calls,
+            "model_calls": progress.model_calls,
+            "elapsed_secs": progress.elapsed().as_secs(),
+        }),
+    );
+    let message = progress.pivot_message(reason);
+    append_user(&core.session, &message)?;
+    let _ = tx.send(AgentEvent::Notice(format!(
+        "no progress ({}): asked the model to change approach; one more allowance before the turn ends.",
+        reason.code()
+    )));
+    Ok(())
+}
+
 fn report_renewal(
     core: &Core,
     tx: &UnboundedSender<AgentEvent>,

@@ -145,6 +145,9 @@ pub struct RunProgress {
     pub presend_compaction_used: bool,
     /// Whether the advance notice for the todo gate was attached this turn.
     pub todo_notice_sent: bool,
+    /// Whether a no-progress checkpoint already asked for a different
+    /// approach this turn. The first one pivots; the second ends the turn.
+    pub pivot_used: bool,
 }
 
 impl RunProgress {
@@ -177,6 +180,7 @@ impl RunProgress {
             thinking_retry_used: false,
             text_calls_noticed: false,
             presend_compaction_used: false,
+            pivot_used: false,
         }
     }
 
@@ -300,6 +304,43 @@ impl RunProgress {
             }
             StopReason::Cancelled => "cancelled by the user".into(),
         }
+    }
+
+    /// The first no-progress stop of a turn (a budget checkpoint or the stall
+    /// guard) does not end it: the model gets one fresh allowance and clean
+    /// stall counters, with an instruction to drop the approach that is
+    /// repeating. Returns false once that pivot is spent, and the turn ends
+    /// as before.
+    pub fn try_pivot(&mut self) -> bool {
+        if self.pivot_used {
+            return false;
+        }
+        self.pivot_used = true;
+        self.stall.reset();
+        self.epoch_tool_calls = 0;
+        self.epoch_model_calls = 0;
+        self.epoch_started_at = Instant::now();
+        self.last_progress_call = None;
+        self.last_progress_at = None;
+        true
+    }
+
+    /// The instruction sent to the model when a checkpoint pivots.
+    pub fn pivot_message(&self, reason: StopReason) -> String {
+        let why = match reason {
+            StopReason::Stalled => {
+                "recent calls keep repeating without changing a file or passing a verification"
+                    .to_string()
+            }
+            _ => format!(
+                "the last {} call(s) changed no file and passed no verification",
+                self.limits.stall_calls
+            ),
+        };
+        format!(
+            "[totality] {}: {why}; the current approach is not working. Do not repeat it or try small variations of it, and do not search for a ready-made tool that may not exist. In one sentence, say why it failed, then switch to a different method: for example, write and run a small script with what is installed, use a different tool, or read the relevant documentation once. You have one more allowance; if it also makes no progress, the turn ends.",
+            reason.code()
+        )
     }
 
     /// User-facing notice when a productive checkpoint renews the allowance.
@@ -598,6 +639,14 @@ impl StallTracker {
             detail,
             workspace,
         });
+    }
+
+    /// Forget every counter and trip: after a pivot, the next approach is
+    /// judged on its own calls.
+    pub fn reset(&mut self) {
+        self.clear();
+        self.strikes = 0;
+        self.last = None;
     }
 
     fn clear(&mut self) {
@@ -1399,6 +1448,65 @@ mod tests {
         assert_eq!(progress.model_calls, 4, "cumulative remains for reporting");
         assert_eq!(progress.epoch_model_calls, 0);
         assert_eq!(progress.model_checkpoint(), BudgetCheck::Ok);
+    }
+
+    #[test]
+    fn the_first_no_progress_checkpoint_pivots_once() {
+        let mut progress = RunProgress::new(limits());
+        for _ in 0..4 {
+            progress.model_call_started();
+        }
+        assert_eq!(
+            progress.model_checkpoint(),
+            BudgetCheck::Exhausted(StopReason::ModelBudget)
+        );
+        assert!(progress.try_pivot(), "the first checkpoint pivots");
+        assert!(
+            progress
+                .pivot_message(StopReason::ModelBudget)
+                .contains("switch to a different method")
+        );
+        assert_eq!(
+            progress.model_checkpoint(),
+            BudgetCheck::Ok,
+            "fresh allowance"
+        );
+        assert_eq!(progress.renewals, 0, "a pivot is not a productive renewal");
+        for _ in 0..4 {
+            progress.model_call_started();
+        }
+        assert_eq!(
+            progress.model_checkpoint(),
+            BudgetCheck::Exhausted(StopReason::ModelBudget)
+        );
+        assert!(!progress.try_pivot(), "the second checkpoint ends the turn");
+    }
+
+    #[test]
+    fn a_pivot_clears_the_stall_guard() {
+        let dir = empty_workspace();
+        let mut progress = RunProgress::new(limits());
+        for index in 0..10 {
+            record(
+                &mut progress,
+                dir.path(),
+                "bash ls",
+                &format!("bash ls :: ls /missing-{index}"),
+                "no such file",
+                true,
+                false,
+                false,
+            );
+        }
+        assert!(progress.stalled());
+        assert!(progress.try_pivot());
+        assert!(!progress.stalled(), "the next approach starts clean");
+        assert!(
+            progress
+                .pivot_message(StopReason::Stalled)
+                .starts_with("[totality] stalled:")
+        );
+        assert!(!progress.try_pivot(), "one pivot per turn");
     }
 
     #[test]
