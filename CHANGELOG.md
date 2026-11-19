@@ -9,6 +9,12 @@ release may change defaults when the change is called out below.
 
 ### Added
 
+- Files named in a prompt without `@` are attached like `@` mentions:
+  `the panic at src/parser.rs:88:5`, a pasted stack trace, or
+  `File "pkg/mod.py", line 3` attaches up to three existing text files under
+  the working directory, after the `@` mentions and within the same budget.
+  Words that only look like paths are ignored silently
+  (`[prompt] attach_named_files`, default `true`).
 - Repeated approvals become a rule. Approvals of each exact `bash`/`bg`
   command are counted per project; from the third ask on, the prompt shows an
   exact-match allow rule and `a` saves it to the global config. Commands with

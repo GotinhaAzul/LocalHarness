@@ -225,8 +225,13 @@ async fn run_turn_inner(
     // `@path` mentions attach file snapshots, within a quarter of the
     // usable prompt so one message cannot crowd out the conversation.
     let attachment_budget = turn.budget.chars_for(turn.budget.usable_prompt() / 4);
-    let mentions =
-        super::mentions::resolve(&core.tool_context(), &user_text, attachment_budget).await;
+    let mentions = super::mentions::resolve_with(
+        &core.tool_context(),
+        &user_text,
+        attachment_budget,
+        core.config.prompt.attach_named_files,
+    )
+    .await;
     if !mentions.attachments.is_empty() {
         let names: Vec<String> = mentions
             .attachments

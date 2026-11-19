@@ -161,6 +161,7 @@ identity = ""                   # replaces the built-in one-line identity
 instructions = ""               # extra instructions appended to the prompt
 file = ""                       # or a Markdown file, relative to the config dir
 agents_md = true                # load the hierarchical AGENTS.md chain
+attach_named_files = true       # attach files a prompt names without @ (up to 3)
 
 [lsp]
 gate = "warn"                   # off | warn | block (see below)

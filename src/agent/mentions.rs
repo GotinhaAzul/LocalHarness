@@ -7,6 +7,12 @@
 //! numbering, and the read stamp that lets the model `edit` the file without
 //! re-reading it all apply unchanged.
 //!
+//! A path written without `@` (`the panic in src/parser.rs:88`, a pasted
+//! stack trace) is attached the same way when it names an existing text file
+//! in the working directory: at most [`MAX_NAMED`] per prompt, after the
+//! `@` mentions, within the same budget, and silently skipped otherwise.
+//! `[prompt] attach_named_files = false` turns this off.
+//!
 //! An image mention (`@shot.png`, recognised by content) is validated,
 //! stripped of metadata, stored as an artifact, and either sent as an image
 //! (a model with vision input) or described once by `[vision] model` and
@@ -21,6 +27,8 @@ use crate::tools::{ToolContext, display_path};
 
 /// Most files one prompt may attach.
 pub const MAX_MENTIONS: usize = 8;
+/// Most files attached because the prompt named them without `@`.
+pub const MAX_NAMED: usize = 3;
 
 /// The result of resolving the mentions in one prompt.
 #[derive(Debug, Default)]
@@ -51,11 +59,88 @@ pub fn parse(text: &str) -> Vec<String> {
     found
 }
 
+/// Path-like words in `text` written without `@`, in order and without
+/// duplicates: a word with a `/` or a file extension, with quotes, brackets,
+/// trailing punctuation, and a `:line[:col]` or `(line,col)` suffix removed.
+/// URLs, options, and `~` paths are not candidates. Whether one names a file
+/// is decided by [`resolve`].
+pub fn parse_named(text: &str) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    for word in text.split_whitespace() {
+        if word.starts_with('@') || word.contains("://") {
+            continue;
+        }
+        let mut path = word
+            .trim_start_matches(['"', '\'', '`', '(', '[', '<'])
+            .trim_end_matches(['"', '\'', '`', ',', ';', '!', '?', ')', ']', '>', '.']);
+        // `src/a.rs:12:5`, `src/a.rs:12:`, `src/a.ts(12,5):`.
+        loop {
+            if let Some(head) = path.strip_suffix(':') {
+                path = head;
+            } else if let Some((head, tail)) = path.rsplit_once(':')
+                && !tail.is_empty()
+                && tail.chars().all(|c| c.is_ascii_digit())
+            {
+                path = head;
+            } else if let Some(open) = path.rfind('(')
+                && path.ends_with(')')
+                && path[open + 1..path.len() - 1]
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || c == ',')
+            {
+                path = &path[..open];
+            } else {
+                break;
+            }
+        }
+        let path = path.trim_start_matches("./");
+        if path.is_empty()
+            || path.starts_with('-')
+            || path.starts_with('~')
+            || !path_like(path)
+            || found.iter().any(|seen| seen == path)
+        {
+            continue;
+        }
+        found.push(path.to_string());
+    }
+    found
+}
+
+/// A word that could be a path: it has a directory separator, or a file
+/// name with an extension that is not just digits (`v1.2`, `3.14`).
+fn path_like(word: &str) -> bool {
+    if word.contains('/') {
+        return word.chars().any(|c| c.is_ascii_alphabetic());
+    }
+    match word.rsplit_once('.') {
+        Some((stem, ext)) => {
+            !stem.is_empty()
+                && !ext.is_empty()
+                && ext.len() <= 10
+                && ext.chars().all(|c| c.is_ascii_alphanumeric())
+                && !ext.chars().all(|c| c.is_ascii_digit())
+        }
+        None => false,
+    }
+}
+
 /// Attach every mentioned file that exists, within `char_budget` characters
 /// in total. Mentions that name nothing on disk are left alone silently:
 /// `@someone` in prose is not an error. Real files that cannot be attached
 /// (binary, outside the working directory, over budget) are reported.
 pub async fn resolve(ctx: &ToolContext, text: &str, char_budget: usize) -> Resolved {
+    resolve_with(ctx, text, char_budget, false).await
+}
+
+/// [`resolve`], then, when `named` is set, files the prompt names without
+/// `@` (see [`parse_named`]).
+pub async fn resolve_with(
+    ctx: &ToolContext,
+    text: &str,
+    char_budget: usize,
+    named: bool,
+) -> Resolved {
     let mut resolved = Resolved::default();
     let mut used = 0usize;
     for raw in parse(text) {
@@ -118,7 +203,67 @@ pub async fn resolve(ctx: &ToolContext, text: &str, char_budget: usize) -> Resol
             .attachments
             .push(Attachment::file(path, result.content));
     }
+    if named {
+        attach_named(ctx, text, char_budget, &mut used, &mut resolved);
+    }
     resolved
+}
+
+/// Attach up to [`MAX_NAMED`] text files the prompt names without `@`.
+/// Nothing here is reported: a word that only looks like a path, a file
+/// outside the jail, a binary, or one over budget is simply not attached.
+fn attach_named(
+    ctx: &ToolContext,
+    text: &str,
+    char_budget: usize,
+    used: &mut usize,
+    resolved: &mut Resolved,
+) {
+    let mut attached = 0usize;
+    for raw in parse_named(text) {
+        if attached >= MAX_NAMED || resolved.attachments.len() >= MAX_MENTIONS {
+            break;
+        }
+        let Ok(path) = ctx.resolve(&raw) else {
+            continue;
+        };
+        // Only the project's own files: a named path is never an invitation
+        // to read outside the working directory, jail or not.
+        if !path.starts_with(&ctx.cwd)
+            || !path.is_file()
+            || image::is_image_file(&path)
+            || path.components().any(|part| part.as_os_str() == ".git")
+        {
+            continue;
+        }
+        let display = display_path(&ctx.cwd, &path);
+        if resolved
+            .attachments
+            .iter()
+            .any(|attachment| attachment.path == display)
+        {
+            continue;
+        }
+        let result = match crate::tools::read::run_with_budget(
+            ctx,
+            &json!({ "path": display, "limit": 800 }),
+            usize::MAX,
+        ) {
+            Ok(result) | Err(result) => result,
+        };
+        if result.is_error {
+            continue;
+        }
+        let size = result.content.chars().count();
+        if *used + size > char_budget {
+            continue;
+        }
+        *used += size;
+        attached += 1;
+        resolved
+            .attachments
+            .push(Attachment::file(display, result.content));
+    }
 }
 
 /// Validate, store, and route one image. Returns the attachment and its
@@ -230,6 +375,92 @@ mod tests {
         // The read stamp lets edit/write proceed without a separate read.
         let reads = crate::tools::write::lock_reads(&ctx);
         assert!(reads.is_current(&dir.path().join("a.rs")));
+    }
+
+    #[test]
+    fn named_paths_are_found_in_prose_and_stack_traces() {
+        assert_eq!(
+            parse_named(
+                "the panic at src/parser.rs:88:5 and (see README.md). Also `lib/util.py`, \
+                 File \"pkg/mod.py\", line 3 and src/a.ts(12,5): error"
+            ),
+            vec![
+                "src/parser.rs",
+                "README.md",
+                "lib/util.py",
+                "pkg/mod.py",
+                "src/a.ts"
+            ]
+        );
+        // Not paths: versions, numbers, URLs, options, home paths, @mentions.
+        assert!(
+            parse_named(
+                "bump to v1.2 or 3.14, see https://x.io/a.rs --out=a.txt ~/a.rs @b.rs e.g."
+            )
+            .iter()
+            .all(|word| word == "e.g"),
+            "{:?}",
+            parse_named(
+                "bump to v1.2 or 3.14, see https://x.io/a.rs --out=a.txt ~/a.rs @b.rs e.g."
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn files_named_without_at_are_attached_only_when_they_exist_here() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/parser.rs"), "fn parse() {}\n").unwrap();
+        std::fs::write(dir.path().join("blob.bin"), [0u8, 1, 2]).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("x.rs"), "fn x() {}\n").unwrap();
+        let ctx = test_context(dir.path());
+        let text = format!(
+            "it panics at src/parser.rs:3:1, not in missing.rs or blob.bin or {}",
+            outside.path().join("x.rs").display()
+        );
+
+        let resolved = resolve_with(&ctx, &text, 10_000, true).await;
+        let paths: Vec<&str> = resolved
+            .attachments
+            .iter()
+            .map(|a| a.path.as_str())
+            .collect();
+        assert_eq!(paths, vec!["src/parser.rs"]);
+        assert!(
+            resolved.skipped.is_empty(),
+            "named paths are never reported: {:?}",
+            resolved.skipped
+        );
+        assert!(
+            crate::tools::write::lock_reads(&ctx).is_current(&dir.path().join("src/parser.rs"))
+        );
+
+        // Off: only @ mentions attach.
+        let ctx = test_context(dir.path());
+        assert!(
+            resolve_with(&ctx, &text, 10_000, false)
+                .await
+                .attachments
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn named_files_are_capped_and_never_duplicate_a_mention() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["a.rs", "b.rs", "c.rs", "d.rs", "e.rs"] {
+            std::fs::write(dir.path().join(name), "x\n").unwrap();
+        }
+        let ctx = test_context(dir.path());
+        let resolved =
+            resolve_with(&ctx, "@a.rs then a.rs b.rs c.rs d.rs e.rs", 10_000, true).await;
+        let paths: Vec<&str> = resolved
+            .attachments
+            .iter()
+            .map(|a| a.path.as_str())
+            .collect();
+        assert_eq!(paths, vec!["a.rs", "b.rs", "c.rs", "d.rs"]);
     }
 
     #[tokio::test]
