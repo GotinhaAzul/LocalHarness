@@ -9,7 +9,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use tokio::io::AsyncReadExt;
-use tokio::process::{ChildStderr, ChildStdout, Command};
+use tokio::process::{ChildStderr, ChildStdout};
 
 use crate::text::clip;
 use crate::tools::project::{Runner, detect_runner, is_executable, python_program};
@@ -353,7 +353,7 @@ async fn run_invocation(
     cwd: &Path,
     timeout: Duration,
 ) -> Result<RunOutput, ToolResult> {
-    let mut command = Command::new(&invocation.program);
+    let mut command = crate::tools::procenv::command(&invocation.program);
     command
         .args(&invocation.args)
         .current_dir(cwd)
@@ -361,7 +361,6 @@ async fn run_invocation(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    crate::tools::procenv::detach(&mut command);
 
     let mut child = command.spawn().map_err(|error| {
         ToolResult::err(

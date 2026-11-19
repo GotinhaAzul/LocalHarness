@@ -188,7 +188,9 @@ impl Sandbox {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        crate::tools::procenv::detach(&mut cmd);
+        // bwrap's `--new-session` detaches the shell; bwrap itself only needs
+        // its own group so a timeout can signal the whole tree.
+        cmd.as_std_mut().process_group(0);
 
         // `--seccomp` needs an fd number that survives the exec of bwrap.
         // Duplicate the filter onto a fixed descriptor in the child; `dup2`
@@ -408,14 +410,13 @@ fn push_env(args: &mut Vec<OsString>) {
 /// `crate::tools::bash::shell_command` so both paths agree on shell semantics
 /// and process-group ownership.
 fn plain_command(command: &str, cwd: &Path) -> tokio::process::Command {
-    let mut cmd = tokio::process::Command::new("bash");
+    let mut cmd = crate::tools::procenv::command("bash");
     cmd.arg("-c")
         .arg(command)
         .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    crate::tools::procenv::detach(&mut cmd);
     cmd
 }
 

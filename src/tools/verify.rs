@@ -9,7 +9,6 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use tokio::io::AsyncReadExt;
-use tokio::process::Command;
 use tokio::task::JoinHandle;
 
 use crate::config::VerifyStep;
@@ -274,7 +273,7 @@ impl Tool for VerifyTool {
 }
 
 async fn run_step(ctx: &ToolContext, step: &VerifyStep) -> StepOutcome {
-    let mut command = Command::new(&step.command[0]);
+    let mut command = crate::tools::procenv::command(&step.command[0]);
     command
         .args(&step.command[1..])
         .current_dir(&ctx.cwd)
@@ -282,7 +281,6 @@ async fn run_step(ctx: &ToolContext, step: &VerifyStep) -> StepOutcome {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    crate::tools::procenv::detach(&mut command);
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(err) => return StepOutcome::SpawnFailed(err.to_string()),
