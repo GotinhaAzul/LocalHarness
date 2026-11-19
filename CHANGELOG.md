@@ -217,6 +217,14 @@ release may change defaults when the change is called out below.
 
 ### Changed
 
+- The system prompt's operating rules no longer restate what the gates
+  enforce (read before edit, the plan from the third file, no interactive
+  programs, `recall` for truncated output) or ask the model to judge its own
+  context size for `thread split`; each gate says what to do when it applies,
+  and compaction runs on the measured budget. "Run verify, then review" is
+  included only with `[gates] auto_settle = false`, and the `bg` and
+  `repo_map` hints only when the profile has those tools. About 450 fewer
+  characters on every request with the default profile.
 - The repository map injected into the system prompt is smaller (at most
   1200 chars, down from 1800) and says it is an index, not a full listing.
   The map ranks files (README, manifests, entry points, source, tests, then
