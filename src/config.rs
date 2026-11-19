@@ -92,11 +92,18 @@ pub struct GatesConfig {
     /// instead of asking the model to call them. A clean result settles on
     /// the answer already written; a failure continues with one message.
     pub auto_settle: bool,
+    /// With no configured or accepted verify steps, use the steps detected
+    /// from the project manifest for this session. They run through the
+    /// permission policy like any command and are not saved.
+    pub verify_detected: bool,
 }
 
 impl Default for GatesConfig {
     fn default() -> Self {
-        Self { auto_settle: true }
+        Self {
+            auto_settle: true,
+            verify_detected: true,
+        }
     }
 }
 
@@ -1595,6 +1602,17 @@ pub enum ToolMode {
 #[serde(default)]
 pub struct VerifyConfig {
     pub steps: Vec<VerifyStep>,
+    /// Manifest files the steps were detected from, when nobody configured
+    /// or accepted them. Empty for configured steps. Never read from config.
+    #[serde(skip)]
+    pub detected_from: Vec<String>,
+}
+
+impl VerifyConfig {
+    /// Whether the steps are this session's detection, not a saved choice.
+    pub fn is_detected(&self) -> bool {
+        !self.steps.is_empty() && !self.detected_from.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

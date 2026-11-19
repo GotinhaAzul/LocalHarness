@@ -1245,22 +1245,41 @@ async fn no_redact_keeps_raw_output_and_is_recorded_in_the_header() {
 }
 
 #[tokio::test]
-async fn print_in_an_unconfigured_project_names_the_detected_steps_and_runs_none() {
+async fn print_in_an_unconfigured_project_uses_the_detected_steps_and_says_so() {
     let (base, _fake) = spawn().await;
     let env = env();
     std::fs::write(env.cwd.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
-    // A marker a detected step would create if anything ran it.
     let output = run_tot(&env, &base, &["--print", "hi"]).await;
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
     let notices = stderr
         .lines()
-        .filter(|line| line.contains("verify: not configured"))
+        .filter(|line| line.contains("verify: using steps detected from Cargo.toml"))
         .count();
     assert_eq!(notices, 1, "stderr: {stderr}");
     assert!(stderr.contains("cargo check --all-targets"), "{stderr}");
     assert!(stderr.contains("tot verify --init"), "{stderr}");
+    assert!(stderr.contains("verify_detected = false"), "{stderr}");
+    // Detection reads the manifest only; a turn that changed nothing runs no step.
     assert!(!env.cwd.join("target").exists(), "no detected step may run");
+}
+
+#[tokio::test]
+async fn print_with_detection_off_names_the_detected_steps_and_runs_none() {
+    let (base, _fake) = spawn().await;
+    let env = env();
+    std::fs::create_dir_all(&env.config_dir).unwrap();
+    std::fs::write(
+        env.config_dir.join("config.toml"),
+        "[gates]\nverify_detected = false\n",
+    )
+    .unwrap();
+    std::fs::write(env.cwd.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+    let output = run_tot(&env, &base, &["--print", "hi"]).await;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
+    assert!(stderr.contains("verify: not configured"), "{stderr}");
+    assert!(stderr.contains("cargo check --all-targets"), "{stderr}");
 }
 
 #[tokio::test]
@@ -1270,7 +1289,10 @@ async fn verify_init_saves_the_detected_steps_for_later_runs() {
     std::fs::write(env.cwd.join("go.mod"), "module example.com/x\n").unwrap();
     let output = run_tot(&env, &base, &["verify"]).await;
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("verify: not configured"), "{stdout}");
+    assert!(
+        stdout.contains("verify: using steps detected from go.mod"),
+        "{stdout}"
+    );
 
     let output = run_tot(&env, &base, &["verify", "--init"]).await;
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1284,4 +1306,5 @@ async fn verify_init_saves_the_detected_steps_for_later_runs() {
     let output = run_tot(&env, &base, &["--print", "hi"]).await;
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!stderr.contains("verify: not configured"), "{stderr}");
+    assert!(!stderr.contains("verify: using steps detected"), "{stderr}");
 }

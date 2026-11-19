@@ -54,7 +54,7 @@ impl Fixture {
             artifacts,
             cancel: CancellationToken::new(),
             trust: false,
-            verify: VerifyConfig { steps: Vec::new() },
+            verify: VerifyConfig::default(),
             profile: "test".into(),
             packs: Vec::new(),
             reads: Arc::new(Mutex::new(ReadTracker::default())),

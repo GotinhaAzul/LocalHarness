@@ -59,6 +59,11 @@ impl Host {
         if root != self.process_paths.cwd {
             config.trust = false;
             config.verify = crate::config::VerifyConfig::default();
+            // Detection reads only the manifest; the steps still run through
+            // the permission policy, so another root may use its own.
+            if let Ok(paths) = Paths::discover(root) {
+                crate::verify_setup::fill_unconfigured(&mut config, &paths);
+            }
         }
         config
     }
