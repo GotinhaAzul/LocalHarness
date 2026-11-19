@@ -3054,6 +3054,7 @@ async fn a_targeted_verify_does_not_clear_the_project_verify_gate() {
             command: vec!["true".into()],
             timeout_secs: 5,
         }],
+        ..Default::default()
     };
     let harness = harness_config(
         dir.path(),
