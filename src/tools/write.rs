@@ -455,7 +455,7 @@ pub(crate) fn test_context(dir: &Path) -> ToolContext {
         artifacts: Arc::new(ArtifactStore::ephemeral()),
         cancel: CancellationToken::new(),
         trust: false,
-        verify: VerifyConfig { steps: Vec::new() },
+        verify: VerifyConfig::default(),
         profile: "test".into(),
         edit_mode: crate::config::EditMode::Text,
         packs: Vec::new(),

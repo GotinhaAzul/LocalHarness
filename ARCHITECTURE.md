@@ -406,6 +406,10 @@ review continues once with a user-role message carrying the results, so no
 orphan tool result enters the context path. `auto_settle = false` keeps the
 model-relayed gate messages.
 
+A failing verify attaches the first three project `file:line` locations its
+output names, three lines on each side, and records them as read, so the next
+call can be the fix instead of a `read`.
+
 One step before the todo gate — the second mutation, or the first edit of a
 second file, with no plan — the successful mutation's tool result ends with one
 line saying the next edit needs a plan. It appears once per turn; the gate
@@ -1786,7 +1790,7 @@ cursor = "#c0caf5"
   `cache <cached>/<prompt>` when the engine reports prefix-cache hits.
 - Session: short id and trusted/untrusted marker.
 - Verify: `verify: not configured` when no steps are set; the marker drops
-  once steps are configured.
+  once steps are configured or detected (`[gates] verify_detected`).
 - At narrow widths, drop throughput, then session id, then profile; never drop
   cwd, context, or model. With no model selected, the model slot reads
   `not logged in` and the footer says the same.
@@ -2043,6 +2047,9 @@ strip_reasoning = true
 `verify.toml` is a project file and needs `--trust`. Steps accepted through
 `tot verify --init` or `/verify accept` are stored per project in
 `verify-steps.json` in the user data directory, so they load without trust.
+With neither, `[gates] verify_detected` (default on) uses the steps detected
+from the manifest for the session; they run under the permission policy and
+are not saved.
 
 `AGENTS.md` files between the repository root and the working directory are
 read as untrusted project instructions, nearest last. They are data, not
