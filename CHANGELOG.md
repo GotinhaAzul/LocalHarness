@@ -217,6 +217,12 @@ release may change defaults when the change is called out below.
 
 ### Changed
 
+- The wall-clock checkpoint scales with the measured model speed: the
+  allowance is `[budgets] max_wall_minutes` or six model calls at the slowest
+  of the last five measured calls, whichever is longer, and the "recent
+  progress" window covers at least three such calls. A 10 tok/s thinking
+  model whose calls take several minutes is no longer stopped as
+  no-progress during one long call. Fast engines see no change.
 - The repository map injected into the system prompt is smaller (at most
   1200 chars, down from 1800) and says it is an index, not a full listing.
   The map ranks files (README, manifests, entry points, source, tests, then
