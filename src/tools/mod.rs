@@ -14,6 +14,7 @@ pub mod glob;
 pub mod grep;
 pub mod hunk;
 pub mod iocs;
+pub(crate) mod locations;
 pub mod lsp;
 pub mod patch;
 pub mod pr;

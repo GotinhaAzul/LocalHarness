@@ -19,6 +19,10 @@ use crate::tools::{Tool, ToolContext, ToolPack, ToolResult, optional_str};
 const OUTPUT_CAP_BYTES: usize = 1024 * 1024;
 /// Failure excerpt shown in the tool result.
 const FAILURE_EXCERPT_CHARS: usize = 1400;
+/// Characters the attached failing locations may take.
+const MAX_LOCATION_CHARS: usize = 1600;
+/// Room kept for the lines after the locations (rerun, detection note).
+const LOCATION_RESERVE_CHARS: usize = 300;
 /// A step may not run longer than this, whatever its config says.
 const MAX_STEP_SECS: u64 = 600;
 /// How long to wait for pipe readers after the child exits.
@@ -217,9 +221,28 @@ impl Tool for VerifyTool {
                 content.push('\n');
             }
             content.push_str("---\n");
+            // The spots the output names, already read for the model.
+            let locations = crate::tools::locations::find(output, &ctx.cwd);
+            let budget = ctx
+                .caps
+                .tool_budget()
+                .saturating_sub(content.len() + LOCATION_RESERVE_CHARS)
+                .min(MAX_LOCATION_CHARS);
+            let attached = crate::tools::locations::attach(ctx, &locations, budget);
+            if !attached.is_empty() {
+                content.push_str("\n--- failing locations (read) ---\n");
+                content.push_str(&attached);
+                content.push_str("---\n");
+            }
             content.push_str(&format!("rerun: {}\n", format_command(command)));
         } else {
             content.push_str(&format!("all {} steps passed\n", runs.len()));
+        }
+        if ctx.verify.is_detected() {
+            content.push_str(&format!(
+                "(steps detected from {}; not saved)\n",
+                ctx.verify.detected_from.join(", ")
+            ));
         }
 
         let steps: Vec<Value> = runs
@@ -430,7 +453,10 @@ mod tests {
             artifacts: Arc::new(ArtifactStore::ephemeral()),
             cancel: CancellationToken::new(),
             trust: true,
-            verify: VerifyConfig { steps },
+            verify: VerifyConfig {
+                steps,
+                ..Default::default()
+            },
             profile: "test".into(),
             edit_mode: Default::default(),
             packs: Vec::new(),
@@ -489,6 +515,72 @@ mod tests {
         assert_eq!(entry["passed"], false);
         assert_eq!(entry["failed_step"], "bad");
         assert_eq!(entry["steps"].as_array().expect("steps").len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_failure_attaches_the_location_it_names_and_records_the_read() {
+        let (dir, ctx) = test_ctx(vec![step(
+            "check",
+            "printf 'error[E0308]: mismatched types\\n  --> src/lib.rs:5:3\\n'; exit 101",
+        )]);
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        let body: String = (1..=12).map(|n| format!("fn f{n}() {{}}\n")).collect();
+        std::fs::write(dir.path().join("src/lib.rs"), body).unwrap();
+
+        let result = VerifyTool.call(&ctx, json!({})).await;
+        assert!(
+            result.content.contains("--- failing locations (read) ---"),
+            "{}",
+            result.content
+        );
+        assert!(
+            result.content.contains("src/lib.rs:5\n"),
+            "{}",
+            result.content
+        );
+        assert!(
+            result.content.contains(">    5  fn f5() {}"),
+            "{}",
+            result.content
+        );
+        assert!(
+            result.content.contains("     2  fn f2() {}"),
+            "{}",
+            result.content
+        );
+        assert!(!result.content.contains("fn f9()"), "{}", result.content);
+
+        // The attached lines count as read, so an edit there needs no re-read.
+        let path = ctx.resolve("src/lib.rs").unwrap();
+        let reads = crate::tools::write::lock_reads(&ctx);
+        assert!(reads.is_current(&path));
+        assert!(!reads.is_fully_read(&path), "only the window was shown");
+    }
+
+    #[tokio::test]
+    async fn a_failure_naming_no_project_file_attaches_nothing() {
+        let (_dir, ctx) = test_ctx(vec![step("t", "echo 'at /usr/lib/x.rs:3:1'; exit 1")]);
+        let result = VerifyTool.call(&ctx, json!({})).await;
+        assert!(
+            !result.content.contains("failing locations"),
+            "{}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn detected_steps_run_and_say_where_they_came_from() {
+        let (_dir, mut ctx) = test_ctx(vec![step("test", "exit 0")]);
+        ctx.verify.detected_from = vec!["Cargo.toml".into()];
+        let result = VerifyTool.call(&ctx, json!({})).await;
+        assert!(result.content.contains("PASS test"), "{}", result.content);
+        assert!(
+            result
+                .content
+                .contains("(steps detected from Cargo.toml; not saved)"),
+            "{}",
+            result.content
+        );
     }
 
     #[tokio::test]

@@ -152,6 +152,10 @@ max_same_tool_family = 8
 max_same_tool_family_success = 24
 verify_attempts = 2
 
+[gates]
+auto_settle = true              # the harness runs verify and review when the model settles
+verify_detected = true          # no steps configured: use the ones detected from the manifest
+
 [prompt]
 identity = ""                   # replaces the built-in one-line identity
 instructions = ""               # extra instructions appended to the prompt
@@ -654,7 +658,21 @@ name = "lint"
 command = ["cargo", "clippy", "--all-targets", "--", "-D", "warnings"]
 ```
 
-Steps run sequentially without a shell and stop at the first failure.
+Steps run sequentially without a shell and stop at the first failure. When
+one fails, up to three `file:line` locations its output names (rustc, Rust
+panics, tsc, Python tracebacks, pytest, Go, gcc and eslint shapes) are attached
+with three lines of context each and count as read. Only existing files under
+the working directory count; `target/`, `node_modules/`, virtualenvs and build
+output are skipped.
+
+With no configured or accepted steps, `[gates] verify_detected` (default
+`true`) uses the steps detected from the project manifest (`Cargo.toml`,
+`package.json`, Python markers, `go.mod`) for the session, so the verify gate
+is on in an ordinary repository. Detection reads files only; the steps run
+through the permission policy like any other command, so in the default mode
+the first run asks. They are not saved: `tot verify --init` or `/verify accept`
+keeps them, and `verify_detected = false` restores the old behavior (no steps,
+the gate stays off, a notice names what was detected).
 
 ## Environment
 
