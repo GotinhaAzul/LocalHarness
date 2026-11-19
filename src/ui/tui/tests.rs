@@ -1443,6 +1443,9 @@ fn cache_is_a_percentage_and_a_cold_cache_stands_out() {
         Some(("cache 30%".into(), Role::Warning))
     );
     assert_eq!(cache_label(0, 0), None);
+}
+
+#[tokio::test]
 async fn a_suggested_rule_is_offered_and_a_saves_it_only_when_offered() {
     let (_dir, mut app) = test_app().await;
     let ask = |suggestion: Option<Box<crate::policy::remember::Suggestion>>| {
@@ -1481,7 +1484,9 @@ async fn a_suggested_rule_is_offered_and_a_saves_it_only_when_offered() {
         "{shown}"
     );
     assert!(shown.contains("a always"), "{shown}");
-    let bar = app.activity().expect("the question is on the activity line");
+    let bar = app
+        .activity()
+        .expect("the question is on the activity line");
     assert_eq!(bar.meta, "y allow · a always · n deny");
     app.handle_key(key(KeyCode::Char('a'))).await;
     assert_eq!(answer.await.unwrap(), crate::policy::AskAnswer::AllowAlways);
