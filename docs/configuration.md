@@ -161,6 +161,9 @@ agents_md = true                # load the hierarchical AGENTS.md chain
 [lsp]
 gate = "warn"                   # off | warn | block (see below)
 
+[format]
+on_edit = true                  # format edited files the project keeps formatted
+
 [git]
 commit = "ask"                  # ask: /commit confirm approves; allow: commit at once
 pr = "ask"                      # ask: /pr confirm approves drafts and comments
@@ -564,6 +567,31 @@ visible in the transcript and recorded in the session; it never looks like
 approval. Hook output cannot change tools, scope, the endpoint, or the
 permission mode. See [hooks.md](hooks.md) for the payload, output schema, exit
 codes, and `tot hooks test <name>`.
+
+## Formatting edits
+
+With `[format] on_edit` (default `true`), `edit`, exact-text `patch`, and
+`write` pass the new content through the project's formatter before writing
+it, so the model does not spend turns on whitespace and review shows no
+formatter noise. The diff in the tool result is what landed.
+
+A clean file stays clean, and nothing else is touched: an existing file is
+formatted only when its content before the edit was already what the
+formatter produces. A new file is formatted when the project has the
+formatter's config, or always for Rust and Go.
+
+| Files | Formatter | Used when |
+|---|---|---|
+| `.rs` | `rustfmt --edition <Cargo.toml edition>` | on `PATH` |
+| `.go` | `gofmt` | on `PATH` |
+| `.py`, `.pyi` | `ruff format`, else `black` | `[tool.ruff]`/`ruff.toml`, or `[tool.black]`, and on `PATH` |
+| JS/TS, JSON, CSS, HTML, Markdown, YAML | `prettier` | a prettier config; `node_modules/.bin/prettier` only in a trusted project, else on `PATH` |
+
+Formatters read stdin and write stdout with a 5-second limit. A missing
+formatter, a failure (such as a syntax error mid-edit), or a timeout writes
+the content as given. Hash-mode `patch` is never formatted, because its result
+returns line anchors for the content the operations produced. Files over
+512 KB and non-UTF-8 files are written as given.
 
 ## LSP gate
 

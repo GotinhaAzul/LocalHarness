@@ -871,6 +871,10 @@ form. `tot doctor` prints both sizes.
   anchors for the changed lines, and untouched lines keep their bytes and line
   endings. Text-mode `patch` and `edit` are unchanged.
 - `write` and `edit` are atomic (temp file plus rename) and record `fs-change`.
+- `edit`, exact-text `patch`, and `write` pass new content through the
+  project's formatter (`[format] on_edit`) when the file was already
+  formatter-clean before the edit (`tools/format.rs`); the result's diff is
+  what landed. Hash-mode `patch` is not formatted.
 - `edit` preflight handles: multiple matches (list line numbers), whitespace-
   only match (show the verbatim excerpt), and no match (show the closest
   window). It never blocks an edit that would succeed. When the exact text is

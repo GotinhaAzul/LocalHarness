@@ -9,6 +9,12 @@ release may change defaults when the change is called out below.
 
 ### Added
 
+- `edit`, exact-text `patch`, and `write` run the project's formatter on the
+  new content before writing it (`[format] on_edit`, default `true`):
+  `rustfmt`, `gofmt`, `ruff`/`black`, or `prettier`. A file is formatted only
+  when it was already formatter-clean, so an unformatted project never gets
+  churn. A failing or missing formatter writes the content as given, and a
+  project's own `node_modules/.bin/prettier` runs only in a trusted project.
 - `/permissions` gathers the permission levels in one TUI command. With no
   argument it opens the filterable picker over `normal`, `accept-edits`,
   `deny-all`, and `yolo`, marking the current level and describing each one;

@@ -135,6 +135,8 @@ fn run(ctx: &ToolContext, args: &Value) -> Result<ToolResult, ToolResult> {
         before.replacen(&old, new, 1)
     };
     let replacements = if replace_all { count } else { 1 };
+    let formatted = crate::tools::format::format_content(ctx, &path, Some(&before), after);
+    let after = formatted.content;
     let (diff, added, removed) = diff_report(&before, &after, MAX_DIFF_LINES);
 
     let change = crate::tools::undo::record_change(ctx, Ok(Some(&before)), &after);
@@ -146,7 +148,11 @@ fn run(ctx: &ToolContext, args: &Value) -> Result<ToolResult, ToolResult> {
     let how = located
         .how
         .map(|how| format!("; {how}"))
-        .unwrap_or_default();
+        .unwrap_or_default()
+        + &formatted
+            .by
+            .map(|by| format!("; formatted by {by}"))
+            .unwrap_or_default();
     let text = format!(
         "edited {display} ({replacements} replacement{plural}, +{added} -{removed}{how})\n{diff}"
     );
@@ -588,6 +594,46 @@ mod tests {
 
     fn on_disk(dir: &tempfile::TempDir) -> String {
         std::fs::read_to_string(dir.path().join("a.txt")).unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_edit_to_a_formatted_file_lands_formatted_and_needs_no_reread() {
+        if std::env::var_os("PATH").is_none_or(|path| {
+            !std::env::split_paths(&path).any(|dir| dir.join("rustfmt").is_file())
+        }) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("lib.rs"), "fn a() {}\n").unwrap();
+        let mut ctx = test_context(dir.path());
+        ctx.format_on_edit = true;
+        let read = ReadTool.call(&ctx, json!({"path": "lib.rs"})).await;
+        assert!(!read.is_error, "{}", read.content);
+
+        let result = EditTool
+            .call(
+                &ctx,
+                json!({"path": "lib.rs", "old": "fn a() {}", "new": "fn a() {}\nfn   b( ){ }"}),
+            )
+            .await;
+        assert!(!result.is_error, "{}", result.content);
+        assert!(
+            result.content.contains("formatted by rustfmt"),
+            "{}",
+            result.content
+        );
+        let disk = std::fs::read_to_string(dir.path().join("lib.rs")).unwrap();
+        assert_eq!(disk, "fn a() {}\nfn b() {}\n");
+        // The diff the model saw is what landed.
+        assert!(result.content.contains("+fn b() {}"), "{}", result.content);
+
+        let again = EditTool
+            .call(
+                &ctx,
+                json!({"path": "lib.rs", "old": "fn b() {}", "new": "fn c() {}"}),
+            )
+            .await;
+        assert!(!again.is_error, "{}", again.content);
     }
 
     #[tokio::test]
