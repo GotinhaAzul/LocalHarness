@@ -51,10 +51,7 @@ fn draw_scene(width: u16, height: u16, header: HeaderData, theme: Theme) -> Term
     let input = TextArea::new(vec![String::new()]);
     let footer = FooterData {
         hints: "Enter send".into(),
-        status: String::new(),
-        status_role: Role::Muted,
-        notice: None,
-        notice_role: Role::Warning,
+        ..FooterData::default()
     };
     let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
     terminal
@@ -108,8 +105,12 @@ fn header_at_120_contains_cwd_model_and_context() {
     assert!(text.contains("12.4k/64k"), "context missing:\n{text}");
     assert!(text.contains("tok/s"));
     assert!(
-        text.contains("cache 940/1000"),
-        "cached and total prompt tokens missing:\n{text}"
+        text.contains("cache 94%"),
+        "cache hit percentage missing:\n{text}"
+    );
+    assert!(
+        !text.contains("940/1000"),
+        "raw cache counts are gone:\n{text}"
     );
     assert!(text.contains("▰"), "context gauge missing:\n{text}");
 }
@@ -1272,7 +1273,8 @@ async fn permissions_command_sets_levels_and_yolo_needs_a_key() {
     // Yolo asks for one key; anything else leaves the level alone.
     app.run_command("/permissions yolo").await;
     assert_eq!(mode(&app), PermissionMode::Ask);
-    assert!(app.footer().status.contains("press y to confirm"));
+    assert!(app.footer().hints.contains("y confirm"));
+    assert!(app.footer().status_badge);
     app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE))
         .await;
     assert_eq!(mode(&app), PermissionMode::Ask);
@@ -1347,6 +1349,8 @@ async fn a_permission_prompt_shows_the_exact_command_and_answers_with_y_or_n() {
                 preview: None,
                 rule: Some("push-asks".into()),
                 key: format!("bash\0{subject}"),
+                call_id: String::new(),
+                suggestion: None,
             },
             reply,
         };
@@ -1374,6 +1378,144 @@ async fn a_permission_prompt_shows_the_exact_command_and_answers_with_y_or_n() {
     assert!(app.pending_ask.is_none());
 }
 
+#[tokio::test]
+async fn a_pending_question_takes_over_the_bottom_of_the_screen() {
+    let (_dir, mut app) = test_app().await;
+    let (reply, answer) = tokio::sync::oneshot::channel();
+    app.show_permission_request(permission::PendingAsk {
+        request: crate::policy::AskRequest {
+            tool: "bash".into(),
+            subject: "cargo test --all".into(),
+            preview: None,
+            rule: None,
+            key: "bash\0cargo test --all".into(),
+            call_id: String::new(),
+            suggestion: None,
+        },
+        reply,
+    });
+
+    // One answer everywhere: activity line, footer, and title.
+    let activity = app
+        .activity()
+        .expect("the activity line shows the question");
+    assert!(activity.attention);
+    assert_eq!(activity.label, "Needs you: Approve command");
+    assert_eq!(activity.detail, "$ cargo test --all");
+    assert_eq!(activity.meta, "y allow · n deny");
+    let footer = app.footer();
+    assert!(footer.status_badge);
+    assert_eq!(footer.status.trim(), "WAITING FOR YOU");
+    assert_eq!(footer.hints, "y allow · n deny");
+    assert!(app.window_title().contains("needs you: approve command"));
+
+    let mut screen = EmulatedScreen::new(100, 30);
+    screen.frame(&mut app, "question pending");
+    let shown = screen.parser.screen().contents();
+    assert!(shown.contains("Needs you: Approve command"), "{shown}");
+    assert!(shown.contains("WAITING FOR YOU"), "{shown}");
+
+    // Answered: the bottom goes back to normal.
+    app.handle_key(key(KeyCode::Char('y'))).await;
+    assert_eq!(answer.await.unwrap(), crate::policy::AskAnswer::Allow);
+    assert!(app.attention().is_none());
+    assert!(!app.footer().status_badge);
+}
+
+#[tokio::test]
+async fn a_finished_turn_says_it_is_the_users_turn() {
+    let (_dir, mut app) = test_app().await;
+    app.turn_done = true;
+    let footer = app.footer();
+    assert!(footer.status.contains("your turn"), "{}", footer.status);
+    assert!(!footer.status_badge);
+}
+
+#[test]
+fn cache_is_a_percentage_and_a_cold_cache_stands_out() {
+    use crate::ui::widgets::cache_label;
+    assert_eq!(
+        cache_label(940, 1000),
+        Some(("cache 94%".into(), Role::Muted))
+    );
+    assert_eq!(
+        cache_label(300, 1000),
+        Some(("cache 30%".into(), Role::Warning))
+    );
+    assert_eq!(cache_label(0, 0), None);
+}
+
+#[tokio::test]
+async fn a_suggested_rule_is_offered_and_a_saves_it_only_when_offered() {
+    let (_dir, mut app) = test_app().await;
+    let ask = |suggestion: Option<Box<crate::policy::remember::Suggestion>>| {
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        let pending = permission::PendingAsk {
+            request: crate::policy::AskRequest {
+                tool: "bash".into(),
+                subject: "cargo test".into(),
+                preview: None,
+                rule: None,
+                key: "bash\0cargo test".into(),
+                call_id: "call_0001".into(),
+                suggestion,
+            },
+            reply,
+        };
+        (pending, answer)
+    };
+
+    // Without a suggestion, `a` does not answer.
+    let (pending, answer) = ask(None);
+    app.show_permission_request(pending);
+    app.handle_key(key(KeyCode::Char('a'))).await;
+    assert!(app.pending_ask.is_some());
+    app.handle_key(key(KeyCode::Char('n'))).await;
+    assert_eq!(answer.await.unwrap(), crate::policy::AskAnswer::Deny);
+
+    let suggestion = crate::policy::remember::suggest("bash", "cargo test", 2).map(Box::new);
+    let (pending, answer) = ask(suggestion);
+    app.show_permission_request(pending);
+    let mut screen = EmulatedScreen::new(100, 40);
+    screen.frame(&mut app, "ask with a suggestion");
+    let shown = screen.parser.screen().contents();
+    assert!(
+        shown.contains("approved this exact command 2 times"),
+        "{shown}"
+    );
+    assert!(shown.contains("a always"), "{shown}");
+    let bar = app
+        .activity()
+        .expect("the question is on the activity line");
+    assert_eq!(bar.meta, "y allow · a always · n deny");
+    app.handle_key(key(KeyCode::Char('a'))).await;
+    assert_eq!(answer.await.unwrap(), crate::policy::AskAnswer::AllowAlways);
+}
+
+#[test]
+fn permissions_why_lists_calls_that_needed_a_decision_with_their_layer() {
+    let entry =
+        |call: &str, subject: &str, layer: &str, read_only: bool| crate::policy::LoggedDecision {
+            call_id: call.into(),
+            tool: "bash".into(),
+            subject: subject.into(),
+            outcome: "allowed",
+            layer: layer.into(),
+            read_only,
+        };
+    let text = commands::permission_log_text(&[
+        entry("call_0001", "ls", "normal mode default", true),
+        entry("call_0002", "cargo test", "rule rule-2", false),
+        entry("call_0003", "make", "you", false),
+    ]);
+    assert!(!text.contains("`ls`"), "{text}");
+    assert!(
+        text.contains("allowed bash `cargo test` — rule rule-2"),
+        "{text}"
+    );
+    assert!(text.contains("allowed bash `make` — you"), "{text}");
+}
+
 #[test]
 fn ask_text_includes_the_diff_preview() {
     let request = crate::policy::AskRequest {
@@ -1387,6 +1529,8 @@ fn ask_text_includes_the_diff_preview() {
         ),
         rule: None,
         key: String::new(),
+        call_id: String::new(),
+        suggestion: None,
     };
     let text = permission::ask_text(&request);
     assert!(text.starts_with("edit: src/lib.rs"), "{text}");

@@ -72,6 +72,9 @@ impl Tool for WriteTool {
     }
 }
 
+/// Lines of the formatter's changes shown after a formatted write.
+const FORMAT_DIFF_LINES: usize = 40;
+
 fn run(ctx: &ToolContext, args: &Value) -> Result<ToolResult, ToolResult> {
     let raw = required_str(args, "path")?;
     let content = args
@@ -176,6 +179,38 @@ fn run(ctx: &ToolContext, args: &Value) -> Result<ToolResult, ToolResult> {
     } else {
         crate::tools::encoding::Encoding::Utf8
     };
+    // Format UTF-8 text only; another encoding is written exactly as given.
+    let formatted = if target_encoding == crate::tools::encoding::Encoding::Utf8 {
+        let before = if existed {
+            std::fs::read_to_string(&path).ok()
+        } else {
+            None
+        };
+        if existed && before.is_none() {
+            crate::tools::format::Formatted {
+                content: content.to_string(),
+                by: None,
+            }
+        } else {
+            crate::tools::format::format_content(ctx, &path, before.as_deref(), content.to_string())
+        }
+    } else {
+        crate::tools::format::Formatted {
+            content: content.to_string(),
+            by: None,
+        }
+    };
+    // The model did not see what the formatter changed; show it, so the file
+    // it believes it wrote is the one on disk.
+    let format_note = match formatted.by {
+        Some(by) => {
+            let (diff, _, _) =
+                crate::tools::edit::diff_report(content, &formatted.content, FORMAT_DIFF_LINES);
+            format!("; formatted by {by}:\n{diff}")
+        }
+        None => String::new(),
+    };
+    let content = formatted.content.as_str();
     let bytes = crate::tools::encoding::encode(content, target_encoding).ok_or_else(|| {
         ToolResult::err(
             "ENCODING",
@@ -229,7 +264,7 @@ fn run(ctx: &ToolContext, args: &Value) -> Result<ToolResult, ToolResult> {
             format!(", {}", target_encoding.label())
         },
         if existed { ", replaced" } else { ", created" }
-    );
+    ) + &format_note;
     Ok(
         ToolResult::ok(text).with_details(crate::tools::undo::merge_details(
             json!({
@@ -455,7 +490,7 @@ pub(crate) fn test_context(dir: &Path) -> ToolContext {
         artifacts: Arc::new(ArtifactStore::ephemeral()),
         cancel: CancellationToken::new(),
         trust: false,
-        verify: VerifyConfig { steps: Vec::new() },
+        verify: VerifyConfig::default(),
         profile: "test".into(),
         edit_mode: crate::config::EditMode::Text,
         packs: Vec::new(),
@@ -467,6 +502,7 @@ pub(crate) fn test_context(dir: &Path) -> ToolContext {
         sandbox: None,
         vision: Default::default(),
         caps: Default::default(),
+        format_on_edit: false,
     }
 }
 

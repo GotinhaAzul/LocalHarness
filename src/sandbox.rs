@@ -182,12 +182,14 @@ impl Sandbox {
         cmd.args(&args)
             .arg("--")
             .arg("bash")
-            .arg("-lc")
+            .arg("-c")
             .arg(command)
             .current_dir(&cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        // bwrap's `--new-session` detaches the shell; bwrap itself only needs
+        // its own group so a timeout can signal the whole tree.
         cmd.as_std_mut().process_group(0);
 
         // `--seccomp` needs an fd number that survives the exec of bwrap.
@@ -401,20 +403,20 @@ fn push_env(args: &mut Vec<OsString>) {
     args.push("--setenv".into());
     args.push("TMPDIR".into());
     args.push("/tmp".into());
+    args.extend(crate::tools::procenv::setenv_args());
 }
 
 /// The plain shell command used when no sandbox is enabled. Mirrors
 /// `crate::tools::bash::shell_command` so both paths agree on shell semantics
 /// and process-group ownership.
 fn plain_command(command: &str, cwd: &Path) -> tokio::process::Command {
-    let mut cmd = tokio::process::Command::new("bash");
-    cmd.arg("-lc")
+    let mut cmd = crate::tools::procenv::command("bash");
+    cmd.arg("-c")
         .arg(command)
         .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    cmd.as_std_mut().process_group(0);
     cmd
 }
 

@@ -103,6 +103,7 @@ color_mode = "auto"             # auto | truecolor | 256 | 16
 show_reasoning = false          # Ctrl+R toggles and rewrites this key
 show_token_counts = true
 mouse = true                    # wheel scrolls the conversation; Shift+drag selects text
+bell = true                     # ring once when something new needs you
 
 [session]
 dir = ""                        # default data dir's sessions/
@@ -119,7 +120,7 @@ artifact_retention_days = 30
 # the turn.
 max_tool_calls = 120
 max_model_calls = 40
-max_wall_minutes = 30
+max_wall_minutes = 30           # at least 6 model calls at the measured speed
 stall_calls = 12
 # Repeated or failing calls of one tool family allowed in a turn before it
 # stops as stalled. A family is `bash`'s program and subcommand, or another
@@ -152,14 +153,22 @@ max_same_tool_family = 8
 max_same_tool_family_success = 24
 verify_attempts = 2
 
+[gates]
+auto_settle = true              # the harness runs verify and review when the model settles
+verify_detected = true          # no steps configured: use the ones detected from the manifest
+
 [prompt]
 identity = ""                   # replaces the built-in one-line identity
 instructions = ""               # extra instructions appended to the prompt
 file = ""                       # or a Markdown file, relative to the config dir
 agents_md = true                # load the hierarchical AGENTS.md chain
+attach_named_files = true       # attach files a prompt names without @ (up to 3)
 
 [lsp]
 gate = "warn"                   # off | warn | block (see below)
+
+[format]
+on_edit = true                  # format edited files the project keeps formatted
 
 [git]
 commit = "ask"                  # ask: /commit confirm approves; allow: commit at once
@@ -540,6 +549,31 @@ does not approve `git push origin main --force`. Headless runs cannot ask, so
 an `ask` is denied there; use `--mode accept-edits`, allow rules, or `--yolo`.
 ACP forwards the question to the editor.
 
+**Repeated approvals become a rule.** The harness counts your approvals of
+each exact `bash`/`bg` command per project (`approvals.json` in the data
+directory). From the third ask on, the prompt shows a ready-made rule for that
+exact command, and `a` allows the call and appends the rule to the global
+config:
+
+```toml
+[[permissions.rules]]
+id = "approved-1f3a9c2e"
+tool = "bash"
+command = '^cargo test$'
+action = "allow"
+```
+
+The rule matches only that command (`cargo test --release` still asks), and
+commands with `;`, `&`, `|`, `$(`, backticks, or redirection are never
+offered one, since they could hide a second command.
+
+**Why a call ran.** `/permissions why` lists the last calls that changed files
+or ran commands, each with the layer that decided it: `rule <id>`,
+`<mode> mode default`, `plan mode`, `session approval`, `you` (your answer, or
+`you (saved rule <id>)`), `hook <name>`, `provenance`, `frontend` (the ACP
+client), or `no one could answer` (headless). When several layers apply, the
+last one to decide is shown.
+
 The session header records the mode and a 16-digit hash of the rules
 (`permissions.mode`, `permissions.rules_hash`). Rules are reloaded when the
 config is (for example on `/trust confirm`); the change is recorded.
@@ -569,6 +603,31 @@ visible in the transcript and recorded in the session; it never looks like
 approval. Hook output cannot change tools, scope, the endpoint, or the
 permission mode. See [hooks.md](hooks.md) for the payload, output schema, exit
 codes, and `tot hooks test <name>`.
+
+## Formatting edits
+
+With `[format] on_edit` (default `true`), `edit`, exact-text `patch`, and
+`write` pass the new content through the project's formatter before writing
+it, so the model does not spend turns on whitespace and review shows no
+formatter noise. The diff in the tool result is what landed.
+
+A clean file stays clean, and nothing else is touched: an existing file is
+formatted only when its content before the edit was already what the
+formatter produces. A new file is formatted when the project has the
+formatter's config, or always for Rust and Go.
+
+| Files | Formatter | Used when |
+|---|---|---|
+| `.rs` | `rustfmt --edition <Cargo.toml edition>` | on `PATH` |
+| `.go` | `gofmt` | on `PATH` |
+| `.py`, `.pyi` | `ruff format`, else `black` | `[tool.ruff]`/`ruff.toml`, or `[tool.black]`, and on `PATH` |
+| JS/TS, JSON, CSS, HTML, Markdown, YAML | `prettier` | a prettier config; `node_modules/.bin/prettier` only in a trusted project, else on `PATH` |
+
+Formatters read stdin and write stdout with a 5-second limit. A missing
+formatter, a failure (such as a syntax error mid-edit), or a timeout writes
+the content as given. Hash-mode `patch` is never formatted, because its result
+returns line anchors for the content the operations produced. Files over
+512 KB and non-UTF-8 files are written as given.
 
 ## LSP gate
 
@@ -659,7 +718,21 @@ name = "lint"
 command = ["cargo", "clippy", "--all-targets", "--", "-D", "warnings"]
 ```
 
-Steps run sequentially without a shell and stop at the first failure.
+Steps run sequentially without a shell and stop at the first failure. When
+one fails, up to three `file:line` locations its output names (rustc, Rust
+panics, tsc, Python tracebacks, pytest, Go, gcc and eslint shapes) are attached
+with three lines of context each and count as read. Only existing files under
+the working directory count; `target/`, `node_modules/`, virtualenvs and build
+output are skipped.
+
+With no configured or accepted steps, `[gates] verify_detected` (default
+`true`) uses the steps detected from the project manifest (`Cargo.toml`,
+`package.json`, Python markers, `go.mod`) for the session, so the verify gate
+is on in an ordinary repository. Detection reads files only; the steps run
+through the permission policy like any other command, so in the default mode
+the first run asks. They are not saved: `tot verify --init` or `/verify accept`
+keeps them, and `verify_detected = false` restores the old behavior (no steps,
+the gate stays off, a notice names what was detected).
 
 ## Environment
 

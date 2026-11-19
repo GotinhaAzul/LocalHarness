@@ -36,6 +36,8 @@ pub struct Config {
     pub review: ReviewMode,
     /// Settle gates (`[gates]`).
     pub gates: GatesConfig,
+    /// Formatting of edited files (`[format]`).
+    pub format: FormatConfig,
     /// Skill index in the system prompt (`[skills]`).
     pub skills: SkillsConfig,
     /// The opt-in `fetch` tool (`[fetch]`).
@@ -90,11 +92,34 @@ pub struct GatesConfig {
     /// instead of asking the model to call them. A clean result settles on
     /// the answer already written; a failure continues with one message.
     pub auto_settle: bool,
+    /// With no configured or accepted verify steps, use the steps detected
+    /// from the project manifest for this session. They run through the
+    /// permission policy like any command and are not saved.
+    pub verify_detected: bool,
 }
 
 impl Default for GatesConfig {
     fn default() -> Self {
-        Self { auto_settle: true }
+        Self {
+            auto_settle: true,
+            verify_detected: true,
+        }
+    }
+}
+
+/// `[format]`: run the project's formatter on content `edit`, `patch`, and
+/// `write` produce, before it is written.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FormatConfig {
+    /// Format a file the project already keeps formatted (see
+    /// [`crate::tools::format`]).
+    pub on_edit: bool,
+}
+
+impl Default for FormatConfig {
+    fn default() -> Self {
+        Self { on_edit: true }
     }
 }
 
@@ -658,6 +683,34 @@ impl Config {
         Self::save_setting(path, "ui", key, value)
     }
 
+    /// Append one rule to `[[permissions.rules]]` in the global config,
+    /// preserving every other key. A rule with the same id is not added twice.
+    pub fn save_permission_rule(path: &Path, rule: &crate::policy::RuleConfig) -> Result<()> {
+        let mut file = read_config_value(path)?;
+        {
+            let root = file.as_table_mut().context("config root is not a table")?;
+            let permissions = root
+                .entry("permissions")
+                .or_insert_with(|| toml::Value::Table(Default::default()))
+                .as_table_mut()
+                .context("[permissions] is not a table")?;
+            let rules = permissions
+                .entry("rules")
+                .or_insert_with(|| toml::Value::Array(Vec::new()))
+                .as_array_mut()
+                .context("permissions.rules is not an array")?;
+            let exists = rule.id.as_deref().is_some_and(|id| {
+                rules
+                    .iter()
+                    .any(|existing| existing.get("id").and_then(|v| v.as_str()) == Some(id))
+            });
+            if !exists {
+                rules.push(toml::Value::try_from(rule).context("cannot encode the rule")?);
+            }
+        }
+        write_config_value(path, &file)
+    }
+
     /// Persist the startup profile `default_profile`, preserving every other
     /// key. `--profile` and `TOT_PROFILE` still win for the current run.
     pub fn save_default_profile(path: &Path, name: &str) -> Result<()> {
@@ -801,6 +854,9 @@ pub struct UiConfig {
     /// Capture the mouse so the wheel scrolls the conversation. Terminal text
     /// selection then needs Shift (Option on macOS) held while dragging.
     pub mouse: bool,
+    /// Ring the terminal bell once when something new waits on the user
+    /// (a permission question, a review, a confirmation).
+    pub bell: bool,
 }
 
 impl Default for UiConfig {
@@ -811,6 +867,7 @@ impl Default for UiConfig {
             show_reasoning: false,
             show_token_counts: true,
             mouse: true,
+            bell: true,
         }
     }
 }
@@ -1089,6 +1146,9 @@ pub struct PromptConfig {
     /// Load the hierarchical `AGENTS.md` chain into the system prompt.
     /// `--no-agents-md` and `TOT_AGENTS_MD=0` disable it.
     pub agents_md: bool,
+    /// Attach files a prompt names without `@` (`src/a.rs:12`, a pasted
+    /// stack trace), like `@` mentions; see `agent::mentions`.
+    pub attach_named_files: bool,
 }
 
 impl Default for PromptConfig {
@@ -1098,6 +1158,7 @@ impl Default for PromptConfig {
             instructions: String::new(),
             file: PathBuf::new(),
             agents_md: true,
+            attach_named_files: true,
         }
     }
 }
@@ -1577,6 +1638,17 @@ pub enum ToolMode {
 #[serde(default)]
 pub struct VerifyConfig {
     pub steps: Vec<VerifyStep>,
+    /// Manifest files the steps were detected from, when nobody configured
+    /// or accepted them. Empty for configured steps. Never read from config.
+    #[serde(skip)]
+    pub detected_from: Vec<String>,
+}
+
+impl VerifyConfig {
+    /// Whether the steps are this session's detection, not a saved choice.
+    pub fn is_detected(&self) -> bool {
+        !self.steps.is_empty() && !self.detected_from.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

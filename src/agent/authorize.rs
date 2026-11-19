@@ -42,17 +42,40 @@ pub struct Verdict {
     pub notes: Vec<String>,
     /// A provenance approval still to resolve after the harness gates.
     pub provenance: Option<Requirement>,
+    /// The layer that decided (see [`crate::policy::LoggedDecision::layer`]).
+    pub layer: String,
 }
 
 impl Verdict {
-    fn new(decision: Decision) -> Self {
+    fn new(decision: Decision, layer: String) -> Self {
         Self {
             decision,
             notices: Vec::new(),
             notes: Vec::new(),
             provenance: None,
+            layer,
         }
     }
+}
+
+/// Record a call's permission outcome in the session's decision log.
+pub fn log_decision(
+    core: &Core,
+    call: &ToolCall,
+    tool: &dyn Tool,
+    args: &Value,
+    allowed: bool,
+    layer: impl Into<String>,
+) {
+    let facts = CallFacts::new(tool.name(), tool.read_only(), args, &core.paths.cwd);
+    core.permissions.record(crate::policy::LoggedDecision {
+        call_id: call.id.clone(),
+        tool: call.name.clone(),
+        subject: facts.subject(),
+        outcome: if allowed { "allowed" } else { "denied" },
+        layer: layer.into(),
+        read_only: facts.effect == crate::policy::Effect::ReadOnly,
+    });
 }
 
 /// The file a call targets, as path rules and hunk review must see it: a
@@ -66,8 +89,9 @@ pub fn target_path<'a>(core: &Core, tool: &str, raw: &'a str) -> &'a str {
     }
 }
 
-/// The permission policy alone, for one call in the current mode.
-pub fn policy_decision(core: &Core, tool: &dyn Tool, args: &Value) -> Decision {
+/// The permission policy alone, for one call in the current mode, and the
+/// layer that decided it.
+pub fn policy_decision(core: &Core, tool: &dyn Tool, args: &Value) -> (Decision, String) {
     let normalized = args
         .get("path")
         .and_then(Value::as_str)
@@ -80,11 +104,15 @@ pub fn policy_decision(core: &Core, tool: &dyn Tool, args: &Value) -> Decision {
         });
     let args = normalized.as_ref().unwrap_or(args);
     let facts = CallFacts::new(tool.name(), tool.read_only(), args, &core.paths.cwd);
-    match core.permissions.decide(&facts) {
-        Decision::Ask(mut request) => {
+    match core.permissions.decide_explained(&facts) {
+        (Decision::Ask(mut request), layer) => {
             request.preview =
                 crate::policy::preview(tool.name(), args, &core.paths.cwd, PREVIEW_LINES);
-            Decision::Ask(request)
+            let times = crate::policy::remember::approvals(&core.paths, &request.key);
+            request.suggestion =
+                crate::policy::remember::suggest(&request.tool, &request.subject, times)
+                    .map(Box::new);
+            (Decision::Ask(request), layer)
         }
         other => other,
     }
@@ -92,9 +120,15 @@ pub fn policy_decision(core: &Core, tool: &dyn Tool, args: &Value) -> Decision {
 
 /// Decide one call: policy, then `pre_tool` hooks, then provenance.
 pub async fn decide(core: &Core, tool: &dyn Tool, call: &ToolCall, args: &Value) -> Verdict {
-    let mut verdict = Verdict::new(policy_decision(core, tool, args));
-    if matches!(verdict.decision, Decision::Deny { .. }) {
-        return verdict;
+    let (decision, layer) = policy_decision(core, tool, args);
+    let mut verdict = Verdict::new(decision, layer);
+    match &mut verdict.decision {
+        Decision::Deny { .. } => {
+            log_decision(core, call, tool, args, false, verdict.layer.clone());
+            return verdict;
+        }
+        Decision::Ask(request) => request.call_id = call.id.clone(),
+        Decision::Allow => log_decision(core, call, tool, args, true, verdict.layer.clone()),
     }
 
     // Hooks see the repaired arguments. They may block or add context; any
@@ -120,6 +154,8 @@ pub async fn decide(core: &Core, tool: &dyn Tool, call: &ToolCall, args: &Value)
             code: "hook_block".into(),
             message,
         };
+        verdict.layer = format!("hook {}", block.hook);
+        log_decision(core, call, tool, args, false, verdict.layer.clone());
         return verdict;
     }
 
@@ -132,6 +168,8 @@ pub async fn decide(core: &Core, tool: &dyn Tool, call: &ToolCall, args: &Value)
             {
                 verdict.notices.push(message.clone());
                 verdict.decision = Decision::Deny { code, message };
+                verdict.layer = "provenance".into();
+                log_decision(core, call, tool, args, false, "provenance");
             }
             return verdict;
         }
@@ -145,13 +183,32 @@ pub async fn decide(core: &Core, tool: &dyn Tool, call: &ToolCall, args: &Value)
 pub async fn confirm_provenance(
     core: &Core,
     call: &ToolCall,
+    tool: &dyn Tool,
     args: &Value,
     required: Requirement,
 ) -> Result<(), ToolResult> {
     match provenance::resolve(core, call, args, required).await {
-        Gate::Allow => Ok(()),
-        Gate::Deny { code, message } => Err(ToolResult::err(&code, message)),
+        Gate::Allow => {
+            log_decision(core, call, tool, args, true, "provenance approval");
+            Ok(())
+        }
+        Gate::Deny { code, message } => {
+            log_decision(core, call, tool, args, false, "provenance");
+            Err(ToolResult::err(&code, message))
+        }
     }
+}
+
+/// Update the logged outcome of the call an ask was about.
+fn log_answer(core: &Core, request: &AskRequest, allowed: bool, layer: impl Into<String>) {
+    core.permissions.record(crate::policy::LoggedDecision {
+        call_id: request.call_id.clone(),
+        tool: request.tool.clone(),
+        subject: request.subject.clone(),
+        outcome: if allowed { "allowed" } else { "denied" },
+        layer: layer.into(),
+        read_only: false,
+    });
 }
 
 /// Resolve an `Ask`: through the frontend asker (TUI), else a frontend
@@ -164,8 +221,10 @@ pub async fn confirm(
 ) -> Result<(), ToolResult> {
     let Some(asker) = core.permissions.asker() else {
         if core.approver.is_some() {
+            log_answer(core, &request, true, "frontend");
             return Ok(());
         }
+        log_answer(core, &request, false, "no one could answer");
         return Err(ToolResult::err(
             "DENIED",
             format!(
@@ -184,6 +243,7 @@ pub async fn confirm(
     let key = request.key.clone();
     let tool = request.tool.clone();
     let subject = request.subject.clone();
+    let asked = request.clone();
     let answer = tokio::select! {
         biased;
         _ = cancel.cancelled() => return Err(ToolResult::err("cancelled", "cancelled while waiting for approval")),
@@ -192,13 +252,42 @@ pub async fn confirm(
     match answer {
         AskAnswer::Allow => {
             core.permissions.approve(&key);
+            crate::policy::remember::record_approval(&core.paths, &key);
+            log_answer(core, &asked, true, "you");
             Ok(())
         }
-        AskAnswer::Deny => Err(ToolResult::err(
-            "DENIED",
-            format!(
-                "the user declined {tool} ({subject}). The call did not run; try a different approach or ask the user what they want instead."
-            ),
-        )),
+        AskAnswer::AllowAlways => {
+            core.permissions.approve(&key);
+            crate::policy::remember::record_approval(&core.paths, &key);
+            let layer = match &asked.suggestion {
+                Some(suggestion) => {
+                    match crate::config::Config::save_permission_rule(
+                        &core.paths.config_file(),
+                        &suggestion.rule,
+                    ) {
+                        Ok(()) => format!(
+                            "you (saved rule {})",
+                            suggestion.rule.id.as_deref().unwrap_or("?")
+                        ),
+                        Err(error) => {
+                            tracing::warn!(%error, "cannot save the permission rule");
+                            "you (rule not saved)".to_string()
+                        }
+                    }
+                }
+                None => "you".to_string(),
+            };
+            log_answer(core, &asked, true, layer);
+            Ok(())
+        }
+        AskAnswer::Deny => {
+            log_answer(core, &asked, false, "you");
+            Err(ToolResult::err(
+                "DENIED",
+                format!(
+                    "the user declined {tool} ({subject}). The call did not run; try a different approach or ask the user what they want instead."
+                ),
+            ))
+        }
     }
 }

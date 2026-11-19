@@ -7,7 +7,7 @@
 //! exact-repetition guards — ends the turn. This lets a real long task run as
 //! long as it keeps making progress without letting a looping model do so.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -47,6 +47,15 @@ impl From<&BudgetConfig> for RunLimits {
         }
     }
 }
+
+/// The wall-clock allowance covers at least this many model calls at the
+/// slowest recently measured call duration, so a slow engine or a long
+/// thinking model is never stopped for being slow.
+const WALL_CALLS: u32 = 6;
+/// The progress window covers at least this many model calls.
+const WINDOW_CALLS: u32 = 3;
+/// Model-call durations remembered for scaling.
+const RECENT_CALLS: usize = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopReason {
@@ -148,6 +157,10 @@ pub struct RunProgress {
     /// Whether a no-progress checkpoint already asked for a different
     /// approach this turn. The first one pivots; the second ends the turn.
     pub pivot_used: bool,
+    /// When the model call in flight started.
+    model_call_at: Option<Instant>,
+    /// Durations of the last few model calls, request to final chunk.
+    recent_calls: VecDeque<Duration>,
 }
 
 impl RunProgress {
@@ -181,6 +194,8 @@ impl RunProgress {
             text_calls_noticed: false,
             presend_compaction_used: false,
             pivot_used: false,
+            model_call_at: None,
+            recent_calls: VecDeque::new(),
         }
     }
 
@@ -188,10 +203,25 @@ impl RunProgress {
         self.started_at.elapsed()
     }
 
+    /// The slowest of the last few model calls, if any finished.
+    fn slowest_call(&self) -> Option<Duration> {
+        self.recent_calls.iter().max().copied()
+    }
+
+    /// The wall-clock allowance: `[budgets] max_wall_minutes`, or
+    /// [`WALL_CALLS`] model calls at the measured speed when that is longer.
+    pub fn effective_wall(&self) -> Duration {
+        let measured = self
+            .slowest_call()
+            .map(|call| call * WALL_CALLS)
+            .unwrap_or_default();
+        self.limits.max_wall.max(measured)
+    }
+
     /// Check the model-call and wall-clock checkpoint before a model call.
     pub fn model_checkpoint(&mut self) -> BudgetCheck {
         let model_hit = self.epoch_model_calls >= self.limits.max_model_calls;
-        let wall_hit = self.epoch_started_at.elapsed() >= self.limits.max_wall;
+        let wall_hit = self.epoch_started_at.elapsed() >= self.effective_wall();
         if !model_hit && !wall_hit {
             return BudgetCheck::Ok;
         }
@@ -211,6 +241,21 @@ impl RunProgress {
     pub fn model_call_started(&mut self) {
         self.model_calls += 1;
         self.epoch_model_calls += 1;
+        self.model_call_at = Some(Instant::now());
+    }
+
+    /// Record how long the model call in flight took, retries included.
+    pub fn model_call_finished(&mut self) {
+        if let Some(at) = self.model_call_at.take() {
+            self.record_call_duration(at.elapsed());
+        }
+    }
+
+    fn record_call_duration(&mut self, duration: Duration) {
+        if self.recent_calls.len() == RECENT_CALLS {
+            self.recent_calls.pop_front();
+        }
+        self.recent_calls.push_back(duration);
     }
 
     /// Check the tool-call checkpoint before a batch of `n` calls. A batch is
@@ -296,8 +341,13 @@ impl RunProgress {
                 self.epoch_model_calls
             ),
             StopReason::WallClock => format!(
-                "wall-clock checkpoint: {} minutes in this allowance, {no_progress}. The run is repeating without progress; summarize the last known state or start a new turn with a different approach.",
-                self.limits.max_wall.as_secs() / 60
+                "wall-clock checkpoint: {} minutes in this allowance{}, {no_progress}. The run is repeating without progress; summarize the last known state or start a new turn with a different approach.",
+                self.effective_wall().as_secs() / 60,
+                if self.effective_wall() > self.limits.max_wall {
+                    " (scaled to the measured model speed)"
+                } else {
+                    ""
+                }
             ),
             StopReason::Stalled => {
                 "the last calls produced no new information or file change; stop and report the last known state, or change approach in a new turn".into()
@@ -360,7 +410,13 @@ impl RunProgress {
     }
 
     fn recent_time_progress(&self) -> bool {
-        let window = (self.limits.max_wall / 2).max(Duration::from_secs(60));
+        let calls = self
+            .slowest_call()
+            .map(|call| call * WINDOW_CALLS)
+            .unwrap_or_default();
+        let window = (self.effective_wall() / 2)
+            .max(calls)
+            .max(Duration::from_secs(60));
         self.last_progress_at
             .is_some_and(|at| at.elapsed() < window)
     }
@@ -1344,6 +1400,64 @@ mod tests {
             max_same_tool_family_success: 0,
             ..limits()
         }
+    }
+
+    fn ago(duration: Duration) -> Instant {
+        Instant::now()
+            .checked_sub(duration)
+            .expect("monotonic clock has room")
+    }
+
+    #[test]
+    fn the_wall_clock_covers_several_calls_at_the_measured_speed() {
+        let mut progress = RunProgress::new(RunLimits {
+            max_wall: Duration::from_secs(60),
+            ..limits()
+        });
+        // No call measured yet: the configured allowance.
+        assert_eq!(progress.effective_wall(), Duration::from_secs(60));
+        // A fast engine never shrinks it.
+        progress.record_call_duration(Duration::from_secs(2));
+        assert_eq!(progress.effective_wall(), Duration::from_secs(60));
+        // A slow one stretches it to WALL_CALLS of its slowest recent call.
+        progress.record_call_duration(Duration::from_secs(40));
+        assert_eq!(progress.effective_wall(), Duration::from_secs(240));
+
+        // 90 seconds in: past the configured minute, within the scaled wall.
+        progress.epoch_started_at = ago(Duration::from_secs(90));
+        assert!(matches!(progress.model_checkpoint(), BudgetCheck::Ok));
+        progress.epoch_started_at = ago(Duration::from_secs(250));
+        assert!(matches!(
+            progress.model_checkpoint(),
+            BudgetCheck::Exhausted(StopReason::WallClock)
+        ));
+    }
+
+    #[test]
+    fn one_slow_call_after_progress_is_still_recent_progress() {
+        let mut progress = RunProgress::new(RunLimits {
+            max_wall: Duration::from_secs(60),
+            ..limits()
+        });
+        progress.record_call_duration(Duration::from_secs(100));
+        // Progress two slow calls ago is within the window (3 calls = 300s).
+        progress.last_progress_at = Some(ago(Duration::from_secs(200)));
+        assert!(progress.recent_time_progress());
+        progress.last_progress_at = Some(ago(Duration::from_secs(400)));
+        assert!(!progress.recent_time_progress());
+    }
+
+    #[test]
+    fn only_the_last_few_calls_set_the_pace() {
+        let mut progress = RunProgress::new(RunLimits {
+            max_wall: Duration::from_secs(60),
+            ..limits()
+        });
+        progress.record_call_duration(Duration::from_secs(100));
+        for _ in 0..RECENT_CALLS {
+            progress.record_call_duration(Duration::from_secs(1));
+        }
+        assert_eq!(progress.effective_wall(), Duration::from_secs(60));
     }
 
     /// A fresh, empty workspace: its state never changes during a test.

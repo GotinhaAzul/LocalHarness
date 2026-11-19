@@ -9,6 +9,30 @@ release may change defaults when the change is called out below.
 
 ### Added
 
+- Files named in a prompt without `@` are attached like `@` mentions:
+  `the panic at src/parser.rs:88:5`, a pasted stack trace, or
+  `File "pkg/mod.py", line 3` attaches up to three existing text files under
+  the working directory, after the `@` mentions and within the same budget.
+  Words that only look like paths are ignored silently
+  (`[prompt] attach_named_files`, default `true`).
+- Repeated approvals become a rule. Approvals of each exact `bash`/`bg`
+  command are counted per project; from the third ask on, the prompt shows an
+  exact-match allow rule and `a` saves it to the global config. Commands with
+  shell control operators, substitution, or redirection are never offered one.
+- `/permissions why` lists the last calls that changed files or ran commands
+  and the layer that decided each one: a rule, the mode default, plan mode, a
+  session approval, your answer, a hook, provenance, the ACP client, or a
+  headless run that could not ask.
+- `edit`, exact-text `patch`, and `write` run the project's formatter on the
+  new content before writing it (`[format] on_edit`, default `true`):
+  `rustfmt`, `gofmt`, `ruff`/`black`, or `prettier`. A file is formatted only
+  when it was already formatter-clean, so an unformatted project never gets
+  churn. A failing or missing formatter writes the content as given, and a
+  project's own `node_modules/.bin/prettier` runs only in a trusted project.
+- A failing `verify` attaches the first three `file:line` locations its
+  output names (rustc, Rust panics, tsc, Python tracebacks, pytest, Go, gcc,
+  eslint) with three lines of context each, and records them as read. Only
+  existing files under the working directory count.
 - `/permissions` gathers the permission levels in one TUI command. With no
   argument it opens the filterable picker over `normal`, `accept-edits`,
   `deny-all`, and `yolo`, marking the current level and describing each one;
@@ -76,6 +100,12 @@ release may change defaults when the change is called out below.
   `/permissions` remains session-only and is never written.
 
 ### Fixed
+
+- Agent-run commands start a new session through the `setsid` utility
+  (util-linux or busybox) instead of a `pre_exec` hook. The hook made every
+  spawn `fork` instead of `posix_spawn`, so a child could briefly hold another
+  thread's just-written script open and that script failed to start with
+  "Text file busy"; the hook remains the fallback when `setsid` is missing.
 
 - The repository brief now lists every non-ignored file, not only extensions
   the symbol scanner knows. Non-code and outline-less files are grouped per
@@ -217,6 +247,53 @@ release may change defaults when the change is called out below.
 
 ### Changed
 
+- The bottom of the TUI says plainly when something needs you. A permission
+  question, a hunk review, the `yolo` confirmation, a missing model, an
+  injection warning, a commit or pull request behind its preview gate, or a
+  finished plan replaces the spinner above the input with a reversed
+  `Needs you: <what>` bar showing the exact command or path and the keys that
+  answer it. The footer shows those keys with a `WAITING FOR YOU` or
+  `ACTION NEEDED` badge, the placeholder says keys answer the question, the
+  terminal title ends with `needs you: <what>`, and the bell rings once per
+  new item (`[ui] bell`, default `true`). Otherwise the footer shows
+  `working` during a turn and `✓ your turn` after it.
+- The header shows the prompt-cache hit as a percentage (`cache 94%`, warning
+  color under 70%) instead of token counts, keeps it at narrower widths, and
+  hides `tok/s` until a call has been measured.
+- The wall-clock checkpoint scales with the measured model speed: the
+  allowance is `[budgets] max_wall_minutes` or six model calls at the slowest
+  of the last five measured calls, whichever is longer, and the "recent
+  progress" window covers at least three such calls. A 10 tok/s thinking
+  model whose calls take several minutes is no longer stopped as
+  no-progress during one long call. Fast engines see no change.
+- The system prompt's operating rules no longer restate what the gates
+  enforce (read before edit, the plan from the third file, no interactive
+  programs, `recall` for truncated output) or ask the model to judge its own
+  context size for `thread split`; each gate says what to do when it applies,
+  and compaction runs on the measured budget. "Run verify, then review" is
+  included only with `[gates] auto_settle = false`, and the `bg` and
+  `repo_map` hints only when the profile has those tools. About 450 fewer
+  characters on every request with the default profile.
+- With no configured or accepted verify steps, a session uses the steps
+  detected from the project manifest (`[gates] verify_detected`, default
+  `true`), so the verify gate and harness-run settle checks are on in an
+  ordinary repository. This replaces "propose, never run" from #128: the
+  steps run through the permission policy like any command (the default mode
+  asks first), are never saved without `tot verify --init` or
+  `/verify accept`, and `verify_detected = false` restores the old behavior.
+  The startup notice, `/verify`, `tot verify` and `tot doctor` say the steps
+  are detected.
+- Agent-run commands (`bash`, `bg`, `verify`, `test`) can no longer wait on a
+  human. Each starts a new session with no controlling terminal, so git, ssh,
+  and sudo prompts fail at once instead of hanging the run or reading the
+  TUI's keystrokes, and each gets `GIT_TERMINAL_PROMPT=0`,
+  `GIT_EDITOR`/`EDITOR`/`VISUAL=true`, `PAGER`/`GIT_PAGER=cat`, and
+  `DEBIAN_FRONTEND=noninteractive` (inside `--sandbox` too).
+- `bash` and `bg` run `bash -c` instead of a login shell (`bash -lc`). The
+  user's profile is no longer sourced on every call, so banners and slow
+  profile scripts stay out of tool output and a command behaves the same on
+  every machine. Commands inherit the environment `tot` was started with; set
+  `BASH_ENV` to a file to source one anyway.
 - The repository map injected into the system prompt is smaller (at most
   1200 chars, down from 1800) and says it is an index, not a full listing.
   The map ranks files (README, manifests, entry points, source, tests, then

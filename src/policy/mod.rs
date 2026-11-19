@@ -11,8 +11,9 @@
 //! through the frontend (see `agent::authorize`).
 
 pub mod command;
+pub mod remember;
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -324,12 +325,20 @@ pub struct AskRequest {
     pub rule: Option<String>,
     /// Approval memory key ([`CallFacts::approval_key`]).
     pub key: String,
+    /// The tool call this question is about, for the decision log.
+    pub call_id: String,
+    /// A ready-made allow rule, offered after the user approved this exact
+    /// command in earlier sessions ([`remember`]).
+    pub suggestion: Option<Box<remember::Suggestion>>,
 }
 
 /// The user's answer to an [`AskRequest`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AskAnswer {
     Allow,
+    /// Allow, and save the request's suggested rule so later sessions do not
+    /// ask again.
+    AllowAlways,
     Deny,
 }
 
@@ -492,6 +501,23 @@ impl Policy {
     /// Decide one call under `mode`. Pure: approval memory and the asking
     /// frontend are applied by [`Permissions`].
     pub fn decide(&self, mode: PermissionMode, call: &CallFacts) -> Decision {
+        self.decide_explained(mode, call).0
+    }
+
+    /// [`Policy::decide`] plus the layer that decided: `plan mode`,
+    /// `rule <id>`, or `<mode> mode default`.
+    pub fn decide_explained(&self, mode: PermissionMode, call: &CallFacts) -> (Decision, String) {
+        if mode == PermissionMode::Plan && !plan_allows(call) {
+            return (self.decide_inner(mode, call), "plan mode".into());
+        }
+        let layer = match self.winner(call) {
+            Some(rule) => format!("rule {}", rule.id),
+            None => format!("{} mode default", mode.label()),
+        };
+        (self.decide_inner(mode, call), layer)
+    }
+
+    fn decide_inner(&self, mode: PermissionMode, call: &CallFacts) -> Decision {
         if mode == PermissionMode::Plan && !plan_allows(call) {
             return Decision::Deny {
                 code: "plan_mode".into(),
@@ -536,6 +562,8 @@ impl Policy {
                     preview: None,
                     rule,
                     key: call.approval_key(),
+                    call_id: String::new(),
+                    suggestion: None,
                 }),
             },
         }
@@ -576,6 +604,25 @@ pub struct Permissions {
     /// Exact calls the user approved this session ([`CallFacts::approval_key`]).
     approved: Mutex<HashSet<String>>,
     asker: Mutex<Option<Arc<dyn Asker>>>,
+    /// The last decisions and the layer that made each one.
+    log: Mutex<VecDeque<LoggedDecision>>,
+}
+
+/// Decisions kept for `/permissions why`.
+const LOG_LEN: usize = 50;
+
+/// One call's final permission outcome and the layer that decided it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoggedDecision {
+    pub call_id: String,
+    pub tool: String,
+    pub subject: String,
+    /// `allowed` or `denied`.
+    pub outcome: &'static str,
+    /// `rule <id>`, `<mode> mode default`, `plan mode`, `session approval`,
+    /// `you`, `hook <name>`, `provenance`, `frontend`, or `no one could answer`.
+    pub layer: String,
+    pub read_only: bool,
 }
 
 impl std::fmt::Debug for Permissions {
@@ -596,6 +643,7 @@ impl Permissions {
             before_plan: Mutex::new(None),
             approved: Mutex::new(HashSet::new()),
             asker: Mutex::new(None),
+            log: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -608,6 +656,7 @@ impl Permissions {
             before_plan: Mutex::new(*self.before_plan.lock().unwrap_or_else(|p| p.into_inner())),
             approved: Mutex::new(HashSet::new()),
             asker: Mutex::new(self.asker()),
+            log: Mutex::new(self.log.lock().unwrap_or_else(|p| p.into_inner()).clone()),
         }
     }
 
@@ -668,10 +717,46 @@ impl Permissions {
     /// Decide a call under the current mode, honoring exact approvals the
     /// user already gave this session.
     pub fn decide(&self, call: &CallFacts) -> Decision {
-        match self.policy.decide(self.mode(), call) {
-            Decision::Ask(request) if self.is_approved(&request.key) => Decision::Allow,
+        self.decide_explained(call).0
+    }
+
+    /// [`Permissions::decide`] plus the deciding layer; an exact approval
+    /// from earlier in the session is `session approval`.
+    pub fn decide_explained(&self, call: &CallFacts) -> (Decision, String) {
+        match self.policy.decide_explained(self.mode(), call) {
+            (Decision::Ask(request), _) if self.is_approved(&request.key) => {
+                (Decision::Allow, "session approval".into())
+            }
             other => other,
         }
+    }
+
+    /// Record a call's outcome. A later record for the same call replaces
+    /// the earlier one, so each call shows the layer that decided last.
+    pub fn record(&self, entry: LoggedDecision) {
+        let mut log = self.log.lock().unwrap_or_else(|p| p.into_inner());
+        if !entry.call_id.is_empty()
+            && let Some(existing) = log
+                .iter_mut()
+                .find(|logged| logged.call_id == entry.call_id)
+        {
+            *existing = entry;
+            return;
+        }
+        if log.len() == LOG_LEN {
+            log.pop_front();
+        }
+        log.push_back(entry);
+    }
+
+    /// The most recent decisions, newest last.
+    pub fn recent(&self) -> Vec<LoggedDecision> {
+        self.log
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .cloned()
+            .collect()
     }
 
     pub fn is_approved(&self, key: &str) -> bool {

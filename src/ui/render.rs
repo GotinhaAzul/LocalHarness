@@ -1857,6 +1857,8 @@ pub struct ActivityData {
     /// Elapsed time, tokens, and the interrupt hint.
     pub meta: String,
     pub role: Role,
+    /// The line says the user is needed: the label is a reversed block.
+    pub attention: bool,
 }
 
 pub struct Scene<'a> {
@@ -1946,11 +1948,23 @@ pub fn plan_lines(
 }
 
 fn activity_line(activity: &ActivityData, width: usize, theme: &Theme) -> Line<'static> {
+    let label_style = if activity.attention {
+        theme
+            .bold(activity.role)
+            .add_modifier(ratatui::style::Modifier::REVERSED)
+    } else {
+        theme.bold(activity.role)
+    };
+    let label = if activity.attention {
+        format!(" {} ", activity.label)
+    } else {
+        activity.label.clone()
+    };
     let mut spans = vec![
         Span::styled(format!("{} ", activity.spinner), theme.bold(activity.role)),
-        Span::styled(activity.label.clone(), theme.bold(activity.role)),
+        Span::styled(label.clone(), label_style),
     ];
-    let label_width = 2 + UnicodeWidthStr::width(activity.label.as_str());
+    let label_width = 2 + UnicodeWidthStr::width(label.as_str());
     let meta = format!("  ({})", activity.meta);
     let meta_width = UnicodeWidthStr::width(meta.as_str());
     let room = width.saturating_sub(label_width + meta_width + 1);
@@ -2694,6 +2708,7 @@ mod tests {
                         detail: "cargo test".into(),
                         meta: "12s · esc to interrupt".into(),
                         role: Role::Accent,
+                        attention: false,
                     }),
                     plan: vec![("write tests".into(), PlanStatus::InProgress)],
                     busy: true,
