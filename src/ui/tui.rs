@@ -48,6 +48,7 @@ use crate::ui::widgets::{
 use crate::workflows::{self, WorkflowSpec};
 
 /// Slash commands with one-line descriptions for the completion popup.
+mod attention;
 mod commands;
 mod git_commands;
 mod keys;
@@ -465,6 +466,8 @@ struct App {
     pending_ask: Option<permission::PendingAsk>,
     /// A level waiting for the one-key confirmation (`yolo`).
     pending_mode_confirm: Option<crate::policy::PermissionMode>,
+    /// The attention the bell last rang for.
+    attention_rung: Option<String>,
     /// The terminal title last written, so it is only sent on change.
     title: String,
     /// A turn finished since the last prompt was sent.
@@ -567,6 +570,7 @@ impl App {
             repaint: false,
             pending_ask: None,
             pending_mode_confirm: None,
+            attention_rung: None,
             title: String::new(),
             turn_done: false,
             #[cfg(test)]
@@ -1022,6 +1026,16 @@ impl App {
             let _ = execute!(terminal.backend_mut(), SetTitle(&title));
             self.title = title;
         }
+        // Ring once when something new starts waiting on the user, so a
+        // question is noticed from another window or tab.
+        let waiting = self.attention().map(|attention| attention.key());
+        if waiting != self.attention_rung {
+            if waiting.is_some() && self.config.ui.bell {
+                let _ = terminal.backend_mut().write_all(b"\x07");
+                let _ = std::io::Write::flush(terminal.backend_mut());
+            }
+            self.attention_rung = waiting;
+        }
         drawn
     }
 
@@ -1032,7 +1046,8 @@ impl App {
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("totality");
-        let state = if self.pending_ask.is_some() {
+        let attention = self.attention();
+        let state = if attention.is_some() {
             "? "
         } else if self.turn_active {
             "◐ "
@@ -1041,11 +1056,9 @@ impl App {
         } else {
             ""
         };
-        let suffix = if self.pending_ask.is_some() {
-            " · needs approval"
-        } else {
-            ""
-        };
+        let suffix = attention
+            .map(|attention| format!(" · needs you: {}", attention.what.to_lowercase()))
+            .unwrap_or_default();
         format!("{state}{place} · totality{suffix}")
     }
 
@@ -1077,8 +1090,11 @@ impl App {
         let activity = self.activity();
         let plan = self.visible_plan();
         let busy = self.turn_active;
+        let blocked = self.attention().is_some_and(|attention| attention.blocking);
         self.input.set_placeholder(if self.hunk_edit.is_some() {
             "editing hunk · Enter saves · Esc cancels"
+        } else if blocked {
+            "keys answer the question above · the agent waits for you"
         } else if busy {
             "the agent is working · esc to interrupt"
         } else if self.switching.is_some() {
@@ -1156,11 +1172,29 @@ impl App {
     }
 
     fn footer(&self) -> FooterData {
-        // Login and trust state live in the info bar; the footer is hints or
-        // a transient notice only.
-        let (status, status_role) = self
-            .permission_status()
-            .unwrap_or((String::new(), Role::Muted));
+        // Something waiting on the user takes the whole footer: the keys that
+        // answer it on the left, a badge that cannot be missed on the right.
+        if let Some(attention) = self.attention() {
+            return FooterData {
+                hints: attention.keys,
+                hints_role: Role::Warning,
+                status: if attention.blocking {
+                    " WAITING FOR YOU ".into()
+                } else {
+                    " ACTION NEEDED ".into()
+                },
+                status_role: Role::Warning,
+                status_badge: true,
+                notice: None,
+                notice_role: Role::Warning,
+            };
+        }
+        let (status, status_role) = match self.permission_status() {
+            Some(status) => status,
+            None if self.turn_active => ("working".into(), Role::Moon),
+            None if self.turn_done => ("✓ your turn".into(), Role::Success),
+            None => (String::new(), Role::Muted),
+        };
         let hints = if !self.transcript.follow {
             "End or Ctrl+End to return to the bottom · wheel/pgup/pgdn scroll".to_string()
         } else if self.turn_active {
@@ -1174,8 +1208,10 @@ impl App {
         };
         FooterData {
             hints,
+            hints_role: Role::Muted,
             status,
             status_role,
+            status_badge: false,
             notice,
             notice_role,
         }
@@ -1183,6 +1219,18 @@ impl App {
 
     /// The live status line: what the agent is doing right now.
     fn activity(&self) -> Option<ActivityData> {
+        // Waiting on the user outranks everything the agent is doing: the
+        // spinner stops, so it never looks like work is still happening.
+        if let Some(attention) = self.attention() {
+            return Some(ActivityData {
+                spinner: if attention.blocking { "▶" } else { "●" },
+                label: format!("Needs you: {}", attention.what),
+                detail: attention.subject,
+                meta: attention.keys,
+                role: Role::Warning,
+                attention: true,
+            });
+        }
         let spinner = SPINNER[self.spinner % SPINNER.len()];
         if !self.turn_active {
             return self.switching.as_ref().map(|switch| ActivityData {
@@ -1191,6 +1239,7 @@ impl App {
                 detail: String::new(),
                 meta: "the prompt stays editable".into(),
                 role: Role::Accent,
+                attention: false,
             });
         }
         let elapsed = self
@@ -1212,6 +1261,7 @@ impl App {
                 detail: String::new(),
                 meta: meta.join(" · "),
                 role: Role::Warning,
+                attention: false,
             });
         }
         meta.push("esc to interrupt".into());
@@ -1259,6 +1309,7 @@ impl App {
             detail,
             meta: meta.join(" · "),
             role,
+            attention: false,
         })
     }
 

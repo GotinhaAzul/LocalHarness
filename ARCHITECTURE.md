@@ -462,8 +462,8 @@ usable_prompt = context_window - max_output_tokens - safety_margin
 - Every entry stores an optional `tokens` estimate for the tree view and budget
   accounting.
 - `usage.cached_tokens` (`prompt_tokens_details.cached_tokens`, or llama.cpp
-  `timings.cache_n`) is reported per call. The TUI header shows `cache
-  <cached>/<prompt>`; `--json` usage events carry `cached_tokens` and
+  `timings.cache_n`) is reported per call. The TUI header shows `cache N%`
+  (warning color under 70%); `--json` usage events carry `cached_tokens` and
   `cache_percent`. Two consecutive calls under 70% emit a notice naming the
   likely invalidator: a compaction, a rewritten system message, a changed
   tool list, or server-side eviction.
@@ -1681,8 +1681,18 @@ given, or a frontend approver attached) is resolved by
 - Transcript: user, assistant, reasoning, tool cards, errors, compaction
   notices.
 - Input: multiline text area with history and slash-command completion.
-- Footer: key hints, active status (streaming, cancelling, trusted/untrusted),
-  and transient notifications.
+- Footer: key hints, active status (`working`, `✓ your turn`, a non-default
+  permission level), and transient notifications.
+- Needs you: one function (`ui/tui/attention.rs`) picks the most urgent thing
+  waiting on the user: a permission question, a hunk review, the `yolo`
+  confirmation, a missing model, an injection warning holding the next
+  sensitive action, a commit or pull request behind its preview gate, or a
+  finished plan. While one exists the activity line above the input becomes a
+  reversed `Needs you: <what>` bar with the exact subject and the answering
+  keys (no spinner), the footer shows those keys with a reversed
+  `WAITING FOR YOU` (blocking) or `ACTION NEEDED` badge, the input
+  placeholder says keys answer the question, the terminal title ends with
+  `needs you: <what>`, and the bell rings once per new item (`[ui] bell`).
 
 ### 9.2 Themes
 
@@ -1776,8 +1786,10 @@ cursor = "#c0caf5"
 - Context: `used/window` and a gauge. `used` is the estimated prompt tokens of
   the next request; during streaming, completion tokens are shown separately.
   Thresholds: normal, warning at 70%, error at 85%.
-- Throughput: rolling tokens/second over the last few seconds, plus
-  `cache <cached>/<prompt>` when the engine reports prefix-cache hits.
+- Throughput: rolling tokens/second over the last few seconds (hidden until a
+  call is measured), plus `cache N%` when the engine reports prefix-cache
+  hits, in the warning color under 70%. Cache stays visible at narrower
+  widths than throughput.
 - Session: short id and trusted/untrusted marker.
 - Verify: `verify: not configured` when no steps are set; the marker drops
   once steps are configured.
