@@ -69,7 +69,7 @@ evidence. Run it from this skill's directory.
 - `finding({"action":"update","id":1,"status":"fixed"})` — status is `open`,
   `fixed`, `accepted`, or `false-positive`.
 - `finding({"action":"report"})` — Markdown report grouped by severity.
-- `review` for a diff, `lsp` for symbol truth, `test` for one failing behavior.
+- `review` for a diff, `lsp` for symbol truth, `verify` with a `test` target for one failing behavior.
   Security code review is still code review: prove the path before reporting it.
 
 ## Severity

@@ -9,7 +9,8 @@ use similar::{ChangeTag, DiffTag, TextDiff};
 use crate::tools::read::split_lines;
 use crate::tools::write::{file_mode, lock_reads, record_own_write};
 use crate::tools::{
-    Tool, ToolContext, ToolPack, ToolResult, display_path, optional_bool, required_str,
+    Tool, ToolContext, ToolPack, ToolResult, display_path, optional_bool, optional_u64,
+    required_str,
 };
 
 /// Files larger than this are not rewritten by exact-text edits.
@@ -30,15 +31,16 @@ impl Tool for EditTool {
     }
 
     fn description(&self) -> &'static str {
-        "Replace exact text in an existing file (read it first). `old` must match once unless replace_all is true."
+        "Replace exact text in an existing file (read it first). `old` must match once unless replace_all or occurrence says which match."
     }
 
     fn schema(&self) -> Value {
         crate::tools::object_schema(
             json!({
                 "path": {"type": "string", "description": "File to edit, relative to the working directory."},
-                "old": {"type": "string", "description": "Exact text to replace; must appear verbatim and uniquely."},
+                "old": {"type": "string", "description": "Exact text to replace; must appear verbatim."},
                 "new": {"type": "string", "description": "Replacement text; empty deletes the match."},
+                "occurrence": {"type": "integer", "minimum": 1, "description": "Replace only the nth match, 1-based. Cannot be combined with replace_all."},
                 "replace_all": {"type": "boolean", "description": "Replace every occurrence of `old` (default false)."}
             }),
             &["path", "old", "new"],
@@ -87,6 +89,19 @@ fn run(ctx: &ToolContext, args: &Value) -> Result<ToolResult, ToolResult> {
             )
         })?;
     let replace_all = optional_bool(args, "replace_all").unwrap_or(false);
+    let occurrence = optional_u64(args, "occurrence");
+    if replace_all && occurrence.is_some() {
+        return Err(ToolResult::err(
+            "invalid_args",
+            "`occurrence` and `replace_all` are mutually exclusive; name one match or ask for all of them",
+        ));
+    }
+    if occurrence == Some(0) {
+        return Err(ToolResult::err(
+            "invalid_args",
+            "occurrence is 1-based; pass \"occurrence\": 1 for the first match",
+        ));
+    }
 
     if old == new {
         return Err(ToolResult::err(
@@ -108,7 +123,7 @@ fn run(ctx: &ToolContext, args: &Value) -> Result<ToolResult, ToolResult> {
     };
     let (old, new) = (located.needle, located.replacement.as_str());
     let count = before.match_indices(&old).count();
-    if count > 1 && !replace_all {
+    if count > 1 && !replace_all && occurrence.is_none() {
         let lines: Vec<usize> = before
             .match_indices(&old)
             .map(|(index, _)| line_of(&before, index))
@@ -123,14 +138,31 @@ fn run(ctx: &ToolContext, args: &Value) -> Result<ToolResult, ToolResult> {
         return Err(ToolResult::err(
             "MULTI_MATCH",
             format!(
-                "`old` matches {count} times (lines {}{more}). Add surrounding context so it matches once, or pass \"replace_all\": true to replace every occurrence.",
+                "`old` matches {count} times (lines {}{more}). Add surrounding context so it matches once, pass \"occurrence\": N to replace the nth match, or pass \"replace_all\": true to replace every occurrence.",
                 shown.join(", ")
+            ),
+        ));
+    }
+    if let Some(occurrence) = occurrence
+        && occurrence as usize > count
+    {
+        return Err(ToolResult::err(
+            "MATCH_COUNT",
+            format!(
+                "occurrence {occurrence} was requested but `old` matches {count} time(s); pass an occurrence between 1 and {count}",
             ),
         ));
     }
 
     let after = if replace_all {
         before.replace(&old, new)
+    } else if let Some(occurrence) = occurrence {
+        replace_nth(&before, &old, new, occurrence as usize).ok_or_else(|| {
+            ToolResult::err(
+                "MATCH_COUNT",
+                format!("occurrence {occurrence} was not found in {display}"),
+            )
+        })?
     } else {
         before.replacen(&old, new, 1)
     };
@@ -168,6 +200,16 @@ fn line_of(content: &str, index: usize) -> usize {
         .bytes()
         .filter(|byte| *byte == b'\n')
         .count()
+}
+
+/// Replace the `nth` (1-based) occurrence of `needle` in `content`.
+fn replace_nth(content: &str, needle: &str, replacement: &str, nth: usize) -> Option<String> {
+    let (index, _) = content.match_indices(needle).nth(nth.checked_sub(1)?)?;
+    let mut out = String::with_capacity(content.len() + replacement.len());
+    out.push_str(&content[..index]);
+    out.push_str(replacement);
+    out.push_str(&content[index + needle.len()..]);
+    Some(out)
 }
 
 /// Where `needle` sits in a file and what to put in its place.
@@ -713,7 +755,56 @@ mod tests {
             result.content
         );
         assert!(result.content.contains("lines 1, 3"), "{}", result.content);
+        assert!(result.content.contains("occurrence"), "{}", result.content);
         assert!(result.content.contains("replace_all"), "{}", result.content);
+    }
+
+    #[tokio::test]
+    async fn occurrence_replaces_only_the_named_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = prepared(&dir, "alpha\nbeta\nalpha\n").await;
+
+        let result = EditTool
+            .call(
+                &ctx,
+                json!({"path": "a.txt", "old": "alpha", "new": "gamma", "occurrence": 2}),
+            )
+            .await;
+        assert!(!result.is_error, "{}", result.content);
+        assert_eq!(on_disk(&dir), "alpha\nbeta\ngamma\n");
+
+        let too_far = EditTool
+            .call(
+                &ctx,
+                json!({"path": "a.txt", "old": "alpha", "new": "gamma", "occurrence": 5}),
+            )
+            .await;
+        assert!(too_far.is_error);
+        assert!(
+            too_far.content.starts_with("[MATCH_COUNT]"),
+            "{}",
+            too_far.content
+        );
+        assert_eq!(on_disk(&dir), "alpha\nbeta\ngamma\n");
+    }
+
+    #[tokio::test]
+    async fn occurrence_and_replace_all_cannot_be_combined() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = prepared(&dir, "one one\n").await;
+        let result = EditTool
+            .call(
+                &ctx,
+                json!({"path": "a.txt", "old": "one", "new": "two", "occurrence": 1, "replace_all": true}),
+            )
+            .await;
+        assert!(result.is_error);
+        assert!(
+            result.content.starts_with("[invalid_args]"),
+            "{}",
+            result.content
+        );
+        assert_eq!(on_disk(&dir), "one one\n");
     }
 
     #[tokio::test]

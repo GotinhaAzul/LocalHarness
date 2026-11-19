@@ -833,8 +833,12 @@ async fn run_doctor(config: &Config, paths: &Paths, json: bool, fix: bool) -> Re
             Vec::new()
         },
     });
-    if let Ok(tools) = crate::tools::ToolRegistry::builtin().select(config.profile(), &[]) {
-        let (full_chars, short_chars) = crate::tools::schema_sizes(&tools);
+    if let Ok(selection) = crate::tools::ToolRegistry::builtin().select_for(
+        config.profile(),
+        config.model_profile().1.edit_mode,
+        &[],
+    ) {
+        let (full_chars, short_chars) = crate::tools::schema_sizes(&selection.tools);
         manifest.tool_schemas = Some(crate::doctor::SchemaSizes {
             full_chars,
             short_chars,

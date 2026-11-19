@@ -87,7 +87,7 @@ hashes of files you created. Keep secrets and personal data out of the report.
   at the end.
 - `iocs({"text":…})` to extract and defang indicators from evidence.
 - `bash` for the commands in `references/recon.md` and `references/validation.md`.
-- `lsp`, `test`, and `review` when the target includes source code: read the
+- `lsp`, `verify` with a `path` or `test` target, and `review` when the target includes source code: read the
   implementation before claiming a runtime behavior.
 - `/sec scope` is user-set. Do not ask the model to set it, and do not edit the
   scope entry directly.

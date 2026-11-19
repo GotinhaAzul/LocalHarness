@@ -424,7 +424,74 @@ pub fn repair(tool: &str, raw: &str, schema: &Value) -> Result<Value, RepairErro
 
 /// Repair and validate tool arguments, reporting what was dropped.
 pub fn repair_with_notes(tool: &str, raw: &str, schema: &Value) -> Result<Repaired, RepairError> {
+    repair_inner(tool, raw, schema, None)
+}
+
+/// Repair a call whose tool name was routed to `to` from `from`, first
+/// renaming the arguments that no longer exist (`patch.anchor` -> `edit.old`,
+/// `patch.replacement` -> `edit.new`).
+pub fn repair_routed(
+    from: &str,
+    to: &str,
+    raw: &str,
+    schema: &Value,
+) -> Result<Repaired, RepairError> {
+    repair_inner(to, raw, schema, Some(from))
+}
+
+/// Rename argument keys when a foreign tool name is routed to the active one.
+fn translate_routed(from: &str, to: &str, map: &mut Map<String, Value>) {
+    let renames: &[(&str, &str)] = match (from, to) {
+        ("patch", "edit") => &[
+            ("anchor", "old"),
+            ("old", "old"),
+            ("old_string", "old"),
+            ("old_str", "old"),
+            ("oldText", "old"),
+            ("old_text", "old"),
+            ("search", "old"),
+            ("replacement", "new"),
+            ("new", "new"),
+            ("new_string", "new"),
+            ("new_str", "new"),
+            ("newText", "new"),
+            ("new_text", "new"),
+            ("replace", "new"),
+        ],
+        _ => &[],
+    };
+    for (alias, canonical) in renames {
+        if *alias == *canonical {
+            continue;
+        }
+        if let Some(value) = map.remove(*alias)
+            && !map.contains_key(*canonical)
+        {
+            map.insert((*canonical).to_string(), value);
+        }
+    }
+}
+
+fn repair_inner(
+    tool: &str,
+    raw: &str,
+    schema: &Value,
+    routed_from: Option<&str>,
+) -> Result<Repaired, RepairError> {
     let mut value = parse_raw(raw)?;
+    // `git status|diff|log|blame` moved to bash; name the command before the
+    // enum check turns the call into a generic `bad_arguments` error.
+    if tool == "git"
+        && let Some(action) = value.get("action").and_then(Value::as_str)
+        && let Some(command) = crate::tools::git::read_command(action, &value)
+    {
+        return Err(RepairError::new(
+            "GIT_READ_VIA_BASH",
+            format!(
+                "git {action} is not an action of this tool; it is a plain read, so run it through bash, for example {{\"command\":\"{command}\"}}. This tool keeps the gated actions: stage, unstage, commit_message, commit, branch, worktree, undo."
+            ),
+        ));
+    }
     let Value::Object(map) = &mut value else {
         return Err(RepairError::new(
             "bad_arguments",
@@ -433,6 +500,9 @@ pub fn repair_with_notes(tool: &str, raw: &str, schema: &Value) -> Result<Repair
     };
     // `null` means "not provided" for every model we have seen.
     map.retain(|_, value| !value.is_null());
+    if let Some(from) = routed_from {
+        translate_routed(from, tool, map);
+    }
     apply_aliases(tool, map, schema);
     infer_action(tool, map);
     apply_defaults(tool, map);
@@ -738,6 +808,20 @@ pub fn resolve_tool_name(name: &str, active: &[&str]) -> ToolName {
         return ToolName::Routed {
             from: name.to_string(),
             to: (*to).to_string(),
+        };
+    }
+    // Tools that are now an argument of another tool. `patch` is the
+    // hash-anchored editor: in text mode the active name is `edit`, and
+    // `test` is `verify` with a `path` or `test` target.
+    let folded = match snake.as_str() {
+        "patch" if active.contains(&"edit") => Some("edit"),
+        "test" if active.contains(&"verify") => Some("verify"),
+        _ => None,
+    };
+    if let Some(to) = folded {
+        return ToolName::Routed {
+            from: name.to_string(),
+            to: to.to_string(),
         };
     }
     let suggestion = active
@@ -1163,6 +1247,78 @@ mod tests {
                 suggestion: Some("grep".into())
             }
         );
+    }
+
+    #[test]
+    fn a_removed_tool_name_routes_to_the_tool_that_absorbed_it() {
+        let text = ["read", "edit", "verify"];
+        assert_eq!(
+            resolve_tool_name("patch", &text),
+            ToolName::Routed {
+                from: "patch".into(),
+                to: "edit".into()
+            }
+        );
+        assert_eq!(
+            resolve_tool_name("test", &text),
+            ToolName::Routed {
+                from: "test".into(),
+                to: "verify".into()
+            }
+        );
+        // In hash mode `patch` is a real tool, so nothing is routed.
+        assert_eq!(
+            resolve_tool_name("patch", &["read", "edit", "patch"]),
+            ToolName::Exact("patch".into())
+        );
+        // With no successor active, the name stays unknown.
+        assert!(matches!(
+            resolve_tool_name("test", &["read"]),
+            ToolName::Unknown { .. }
+        ));
+    }
+
+    #[test]
+    fn a_routed_patch_call_is_rewritten_for_edit() {
+        let schema = schema_for("edit");
+        let repaired = repair_routed(
+            "patch",
+            "edit",
+            r#"{"path":"a.rs","anchor":"old text","replacement":"new text","occurrence":2}"#,
+            &schema,
+        )
+        .expect("routed args repair");
+        assert_eq!(repaired.args["old"], "old text");
+        assert_eq!(repaired.args["new"], "new text");
+        assert_eq!(repaired.args["occurrence"], 2);
+        assert!(repaired.args.get("anchor").is_none());
+        assert!(repaired.args.get("replacement").is_none());
+
+        // Other harnesses' spellings of the same two fields work too.
+        let repaired = repair_routed(
+            "patch",
+            "edit",
+            r#"{"path":"a.rs","old_string":"one","new_string":"two"}"#,
+            &schema,
+        )
+        .expect("aliases survive routing");
+        assert_eq!(repaired.args["old"], "one");
+        assert_eq!(repaired.args["new"], "two");
+    }
+
+    #[test]
+    fn a_routed_test_call_keeps_its_target() {
+        let schema = schema_for("verify");
+        let repaired = repair_routed(
+            "test",
+            "verify",
+            r#"{"path":"tests/parser.rs","test":"parses","timeout":30}"#,
+            &schema,
+        )
+        .expect("routed test args repair");
+        assert_eq!(repaired.args["path"], "tests/parser.rs");
+        assert_eq!(repaired.args["test"], "parses");
+        assert_eq!(repaired.args["timeout"], 30);
     }
 
     #[test]

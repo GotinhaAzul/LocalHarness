@@ -84,7 +84,7 @@ For a confirmed issue:
    authorization middleware), not just the single route.
 2. Keep the change scoped. Do not refactor unrelated code or add telemetry and
    abstractions "while here".
-3. Add a regression test with `test` that fails before the fix and passes after
+3. Add a regression test and run it with `verify` (give it a `path` or `test` target) so it fails before the fix and passes after
    it. Encode the same minimal case used in the PoC.
 4. Run `review` on the diff for a second pass; verify the fix does not rely on a
    blocklist or client-side check.

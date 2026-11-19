@@ -216,6 +216,9 @@ fn recorded_verification(session: &Session) -> (Verification, Option<String>) {
         match custom.kind.as_str() {
             "fs-change" if result != Verification::Missing => result = Verification::Stale,
             "verify-result" => {
+                if !crate::session::Session::counts_as_project_verify(&custom.payload) {
+                    continue;
+                }
                 let passed = custom.payload.get("passed").and_then(Value::as_bool) == Some(true);
                 tree = custom
                     .payload

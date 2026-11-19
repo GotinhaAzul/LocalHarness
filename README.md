@@ -99,9 +99,10 @@ before the turn ends, review the diff after. Loop and stall guards stop
 repetition without cutting off work that is still making progress. Every error
 names the next action, so a model is never left guessing.
 
-**Tools that know the codebase.** Edit, patch, and undo with snapshots; grep,
-glob, and a cached repo map; language-server diagnostics after edits; a test
-runner that returns the first failure, not ten thousand lines. Oversized output
+**Tools that know the codebase.** `edit` and `undo` with snapshots, plus a
+hash-anchored `patch` when enabled; grep, glob, and a cached repo map;
+language-server diagnostics after edits; `verify` with a target that runs one
+test and returns the first failure, not ten thousand lines. Oversized output
 is archived and recalled by exact range.
 
 **Hunk review.** Before a multi-file change lands, Totality shows you the hunks.

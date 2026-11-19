@@ -2962,6 +2962,7 @@ async fn execute_batch(
         // sees the canonical tool, never the model's spelling of it.
         let resolved_name = super::repair::resolve_tool_name(&original.name, &active);
         let mut routed_note = None;
+        let mut routed_from: Option<String> = None;
         let mut unknown_suggestion = None;
         let routed_call;
         let call = match &resolved_name {
@@ -2976,6 +2977,7 @@ async fn execute_batch(
                 routed_note = Some(format!(
                     "note: {from:?} is not a tool here; ran {to}. Call {to} directly next time."
                 ));
+                routed_from = Some(from.clone());
                 routed_call = ToolCall {
                     name: to.clone(),
                     ..original.clone()
@@ -3036,7 +3038,11 @@ async fn execute_batch(
             );
         } else {
             let schema = tool.as_ref().unwrap().schema();
-            match super::repair::repair_with_notes(&call.name, &raw, &schema) {
+            let repaired_result = match routed_from.as_deref() {
+                Some(from) => super::repair::repair_routed(from, &call.name, &raw, &schema),
+                None => super::repair::repair_with_notes(&call.name, &raw, &schema),
+            };
+            match repaired_result {
                 Err(err) => {
                     result = ToolResult::err(err.code, err.message);
                 }
@@ -3555,6 +3561,7 @@ async fn execute_batch(
                         payload,
                     };
                     if custom.kind == "verify-result"
+                        && crate::session::Session::counts_as_project_verify(&custom.payload)
                         && custom.payload.get("passed").and_then(|v| v.as_bool()) == Some(true)
                     {
                         verified_ok = true;

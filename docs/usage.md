@@ -68,23 +68,25 @@ PASS  cargo  42 passed (3.1 s)
 
 ## Tools that know the codebase
 
-Twenty-four built-ins in three packs. `coding` (core + coding) is the default; `full` adds the security pack. `security` and `minimal` narrow it further; `strict` and `shell` are weak-model presets (see [configuration](configuration.md#weak-model-profiles)).
+Twenty-six built-ins in three packs. `coding` (core + coding) is the default; `full` adds the security pack. `security` and `minimal` narrow it further; `strict` and `shell` are weak-model presets (see [configuration](configuration.md#weak-model-profiles)). `patch` is the hash-anchored editor and is selected only when the model profile sets `edit_mode = "hash"`; text mode exposes `edit` alone.
 
 | Pack | Tools |
 |---|---|
-| Core | `read` `write` `edit` `patch` `undo` `bash` `grep` `glob` `todo` `skill` `verify` `recall` `thread` `bg` |
-| Coding | `repo_map` `lsp` `test` `review` |
+| Core | `read` `write` `edit` `patch` (hash mode) `undo` `bash` `grep` `glob` `todo` `skill` `verify` `recall` `thread` `bg` |
+| Coding | `repo_map` `lsp` `review` `git` `pr` |
 | Security | `surface` `evidence` `detect` `attack_path` `finding` `iocs` |
+
+`git` keeps the actions with a gate: `stage`, `unstage`, `commit_message`, `commit`, `branch`, `worktree`, and `undo`. `status`, `diff`, `log`, and `blame` are plain reads: call them through `bash` (`git status --short`, `git diff`, `git log --oneline -n 20`, `git blame -L a,b path`). A call to one of them through `git` returns that command in the error.
 
 - **`grep`** searches text, gitignore-aware, and `path=artifact:out-3` searches a stored tool result such as a fetched page.
 - **`repo_map`** returns a cached, budget-capped outline of files and top-level symbols (2200 chars by default, 8000 at most). A short index of at most 1200 chars ships in the system prompt; it is not exhaustive, and the model is told to call `repo_map` for more. Files are ranked: README, manifests, entry points (`main`, `lib`, `app`, `cmd/`), source, tests, then other docs and config. Code files without room for an outline are counted per directory, and up to 40% of the budget is held for data and config files so a large source tree cannot push them out. Directories with up to 12 such files are listed by name; larger ones get extension counts and name patterns (`inbox/ (26 files: 20 .txt, 5 .html, 1 .eml; names: CN-77.eml, INV-* ×20, RESENT-* ×5)`). A closing line counts anything the budget still left out. `vendor/`, `dist/`, `build/`, and `target/` are only skipped when `.gitignore` excludes them.
 - **`lsp`** adds language-server diagnostics after edits when a supported server is installed and the file belongs to a real project. A missing or cold server never fails an edit.
-- **`test`** detects vitest, jest, go, cargo, pytest, Python unittest, or an npm test script and returns only the first failure.
+- **`verify`** runs the configured steps. With `path` or `test` it runs the detected runner for that one file or test instead (vitest, jest, go, cargo, pytest, Python unittest, or an npm test script) and returns only the first failure. A targeted run never counts as a passing project verify, so it does not clear the verify gate.
 - **`review`** reads the working tree and checks the diff before the session settles. It is scoped to the session root: a workspace inside a larger repository reports only its own changes, and `git` mutations refuse to touch the enclosing repository.
 - **`undo`** reverts the last `edit`, `patch`, or `write` from session snapshots, and refuses when the file changed after the harness wrote it. Before a destructive `bash` command (`rm`, `mv`, `find -delete`, `truncate`, or `>` over a file), the harness snapshots the named files, so `undo` and `/rewind` can bring them back; each such result names the snapshot. `git clean` is not parsed.
 - **Hunk review.** `review = "multi_file"` (the default) pauses before a turn's second file mutation, shows the proposed hunks in the TUI, and writes only what you accept. Rejected hunks are reported back to the model with their ranges, accepted hunks land atomically, and `undo` still steps back over them. `always` reviews every mutation; `off` restores immediate writes. Headless `--print` has no reviewer, so it auto-accepts and never blocks.
 - **`read`/`grep`/`glob`** respect ignore files and keep results small; oversized output is archived and available through `recall`.
-- **Hash edits (opt-in)** — `edit_mode = "hash"` makes `read` print content hashes and lets `patch` apply `PUT`/`CUT`/`REM`/`MV` line anchors from `path#snapshot`; stale anchors write nothing and return fresh ones. Exact-text `edit` remains the default. See [configuration](configuration.md#hash-anchored-edits).
+- **Hash edits (opt-in)** — `edit_mode = "hash"` makes `read` print content hashes and adds `patch`, which applies `PUT`/`CUT`/`REM`/`MV` line anchors from `path#snapshot`; stale anchors write nothing and return fresh ones. `edit` remains the exact-text editor, and `occurrence` replaces one named match. See [configuration](configuration.md#hash-anchored-edits).
 
 Tool results are capped, archived, and retrievable. The model never has to guess where an excerpt came from.
 

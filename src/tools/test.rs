@@ -1,148 +1,110 @@
-//! `test` tool: detects the project's test runner, runs one file or one test,
-//! and returns only the first failure.
+//! Targeted test runs: detect the project's runner, run one file or one test,
+//! and return only the first failure. Shared by the `verify` tool, which takes
+//! a `path` or `test` target.
 
 use std::ffi::OsString;
 use std::path::{Component, Path};
 use std::process::Stdio;
 use std::time::Duration;
 
-use async_trait::async_trait;
-use serde_json::{Value, json};
+use serde_json::json;
 use tokio::io::AsyncReadExt;
 use tokio::process::{ChildStderr, ChildStdout, Command};
 
 use crate::text::clip;
 use crate::tools::project::{Runner, detect_runner, is_executable, python_program};
-use crate::tools::{
-    Tool, ToolContext, ToolPack, ToolResult, display_path, object_schema, optional_str,
-    optional_u64,
-};
+use crate::tools::{ToolContext, ToolResult, display_path};
 
 const DEFAULT_TIMEOUT_SECS: u64 = 600;
 const MAX_TIMEOUT_SECS: u64 = 600;
 const MAX_RESULT_CHARS: usize = 2500;
 const MAX_CAPTURE_BYTES: usize = 1024 * 1024;
 
-pub struct TestTool;
-
-#[async_trait]
-impl Tool for TestTool {
-    fn preview_tail(&self) -> bool {
-        true
-    }
-
-    fn name(&self) -> &'static str {
-        "test"
-    }
-
-    fn description(&self) -> &'static str {
-        "Run one test file or one test; first failure only."
-    }
-
-    fn schema(&self) -> Value {
-        object_schema(
-            json!({
-                "path": {"type": "string", "description": "Test file to run."},
-                "test": {"type": "string", "description": "Test name filter."},
-                "timeout": {"type": "integer", "minimum": 1, "maximum": MAX_TIMEOUT_SECS, "description": "Seconds, default and maximum 600."}
-            }),
-            &[],
-        )
-    }
-
-    fn pack(&self) -> ToolPack {
-        ToolPack::Coding
-    }
-
-    fn read_only(&self) -> bool {
-        false
-    }
-
-    async fn call(&self, ctx: &ToolContext, args: Value) -> ToolResult {
-        match self.run(ctx, args).await {
-            Ok(result) => result,
-            Err(error) => error,
-        }
+/// Run one test file or one test with the detected runner. A failure is a
+/// successful tool call (it carries the first-failure output); only a spawn or
+/// timeout problem is an error.
+pub(crate) async fn run(
+    ctx: &ToolContext,
+    path: Option<&str>,
+    test: Option<&str>,
+    timeout: Option<u64>,
+) -> ToolResult {
+    match run_inner(ctx, path, test, timeout).await {
+        Ok(result) => result,
+        Err(error) => error,
     }
 }
 
-impl TestTool {
-    pub fn new() -> Self {
-        Self
-    }
-
-    async fn run(&self, ctx: &ToolContext, args: Value) -> Result<ToolResult, ToolResult> {
-        let path = match optional_str(&args, "path") {
-            Some(raw) => {
-                let resolved = ctx.resolve(&raw)?;
-                if !resolved.exists() {
-                    return Err(ToolResult::err(
-                        "invalid_args",
-                        format!(
-                            "{} does not exist; pass an existing test file or omit \"path\"",
-                            display_path(&ctx.cwd, &resolved)
-                        ),
-                    ));
-                }
-                Some(resolved)
+async fn run_inner(
+    ctx: &ToolContext,
+    path: Option<&str>,
+    test: Option<&str>,
+    timeout: Option<u64>,
+) -> Result<ToolResult, ToolResult> {
+    let path = match path {
+        Some(raw) => {
+            let resolved = ctx.resolve(raw)?;
+            if !resolved.exists() {
+                return Err(ToolResult::err(
+                    "invalid_args",
+                    format!(
+                        "{} does not exist; pass an existing test file or omit \"path\"",
+                        display_path(&ctx.cwd, &resolved)
+                    ),
+                ));
             }
-            None => None,
-        };
-        let test = optional_str(&args, "test").filter(|name| !name.trim().is_empty());
-        let seconds = optional_u64(&args, "timeout")
-            .unwrap_or(DEFAULT_TIMEOUT_SECS)
-            .clamp(1, MAX_TIMEOUT_SECS);
-
-        let runner = detect_runner(&ctx.cwd, path.as_deref())?;
-        let invocation = build_invocation(&ctx.cwd, runner, path.as_deref(), test.as_deref());
-        let output = run_invocation(&invocation, &ctx.cwd, Duration::from_secs(seconds)).await?;
-        if output.timed_out {
-            return Err(ToolResult::err(
-                "TEST_TIMEOUT",
-                format!(
-                    "{} did not finish within {seconds}s; the process group was killed. Narrow the run with \"test\", pass a single \"path\", or raise \"timeout\" (max {MAX_TIMEOUT_SECS}).",
-                    invocation.display
-                ),
-            ));
+            Some(resolved)
         }
+        None => None,
+    };
+    let test = test.filter(|name| !name.trim().is_empty());
+    let seconds = timeout
+        .unwrap_or(DEFAULT_TIMEOUT_SECS)
+        .clamp(1, MAX_TIMEOUT_SECS);
 
-        let cleaned = crate::sanitize::terminal_output(&output.text).into_owned();
-        let summary = summary_line(runner, &output, &cleaned);
-        let body = match failure_excerpt(&cleaned) {
-            Some(excerpt) => excerpt,
-            None if output.success => String::new(),
-            None => {
-                let tail: Vec<&str> = cleaned.lines().rev().take(40).collect();
-                let mut tail = tail;
-                tail.reverse();
-                format!(
-                    "no failure marker found; last output lines:\n{}",
-                    tail.join("\n")
-                )
-            }
-        };
-        let mut content = format!("{summary}\nrerun: {}", invocation.display);
-        if !body.is_empty() {
-            content.push_str("\n\n");
-            content.push_str(&body);
+    let runner = detect_runner(&ctx.cwd, path.as_deref())?;
+    let invocation = build_invocation(&ctx.cwd, runner, path.as_deref(), test);
+    let output = run_invocation(&invocation, &ctx.cwd, Duration::from_secs(seconds)).await?;
+    if output.timed_out {
+        return Err(ToolResult::err(
+            "TEST_TIMEOUT",
+            format!(
+                "{} did not finish within {seconds}s; the process group was killed. Narrow the run with \"test\", pass a single \"path\", or raise \"timeout\" (max {MAX_TIMEOUT_SECS}).",
+                invocation.display
+            ),
+        ));
+    }
+
+    let cleaned = crate::sanitize::terminal_output(&output.text).into_owned();
+    let summary = summary_line(runner, &output, &cleaned);
+    let body = match failure_excerpt(&cleaned) {
+        Some(excerpt) => excerpt,
+        None if output.success => String::new(),
+        None => {
+            let tail: Vec<&str> = cleaned.lines().rev().take(40).collect();
+            let mut tail = tail;
+            tail.reverse();
+            format!(
+                "no failure marker found; last output lines:\n{}",
+                tail.join("\n")
+            )
         }
-        let content = clip(&content, MAX_RESULT_CHARS);
-
-        Ok(ToolResult::ok(content).with_details(json!({
-            "runner": runner.name(),
-            "command": invocation.display,
-            "exit_code": output.status,
-            "timed_out": output.timed_out,
-            "passed": count_matches(&cleaned, r"(\d+)\s+passed"),
-            "failed": count_matches(&cleaned, r"(\d+)\s+failed"),
-        })))
+    };
+    let mut content = format!("{summary}\nrerun: {}", invocation.display);
+    if !body.is_empty() {
+        content.push_str("\n\n");
+        content.push_str(&body);
     }
-}
+    let content = clip(&content, MAX_RESULT_CHARS);
 
-impl Default for TestTool {
-    fn default() -> Self {
-        Self::new()
-    }
+    Ok(ToolResult::ok(content).with_details(json!({
+        "runner": runner.name(),
+        "command": invocation.display,
+        "exit_code": output.status,
+        "timed_out": output.timed_out,
+        "passed": count_matches(&cleaned, r"(\d+)\s+passed"),
+        "failed": count_matches(&cleaned, r"(\d+)\s+failed"),
+    })))
 }
 
 // ---------------------------------------------------------------------------
@@ -610,7 +572,7 @@ mod tests {
             "import unittest\n\nclass T(unittest.TestCase):\n    def test_ok(self):\n        self.assertEqual(1, 1)\n",
         )]);
         let ctx = crate::tools::bash::test_context(dir.path());
-        let result = TestTool.call(&ctx, json!({"path": "test_x.py"})).await;
+        let result = run(&ctx, Some("test_x.py"), None, None).await;
         assert!(!result.is_error, "{}", result.content);
         assert!(result.content.starts_with("PASS"), "{}", result.content);
         assert_eq!(result.details.unwrap()["exit_code"].as_i64(), Some(0));
@@ -626,7 +588,7 @@ mod tests {
             "import unittest\n\nclass T(unittest.TestCase):\n    def test_fails(self):\n        self.assertEqual(1, 2)\n",
         )]);
         let ctx = crate::tools::bash::test_context(dir.path());
-        let result = TestTool.call(&ctx, json!({"path": "test_x.py"})).await;
+        let result = run(&ctx, Some("test_x.py"), None, None).await;
         assert!(!result.is_error, "{}", result.content);
         assert!(result.content.starts_with("FAIL"), "{}", result.content);
         assert_ne!(result.details.unwrap()["exit_code"].as_i64(), Some(0));

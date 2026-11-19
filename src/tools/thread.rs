@@ -209,6 +209,9 @@ fn snapshot_of(session: &Session) -> Snapshot {
                 snap.todos = parse_todos(&custom.payload);
             }
             "verify-result" => {
+                if !crate::session::Session::counts_as_project_verify(&custom.payload) {
+                    continue;
+                }
                 let passed = custom
                     .payload
                     .get("passed")

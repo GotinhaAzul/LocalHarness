@@ -303,6 +303,13 @@ impl Session {
         self.latest_custom_on_path("verify-result")
     }
 
+    /// Whether a `verify-result` payload is a full project verify. A targeted
+    /// run checks one file or test, so it never clears the verify gate or
+    /// satisfies the final todo verify requirement.
+    pub fn counts_as_project_verify(payload: &serde_json::Map<String, serde_json::Value>) -> bool {
+        payload.get("targeted").and_then(|value| value.as_bool()) != Some(true)
+    }
+
     pub fn fsync(&mut self) -> Result<()> {
         if let Some(store) = &mut self.store {
             store.sync().context("fsync session")?;

@@ -244,6 +244,9 @@ impl Facts {
                         }
                     }
                     "verify-result" => {
+                        if !crate::session::Session::counts_as_project_verify(&custom.payload) {
+                            continue;
+                        }
                         facts.last_verify =
                             match custom.payload.get("passed").and_then(|v| v.as_bool()) {
                                 Some(true) => VerifyState::Pass,
@@ -301,6 +304,7 @@ impl Facts {
         for entry in branch.iter().skip(start).rev() {
             if let EntryKind::Custom(custom) = &entry.kind
                 && custom.kind == "verify-result"
+                && crate::session::Session::counts_as_project_verify(&custom.payload)
             {
                 return match custom.payload.get("passed").and_then(|v| v.as_bool()) {
                     Some(true) => VerifyState::Pass,
