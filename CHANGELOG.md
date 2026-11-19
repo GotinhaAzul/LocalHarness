@@ -247,6 +247,12 @@ release may change defaults when the change is called out below.
 
 ### Changed
 
+- The wall-clock checkpoint scales with the measured model speed: the
+  allowance is `[budgets] max_wall_minutes` or six model calls at the slowest
+  of the last five measured calls, whichever is longer, and the "recent
+  progress" window covers at least three such calls. A 10 tok/s thinking
+  model whose calls take several minutes is no longer stopped as
+  no-progress during one long call. Fast engines see no change.
 - The system prompt's operating rules no longer restate what the gates
   enforce (read before edit, the plan from the third file, no interactive
   programs, `recall` for truncated output) or ask the model to judge its own

@@ -835,6 +835,7 @@ async fn run_loop(
                 _ = tokio::time::sleep(delay) => {}
             }
         };
+        progress.model_call_finished();
 
         force_thinking_off = false;
         let assistant = match result {

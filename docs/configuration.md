@@ -119,7 +119,7 @@ artifact_retention_days = 30
 # the turn.
 max_tool_calls = 120
 max_model_calls = 40
-max_wall_minutes = 30
+max_wall_minutes = 30           # at least 6 model calls at the measured speed
 stall_calls = 12
 # Repeated or failing calls of one tool family allowed in a turn before it
 # stops as stalled. A family is `bash`'s program and subcommand, or another
