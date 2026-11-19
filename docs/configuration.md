@@ -152,6 +152,10 @@ max_same_tool_family = 8
 max_same_tool_family_success = 24
 verify_attempts = 2
 
+[gates]
+auto_settle = true              # the harness runs verify and review when the model settles
+verify_detected = true          # no steps configured: use the ones detected from the manifest
+
 [prompt]
 identity = ""                   # replaces the built-in one-line identity
 instructions = ""               # extra instructions appended to the prompt
@@ -160,6 +164,9 @@ agents_md = true                # load the hierarchical AGENTS.md chain
 
 [lsp]
 gate = "warn"                   # off | warn | block (see below)
+
+[format]
+on_edit = true                  # format edited files the project keeps formatted
 
 [git]
 commit = "ask"                  # ask: /commit confirm approves; allow: commit at once
@@ -590,6 +597,31 @@ approval. Hook output cannot change tools, scope, the endpoint, or the
 permission mode. See [hooks.md](hooks.md) for the payload, output schema, exit
 codes, and `tot hooks test <name>`.
 
+## Formatting edits
+
+With `[format] on_edit` (default `true`), `edit`, exact-text `patch`, and
+`write` pass the new content through the project's formatter before writing
+it, so the model does not spend turns on whitespace and review shows no
+formatter noise. The diff in the tool result is what landed.
+
+A clean file stays clean, and nothing else is touched: an existing file is
+formatted only when its content before the edit was already what the
+formatter produces. A new file is formatted when the project has the
+formatter's config, or always for Rust and Go.
+
+| Files | Formatter | Used when |
+|---|---|---|
+| `.rs` | `rustfmt --edition <Cargo.toml edition>` | on `PATH` |
+| `.go` | `gofmt` | on `PATH` |
+| `.py`, `.pyi` | `ruff format`, else `black` | `[tool.ruff]`/`ruff.toml`, or `[tool.black]`, and on `PATH` |
+| JS/TS, JSON, CSS, HTML, Markdown, YAML | `prettier` | a prettier config; `node_modules/.bin/prettier` only in a trusted project, else on `PATH` |
+
+Formatters read stdin and write stdout with a 5-second limit. A missing
+formatter, a failure (such as a syntax error mid-edit), or a timeout writes
+the content as given. Hash-mode `patch` is never formatted, because its result
+returns line anchors for the content the operations produced. Files over
+512 KB and non-UTF-8 files are written as given.
+
 ## LSP gate
 
 `[lsp] gate` controls what happens when a `write`, `edit`, or `patch` introduces
@@ -679,7 +711,21 @@ name = "lint"
 command = ["cargo", "clippy", "--all-targets", "--", "-D", "warnings"]
 ```
 
-Steps run sequentially without a shell and stop at the first failure.
+Steps run sequentially without a shell and stop at the first failure. When
+one fails, up to three `file:line` locations its output names (rustc, Rust
+panics, tsc, Python tracebacks, pytest, Go, gcc and eslint shapes) are attached
+with three lines of context each and count as read. Only existing files under
+the working directory count; `target/`, `node_modules/`, virtualenvs and build
+output are skipped.
+
+With no configured or accepted steps, `[gates] verify_detected` (default
+`true`) uses the steps detected from the project manifest (`Cargo.toml`,
+`package.json`, Python markers, `go.mod`) for the session, so the verify gate
+is on in an ordinary repository. Detection reads files only; the steps run
+through the permission policy like any other command, so in the default mode
+the first run asks. They are not saved: `tot verify --init` or `/verify accept`
+keeps them, and `verify_detected = false` restores the old behavior (no steps,
+the gate stays off, a notice names what was detected).
 
 ## Environment
 

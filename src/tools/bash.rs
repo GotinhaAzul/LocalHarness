@@ -52,15 +52,13 @@ pub(crate) fn shell_command(
     if let Some(sandbox) = sandbox {
         return sandbox.wrap(command, cwd);
     }
-    use std::os::unix::process::CommandExt;
-    let mut cmd = tokio::process::Command::new("bash");
-    cmd.arg("-lc")
+    let mut cmd = crate::tools::procenv::command("bash");
+    cmd.arg("-c")
         .arg(command)
         .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    cmd.as_std_mut().process_group(0);
     Ok(cmd)
 }
 
@@ -473,6 +471,7 @@ pub(crate) fn test_context(dir: &Path) -> ToolContext {
         sandbox: None,
         vision: Default::default(),
         caps: Default::default(),
+        format_on_edit: false,
     }
 }
 

@@ -2884,6 +2884,7 @@ async fn verify_gate_runs_configured_steps_and_review_settles() {
             command: vec!["true".into()],
             timeout_secs: 5,
         }],
+        ..Default::default()
     };
     let harness = harness_config(
         dir.path(),
@@ -5774,6 +5775,7 @@ fn auto_settle_harness(dir: &std::path::Path, scripts: Vec<Script>, verify: &str
             command: vec!["sh".into(), "-c".into(), verify.into()],
             timeout_secs: 5,
         }],
+        ..Default::default()
     };
     harness_config(dir, scripts, config)
 }

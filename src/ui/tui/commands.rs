@@ -1517,6 +1517,7 @@ impl App {
                     let mut fresh = self.config.clone();
                     fresh.verify.steps =
                         detected.steps.iter().map(|step| step.to_config()).collect();
+                    fresh.verify.detected_from.clear();
                     match app::rebuild_core(&old, fresh).await {
                         Ok(core) => {
                             if let Some(runtime) = &mut self.runtime {
@@ -1550,7 +1551,12 @@ impl App {
             }
             return;
         }
-        let text = if self.config.verify.steps.is_empty() {
+        let text = if self.config.verify.is_detected() {
+            crate::verify_setup::detected_notice(
+                &self.config.verify,
+                "Type /verify accept to save them for this project.",
+            )
+        } else if self.config.verify.steps.is_empty() {
             crate::verify_setup::unconfigured_notice(
                 &crate::tools::project::detect_verify_steps(&old.paths.cwd),
                 "Type /verify accept to save them for this project.",
@@ -1631,6 +1637,7 @@ impl App {
         if verify_path.exists() {
             fresh.verify = crate::config::VerifyConfig::load(&verify_path)?;
         }
+        crate::verify_setup::fill_unconfigured(&mut fresh, &paths);
         // Keep the runtime selections the user already made on the command line
         // or in this session.
         fresh.model.endpoint = self.config.model.endpoint.clone();
