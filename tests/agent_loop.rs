@@ -2313,7 +2313,8 @@ async fn model_budget_stops_before_another_call() {
         dir.path(),
         vec![
             tool_script("read", json!({"path":"a.rs"})),
-            text_script("nope"),
+            tool_script("read", json!({"path":"b.rs"})),
+            text_script("summary"),
         ],
         &["read"],
     );
@@ -2323,13 +2324,26 @@ async fn model_budget_stops_before_another_call() {
     core.config = config;
     core.limits.max_model_calls = 1;
     harness.core = Arc::new(core);
-    let (outcome, _) = run(&harness, "one call").await;
+    let (outcome, events) = run(&harness, "one call").await;
     assert_eq!(outcome.status, TurnStatus::Budget);
+    let requests = harness.provider.requests.lock().unwrap();
     assert_eq!(
-        harness.provider.requests.lock().unwrap().len(),
-        2,
-        "the one budgeted call, then the tool-less summary"
+        requests.len(),
+        3,
+        "the budgeted call, one more after the pivot, then the tool-less summary"
     );
+    assert!(
+        format!("{:?}", requests[1].messages).contains("switch to a different method"),
+        "the call after the first checkpoint carries the pivot instruction"
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::Notice(message) if message.contains("asked the model to change approach")
+    )));
+    let session = harness.session.lock().unwrap();
+    assert!(session.branch_entries().iter().any(
+        |entry| matches!(&entry.kind, EntryKind::Custom(custom) if custom.kind == "budget-pivot")
+    ));
 }
 
 #[tokio::test]
@@ -2382,7 +2396,10 @@ async fn long_task_without_progress_stops_at_the_checkpoint() {
             tool_script("read", json!({"path":"missing-1.rs"})),
             tool_script("read", json!({"path":"missing-2.rs"})),
             tool_script("read", json!({"path":"missing-3.rs"})),
-            text_script("should not be called"),
+            tool_script("read", json!({"path":"missing-4.rs"})),
+            tool_script("read", json!({"path":"missing-5.rs"})),
+            tool_script("read", json!({"path":"missing-6.rs"})),
+            text_script("summary"),
         ],
         &["read"],
     );
@@ -2398,13 +2415,17 @@ async fn long_task_without_progress_stops_at_the_checkpoint() {
     assert_eq!(outcome.status, TurnStatus::Budget);
     assert_eq!(
         harness.provider.requests.lock().unwrap().len(),
-        4,
-        "three calls and the tool-less summary"
+        7,
+        "three calls, three more after the pivot, then the tool-less summary"
     );
     let results = tool_results(&harness.session);
-    assert_eq!(results.len(), 3);
+    assert_eq!(results.len(), 6);
     assert!(
-        results[2].contains("did not run"),
+        results[2].contains("asked for a different approach"),
+        "the call at the first checkpoint is skipped: {results:?}"
+    );
+    assert!(
+        results[5].contains("did not run"),
         "the blocked call needs a result: {results:?}"
     );
     let session = harness.session.lock().unwrap();

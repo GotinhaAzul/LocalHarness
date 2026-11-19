@@ -145,6 +145,9 @@ pub struct RunProgress {
     pub presend_compaction_used: bool,
     /// Whether the advance notice for the todo gate was attached this turn.
     pub todo_notice_sent: bool,
+    /// Whether a no-progress checkpoint already asked for a different
+    /// approach this turn. The first one pivots; the second ends the turn.
+    pub pivot_used: bool,
 }
 
 impl RunProgress {
@@ -177,6 +180,7 @@ impl RunProgress {
             thinking_retry_used: false,
             text_calls_noticed: false,
             presend_compaction_used: false,
+            pivot_used: false,
         }
     }
 
@@ -300,6 +304,33 @@ impl RunProgress {
             }
             StopReason::Cancelled => "cancelled by the user".into(),
         }
+    }
+
+    /// The first no-progress checkpoint of a turn does not end it: the model
+    /// gets one fresh allowance with an instruction to drop the approach that
+    /// is repeating. Returns false once that pivot is spent, and the turn ends
+    /// at the checkpoint as before.
+    pub fn try_pivot(&mut self) -> bool {
+        if self.pivot_used {
+            return false;
+        }
+        self.pivot_used = true;
+        self.epoch_tool_calls = 0;
+        self.epoch_model_calls = 0;
+        self.epoch_started_at = Instant::now();
+        self.last_progress_call = None;
+        self.last_progress_at = None;
+        true
+    }
+
+    /// The instruction sent to the model when a checkpoint pivots.
+    pub fn pivot_message(&self, reason: StopReason) -> String {
+        format!(
+            "[totality] {}: the last {} call(s) changed no file and passed no verification; the current approach is not working. Do not repeat it or try small variations of it. In one sentence, say why it failed, then switch to a different method: for example, write and run a small script, use a different tool, or read the relevant documentation once. You have one more allowance ({} model calls); if it also makes no progress, the turn ends.",
+            reason.code(),
+            self.limits.stall_calls,
+            self.limits.max_model_calls
+        )
     }
 
     /// User-facing notice when a productive checkpoint renews the allowance.
@@ -1399,6 +1430,38 @@ mod tests {
         assert_eq!(progress.model_calls, 4, "cumulative remains for reporting");
         assert_eq!(progress.epoch_model_calls, 0);
         assert_eq!(progress.model_checkpoint(), BudgetCheck::Ok);
+    }
+
+    #[test]
+    fn the_first_no_progress_checkpoint_pivots_once() {
+        let mut progress = RunProgress::new(limits());
+        for _ in 0..4 {
+            progress.model_call_started();
+        }
+        assert_eq!(
+            progress.model_checkpoint(),
+            BudgetCheck::Exhausted(StopReason::ModelBudget)
+        );
+        assert!(progress.try_pivot(), "the first checkpoint pivots");
+        assert!(
+            progress
+                .pivot_message(StopReason::ModelBudget)
+                .contains("switch to a different method")
+        );
+        assert_eq!(
+            progress.model_checkpoint(),
+            BudgetCheck::Ok,
+            "fresh allowance"
+        );
+        assert_eq!(progress.renewals, 0, "a pivot is not a productive renewal");
+        for _ in 0..4 {
+            progress.model_call_started();
+        }
+        assert_eq!(
+            progress.model_checkpoint(),
+            BudgetCheck::Exhausted(StopReason::ModelBudget)
+        );
+        assert!(!progress.try_pivot(), "the second checkpoint ends the turn");
     }
 
     #[test]

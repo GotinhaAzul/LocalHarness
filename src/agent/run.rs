@@ -483,6 +483,11 @@ async fn run_loop(
         match progress.model_checkpoint() {
             BudgetCheck::Ok => {}
             BudgetCheck::Renewed(reason) => report_renewal(core.as_ref(), tx, &progress, reason),
+            BudgetCheck::Exhausted(reason) if progress.try_pivot() => {
+                if let Err(err) = request_pivot(core.as_ref(), tx, &progress, reason) {
+                    return TurnOutcome::error("session_write", err.to_string());
+                }
+            }
             BudgetCheck::Exhausted(reason) => {
                 let message = progress.checkpoint_message(reason);
                 finish_with_summary(
@@ -1359,6 +1364,26 @@ async fn run_loop(
         match progress.tool_checkpoint(calls.len() as u32) {
             BudgetCheck::Ok => {}
             BudgetCheck::Renewed(reason) => report_renewal(core.as_ref(), tx, &progress, reason),
+            BudgetCheck::Exhausted(reason) if progress.try_pivot() => {
+                // The batch is more of the approach that stopped working:
+                // skip it and let the model choose a different one.
+                for call in &calls {
+                    append_tool_result(
+                        &core.session,
+                        call,
+                        &ToolResult::err(
+                            "budget_tools",
+                            "a no-progress checkpoint asked for a different approach; this call did not run",
+                        ),
+                        None,
+                        Some(crate::provenance::tool_tag(&call.name)),
+                    );
+                }
+                if let Err(err) = request_pivot(core.as_ref(), tx, &progress, reason) {
+                    return TurnOutcome::error("session_write", err.to_string());
+                }
+                continue;
+            }
             BudgetCheck::Exhausted(reason) => {
                 for call in &calls {
                     append_tool_result(
@@ -4273,6 +4298,32 @@ fn append_assistant(
 
 /// A productive checkpoint renewed the allowance. This is bookkeeping for the
 /// user, not a message to the model: the turn simply keeps going.
+/// Record a checkpoint pivot and tell the model to change approach.
+fn request_pivot(
+    core: &Core,
+    tx: &UnboundedSender<AgentEvent>,
+    progress: &RunProgress,
+    reason: StopReason,
+) -> anyhow::Result<()> {
+    append_custom(
+        &core.session,
+        "budget-pivot",
+        json!({
+            "trigger": reason.code(),
+            "tool_calls": progress.tool_calls,
+            "model_calls": progress.model_calls,
+            "elapsed_secs": progress.elapsed().as_secs(),
+        }),
+    );
+    let message = progress.pivot_message(reason);
+    append_user(&core.session, &message)?;
+    let _ = tx.send(AgentEvent::Notice(format!(
+        "no-progress checkpoint ({}): asked the model to change approach; one more allowance before the turn ends.",
+        reason.code()
+    )));
+    Ok(())
+}
+
 fn report_renewal(
     core: &Core,
     tx: &UnboundedSender<AgentEvent>,

@@ -63,7 +63,7 @@ PASS  cargo  42 passed (3.1 s)
 - **Plan before the third file.** `todo` is free for a run that touches one or two files; repeated edits to the same file are one change. From the third distinct file, an edit needs a plan. A finished turn is never reopened for one.
 - **Verify before settle.** After changes, configured steps run; a real failure blocks the turn.
 - **Review after verify.** The `review` pass checks the diff for secrets, debug statements, lockfiles, deletion-heavy changes, and source changes whose module has no test.
-- **Stop the loop, not the work.** Loop and stall guards end a repeating run with a status, not a silent bill. A guard or budget stop gives the model one tool-less step to summarize what it changed and what is left. Budget checkpoints renew on the same progress the stall tracker counts: a file change or a passing verification.
+- **Stop the loop, not the work.** Loop and stall guards end a repeating run with a status, not a silent bill. A guard or budget stop gives the model one tool-less step to summarize what it changed and what is left. Budget checkpoints renew on the same progress the stall tracker counts: a file change or a passing verification. The first checkpoint without progress asks the model to change approach and gives it one more allowance; only the second ends the turn.
 - **Name the next action.** Every error tells the model what to do instead of leaving it to guess.
 
 ## Tools that know the codebase
