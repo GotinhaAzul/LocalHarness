@@ -52,14 +52,13 @@ pub(crate) fn shell_command(
     if let Some(sandbox) = sandbox {
         return sandbox.wrap(command, cwd);
     }
-    let mut cmd = tokio::process::Command::new("bash");
+    let mut cmd = crate::tools::procenv::command("bash");
     cmd.arg("-c")
         .arg(command)
         .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    crate::tools::procenv::detach(&mut cmd);
     Ok(cmd)
 }
 
