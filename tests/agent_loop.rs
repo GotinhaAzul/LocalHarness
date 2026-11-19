@@ -4189,6 +4189,92 @@ async fn a_deny_rule_blocks_git_push_even_when_a_workflow_lists_bash() {
 }
 
 #[tokio::test]
+async fn a_third_approval_offers_a_rule_and_always_saves_it_to_the_global_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = harness_in_mode(
+        dir.path(),
+        vec![
+            tool_script("bash", json!({"command": "touch a.txt"})),
+            text_script("done"),
+        ],
+        workflow_config(&["bash"]),
+        Vec::new(),
+        PermissionMode::Ask,
+    );
+    // Two approvals in earlier sessions of this project.
+    for _ in 0..2 {
+        totality::policy::remember::record_approval(&harness.core.paths, "bash\0touch a.txt");
+    }
+    let asker = RecordingAsker::new(AskAnswer::AllowAlways);
+    harness.core.permissions.set_asker(asker.clone());
+
+    let (outcome, _) = run(&harness, "make a.txt").await;
+    assert_eq!(outcome.status, TurnStatus::Done);
+    assert!(dir.path().join("a.txt").exists());
+
+    let asked = asker.asked.lock().unwrap().clone();
+    let suggestion = asked[0].suggestion.clone().expect("a rule is offered");
+    assert_eq!(suggestion.times, 2);
+    let saved = std::fs::read_to_string(harness.core.paths.config_file()).unwrap();
+    assert!(saved.contains("[[permissions.rules]]"), "{saved}");
+    assert!(saved.contains("^touch a\\.txt$"), "{saved}");
+
+    // The log names who decided.
+    let log = harness.core.permissions.recent();
+    let last = log.iter().rev().find(|entry| entry.tool == "bash").unwrap();
+    assert_eq!(last.outcome, "allowed");
+    assert!(
+        last.layer.starts_with("you (saved rule approved-"),
+        "{}",
+        last.layer
+    );
+}
+
+#[tokio::test]
+async fn the_decision_log_names_the_rule_that_denied_and_the_mode_that_allowed() {
+    use totality::policy::RuleAction;
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = workflow_config(&["bash", "write"]);
+    config.permissions.rules = vec![rule(
+        "no-rm",
+        Some("bash"),
+        Some(r"^rm\b"),
+        RuleAction::Deny,
+    )];
+    let harness = harness_in_mode(
+        dir.path(),
+        vec![
+            tool_script("bash", json!({"command": "rm -f x"})),
+            tool_script("write", json!({"path": "b.txt", "content": "b\n"})),
+            text_script("done"),
+        ],
+        config,
+        Vec::new(),
+        PermissionMode::AcceptEdits,
+    );
+    let (outcome, _) = run(&harness, "go").await;
+    assert_eq!(outcome.status, TurnStatus::Done);
+    let log = harness.core.permissions.recent();
+    let layers: Vec<(String, &str, String)> = log
+        .iter()
+        .filter(|entry| !entry.read_only)
+        .map(|entry| (entry.tool.clone(), entry.outcome, entry.layer.clone()))
+        .collect();
+    assert!(
+        layers.contains(&("bash".into(), "denied", "rule no-rm".into())),
+        "{layers:?}"
+    );
+    assert!(
+        layers.contains(&(
+            "write".into(),
+            "allowed",
+            "accept-edits mode default".into()
+        )),
+        "{layers:?}"
+    );
+}
+
+#[tokio::test]
 async fn ask_prompts_once_per_exact_command_not_per_prefix() {
     let dir = tempfile::tempdir().unwrap();
     let harness = harness_in_mode(

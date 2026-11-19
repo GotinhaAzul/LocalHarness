@@ -9,6 +9,14 @@ release may change defaults when the change is called out below.
 
 ### Added
 
+- Repeated approvals become a rule. Approvals of each exact `bash`/`bg`
+  command are counted per project; from the third ask on, the prompt shows an
+  exact-match allow rule and `a` saves it to the global config. Commands with
+  shell control operators, substitution, or redirection are never offered one.
+- `/permissions why` lists the last calls that changed files or ran commands
+  and the layer that decided each one: a rule, the mode default, plan mode, a
+  session approval, your answer, a hook, provenance, the ACP client, or a
+  headless run that could not ask.
 - `/permissions` gathers the permission levels in one TUI command. With no
   argument it opens the filterable picker over `normal`, `accept-edits`,
   `deny-all`, and `yolo`, marking the current level and describing each one;

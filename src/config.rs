@@ -658,6 +658,34 @@ impl Config {
         Self::save_setting(path, "ui", key, value)
     }
 
+    /// Append one rule to `[[permissions.rules]]` in the global config,
+    /// preserving every other key. A rule with the same id is not added twice.
+    pub fn save_permission_rule(path: &Path, rule: &crate::policy::RuleConfig) -> Result<()> {
+        let mut file = read_config_value(path)?;
+        {
+            let root = file.as_table_mut().context("config root is not a table")?;
+            let permissions = root
+                .entry("permissions")
+                .or_insert_with(|| toml::Value::Table(Default::default()))
+                .as_table_mut()
+                .context("[permissions] is not a table")?;
+            let rules = permissions
+                .entry("rules")
+                .or_insert_with(|| toml::Value::Array(Vec::new()))
+                .as_array_mut()
+                .context("permissions.rules is not an array")?;
+            let exists = rule.id.as_deref().is_some_and(|id| {
+                rules
+                    .iter()
+                    .any(|existing| existing.get("id").and_then(|v| v.as_str()) == Some(id))
+            });
+            if !exists {
+                rules.push(toml::Value::try_from(rule).context("cannot encode the rule")?);
+            }
+        }
+        write_config_value(path, &file)
+    }
+
     /// Persist the startup profile `default_profile`, preserving every other
     /// key. `--profile` and `TOT_PROFILE` still win for the current run.
     pub fn save_default_profile(path: &Path, name: &str) -> Result<()> {

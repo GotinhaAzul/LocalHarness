@@ -47,7 +47,18 @@ pub(super) fn ask_text(request: &AskRequest) -> String {
         text.push_str("\n\n");
         text.push_str(preview);
     }
-    text.push_str("\n\nAllow this exact call? y = yes (remembered for this exact call) · n = no");
+    if let Some(suggestion) = &request.suggestion {
+        text.push_str(&format!(
+            "\n\nYou approved this exact command {} times before in this project. Press a to save this rule to your global config:\n{}",
+            suggestion.times,
+            suggestion.toml()
+        ));
+        text.push_str("\n\nAllow this exact call? y = yes (this session) · a = always (save the rule) · n = no");
+    } else {
+        text.push_str(
+            "\n\nAllow this exact call? y = yes (remembered for this exact call) · n = no",
+        );
+    }
     text
 }
 
@@ -82,11 +93,12 @@ impl App {
         };
         let verdict = match answer {
             AskAnswer::Allow => "allowed",
+            AskAnswer::AllowAlways => "allowed and saved the rule",
             AskAnswer::Deny => "denied",
         };
         self.set_notice(
             format!("{verdict}: {}", pending.request.subject),
-            if answer == AskAnswer::Allow {
+            if answer != AskAnswer::Deny {
                 Role::Success
             } else {
                 Role::Warning
@@ -105,6 +117,14 @@ impl App {
         match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
                 self.answer_permission(AskAnswer::Allow);
+            }
+            KeyCode::Char('a') | KeyCode::Char('A')
+                if self
+                    .pending_ask
+                    .as_ref()
+                    .is_some_and(|pending| pending.request.suggestion.is_some()) =>
+            {
+                self.answer_permission(AskAnswer::AllowAlways);
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                 self.answer_permission(AskAnswer::Deny);
@@ -130,7 +150,16 @@ impl App {
     /// Footer status: an open question first, then a non-default mode.
     pub(super) fn permission_status(&self) -> Option<(String, Role)> {
         if self.pending_ask.is_some() {
-            return Some(("permission: y allow · n deny".into(), Role::Warning));
+            let always = self
+                .pending_ask
+                .as_ref()
+                .is_some_and(|pending| pending.request.suggestion.is_some());
+            let keys = if always {
+                "permission: y allow · a always · n deny"
+            } else {
+                "permission: y allow · n deny"
+            };
+            return Some((keys.into(), Role::Warning));
         }
         if self.pending_mode_confirm.is_some() {
             return Some((
