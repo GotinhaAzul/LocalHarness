@@ -225,8 +225,13 @@ async fn run_turn_inner(
     // `@path` mentions attach file snapshots, within a quarter of the
     // usable prompt so one message cannot crowd out the conversation.
     let attachment_budget = turn.budget.chars_for(turn.budget.usable_prompt() / 4);
-    let mentions =
-        super::mentions::resolve(&core.tool_context(), &user_text, attachment_budget).await;
+    let mentions = super::mentions::resolve_with(
+        &core.tool_context(),
+        &user_text,
+        attachment_budget,
+        core.config.prompt.attach_named_files,
+    )
+    .await;
     if !mentions.attachments.is_empty() {
         let names: Vec<String> = mentions
             .attachments
@@ -830,6 +835,7 @@ async fn run_loop(
                 _ = tokio::time::sleep(delay) => {}
             }
         };
+        progress.model_call_finished();
 
         force_thinking_off = false;
         let assistant = match result {
@@ -2670,12 +2676,13 @@ async fn run_settle_check(
         && let crate::tools::ToolApproval::Deny(message) =
             approver.approve(&call, &args, tool.read_only()).await
     {
+        super::authorize::log_decision(core, &call, tool.as_ref(), &args, false, "frontend");
         result = ToolResult::err("permission_denied", message);
     }
     if !result.is_error
         && let Some(required) = verdict.provenance
         && let Err(denied) =
-            super::authorize::confirm_provenance(core, &call, &args, required).await
+            super::authorize::confirm_provenance(core, &call, tool.as_ref(), &args, required).await
     {
         result = denied;
     }
@@ -3181,6 +3188,14 @@ async fn execute_batch(
                             )
                             .await
                     {
+                        super::authorize::log_decision(
+                            core,
+                            call,
+                            tool.as_deref().unwrap(),
+                            &args,
+                            false,
+                            "frontend",
+                        );
                         result = ToolResult::err("permission_denied", message);
                     }
 
@@ -3188,8 +3203,14 @@ async fn execute_batch(
                     // ask the frontend only now that the call can run.
                     if !result.is_error
                         && let Some(required) = pending_provenance.take()
-                        && let Err(denied) =
-                            super::authorize::confirm_provenance(core, call, &args, required).await
+                        && let Err(denied) = super::authorize::confirm_provenance(
+                            core,
+                            call,
+                            tool.as_deref().unwrap(),
+                            &args,
+                            required,
+                        )
+                        .await
                     {
                         let _ = tx.send(AgentEvent::Notice(denied.content.clone()));
                         result = denied;

@@ -54,7 +54,7 @@ impl Fixture {
             artifacts,
             cancel: CancellationToken::new(),
             trust: false,
-            verify: VerifyConfig { steps: Vec::new() },
+            verify: VerifyConfig::default(),
             profile: "test".into(),
             packs: Vec::new(),
             reads: Arc::new(Mutex::new(ReadTracker::default())),
@@ -65,6 +65,7 @@ impl Fixture {
             sandbox: None,
             vision: Default::default(),
             caps: Default::default(),
+            format_on_edit: false,
             edit_mode: totality::config::EditMode::Text,
         };
         Fixture {

@@ -309,6 +309,7 @@ impl Core {
                     self.config.budgets.result_cap_chars,
                     self.config.budgets.batch_cap_chars,
                 ),
+            format_on_edit: self.config.format.on_edit,
         }
     }
 

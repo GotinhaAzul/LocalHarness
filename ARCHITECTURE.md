@@ -357,7 +357,7 @@ observable.
 | Sandbox | When `--sandbox` is set, `bash` and `bg` run in a bubblewrap namespace (or the Landlock fallback): read-only root, hidden `$HOME`, private `/tmp`, no network, and `.git` read-only in `workspace-write`. Startup fails closed when no backend exists; a per-command wrap failure returns `SANDBOX_UNAVAILABLE`. Commands never fall back to an unsandboxed run. |
 | Loop guard | Signature is tool name plus canonical arguments. Four identical calls in a row, or an exact 2-8 call cycle repeated four times, blocks the call and ends the turn with a recovery instruction and the `stalled` status (exit code 2 from `tot -p`, never a successful workflow step). A file change or a passing verification clears the history, so long multi-step work does not trip it. A read-only call (a read-only tool, a reading action such as `bg logs`, `todo list`, `pr checks`, `git status` or `git branch op = "list"`, or a bash command that only reads) is recorded in the history but never trips it: the same poll can carry new output every time, and a read with the same output is caught by the stall guard. No automatic session replacement in v1. |
 | Interactive command guard | Blocks `vim`, `less`, `top`, `htop`, `watch`, `nano`, `ssh` without a command, and similar TTY-only invocations. |
-| Budget checkpoint | Tool calls, model calls, and wall clock are checked at 120 calls, 40 model calls, and 30 minutes. A checkpoint that finds a new result, a file change, or a passing verify within the last `stall_calls` calls renews the allowance and the turn continues. The first checkpoint with no recent progress in a turn skips the pending batch, tells the model to drop the repeating approach (write a script, use another tool), and grants one more allowance; the second ends the turn with a tool-less summary and reports why. |
+| Budget checkpoint | Tool calls, model calls, and wall clock are checked at 120 calls, 40 model calls, and 30 minutes. The wall clock is measured, not fixed: the allowance is at least six model calls at the slowest of the last five measured calls, and "recent progress" means within half of it or three such calls, so a slow engine or a long thinking model is never stopped for being slow. A checkpoint that finds a new result, a file change, or a passing verify within the last `stall_calls` calls renews the allowance and the turn continues. The first checkpoint with no recent progress in a turn skips the pending batch, tells the model to drop the repeating approach (write a script, use another tool), and grants one more allowance; the second ends the turn with a tool-less summary and reports why. |
 | Stall | Twelve consecutive calls with no new result fingerprint, no file change, and no successful verify. Ends the turn with the last known state. |
 | Tool-family guard | Calls are grouped into a family: `bash` by program and operation, other tools by name plus key arguments (body arguments are ignored; temporary-path and number normalization is for bash families only). Three cumulative counters run across the turn: repeated calls of one family (successful or not), failing calls of one family, and successful calls of one family that changed no workspace file and passed no verify. They stop the turn as `stalled` at `[budgets] max_same_tool_family` (8; repeated and failing calls) and `max_same_tool_family_success` (24; unproductive successes). Interleaving another call, a success of the same family, and writes outside the session directory do not reset them; a workspace change or a passing verify does. 0 disables either budget. Read-only calls never count as repeats or as idle successes — read-only tools, the reading actions of mixed tools, and bash commands that only read (`cat`, `git show`, `curl` without a writing flag, `gh pr view`, ...) — though a failing read-only call still counts as a failure; a read repeated with the same output is caught by the stall guard. The workspace is fingerprinted lazily: the first counter that needs a baseline reads it, every later counter reuses that reading, a fresh reading is taken only to decide a trip and once at the end of the batch, and a call that reports a file change invalidates it. In a repository the fingerprint is `git status --porcelain=v1 -z --untracked-files=all -- .` from the session directory plus HEAD and the size and mtime of each listed path (nothing is written to the object store); elsewhere it is a bounded mtime/size walk. So a `sed -i` fix loop that really changes files is not a stall. |
 | Todo gate | After changes to three distinct files, an edit requires a plan; repeated edits to one file are one change. Settlement never reopens a finished turn for a plan. The final task requires a fresh passing verify when verification is configured. |
@@ -365,6 +365,16 @@ observable.
 | Review nudge | One continuation per run after mutations, asking for `review`. Never fights verify or todo gates. |
 
 Guards are inert when their required tool is absent from the active profile.
+
+The system prompt does not restate the guards. Read-before-edit, the plan
+from the third changed file, interactive commands, truncated output, and the
+settle checks each produce a prescriptive error or note when they apply. The
+operating rules keep only what no code enforces (inspect before acting, follow
+the error's next action, small arguments, `bg` for long-running processes),
+name only tools the profile has, and ask for verify and review only when
+`[gates] auto_settle = false` leaves them to the model. Context size is the
+harness's job too: compaction runs on the measured budget, so the prompt no
+longer asks the model to judge when to `thread split`.
 
 ### 3.5 Execution and cancellation
 
@@ -405,6 +415,10 @@ a `[harness] verify passed, review clean` notice; a failed verify or a flagged
 review continues once with a user-role message carrying the results, so no
 orphan tool result enters the context path. `auto_settle = false` keeps the
 model-relayed gate messages.
+
+A failing verify attaches the first three project `file:line` locations its
+output names, three lines on each side, and records them as read, so the next
+call can be the fix instead of a `read`.
 
 One step before the todo gate — the second mutation, or the first edit of a
 second file, with no plan — the successful mutation's tool result ends with one
@@ -871,6 +885,10 @@ form. `tot doctor` prints both sizes.
   anchors for the changed lines, and untouched lines keep their bytes and line
   endings. Text-mode `patch` and `edit` are unchanged.
 - `write` and `edit` are atomic (temp file plus rename) and record `fs-change`.
+- `edit`, exact-text `patch`, and `write` pass new content through the
+  project's formatter (`[format] on_edit`) when the file was already
+  formatter-clean before the edit (`tools/format.rs`); the result's diff is
+  what landed. Hash-mode `patch` is not formatted.
 - `edit` preflight handles: multiple matches (list line numbers), whitespace-
   only match (show the verbatim excerpt), and no match (show the closest
   window). It never blocks an edit that would succeed. When the exact text is
@@ -895,8 +913,14 @@ form. `tot doctor` prints both sizes.
   redirection) the named files are snapshotted into the same store, and the
   command's result lists them; undo and `/rewind` restore them even though the
   command ran outside the write path. `git clean` is not parsed.
-- `bash` uses `bash -lc`, captures stdout/stderr separately, caps output, and
-  kills the process group on timeout. Interactive-only commands are blocked.
+- `bash` uses `bash -c` (not a login shell: the user's profile is not sourced;
+  set `BASH_ENV` to source a file), captures stdout/stderr separately, caps
+  output, and kills the process group on timeout. Every agent-run command
+  (`bash`, `bg`, `verify`, `test`) starts a new session with no controlling
+  terminal and gets `GIT_TERMINAL_PROMPT=0`, `GIT_EDITOR`/`EDITOR`/`VISUAL=true`,
+  `PAGER`/`GIT_PAGER=cat`, and `DEBIAN_FRONTEND=noninteractive`, so a prompt
+  fails at once instead of waiting on a human. Interactive-only commands are
+  blocked.
 - `bg` starts a process in its own group, captures output to an artifact, and
   exposes `status`, `logs`, and `stop`. At most four live processes per session.
 - `todo` uses an adaptive gate: free for a run that touches one or two files,
@@ -1575,12 +1599,12 @@ input characters. Missing input and unreadable files return prescriptive errors.
   picks a backend: bubblewrap when `bwrap` (or `TOT_BWRAP`) is executable,
   otherwise Landlock. If neither is usable the constructor returns a
   fail-closed error, and `detect` exposes the same check to the CLI.
-- Bubblewrap wraps `bash -lc` with `--unshare-all`, `--cap-drop ALL`, a
+- Bubblewrap wraps `bash -c` with `--unshare-all`, `--cap-drop ALL`, a
   read-only `/`, private tmpfs mounts for `/tmp`, `/home`, and `/root`, the
   workspace re-bound read-only or writable, `.git` re-bound read-only in
   `workspace-write`, `--clearenv` plus an allowlisted environment,
-  `HOME=/nonexistent`, `TMPDIR=/tmp`, and a classic-BPF seccomp filter passed
-  through `--seccomp`. The filter returns `EPERM` for mount, namespace, module,
+  `HOME=/nonexistent`, `TMPDIR=/tmp`, the non-interactive variables above,
+  and a classic-BPF seccomp filter passed through `--seccomp`. The filter returns `EPERM` for mount, namespace, module,
   keyring, BPF, perf, ptrace, and `process_vm_*` syscalls.
 - The Landlock fallback builds a ruleset with read/execute on `/`, write rights
   under the workspace (`workspace-write`) and `TMPDIR`, and TCP bind/connect
@@ -1792,7 +1816,7 @@ cursor = "#c0caf5"
   widths than throughput.
 - Session: short id and trusted/untrusted marker.
 - Verify: `verify: not configured` when no steps are set; the marker drops
-  once steps are configured.
+  once steps are configured or detected (`[gates] verify_detected`).
 - At narrow widths, drop throughput, then session id, then profile; never drop
   cwd, context, or model. With no model selected, the model slot reads
   `not logged in` and the footer says the same.
@@ -1838,7 +1862,11 @@ cursor = "#c0caf5"
   entry (`UserData.attachments`), read through the `read` tool so the jail,
   caps, and read stamp apply. The model sees them after the prompt; the
   transcript shows the prompt only. At most eight files, within a quarter of
-  the usable prompt.
+  the usable prompt. A path written without `@` (`src/a.rs:12:5`, a pasted
+  stack trace, `File "pkg/mod.py", line 3`) is attached the same way when it
+  names an existing text file under the working directory: at most three,
+  after the `@` mentions, never reported when skipped
+  (`[prompt] attach_named_files`).
 - Paste is bracketed and inserted literally. Large pastes are accepted; the
   model sees them as user content.
 
@@ -2008,7 +2036,7 @@ no_session = false
 [budgets]
 max_tool_calls = 120            # checkpoint interval; productive runs renew
 max_model_calls = 40            # checkpoint interval; productive runs renew
-max_wall_minutes = 30           # checkpoint interval; productive runs renew
+max_wall_minutes = 30           # checkpoint interval; productive runs renew; scaled up for slow models
 stall_calls = 12
 max_same_tool_family = 8        # repeated and failing calls per family per turn; 0 disables
 max_same_tool_family_success = 24  # unproductive successes per family per turn; 0 disables
@@ -2049,6 +2077,9 @@ strip_reasoning = true
 `verify.toml` is a project file and needs `--trust`. Steps accepted through
 `tot verify --init` or `/verify accept` are stored per project in
 `verify-steps.json` in the user data directory, so they load without trust.
+With neither, `[gates] verify_detected` (default on) uses the steps detected
+from the manifest for the session; they run under the permission policy and
+are not saved.
 
 `AGENTS.md` files between the repository root and the working directory are
 read as untrusted project instructions, nearest last. They are data, not

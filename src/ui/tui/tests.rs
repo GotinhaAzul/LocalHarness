@@ -1349,6 +1349,8 @@ async fn a_permission_prompt_shows_the_exact_command_and_answers_with_y_or_n() {
                 preview: None,
                 rule: Some("push-asks".into()),
                 key: format!("bash\0{subject}"),
+                call_id: String::new(),
+                suggestion: None,
             },
             reply,
         };
@@ -1387,6 +1389,8 @@ async fn a_pending_question_takes_over_the_bottom_of_the_screen() {
             preview: None,
             rule: None,
             key: "bash\0cargo test --all".into(),
+            call_id: String::new(),
+            suggestion: None,
         },
         reply,
     });
@@ -1439,6 +1443,72 @@ fn cache_is_a_percentage_and_a_cold_cache_stands_out() {
         Some(("cache 30%".into(), Role::Warning))
     );
     assert_eq!(cache_label(0, 0), None);
+async fn a_suggested_rule_is_offered_and_a_saves_it_only_when_offered() {
+    let (_dir, mut app) = test_app().await;
+    let ask = |suggestion: Option<Box<crate::policy::remember::Suggestion>>| {
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        let pending = permission::PendingAsk {
+            request: crate::policy::AskRequest {
+                tool: "bash".into(),
+                subject: "cargo test".into(),
+                preview: None,
+                rule: None,
+                key: "bash\0cargo test".into(),
+                call_id: "call_0001".into(),
+                suggestion,
+            },
+            reply,
+        };
+        (pending, answer)
+    };
+
+    // Without a suggestion, `a` does not answer.
+    let (pending, answer) = ask(None);
+    app.show_permission_request(pending);
+    app.handle_key(key(KeyCode::Char('a'))).await;
+    assert!(app.pending_ask.is_some());
+    app.handle_key(key(KeyCode::Char('n'))).await;
+    assert_eq!(answer.await.unwrap(), crate::policy::AskAnswer::Deny);
+
+    let suggestion = crate::policy::remember::suggest("bash", "cargo test", 2).map(Box::new);
+    let (pending, answer) = ask(suggestion);
+    app.show_permission_request(pending);
+    let mut screen = EmulatedScreen::new(100, 40);
+    screen.frame(&mut app, "ask with a suggestion");
+    let shown = screen.parser.screen().contents();
+    assert!(
+        shown.contains("approved this exact command 2 times"),
+        "{shown}"
+    );
+    assert!(shown.contains("a always"), "{shown}");
+    let bar = app.activity().expect("the question is on the activity line");
+    assert_eq!(bar.meta, "y allow · a always · n deny");
+    app.handle_key(key(KeyCode::Char('a'))).await;
+    assert_eq!(answer.await.unwrap(), crate::policy::AskAnswer::AllowAlways);
+}
+
+#[test]
+fn permissions_why_lists_calls_that_needed_a_decision_with_their_layer() {
+    let entry =
+        |call: &str, subject: &str, layer: &str, read_only: bool| crate::policy::LoggedDecision {
+            call_id: call.into(),
+            tool: "bash".into(),
+            subject: subject.into(),
+            outcome: "allowed",
+            layer: layer.into(),
+            read_only,
+        };
+    let text = commands::permission_log_text(&[
+        entry("call_0001", "ls", "normal mode default", true),
+        entry("call_0002", "cargo test", "rule rule-2", false),
+        entry("call_0003", "make", "you", false),
+    ]);
+    assert!(!text.contains("`ls`"), "{text}");
+    assert!(
+        text.contains("allowed bash `cargo test` — rule rule-2"),
+        "{text}"
+    );
+    assert!(text.contains("allowed bash `make` — you"), "{text}");
 }
 
 #[test]
@@ -1454,6 +1524,8 @@ fn ask_text_includes_the_diff_preview() {
         ),
         rule: None,
         key: String::new(),
+        call_id: String::new(),
+        suggestion: None,
     };
     let text = permission::ask_text(&request);
     assert!(text.starts_with("edit: src/lib.rs"), "{text}");
