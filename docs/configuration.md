@@ -103,6 +103,7 @@ color_mode = "auto"             # auto | truecolor | 256 | 16
 show_reasoning = false          # Ctrl+R toggles and rewrites this key
 show_token_counts = true
 mouse = true                    # wheel scrolls the conversation; Shift+drag selects text
+bell = true                     # ring once when something new needs you
 
 [session]
 dir = ""                        # default data dir's sessions/

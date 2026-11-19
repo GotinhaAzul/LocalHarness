@@ -247,6 +247,19 @@ release may change defaults when the change is called out below.
 
 ### Changed
 
+- The bottom of the TUI says plainly when something needs you. A permission
+  question, a hunk review, the `yolo` confirmation, a missing model, an
+  injection warning, a commit or pull request behind its preview gate, or a
+  finished plan replaces the spinner above the input with a reversed
+  `Needs you: <what>` bar showing the exact command or path and the keys that
+  answer it. The footer shows those keys with a `WAITING FOR YOU` or
+  `ACTION NEEDED` badge, the placeholder says keys answer the question, the
+  terminal title ends with `needs you: <what>`, and the bell rings once per
+  new item (`[ui] bell`, default `true`). Otherwise the footer shows
+  `working` during a turn and `✓ your turn` after it.
+- The header shows the prompt-cache hit as a percentage (`cache 94%`, warning
+  color under 70%) instead of token counts, keeps it at narrower widths, and
+  hides `tok/s` until a call has been measured.
 - The wall-clock checkpoint scales with the measured model speed: the
   allowance is `[budgets] max_wall_minutes` or six model calls at the slowest
   of the last five measured calls, whichever is longer, and the "recent

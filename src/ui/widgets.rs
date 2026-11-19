@@ -42,8 +42,13 @@ pub struct HeaderData {
 #[derive(Debug, Clone)]
 pub struct FooterData {
     pub hints: String,
+    /// `Muted` for key hints; `Warning` when the hints answer something that
+    /// waits on the user.
+    pub hints_role: Role,
     pub status: String,
     pub status_role: Role,
+    /// Draw the status as a reversed badge (something waits on the user).
+    pub status_badge: bool,
     pub notice: Option<String>,
     pub notice_role: Role,
 }
@@ -52,12 +57,31 @@ impl Default for FooterData {
     fn default() -> Self {
         Self {
             hints: String::new(),
+            hints_role: Role::Muted,
             status: String::new(),
             status_role: Role::Muted,
+            status_badge: false,
             notice: None,
             notice_role: Role::Warning,
         }
     }
+}
+
+/// `cache 94%`: the share of the prompt the engine reused. Below 70% the
+/// engine re-evaluated most of the prompt, which is worth noticing.
+pub fn cache_label(cached: u32, prompt: u32) -> Option<(String, Role)> {
+    if prompt == 0 {
+        return None;
+    }
+    let percent = (f64::from(cached) / f64::from(prompt) * 100.0)
+        .round()
+        .clamp(0.0, 100.0) as u32;
+    let role = if percent < 70 {
+        Role::Warning
+    } else {
+        Role::Muted
+    };
+    Some((format!("cache {percent}%"), role))
 }
 
 fn spans_width(spans: &[Span<'_>]) -> usize {
@@ -287,14 +311,17 @@ fn header_sides(
         vec![Span::styled(model, theme.bold(model_role))],
         context_spans(data, flags.gauge, theme),
     ];
-    if flags.throughput {
-        let mut speed = format!("{:.0} tok/s", data.tok_s.max(0.0));
-        if flags.cache
-            && let Some((cached, prompt)) = data.cache
-        {
-            speed.push_str(&format!(" · cache {cached}/{prompt}"));
-        }
-        right.push(vec![Span::styled(speed, theme.style(Role::Muted))]);
+    if flags.throughput && data.tok_s > 0.0 {
+        right.push(vec![Span::styled(
+            format!("{:.0} tok/s", data.tok_s),
+            theme.style(Role::Muted),
+        )]);
+    }
+    if flags.cache
+        && let Some((cached, prompt)) = data.cache
+        && let Some((label, role)) = cache_label(cached, prompt)
+    {
+        right.push(vec![Span::styled(label, theme.style(role))]);
     }
     if flags.session && !data.session.is_empty() {
         right.push(vec![Span::styled(
@@ -313,7 +340,7 @@ pub fn header_line(data: &HeaderData, width: usize, theme: &Theme) -> Line<'stat
         tool_mode: width >= 80,
         session: width >= 90,
         throughput: width >= 100,
-        cache: width >= 110,
+        cache: width >= 90,
         gauge: width >= 70,
     };
     let limit = width.max(1);
@@ -324,13 +351,13 @@ pub fn header_line(data: &HeaderData, width: usize, theme: &Theme) -> Line<'stat
     };
     let (mut left, mut right) = header_sides(data, &cwd, &flags, theme);
 
-    // Drop optional items in order: cache, throughput, session, profile, and
+    // Drop optional items in order: throughput, cache, session, profile, and
     // the gauge. Working directory, model, and context always remain.
     while measure(&left, &right) > limit {
-        if flags.cache {
-            flags.cache = false;
-        } else if flags.throughput {
+        if flags.throughput {
             flags.throughput = false;
+        } else if flags.cache {
+            flags.cache = false;
         } else if flags.session {
             flags.session = false;
         } else if flags.tool_mode {
@@ -367,7 +394,7 @@ pub fn header_line(data: &HeaderData, width: usize, theme: &Theme) -> Line<'stat
 pub fn footer_line(data: &FooterData, width: usize, theme: &Theme) -> Line<'static> {
     let (left, left_role) = match &data.notice {
         Some(notice) => (notice.as_str(), data.notice_role),
-        None => (data.hints.as_str(), Role::Muted),
+        None => (data.hints.as_str(), data.hints_role),
     };
     let width = width.saturating_sub(2);
     let status_width = UnicodeWidthStr::width(data.status.as_str());
@@ -375,16 +402,26 @@ pub fn footer_line(data: &FooterData, width: usize, theme: &Theme) -> Line<'stat
     let left = clip_end(left, left_max.max(1));
     let left_width = UnicodeWidthStr::width(left.as_str());
     let padding = width.saturating_sub(left_width + status_width).max(1);
+    let left_style = if data.status_badge {
+        theme.bold(left_role)
+    } else {
+        theme.style(left_role)
+    };
     let mut spans = vec![
         Span::raw(" "),
-        Span::styled(left, theme.style(left_role)),
+        Span::styled(left, left_style),
         Span::raw(" ".repeat(padding)),
     ];
     if status_width <= width {
-        spans.push(Span::styled(
-            data.status.clone(),
-            theme.style(data.status_role),
-        ));
+        let style = if data.status_badge {
+            // Reversed works with NO_COLOR too: the badge is a block.
+            theme
+                .bold(data.status_role)
+                .add_modifier(Modifier::REVERSED)
+        } else {
+            theme.style(data.status_role)
+        };
+        spans.push(Span::styled(data.status.clone(), style));
     }
     Line::from(spans)
 }

@@ -854,6 +854,9 @@ pub struct UiConfig {
     /// Capture the mouse so the wheel scrolls the conversation. Terminal text
     /// selection then needs Shift (Option on macOS) held while dragging.
     pub mouse: bool,
+    /// Ring the terminal bell once when something new waits on the user
+    /// (a permission question, a review, a confirmation).
+    pub bell: bool,
 }
 
 impl Default for UiConfig {
@@ -864,6 +867,7 @@ impl Default for UiConfig {
             show_reasoning: false,
             show_token_counts: true,
             mouse: true,
+            bell: true,
         }
     }
 }

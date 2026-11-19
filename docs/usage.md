@@ -123,7 +123,7 @@ Compaction is deterministic, not model-written. Tool output is archived with an 
 
 ### The TUI
 
-The terminal interface is the default. It speaks in two voices: the model in Skoll's amber, the harness in Hati's silver-blue (the `sun` and `moon` theme tokens). Tool calls render as compact rows grouped with the thoughts between them, diffs and streamed Markdown are styled, and the context gauge stays visible. The terminal title shows whether a turn is running, waiting for approval, or done. When the engine reports a prefix-cache hit, the header also shows `cache <cached>/<prompt>` tokens; `--json` usage events carry the same counts.
+The terminal interface is the default. It speaks in two voices: the model in Skoll's amber, the harness in Hati's silver-blue (the `sun` and `moon` theme tokens). Tool calls render as compact rows grouped with the thoughts between them, diffs and streamed Markdown are styled, and the context gauge stays visible. When something needs you (a permission question, a hunk review, a commit or PR to confirm, an injection warning, a finished plan, a missing model), the bottom of the screen says so in one place: a reversed `Needs you: Approve command  $ cargo test  (y allow · n deny)` bar above the input, a `WAITING FOR YOU` badge in the footer next to the keys that answer it, the terminal title, and one bell (`[ui] bell = false` silences it). Otherwise the footer shows `working` during a turn and `✓ your turn` after it. When the engine reports a prefix-cache hit, the header shows `cache 94%`, in the warning color under 70%; `--json` usage events carry the raw counts.
 
 | Key | Action |
 |---|---|
