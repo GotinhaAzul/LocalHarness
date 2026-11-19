@@ -113,9 +113,10 @@ artifact_retention_days = 30
 [budgets]
 # Checkpoints, not hard caps. When one is reached and the run produced a new
 # result, a file change, or a passing verify within the last `stall_calls`
-# calls, the allowance renews and the turn keeps going. The first checkpoint
-# with no recent progress asks the model to switch approach and grants one more
-# allowance; the second one, the loop guard, and the stall guard stop the turn.
+# calls, the allowance renews and the turn keeps going. The first no-progress
+# stop in a turn (a checkpoint or the stall guard) asks the model to switch
+# approach and grants one more allowance; the second, or the loop guard, ends
+# the turn.
 max_tool_calls = 120
 max_model_calls = 40
 max_wall_minutes = 30

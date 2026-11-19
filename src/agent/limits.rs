@@ -306,15 +306,17 @@ impl RunProgress {
         }
     }
 
-    /// The first no-progress checkpoint of a turn does not end it: the model
-    /// gets one fresh allowance with an instruction to drop the approach that
-    /// is repeating. Returns false once that pivot is spent, and the turn ends
-    /// at the checkpoint as before.
+    /// The first no-progress stop of a turn (a budget checkpoint or the stall
+    /// guard) does not end it: the model gets one fresh allowance and clean
+    /// stall counters, with an instruction to drop the approach that is
+    /// repeating. Returns false once that pivot is spent, and the turn ends
+    /// as before.
     pub fn try_pivot(&mut self) -> bool {
         if self.pivot_used {
             return false;
         }
         self.pivot_used = true;
+        self.stall.reset();
         self.epoch_tool_calls = 0;
         self.epoch_model_calls = 0;
         self.epoch_started_at = Instant::now();
@@ -325,11 +327,19 @@ impl RunProgress {
 
     /// The instruction sent to the model when a checkpoint pivots.
     pub fn pivot_message(&self, reason: StopReason) -> String {
+        let why = match reason {
+            StopReason::Stalled => {
+                "recent calls keep repeating without changing a file or passing a verification"
+                    .to_string()
+            }
+            _ => format!(
+                "the last {} call(s) changed no file and passed no verification",
+                self.limits.stall_calls
+            ),
+        };
         format!(
-            "[totality] {}: the last {} call(s) changed no file and passed no verification; the current approach is not working. Do not repeat it or try small variations of it. In one sentence, say why it failed, then switch to a different method: for example, write and run a small script, use a different tool, or read the relevant documentation once. You have one more allowance ({} model calls); if it also makes no progress, the turn ends.",
-            reason.code(),
-            self.limits.stall_calls,
-            self.limits.max_model_calls
+            "[totality] {}: {why}; the current approach is not working. Do not repeat it or try small variations of it, and do not search for a ready-made tool that may not exist. In one sentence, say why it failed, then switch to a different method: for example, write and run a small script with what is installed, use a different tool, or read the relevant documentation once. You have one more allowance; if it also makes no progress, the turn ends.",
+            reason.code()
         )
     }
 
@@ -629,6 +639,14 @@ impl StallTracker {
             detail,
             workspace,
         });
+    }
+
+    /// Forget every counter and trip: after a pivot, the next approach is
+    /// judged on its own calls.
+    pub fn reset(&mut self) {
+        self.clear();
+        self.strikes = 0;
+        self.last = None;
     }
 
     fn clear(&mut self) {
@@ -1462,6 +1480,33 @@ mod tests {
             BudgetCheck::Exhausted(StopReason::ModelBudget)
         );
         assert!(!progress.try_pivot(), "the second checkpoint ends the turn");
+    }
+
+    #[test]
+    fn a_pivot_clears_the_stall_guard() {
+        let dir = empty_workspace();
+        let mut progress = RunProgress::new(limits());
+        for index in 0..10 {
+            record(
+                &mut progress,
+                dir.path(),
+                "bash ls",
+                &format!("bash ls :: ls /missing-{index}"),
+                "no such file",
+                true,
+                false,
+                false,
+            );
+        }
+        assert!(progress.stalled());
+        assert!(progress.try_pivot());
+        assert!(!progress.stalled(), "the next approach starts clean");
+        assert!(
+            progress
+                .pivot_message(StopReason::Stalled)
+                .starts_with("[totality] stalled:")
+        );
+        assert!(!progress.try_pivot(), "one pivot per turn");
     }
 
     #[test]

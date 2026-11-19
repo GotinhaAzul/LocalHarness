@@ -380,9 +380,10 @@ Guards are inert when their required tool is absent from the active profile.
   error entry if useful, and returns the TUI to idle. The session remains
   consistent and resumable.
 - The model loop checks tool, model, and wall-clock checkpoints. A productive
-  run renews each allowance. The first checkpoint with no recent progress
-  pivots (one more allowance with an instruction to change approach); only a
-  second one, the loop guard, or the stall guard ends the turn.
+  run renews each allowance. The first no-progress stop in a turn (a
+  checkpoint or the stall guard) pivots: one more allowance, clean stall
+  counters, and an instruction to change approach. A second one, or the loop
+  guard, ends the turn.
 
 ### 3.6 Settlement
 

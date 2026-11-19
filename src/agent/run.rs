@@ -508,7 +508,11 @@ async fn run_loop(
                 return TurnOutcome::ok(TurnStatus::Budget);
             }
         }
-        if progress.stalled() {
+        if progress.stalled() && progress.try_pivot() {
+            if let Err(err) = request_pivot(core.as_ref(), tx, &progress, StopReason::Stalled) {
+                return TurnOutcome::error("session_write", err.to_string());
+            }
+        } else if progress.stalled() {
             let message = progress.stall_message();
             finish_with_summary(
                 core,
@@ -1523,7 +1527,11 @@ async fn run_loop(
             }
             return TurnOutcome::ok(TurnStatus::Done);
         }
-        if progress.stalled() {
+        if progress.stalled() && progress.try_pivot() {
+            if let Err(err) = request_pivot(core.as_ref(), tx, &progress, StopReason::Stalled) {
+                return TurnOutcome::error("session_write", err.to_string());
+            }
+        } else if progress.stalled() {
             let message = progress.stall_message();
             finish_with_summary(
                 core,
@@ -4089,6 +4097,11 @@ fn tool_body(content: &str) -> &str {
 /// Give the model one tool-less request to say what it did and what is left,
 /// before a stalled or exhausted turn ends. The turn keeps its status; the
 /// summary is what the person sees instead of a mid-thought sentence.
+/// Output cap for the tool-less summary when thinking can be turned off.
+const SUMMARY_TOKENS: u32 = 1536;
+/// Output cap when it cannot: room for the reasoning plus the summary.
+const SUMMARY_TOKENS_THINKING: u32 = 6144;
+
 async fn finish_with_summary(
     core: &Core,
     tx: &UnboundedSender<AgentEvent>,
@@ -4111,9 +4124,15 @@ async fn finish_with_summary(
     let assembled = assemble_context(core, budget, findings.as_ref(), tool_specs_cost);
     // Keep the profile's extra_body even when it has no thinking control: a
     // template flag or sampler there may be required by the engine.
-    let extra_body = core
-        .model_profile
-        .request_extra_body_thinking_off()
+    let thinking_off = core.model_profile.request_extra_body_thinking_off();
+    // Without a way to turn thinking off, a thinking model reasons before it
+    // answers; 1536 tokens can go entirely to reasoning and leave no summary.
+    let summary_tokens = if thinking_off.is_some() {
+        SUMMARY_TOKENS
+    } else {
+        SUMMARY_TOKENS_THINKING
+    };
+    let extra_body = thinking_off
         .or_else(|| core.model_profile.request_extra_body(false).ok().flatten())
         .or_else(|| {
             core.model_profile
@@ -4133,7 +4152,7 @@ async fn finish_with_summary(
         ),
         engine: core.engine,
         response_schema: None,
-        max_tokens: budget.max_output_tokens.min(1536),
+        max_tokens: budget.max_output_tokens.min(summary_tokens),
         stop: core.model_profile.stop.clone(),
         extra_body,
         include_usage: true,
@@ -4163,8 +4182,17 @@ async fn finish_with_summary(
             // with a call anyway must not leave an unpaired tool call in the
             // branch.
             assistant.tool_calls = None;
+            let empty = assistant
+                .content
+                .as_deref()
+                .is_none_or(|text| text.trim().is_empty());
             if let Err(error) = append_assistant(&core.session, assistant) {
                 tracing::warn!(%error, "cannot append the final summary");
+            }
+            if empty {
+                let _ = tx.send(AgentEvent::Notice(
+                    "the final summary came back empty (the reply was reasoning only); check the workspace state directly".into(),
+                ));
             }
         }
         Err(error) => {
@@ -4318,7 +4346,7 @@ fn request_pivot(
     let message = progress.pivot_message(reason);
     append_user(&core.session, &message)?;
     let _ = tx.send(AgentEvent::Notice(format!(
-        "no-progress checkpoint ({}): asked the model to change approach; one more allowance before the turn ends.",
+        "no progress ({}): asked the model to change approach; one more allowance before the turn ends.",
         reason.code()
     )));
     Ok(())
