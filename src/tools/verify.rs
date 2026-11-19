@@ -282,6 +282,7 @@ async fn run_step(ctx: &ToolContext, step: &VerifyStep) -> StepOutcome {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    crate::tools::procenv::detach(&mut command);
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(err) => return StepOutcome::SpawnFailed(err.to_string()),

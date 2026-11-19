@@ -182,13 +182,13 @@ impl Sandbox {
         cmd.args(&args)
             .arg("--")
             .arg("bash")
-            .arg("-lc")
+            .arg("-c")
             .arg(command)
             .current_dir(&cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        cmd.as_std_mut().process_group(0);
+        crate::tools::procenv::detach(&mut cmd);
 
         // `--seccomp` needs an fd number that survives the exec of bwrap.
         // Duplicate the filter onto a fixed descriptor in the child; `dup2`
@@ -401,6 +401,7 @@ fn push_env(args: &mut Vec<OsString>) {
     args.push("--setenv".into());
     args.push("TMPDIR".into());
     args.push("/tmp".into());
+    args.extend(crate::tools::procenv::setenv_args());
 }
 
 /// The plain shell command used when no sandbox is enabled. Mirrors
@@ -408,13 +409,13 @@ fn push_env(args: &mut Vec<OsString>) {
 /// and process-group ownership.
 fn plain_command(command: &str, cwd: &Path) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new("bash");
-    cmd.arg("-lc")
+    cmd.arg("-c")
         .arg(command)
         .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    cmd.as_std_mut().process_group(0);
+    crate::tools::procenv::detach(&mut cmd);
     cmd
 }
 

@@ -230,6 +230,17 @@ release may change defaults when the change is called out below.
   `/verify accept`, and `verify_detected = false` restores the old behavior.
   The startup notice, `/verify`, `tot verify` and `tot doctor` say the steps
   are detected.
+- Agent-run commands (`bash`, `bg`, `verify`, `test`) can no longer wait on a
+  human. Each starts a new session with no controlling terminal, so git, ssh,
+  and sudo prompts fail at once instead of hanging the run or reading the
+  TUI's keystrokes, and each gets `GIT_TERMINAL_PROMPT=0`,
+  `GIT_EDITOR`/`EDITOR`/`VISUAL=true`, `PAGER`/`GIT_PAGER=cat`, and
+  `DEBIAN_FRONTEND=noninteractive` (inside `--sandbox` too).
+- `bash` and `bg` run `bash -c` instead of a login shell (`bash -lc`). The
+  user's profile is no longer sourced on every call, so banners and slow
+  profile scripts stay out of tool output and a command behaves the same on
+  every machine. Commands inherit the environment `tot` was started with; set
+  `BASH_ENV` to a file to source one anyway.
 - The repository map injected into the system prompt is smaller (at most
   1200 chars, down from 1800) and says it is an index, not a full listing.
   The map ranks files (README, manifests, entry points, source, tests, then

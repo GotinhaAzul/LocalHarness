@@ -18,6 +18,7 @@ pub(crate) mod locations;
 pub mod lsp;
 pub mod patch;
 pub mod pr;
+pub(crate) mod procenv;
 pub mod project;
 pub mod read;
 pub mod recall;
