@@ -1,11 +1,14 @@
-//! Proposing verify steps for a project that has none (#128).
+//! Verify steps for a project that has none configured (#128).
 //!
 //! Detection reads manifest files and Python test files, and asks the Python
-//! interpreter whether pytest is importable ([`crate::tools::project`]);
-//! nothing from the repository runs until the user accepts. Accepted steps are
-//! kept in the user's data directory, keyed by the project path, so they load
-//! on later runs without `--trust`: the user chose them, the repository did
-//! not.
+//! interpreter whether pytest is importable ([`crate::tools::project`]); it
+//! never runs repository code. With `[gates] verify_detected` (default on) a
+//! session with no configured or accepted steps uses the detected ones, so the
+//! verify gate is on in an ordinary repository. Running them is a command like
+//! any other: the permission policy asks, denies, or allows it, so consent is
+//! per run, not per manifest. Accepted steps are kept in the user's data
+//! directory, keyed by the project path, so they load on later runs without
+//! `--trust`: the user chose them, the repository did not.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -64,6 +67,44 @@ pub fn accepted_steps(paths: &Paths) -> Option<Vec<VerifyStep>> {
         .accepted
         .remove(&project_key(&paths.cwd))
         .filter(|steps| !steps.is_empty())
+}
+
+/// Fill an empty step list: the steps the user accepted for this project,
+/// else (when `[gates] verify_detected` is on) the steps detected from its
+/// manifest, marked as detected. Configured steps are never replaced.
+pub fn fill_unconfigured(config: &mut crate::config::Config, paths: &Paths) {
+    if !config.verify.steps.is_empty() {
+        return;
+    }
+    if let Some(steps) = accepted_steps(paths) {
+        config.verify.steps = steps;
+        config.verify.detected_from.clear();
+        return;
+    }
+    if !config.gates.verify_detected {
+        return;
+    }
+    let detected = detect_verify_steps(&paths.cwd);
+    if detected.steps.is_empty() {
+        return;
+    }
+    config.verify.steps = detected.steps.iter().map(|step| step.to_config()).collect();
+    config.verify.detected_from = detected.markers;
+}
+
+/// The one-line notice for a session running detected steps. `accept` names
+/// how this frontend saves them.
+pub fn detected_notice(verify: &crate::config::VerifyConfig, accept: &str) -> String {
+    let steps: Vec<String> = verify
+        .steps
+        .iter()
+        .map(|step| format!("{} (`{}`)", step.name, step.command.join(" ")))
+        .collect();
+    format!(
+        "verify: using steps detected from {}: {}. {accept} `[gates] verify_detected = false` turns detection off.",
+        verify.detected_from.join(", "),
+        steps.join(", ")
+    )
 }
 
 /// Detect steps and save them for this project. Returns what was saved and
@@ -147,6 +188,47 @@ mod tests {
         assert_eq!(detected.kind, Some("go"));
         let steps = accepted_steps(&paths).expect("saved");
         assert_eq!(steps[0].command, ["go", "vet", "./..."]);
+    }
+
+    #[test]
+    fn an_unconfigured_project_uses_detected_steps_unless_turned_off() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("go.mod"), "module example.com/x\n").unwrap();
+        let paths = paths(dir.path());
+
+        let mut config = crate::config::Config::default();
+        fill_unconfigured(&mut config, &paths);
+        assert!(config.verify.is_detected());
+        assert_eq!(config.verify.detected_from, ["go.mod"]);
+        assert_eq!(config.verify.steps[0].command, ["go", "vet", "./..."]);
+
+        let mut off = crate::config::Config::default();
+        off.gates.verify_detected = false;
+        fill_unconfigured(&mut off, &paths);
+        assert!(off.verify.steps.is_empty());
+
+        // Accepted steps win over detection and are not marked detected.
+        accept_detected(&paths).unwrap();
+        let mut accepted = crate::config::Config::default();
+        fill_unconfigured(&mut accepted, &paths);
+        assert!(!accepted.verify.steps.is_empty());
+        assert!(!accepted.verify.is_detected());
+    }
+
+    #[test]
+    fn configured_steps_are_never_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("go.mod"), "module example.com/x\n").unwrap();
+        let paths = paths(dir.path());
+        let mut config = crate::config::Config::default();
+        config.verify.steps = vec![VerifyStep {
+            name: "mine".into(),
+            command: vec!["make".into(), "check".into()],
+            timeout_secs: 60,
+        }];
+        fill_unconfigured(&mut config, &paths);
+        assert_eq!(config.verify.steps.len(), 1);
+        assert!(!config.verify.is_detected());
     }
 
     #[test]

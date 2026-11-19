@@ -472,6 +472,7 @@ fn complete_argument(
             Candidate::new("accept-edits", "edits run, commands ask"),
             Candidate::new("deny-all", "anything that would ask is denied"),
             Candidate::new("yolo", "no approvals; deny rules still apply"),
+            Candidate::new("why", "which layer allowed or denied the last calls"),
         ],
         ("pr", []) => vec![
             Candidate::new("confirm", "carry out the pending pull request action"),
@@ -701,7 +702,7 @@ mod tests {
         let completion = complete("/permissions ", COMMANDS, &src, false).unwrap();
         assert_eq!(
             values(&completion),
-            vec!["normal", "accept-edits", "deny-all", "yolo"]
+            vec!["normal", "accept-edits", "deny-all", "yolo", "why"]
         );
     }
 

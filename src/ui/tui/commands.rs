@@ -573,9 +573,19 @@ impl App {
             self.open_picker(picker, "no permission levels");
             return;
         }
+        if argument == "why" {
+            let Some(core) = self.core().cloned() else {
+                return;
+            };
+            let text = permission_log_text(&core.permissions.recent());
+            self.transcript
+                .push_note("permissions · why".to_string(), text, false);
+            self.transcript.scroll_end();
+            return;
+        }
         let Some(mode) = PermissionMode::parse(argument) else {
             self.set_notice(
-                "permissions: normal, accept-edits, deny-all, or yolo",
+                "permissions: normal, accept-edits, deny-all, yolo, or why",
                 Role::Error,
             );
             return;
@@ -1507,6 +1517,7 @@ impl App {
                     let mut fresh = self.config.clone();
                     fresh.verify.steps =
                         detected.steps.iter().map(|step| step.to_config()).collect();
+                    fresh.verify.detected_from.clear();
                     match app::rebuild_core(&old, fresh).await {
                         Ok(core) => {
                             if let Some(runtime) = &mut self.runtime {
@@ -1540,7 +1551,12 @@ impl App {
             }
             return;
         }
-        let text = if self.config.verify.steps.is_empty() {
+        let text = if self.config.verify.is_detected() {
+            crate::verify_setup::detected_notice(
+                &self.config.verify,
+                "Type /verify accept to save them for this project.",
+            )
+        } else if self.config.verify.steps.is_empty() {
             crate::verify_setup::unconfigured_notice(
                 &crate::tools::project::detect_verify_steps(&old.paths.cwd),
                 "Type /verify accept to save them for this project.",
@@ -1621,6 +1637,7 @@ impl App {
         if verify_path.exists() {
             fresh.verify = crate::config::VerifyConfig::load(&verify_path)?;
         }
+        crate::verify_setup::fill_unconfigured(&mut fresh, &paths);
         // Keep the runtime selections the user already made on the command line
         // or in this session.
         fresh.model.endpoint = self.config.model.endpoint.clone();
@@ -1855,4 +1872,29 @@ impl App {
             self.transcript.push_note("session warning", warning, false);
         }
     }
+}
+
+/// Calls shown by `/permissions why`.
+const WHY_CALLS: usize = 15;
+
+/// The last calls that needed a decision (read-only calls are always allowed
+/// and left out), newest last, each with the layer that decided it.
+pub(super) fn permission_log_text(log: &[crate::policy::LoggedDecision]) -> String {
+    let shown: Vec<&crate::policy::LoggedDecision> =
+        log.iter().filter(|entry| !entry.read_only).collect();
+    if shown.is_empty() {
+        return "No calls that change files or run commands yet. Read-only calls always run."
+            .into();
+    }
+    let skip = shown.len().saturating_sub(WHY_CALLS);
+    let mut out = String::new();
+    for entry in &shown[skip..] {
+        let subject: String = entry.subject.chars().take(80).collect();
+        out.push_str(&format!(
+            "{} {} `{}` — {}\n",
+            entry.outcome, entry.tool, subject, entry.layer
+        ));
+    }
+    out.push_str("Layers: `rule <id>` and `<mode> mode default` come from [permissions]; `session approval` and `you` are your answers; `hook`, `provenance`, and `frontend` are checks that run after the policy.");
+    out
 }

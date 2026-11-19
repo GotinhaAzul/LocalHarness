@@ -160,6 +160,8 @@ fn run(ctx: &ToolContext, args: &Value) -> Result<ToolResult, ToolResult> {
         replacement,
         &before[index + anchor.len()..]
     );
+    let formatted = crate::tools::format::format_content(ctx, &path, Some(&before), after);
+    let after = formatted.content;
 
     let (diff, added, removed) = diff_report(&before, &after, MAX_DIFF_LINES);
     let change = crate::tools::undo::record_change(ctx, Ok(Some(&before)), &after);
@@ -170,7 +172,11 @@ fn run(ctx: &ToolContext, args: &Value) -> Result<ToolResult, ToolResult> {
     let how = located
         .how
         .map(|how| format!("; {how}"))
-        .unwrap_or_default();
+        .unwrap_or_default()
+        + &formatted
+            .by
+            .map(|by| format!("; formatted by {by}"))
+            .unwrap_or_default();
     let text = format!(
         "patched {display} (occurrence {occurrence} of {total}, +{added} -{removed}{how})\n{diff}"
     );

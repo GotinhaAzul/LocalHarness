@@ -125,7 +125,9 @@ fn command_usage(name: &str) -> &'static str {
         "commit" => "/commit [confirm|cancel|edit <message>]   (no argument: show or draft)",
         "pr" => "/pr [confirm|cancel]   (no argument: show the pending action)",
         "plan" => "/plan [approve|exit]   (no argument: enter plan mode, or show the plan)",
-        "permissions" => "/permissions [normal|accept-edits|deny-all|yolo]   (no argument: pick)",
+        "permissions" => {
+            "/permissions [normal|accept-edits|deny-all|yolo|why]   (no argument: pick; why: what decided the last calls)"
+        }
         "export" => "/export [path]",
         _ => "",
     }

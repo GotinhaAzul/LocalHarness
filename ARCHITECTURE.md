@@ -366,6 +366,16 @@ observable.
 
 Guards are inert when their required tool is absent from the active profile.
 
+The system prompt does not restate the guards. Read-before-edit, the plan
+from the third changed file, interactive commands, truncated output, and the
+settle checks each produce a prescriptive error or note when they apply. The
+operating rules keep only what no code enforces (inspect before acting, follow
+the error's next action, small arguments, `bg` for long-running processes),
+name only tools the profile has, and ask for verify and review only when
+`[gates] auto_settle = false` leaves them to the model. Context size is the
+harness's job too: compaction runs on the measured budget, so the prompt no
+longer asks the model to judge when to `thread split`.
+
 ### 3.5 Execution and cancellation
 
 - Tools execute sequentially. Parallel read-only tools are a later optimization
@@ -405,6 +415,10 @@ a `[harness] verify passed, review clean` notice; a failed verify or a flagged
 review continues once with a user-role message carrying the results, so no
 orphan tool result enters the context path. `auto_settle = false` keeps the
 model-relayed gate messages.
+
+A failing verify attaches the first three project `file:line` locations its
+output names, three lines on each side, and records them as read, so the next
+call can be the fix instead of a `read`.
 
 One step before the todo gate — the second mutation, or the first edit of a
 second file, with no plan — the successful mutation's tool result ends with one
@@ -871,6 +885,10 @@ form. `tot doctor` prints both sizes.
   anchors for the changed lines, and untouched lines keep their bytes and line
   endings. Text-mode `patch` and `edit` are unchanged.
 - `write` and `edit` are atomic (temp file plus rename) and record `fs-change`.
+- `edit`, exact-text `patch`, and `write` pass new content through the
+  project's formatter (`[format] on_edit`) when the file was already
+  formatter-clean before the edit (`tools/format.rs`); the result's diff is
+  what landed. Hash-mode `patch` is not formatted.
 - `edit` preflight handles: multiple matches (list line numbers), whitespace-
   only match (show the verbatim excerpt), and no match (show the closest
   window). It never blocks an edit that would succeed. When the exact text is
@@ -895,8 +913,14 @@ form. `tot doctor` prints both sizes.
   redirection) the named files are snapshotted into the same store, and the
   command's result lists them; undo and `/rewind` restore them even though the
   command ran outside the write path. `git clean` is not parsed.
-- `bash` uses `bash -lc`, captures stdout/stderr separately, caps output, and
-  kills the process group on timeout. Interactive-only commands are blocked.
+- `bash` uses `bash -c` (not a login shell: the user's profile is not sourced;
+  set `BASH_ENV` to source a file), captures stdout/stderr separately, caps
+  output, and kills the process group on timeout. Every agent-run command
+  (`bash`, `bg`, `verify`, `test`) starts a new session with no controlling
+  terminal and gets `GIT_TERMINAL_PROMPT=0`, `GIT_EDITOR`/`EDITOR`/`VISUAL=true`,
+  `PAGER`/`GIT_PAGER=cat`, and `DEBIAN_FRONTEND=noninteractive`, so a prompt
+  fails at once instead of waiting on a human. Interactive-only commands are
+  blocked.
 - `bg` starts a process in its own group, captures output to an artifact, and
   exposes `status`, `logs`, and `stop`. At most four live processes per session.
 - `todo` uses an adaptive gate: free for a run that touches one or two files,
@@ -1575,12 +1599,12 @@ input characters. Missing input and unreadable files return prescriptive errors.
   picks a backend: bubblewrap when `bwrap` (or `TOT_BWRAP`) is executable,
   otherwise Landlock. If neither is usable the constructor returns a
   fail-closed error, and `detect` exposes the same check to the CLI.
-- Bubblewrap wraps `bash -lc` with `--unshare-all`, `--cap-drop ALL`, a
+- Bubblewrap wraps `bash -c` with `--unshare-all`, `--cap-drop ALL`, a
   read-only `/`, private tmpfs mounts for `/tmp`, `/home`, and `/root`, the
   workspace re-bound read-only or writable, `.git` re-bound read-only in
   `workspace-write`, `--clearenv` plus an allowlisted environment,
-  `HOME=/nonexistent`, `TMPDIR=/tmp`, and a classic-BPF seccomp filter passed
-  through `--seccomp`. The filter returns `EPERM` for mount, namespace, module,
+  `HOME=/nonexistent`, `TMPDIR=/tmp`, the non-interactive variables above,
+  and a classic-BPF seccomp filter passed through `--seccomp`. The filter returns `EPERM` for mount, namespace, module,
   keyring, BPF, perf, ptrace, and `process_vm_*` syscalls.
 - The Landlock fallback builds a ruleset with read/execute on `/`, write rights
   under the workspace (`workspace-write`) and `TMPDIR`, and TCP bind/connect
@@ -1780,7 +1804,7 @@ cursor = "#c0caf5"
   `cache <cached>/<prompt>` when the engine reports prefix-cache hits.
 - Session: short id and trusted/untrusted marker.
 - Verify: `verify: not configured` when no steps are set; the marker drops
-  once steps are configured.
+  once steps are configured or detected (`[gates] verify_detected`).
 - At narrow widths, drop throughput, then session id, then profile; never drop
   cwd, context, or model. With no model selected, the model slot reads
   `not logged in` and the footer says the same.
@@ -1826,7 +1850,11 @@ cursor = "#c0caf5"
   entry (`UserData.attachments`), read through the `read` tool so the jail,
   caps, and read stamp apply. The model sees them after the prompt; the
   transcript shows the prompt only. At most eight files, within a quarter of
-  the usable prompt.
+  the usable prompt. A path written without `@` (`src/a.rs:12:5`, a pasted
+  stack trace, `File "pkg/mod.py", line 3`) is attached the same way when it
+  names an existing text file under the working directory: at most three,
+  after the `@` mentions, never reported when skipped
+  (`[prompt] attach_named_files`).
 - Paste is bracketed and inserted literally. Large pastes are accepted; the
   model sees them as user content.
 
@@ -2037,6 +2065,9 @@ strip_reasoning = true
 `verify.toml` is a project file and needs `--trust`. Steps accepted through
 `tot verify --init` or `/verify accept` are stored per project in
 `verify-steps.json` in the user data directory, so they load without trust.
+With neither, `[gates] verify_detected` (default on) uses the steps detected
+from the manifest for the session; they run under the permission policy and
+are not saved.
 
 `AGENTS.md` files between the repository root and the working directory are
 read as untrusted project instructions, nearest last. They are data, not
