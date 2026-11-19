@@ -542,6 +542,31 @@ does not approve `git push origin main --force`. Headless runs cannot ask, so
 an `ask` is denied there; use `--mode accept-edits`, allow rules, or `--yolo`.
 ACP forwards the question to the editor.
 
+**Repeated approvals become a rule.** The harness counts your approvals of
+each exact `bash`/`bg` command per project (`approvals.json` in the data
+directory). From the third ask on, the prompt shows a ready-made rule for that
+exact command, and `a` allows the call and appends the rule to the global
+config:
+
+```toml
+[[permissions.rules]]
+id = "approved-1f3a9c2e"
+tool = "bash"
+command = '^cargo test$'
+action = "allow"
+```
+
+The rule matches only that command (`cargo test --release` still asks), and
+commands with `;`, `&`, `|`, `$(`, backticks, or redirection are never
+offered one, since they could hide a second command.
+
+**Why a call ran.** `/permissions why` lists the last calls that changed files
+or ran commands, each with the layer that decided it: `rule <id>`,
+`<mode> mode default`, `plan mode`, `session approval`, `you` (your answer, or
+`you (saved rule <id>)`), `hook <name>`, `provenance`, `frontend` (the ACP
+client), or `no one could answer` (headless). When several layers apply, the
+last one to decide is shown.
+
 The session header records the mode and a 16-digit hash of the rules
 (`permissions.mode`, `permissions.rules_hash`). Rules are reloaded when the
 config is (for example on `/trust confirm`); the change is recorded.

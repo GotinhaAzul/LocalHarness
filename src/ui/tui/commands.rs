@@ -573,9 +573,19 @@ impl App {
             self.open_picker(picker, "no permission levels");
             return;
         }
+        if argument == "why" {
+            let Some(core) = self.core().cloned() else {
+                return;
+            };
+            let text = permission_log_text(&core.permissions.recent());
+            self.transcript
+                .push_note("permissions · why".to_string(), text, false);
+            self.transcript.scroll_end();
+            return;
+        }
         let Some(mode) = PermissionMode::parse(argument) else {
             self.set_notice(
-                "permissions: normal, accept-edits, deny-all, or yolo",
+                "permissions: normal, accept-edits, deny-all, yolo, or why",
                 Role::Error,
             );
             return;
@@ -1862,4 +1872,29 @@ impl App {
             self.transcript.push_note("session warning", warning, false);
         }
     }
+}
+
+/// Calls shown by `/permissions why`.
+const WHY_CALLS: usize = 15;
+
+/// The last calls that needed a decision (read-only calls are always allowed
+/// and left out), newest last, each with the layer that decided it.
+pub(super) fn permission_log_text(log: &[crate::policy::LoggedDecision]) -> String {
+    let shown: Vec<&crate::policy::LoggedDecision> =
+        log.iter().filter(|entry| !entry.read_only).collect();
+    if shown.is_empty() {
+        return "No calls that change files or run commands yet. Read-only calls always run."
+            .into();
+    }
+    let skip = shown.len().saturating_sub(WHY_CALLS);
+    let mut out = String::new();
+    for entry in &shown[skip..] {
+        let subject: String = entry.subject.chars().take(80).collect();
+        out.push_str(&format!(
+            "{} {} `{}` — {}\n",
+            entry.outcome, entry.tool, subject, entry.layer
+        ));
+    }
+    out.push_str("Layers: `rule <id>` and `<mode> mode default` come from [permissions]; `session approval` and `you` are your answers; `hook`, `provenance`, and `frontend` are checks that run after the policy.");
+    out
 }
