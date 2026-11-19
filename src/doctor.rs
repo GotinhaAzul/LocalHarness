@@ -73,6 +73,9 @@ pub struct DoctorManifest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VerifyStatus {
     pub configured: usize,
+    /// The detected steps are in use for this session (not saved).
+    #[serde(default)]
+    pub in_use: bool,
     /// Detected candidate steps as `name: command`, when none are configured.
     pub detected: Vec<String>,
 }
@@ -501,6 +504,11 @@ impl DoctorManifest {
                 ));
             } else if verify.detected.is_empty() {
                 out.push_str("verify: not configured (nothing detected)\n");
+            } else if verify.in_use {
+                out.push_str(&format!(
+                    "verify: using detected {} (save with `tot verify --init`)\n",
+                    verify.detected.join(", ")
+                ));
             } else {
                 out.push_str(&format!(
                     "verify: not configured; detected {} (save with `tot verify --init`)\n",
@@ -862,6 +870,7 @@ mod tests {
         assert!(manifest.to_json_pretty().contains("\"usage_report\""));
         manifest.verify = Some(VerifyStatus {
             configured: 0,
+            in_use: false,
             detected: vec!["check: cargo check --all-targets".into()],
         });
         assert!(

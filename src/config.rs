@@ -36,6 +36,8 @@ pub struct Config {
     pub review: ReviewMode,
     /// Settle gates (`[gates]`).
     pub gates: GatesConfig,
+    /// Formatting of edited files (`[format]`).
+    pub format: FormatConfig,
     /// Skill index in the system prompt (`[skills]`).
     pub skills: SkillsConfig,
     /// The opt-in `fetch` tool (`[fetch]`).
@@ -90,11 +92,34 @@ pub struct GatesConfig {
     /// instead of asking the model to call them. A clean result settles on
     /// the answer already written; a failure continues with one message.
     pub auto_settle: bool,
+    /// With no configured or accepted verify steps, use the steps detected
+    /// from the project manifest for this session. They run through the
+    /// permission policy like any command and are not saved.
+    pub verify_detected: bool,
 }
 
 impl Default for GatesConfig {
     fn default() -> Self {
-        Self { auto_settle: true }
+        Self {
+            auto_settle: true,
+            verify_detected: true,
+        }
+    }
+}
+
+/// `[format]`: run the project's formatter on content `edit`, `patch`, and
+/// `write` produce, before it is written.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FormatConfig {
+    /// Format a file the project already keeps formatted (see
+    /// [`crate::tools::format`]).
+    pub on_edit: bool,
+}
+
+impl Default for FormatConfig {
+    fn default() -> Self {
+        Self { on_edit: true }
     }
 }
 
@@ -656,6 +681,34 @@ impl Config {
     /// Persist one `[ui]` setting, used by `/theme` and `Ctrl+R`.
     pub fn save_ui_setting(path: &Path, key: &str, value: toml::Value) -> Result<()> {
         Self::save_setting(path, "ui", key, value)
+    }
+
+    /// Append one rule to `[[permissions.rules]]` in the global config,
+    /// preserving every other key. A rule with the same id is not added twice.
+    pub fn save_permission_rule(path: &Path, rule: &crate::policy::RuleConfig) -> Result<()> {
+        let mut file = read_config_value(path)?;
+        {
+            let root = file.as_table_mut().context("config root is not a table")?;
+            let permissions = root
+                .entry("permissions")
+                .or_insert_with(|| toml::Value::Table(Default::default()))
+                .as_table_mut()
+                .context("[permissions] is not a table")?;
+            let rules = permissions
+                .entry("rules")
+                .or_insert_with(|| toml::Value::Array(Vec::new()))
+                .as_array_mut()
+                .context("permissions.rules is not an array")?;
+            let exists = rule.id.as_deref().is_some_and(|id| {
+                rules
+                    .iter()
+                    .any(|existing| existing.get("id").and_then(|v| v.as_str()) == Some(id))
+            });
+            if !exists {
+                rules.push(toml::Value::try_from(rule).context("cannot encode the rule")?);
+            }
+        }
+        write_config_value(path, &file)
     }
 
     /// Persist the startup profile `default_profile`, preserving every other
@@ -1581,6 +1634,17 @@ pub enum ToolMode {
 #[serde(default)]
 pub struct VerifyConfig {
     pub steps: Vec<VerifyStep>,
+    /// Manifest files the steps were detected from, when nobody configured
+    /// or accepted them. Empty for configured steps. Never read from config.
+    #[serde(skip)]
+    pub detected_from: Vec<String>,
+}
+
+impl VerifyConfig {
+    /// Whether the steps are this session's detection, not a saved choice.
+    pub fn is_detected(&self) -> bool {
+        !self.steps.is_empty() && !self.detected_from.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

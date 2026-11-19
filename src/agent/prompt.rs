@@ -59,23 +59,30 @@ pub(crate) fn build_system_prompt_with_agents(
         out.push_str("\n```\n\n");
     }
 
+    // Only what no gate enforces. Read-before-edit, the plan from the third
+    // changed file, interactive programs, and truncated output each get a
+    // prescriptive error or note at the moment they apply; repeating them
+    // here costs every request and drifts from what the code does.
     out.push_str("## Operating rules\n\n");
-    let repo_hint = if tools.iter().any(|tool| tool.name() == "repo_map") {
+    let has = |name: &str| tools.iter().any(|tool| tool.name() == name);
+    let repo_hint = if has("repo_map") {
         " Use repo_map for repository structure before broad scans."
     } else {
         ""
     };
     out.push_str(&format!(
         "- Inspect before acting. Use read, grep, glob, and bash to establish facts; never invent file contents, test results, or citations.{repo_hint}\n\
-         - read a file before edit, write, or patch. If a file changed since the last read, read it again.\n\
-         - After two mutations or edits touching two files, call todo action=\"plan\" before any further edit.\n\
-         - After changing files, run verify when verification is configured, then review once. Fix real failures before settling.\n\
          - Every tool error names the next action. Follow it; do not repeat the same failing call.\n\
-         - Use recall for truncated tool output. Use bash for short commands and bg for long-running processes.\n\
-         - Do not launch interactive programs (editors, pagers, top, REPLs, bare ssh).\n\
-         - Keep tool arguments small and targeted. Prefer one precise call over broad scanning.\n\
-         - When context grows large, use thread action=\"split\" with a title, objective, and first open step.\n\n"
+         - Keep tool arguments small and targeted. Prefer one precise call over broad scanning.\n"
     ));
+    if has("bg") {
+        out.push_str("- Use bg for servers, watchers, and other long-running processes; bash for commands that finish.\n");
+    }
+    // With auto_settle the harness runs verify and review itself.
+    if !config.gates.auto_settle && has("verify") {
+        out.push_str("- After changing files, run verify, then review once. Fix real failures before settling.\n");
+    }
+    out.push('\n');
 
     if let Some(extra) = config.load_custom_prompt(paths) {
         out.push_str("## Custom instructions\n\n");
@@ -237,7 +244,7 @@ mod tests {
         );
         assert!(prompt.contains("## Repository map"));
         assert!(prompt.contains("fn main (line 1)"));
-        assert!(prompt.contains("read a file before edit"));
+        assert!(prompt.contains("## Operating rules"));
         assert!(prompt.contains("security-red"));
         assert!(prompt.contains("## Security posture"));
         assert!(prompt.contains("Available tools (names only"));
@@ -247,6 +254,45 @@ mod tests {
         assert!(facts.starts_with(SESSION_FACTS_HEADING));
         assert!(facts.contains("Working directory:"));
         assert!(facts.ends_with(&format!("Profile: {}\n", config.profile_name())));
+    }
+
+    #[test]
+    fn the_verify_rule_is_only_for_runs_where_the_model_must_call_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut paths = Paths::discover(dir.path()).unwrap();
+        paths.data_dir = dir.path().join("data");
+        paths.config_dir = dir.path().join("config");
+        let mut config = Config::builtin();
+        let registry = ToolRegistry::builtin();
+        let tools = registry.select(config.profile(), &[]).unwrap();
+        let build = |config: &Config| {
+            build_system_prompt(config, &paths, &SkillIndex::bundled(), &tools, None)
+        };
+        // The harness runs verify and review itself: no rule asks for them.
+        assert!(config.gates.auto_settle);
+        assert!(!build(&config).contains("run verify, then review"));
+        config.gates.auto_settle = false;
+        assert!(build(&config).contains("run verify, then review"));
+    }
+
+    #[test]
+    fn operating_rules_name_only_tools_the_profile_has() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut paths = Paths::discover(dir.path()).unwrap();
+        paths.data_dir = dir.path().join("data");
+        paths.config_dir = dir.path().join("config");
+        let mut config = Config::builtin();
+        config.gates.auto_settle = false;
+        config.profile_name = "minimal".into();
+        let registry = ToolRegistry::builtin();
+        let tools = registry.select(config.profile(), &[]).unwrap();
+        assert!(!tools.iter().any(|tool| tool.name() == "bg"));
+        let prompt = build_system_prompt(&config, &paths, &SkillIndex::bundled(), &tools, None);
+        let rules = &prompt[prompt.find("## Operating rules").unwrap()..];
+        let rules = &rules[..rules.find("\n\n## ").unwrap_or(rules.len())];
+        assert!(!rules.contains("bg "), "{rules}");
+        assert!(!rules.contains("repo_map"), "{rules}");
+        assert!(rules.contains("run verify"), "{rules}");
     }
 
     #[test]

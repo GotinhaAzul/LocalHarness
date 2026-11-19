@@ -386,13 +386,9 @@ pub async fn run(cli: Cli) -> Result<i32> {
             config.verify = crate::config::VerifyConfig::load(&verify_path)?;
         }
     }
-    // Steps the user accepted for this project (`tot verify --init`, the TUI
-    // offer). They live in the user's data directory, not the repository.
-    if config.verify.steps.is_empty()
-        && let Some(steps) = crate::verify_setup::accepted_steps(&paths)
-    {
-        config.verify.steps = steps;
-    }
+    // Steps the user accepted for this project (`tot verify --init`,
+    // `/verify accept`), else the detected ones for this session.
+    crate::verify_setup::fill_unconfigured(&mut config, &paths);
 
     let project_profiles = paths.project_dir().join("profiles");
     config.load_profile_dirs(
@@ -622,9 +618,26 @@ pub async fn run(cli: Cli) -> Result<i32> {
         );
     }
 
-    // No verify steps: say so once, with what was detected. Headless never
-    // prompts; the TUI offers the steps once per project.
-    if config.verify.steps.is_empty() {
+    // Detected steps: say which, and how to keep or turn them off. Headless
+    // says it every run; the TUI once per project.
+    if config.verify.is_detected() {
+        if cli.print.is_some() {
+            eprintln!(
+                "[notice] {}",
+                crate::verify_setup::detected_notice(
+                    &config.verify,
+                    "Save them with `tot verify --init`."
+                )
+            );
+        } else if crate::verify_setup::take_offer(&paths)
+            && let Ok(mut session) = runtime.core.session.lock()
+        {
+            session.warnings.push(crate::verify_setup::detected_notice(
+                &config.verify,
+                "Type /verify accept to save them for this project.",
+            ));
+        }
+    } else if config.verify.steps.is_empty() {
         let detected = crate::tools::project::detect_verify_steps(&paths.cwd);
         if cli.print.is_some() {
             eprintln!(
@@ -668,6 +681,16 @@ pub async fn run(cli: Cli) -> Result<i32> {
 
 /// `tot verify [--init]`: show the verify steps, or detect and save them.
 fn run_verify(config: &Config, paths: &Paths, init: bool) -> Result<i32> {
+    if config.verify.is_detected() && !init {
+        println!(
+            "{}",
+            crate::verify_setup::detected_notice(
+                &config.verify,
+                "Save them with `tot verify --init`."
+            )
+        );
+        return Ok(0);
+    }
     if !config.verify.steps.is_empty() && !init {
         println!("verify: {} step(s) configured", config.verify.steps.len());
         for step in &config.verify.steps {
@@ -822,8 +845,13 @@ async fn run_doctor(config: &Config, paths: &Paths, json: bool, fix: bool) -> Re
         manifest.tool_probe = Some(cached);
     }
     manifest.verify = Some(crate::doctor::VerifyStatus {
-        configured: config.verify.steps.len(),
-        detected: if config.verify.steps.is_empty() {
+        configured: if config.verify.is_detected() {
+            0
+        } else {
+            config.verify.steps.len()
+        },
+        in_use: config.verify.is_detected(),
+        detected: if config.verify.steps.is_empty() || config.verify.is_detected() {
             crate::tools::project::detect_verify_steps(&paths.cwd)
                 .steps
                 .iter()
