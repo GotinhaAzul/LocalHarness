@@ -7,12 +7,14 @@ release may change defaults when the change is called out below.
 
 ## [Unreleased]
 
-## [0.2.1] - 2026-11-19
+## [0.3.0] - 2026-11-19
 
 Quality-of-life updates: `/init` for workspace onboarding, `/tree` and
 `/rewind` pickers for moving around a session, `/approve` while the model
-works, and a run of TUI, permission, and tool-surface refinements merged since
-0.2.0.
+works, and TUI, permission, and tool-surface refinements merged since 0.2.0.
+It is a minor release because it removes the `test` tool and the `git` read
+actions ([#170](https://github.com/GotinhaAzul/Totality/issues/170); see
+Removed).
 
 ### Added
 
@@ -598,6 +600,6 @@ packaging, and a local HTTP API. It includes all work merged in PRs
   event-log lock, and refuses a cross-root session-id collision instead of
   replacing the live entry ([PR #113](https://github.com/GotinhaAzul/LocalHarness/pull/113)).
 
-[Unreleased]: https://github.com/GotinhaAzul/Totality/compare/v0.2.1...HEAD
-[0.2.1]: https://github.com/GotinhaAzul/Totality/compare/v0.2.0...v0.2.1
+[Unreleased]: https://github.com/GotinhaAzul/Totality/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/GotinhaAzul/Totality/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/GotinhaAzul/LocalHarness/compare/v0.1.0...v0.2.0

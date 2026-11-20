@@ -139,7 +139,7 @@ workflow renders it with real checksums and attaches `totality.rb`; a tap
 maintainer can also do it by hand:
 
 ```sh
-sh packaging/homebrew/render.sh 0.2.1 SHA256SUMS <source-sha256> > totality.rb
+sh packaging/homebrew/render.sh 0.3.0 SHA256SUMS <source-sha256> > totality.rb
 ```
 
 Linux installs the prebuilt static binary. macOS is best-effort and builds from
