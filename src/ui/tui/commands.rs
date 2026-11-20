@@ -2088,9 +2088,8 @@ pub(super) fn permission_log_text(log: &[crate::policy::LoggedDecision]) -> Stri
 /// Rows for the `/rewind` picker: the user messages on the active branch,
 /// newest first, each running `/rewind <turns>`.
 fn rewind_items(session: &crate::session::Session) -> Vec<PickItem> {
-    use crate::session::EntryKind;
-    let branch = session.branch_entries();
     let users = crate::session::rewind::branch_user_messages(session);
+    let preview = crate::session::rewind::Preview::new(session);
     let total = users.len();
     users
         .iter()
@@ -2098,20 +2097,12 @@ fn rewind_items(session: &crate::session::Session) -> Vec<PickItem> {
         .enumerate()
         .map(|(index, user)| {
             let turns = index + 1;
-            // Files the harness wrote from this message on; the rewind puts
-            // each one back.
-            let mut files: Vec<&str> = branch
-                .iter()
-                .filter(|entry| entry.seq > user.seq)
-                .filter_map(|entry| match &entry.kind {
-                    EntryKind::Custom(custom) if custom.kind == "fs-change" => {
-                        custom.payload.get("path").and_then(|path| path.as_str())
-                    }
-                    _ => None,
-                })
-                .collect();
-            files.sort_unstable();
-            files.dedup();
+            // Files a rewind to just before this message puts back. Ask the
+            // planner, so a write a later undo reverted is not promised here.
+            let files = crate::ui::tree::destination_for(&session.tree, &user.id)
+                .ok()
+                .and_then(|destination| preview.files(&destination.target).ok())
+                .unwrap_or_default();
             let ago = match turns {
                 1 => "last message".to_string(),
                 n => format!("{n} messages back"),

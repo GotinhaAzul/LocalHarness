@@ -1652,6 +1652,47 @@ async fn tree_opens_on_a_session_that_starts_with_a_hidden_record() {
 }
 
 #[tokio::test]
+async fn rewind_picker_does_not_promise_writes_that_were_undone() {
+    let (_dir, mut app) = test_app().await;
+    seed_navigation_session(&app);
+    let session = app.runtime.as_ref().unwrap().session.clone();
+    {
+        let mut session = session.lock().unwrap();
+        let change = session
+            .branch_entries()
+            .iter()
+            .find(|entry| {
+                matches!(
+                    &entry.kind,
+                    EntryKind::Custom(custom)
+                        if custom.kind == "fs-change" && custom.payload.get("undo").is_none()
+                )
+            })
+            .map(|entry| entry.seq)
+            .expect("the seed wrote a file");
+        session
+            .append(EntryKind::Custom(
+                crate::session::CustomData::new("fs-change")
+                    .with("path", "a.txt")
+                    .with("undo", true)
+                    .with("reverts", change),
+            ))
+            .unwrap();
+    }
+    app.run_command("/rewind").await;
+    let Some(ModalData::Picker(view)) = &app.modal else {
+        panic!("the rewind picker did not open: {:?}", app.notice);
+    };
+    for item in &view.items {
+        assert!(
+            item.description.contains("no file changes"),
+            "an undone write is still promised: {}",
+            item.description
+        );
+    }
+}
+
+#[tokio::test]
 async fn tree_enter_on_a_message_goes_back_before_it_and_prefills_it() {
     let (_dir, mut app) = test_app().await;
     let (_, reply, _) = seed_navigation_session(&app);
