@@ -1784,3 +1784,66 @@ async fn approve_runs_while_the_model_is_working() {
         app.input.set_text("");
     }
 }
+
+async fn next_init(app: &mut App) {
+    let mut rx = app.bg_rx.take().unwrap();
+    loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv())
+            .await
+            .expect("the init draft lands")
+            .expect("channel open");
+        let is_init = matches!(event, BgEvent::Init(_));
+        app.handle_bg(event).await;
+        if is_init {
+            app.bg_rx = Some(rx);
+            return;
+        }
+    }
+}
+
+#[tokio::test]
+async fn init_drafts_in_the_background_and_writes_only_accepted_files() {
+    let (_dir, mut app) = test_app().await;
+    let cwd = app.cwd_path();
+    std::fs::write(cwd.join("Makefile"), "test:\n\t./run-tests\n").unwrap();
+    app.run_command("/init").await;
+    assert!(app.init_job.is_some());
+    next_init(&mut app).await;
+    let Some(ModalData::Init(view)) = &app.modal else {
+        panic!("the init review did not open: {:?}", app.notice);
+    };
+    let paths: Vec<&str> = view
+        .proposal
+        .files
+        .iter()
+        .map(|f| f.path.as_str())
+        .collect();
+    assert_eq!(paths, ["AGENTS.md", ".harness/verify.toml"]);
+    // Reject AGENTS.md, keep verify.toml, write.
+    app.handle_modal_key(key(KeyCode::Char('r'))).await;
+    app.handle_modal_key(key(KeyCode::Enter)).await;
+    assert!(app.modal.is_none());
+    assert!(!cwd.join("AGENTS.md").exists());
+    let written = std::fs::read_to_string(cwd.join(".harness/verify.toml")).unwrap();
+    assert!(
+        written.contains("command = [\"make\", \"test\"]"),
+        "{written}"
+    );
+}
+
+#[tokio::test]
+async fn init_review_esc_writes_nothing_and_esc_cancels_a_draft() {
+    let (_dir, mut app) = test_app().await;
+    let cwd = app.cwd_path();
+    std::fs::write(cwd.join("Makefile"), "test:\n\t./run-tests\n").unwrap();
+    app.run_command("/init").await;
+    next_init(&mut app).await;
+    app.handle_modal_key(key(KeyCode::Esc)).await;
+    assert!(app.modal.is_none());
+    assert!(!cwd.join("AGENTS.md").exists());
+    assert!(!cwd.join(".harness").exists());
+
+    app.run_command("/init").await;
+    app.handle_key(key(KeyCode::Esc)).await;
+    assert!(app.init_job.is_none(), "Esc cancels the draft");
+}

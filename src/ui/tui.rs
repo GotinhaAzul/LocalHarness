@@ -42,8 +42,8 @@ use crate::ui::render::{self, ActivityData, Transcript};
 use crate::ui::theme::{Role, Theme};
 use crate::ui::tree::TreeView;
 use crate::ui::widgets::{
-    FooterData, HeaderData, HunkReviewModal, ModalData, PickAction, PickItem, PickerModal,
-    SessionItem, SessionsModal, ToolItem, ToolsModal, clip_end,
+    FooterData, HeaderData, HunkReviewModal, InitReview, ModalData, PickAction, PickItem,
+    PickerModal, SessionItem, SessionsModal, ToolItem, ToolsModal, clip_end,
 };
 use crate::workflows::{self, WorkflowSpec};
 
@@ -75,6 +75,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
         "pick a message to rewind files and the conversation to",
     ),
     ("fork", "checkout the latest assistant step"),
+    (
+        "init",
+        "draft AGENTS.md and verify steps for this workspace, then review",
+    ),
     ("new", "start a fresh session"),
     ("resume", "resume a previous session"),
     ("sessions", "list and switch sessions"),
@@ -202,6 +206,8 @@ enum BgEvent {
     },
     /// A running turn asks the user to approve one call.
     Permission(permission::PendingAsk),
+    /// An `/init` draft finished.
+    Init(crate::init::Proposal),
 }
 
 /// A config switch running in the background.
@@ -475,6 +481,8 @@ struct App {
     bg_rx: Option<UnboundedReceiver<BgEvent>>,
     /// A model or profile switch in flight.
     switching: Option<Switch>,
+    /// An `/init` draft in flight; Esc cancels it.
+    init_job: Option<tokio_util::sync::CancellationToken>,
     /// The theme to restore when a `/theme` picker previewing others is
     /// dismissed.
     theme_before_preview: Option<String>,
@@ -586,6 +594,7 @@ impl App {
             bg_tx,
             bg_rx: Some(bg_rx),
             switching: None,
+            init_job: None,
             theme_before_preview: None,
             reviewer,
             hunk_edit: None,
@@ -748,6 +757,7 @@ impl App {
                 }
             }
             BgEvent::Permission(pending) => self.show_permission_request(pending),
+            BgEvent::Init(proposal) => self.show_init_proposal(proposal),
             BgEvent::Rebuilt { switch, result } => {
                 self.switching = None;
                 let core = match result {

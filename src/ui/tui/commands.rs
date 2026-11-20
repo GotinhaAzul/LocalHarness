@@ -36,6 +36,7 @@ impl App {
             "tree" => self.command_tree(),
             "rewind" => self.command_rewind(rest),
             "fork" => self.command_fork(),
+            "init" => self.command_init(),
             "new" => self.command_new().await,
             "resume" => self.command_resume(rest).await,
             "sessions" => self.command_sessions(),
@@ -950,6 +951,92 @@ impl App {
         }
         self.set_notice(message, Role::Success);
         true
+    }
+
+    /// `/init`: draft `AGENTS.md` and verify steps in the background. The
+    /// model gets no tools and nothing runs; the review modal opens when the
+    /// draft lands, and only approved files are written.
+    pub(super) fn command_init(&mut self) {
+        let Some(core) = self.core().cloned() else {
+            return;
+        };
+        if self.init_job.is_some() {
+            self.set_notice(
+                "an init draft is already running (Esc cancels it)",
+                Role::Warning,
+            );
+            return;
+        }
+        let cancel = tokio_util::sync::CancellationToken::new();
+        self.init_job = Some(cancel.clone());
+        self.set_notice(
+            format!(
+                "init: {} is drafting AGENTS.md and verify steps (no tools; nothing runs) · Esc cancels",
+                core.provider.model()
+            ),
+            Role::Muted,
+        );
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            let proposal = crate::init::draft(&core, cancel.clone()).await;
+            if !cancel.is_cancelled() {
+                let _ = tx.send(BgEvent::Init(proposal));
+            }
+        });
+    }
+
+    /// The draft landed: show every file in full (or as a diff) in the
+    /// transcript, then the accept/reject modal.
+    pub(super) fn show_init_proposal(&mut self, proposal: crate::init::Proposal) {
+        if self.init_job.take().is_none() {
+            return;
+        }
+        self.transcript
+            .push_note("init", crate::init::report(&proposal), false);
+        if proposal.files.is_empty() {
+            self.set_notice("init: nothing to change", Role::Muted);
+            return;
+        }
+        if self.modal.is_some() || self.turn_active {
+            self.set_notice(
+                "init: the proposal is in the transcript; run /init again to review it",
+                Role::Warning,
+            );
+            return;
+        }
+        self.modal = Some(ModalData::Init(InitReview::new(proposal)));
+        self.set_notice(
+            "init: review the files above, then Enter writes the accepted ones",
+            Role::Muted,
+        );
+    }
+
+    pub(super) fn apply_init(&mut self, review: &InitReview) {
+        let Some(cwd) = self.core().map(|core| core.paths.cwd.clone()) else {
+            return;
+        };
+        let chosen = review.chosen();
+        if chosen.is_empty() {
+            self.set_notice("init: no file accepted; nothing was written", Role::Muted);
+            return;
+        }
+        match crate::init::apply(&cwd, &chosen) {
+            Ok(written) => {
+                let mut message = format!("wrote {}.", written.join(", "));
+                if written.iter().any(|path| path.starts_with(".harness/")) {
+                    message.push(' ');
+                    message.push_str(&crate::init::trust_note(review.proposal.trusted));
+                }
+                message.push_str(" Start a new session (/new) to load them.");
+                self.transcript.push_note("init", message, false);
+                self.set_notice(format!("init: wrote {}", written.join(", ")), Role::Success);
+                self.spawn_files_refresh();
+            }
+            Err(error) => {
+                self.transcript.push_note("init", error.clone(), true);
+                self.set_notice(error, Role::Error);
+            }
+        }
     }
 
     pub(super) fn command_fork(&mut self) {

@@ -730,9 +730,16 @@ With no configured or accepted steps, `[gates] verify_detected` (default
 `package.json`, Python markers, `go.mod`) for the session, so the verify gate
 is on in an ordinary repository. Detection reads files only; the steps run
 through the permission policy like any other command, so in the default mode
-the first run asks. They are not saved: `tot verify --init` or `/verify accept`
+the first run asks. They are not saved: `tot verify accept` or `/verify accept`
 keeps them, and `verify_detected = false` restores the old behavior (no steps,
-the gate stays off, a notice names what was detected).
+the gate stays off, a notice names what was detected). `tot verify --init` is
+the deprecated spelling of `tot verify accept` and will be removed in the next
+release.
+
+Accepted steps are per machine. To share steps, write them to
+`.harness/verify.toml` and commit it: `/init` or `tot init` drafts that file,
+with evidence for each step, from the manifest, task runners, and CI
+([usage](usage.md#set-up-a-workspace-with-init)).
 
 ## Environment
 

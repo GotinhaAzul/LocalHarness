@@ -150,6 +150,9 @@ impl App {
             KeyCode::Esc => {
                 if self.turn_active {
                     self.cancel_turn();
+                } else if let Some(job) = self.init_job.take() {
+                    job.cancel();
+                    self.set_notice("init draft cancelled; nothing was written", Role::Muted);
                 } else if self.input.text().trim_start().starts_with('/')
                     && !self.input.text().contains('\n')
                 {
@@ -309,6 +312,7 @@ impl App {
         let mut close = false;
         // Row id, and `Some(force)` to rewind files as well as the conversation.
         let mut tree_go: Option<(String, Option<bool>)> = None;
+        let mut init_apply: Option<InitReview> = None;
         let mut switch: Option<PathBuf> = None;
         let mut picked: Option<PickAction> = None;
         let mut preview_theme: Option<String> = None;
@@ -334,6 +338,16 @@ impl App {
                 KeyCode::Char('R') => {
                     tree_go = view.selected_row().map(|row| (row.id.clone(), Some(true)));
                 }
+                _ => {}
+            },
+            ModalData::Init(view) => match key.code {
+                KeyCode::Esc => close = true,
+                KeyCode::Up | KeyCode::Char('k') => view.move_by(-1),
+                KeyCode::Down | KeyCode::Char('j') => view.move_by(1),
+                KeyCode::Char(' ') => view.set(None),
+                KeyCode::Char('a') | KeyCode::Char('y') => view.set(Some(true)),
+                KeyCode::Char('r') | KeyCode::Char('n') => view.set(Some(false)),
+                KeyCode::Enter => init_apply = Some(view.clone()),
                 _ => {}
             },
             ModalData::Sessions(view) => match key.code {
@@ -461,6 +475,12 @@ impl App {
             return;
         }
 
+        if let Some(review) = init_apply {
+            self.modal = None;
+            self.apply_init(&review);
+            return;
+        }
+
         if let Some((row, rewind)) = tree_go
             && self.tree_go(&row, rewind)
         {
@@ -496,6 +516,9 @@ impl App {
         }
 
         if close {
+            if matches!(modal, ModalData::Init(_)) {
+                self.set_notice("init cancelled; nothing was written", Role::Muted);
+            }
             self.modal = None;
             self.restore_previewed_theme();
         } else {

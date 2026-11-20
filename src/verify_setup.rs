@@ -178,7 +178,7 @@ mod tests {
         let paths = paths(dir.path());
         assert!(accepted_steps(&paths).is_none());
         let notice =
-            unconfigured_notice(&detect_verify_steps(&paths.cwd), "Run tot verify --init.");
+            unconfigured_notice(&detect_verify_steps(&paths.cwd), "Run tot verify accept.");
         assert!(notice.contains("go vet ./..."), "{notice}");
         assert!(notice.contains("Nothing was run"), "{notice}");
         // Still nothing saved after the notice.

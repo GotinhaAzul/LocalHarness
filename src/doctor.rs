@@ -78,6 +78,9 @@ pub struct VerifyStatus {
     pub in_use: bool,
     /// Detected candidate steps as `name: command`, when none are configured.
     pub detected: Vec<String>,
+    /// Configured steps naming a target or script that no longer exists.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stale: Vec<String>,
 }
 
 /// Serialized tool-schema sizes for `tot doctor`.
@@ -506,13 +509,18 @@ impl DoctorManifest {
                 out.push_str("verify: not configured (nothing detected)\n");
             } else if verify.in_use {
                 out.push_str(&format!(
-                    "verify: using detected {} (save with `tot verify --init`)\n",
+                    "verify: using detected {} (save with `tot verify accept`)\n",
                     verify.detected.join(", ")
                 ));
             } else {
                 out.push_str(&format!(
-                    "verify: not configured; detected {} (save with `tot verify --init`)\n",
+                    "verify: not configured; detected {} (save with `tot verify accept`)\n",
                     verify.detected.join(", ")
+                ));
+            }
+            for stale in &verify.stale {
+                out.push_str(&format!(
+                    "  stale: {stale}; run /init or `tot init` to propose an update\n"
                 ));
             }
         }
@@ -872,6 +880,7 @@ mod tests {
             configured: 0,
             in_use: false,
             detected: vec!["check: cargo check --all-targets".into()],
+            stale: Vec::new(),
         });
         assert!(
             manifest

@@ -1258,7 +1258,7 @@ async fn print_in_an_unconfigured_project_uses_the_detected_steps_and_says_so() 
         .count();
     assert_eq!(notices, 1, "stderr: {stderr}");
     assert!(stderr.contains("cargo check --all-targets"), "{stderr}");
-    assert!(stderr.contains("tot verify --init"), "{stderr}");
+    assert!(stderr.contains("tot verify accept"), "{stderr}");
     assert!(stderr.contains("verify_detected = false"), "{stderr}");
     // Detection reads the manifest only; a turn that changed nothing runs no step.
     assert!(!env.cwd.join("target").exists(), "no detected step may run");
@@ -1294,10 +1294,19 @@ async fn verify_init_saves_the_detected_steps_for_later_runs() {
         "{stdout}"
     );
 
-    let output = run_tot(&env, &base, &["verify", "--init"]).await;
+    let output = run_tot(&env, &base, &["verify", "accept"]).await;
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_eq!(output.status.code(), Some(0), "{stdout}");
     assert!(stdout.contains("go vet ./..."), "{stdout}");
+
+    // The old spelling still works for one release, with a warning.
+    let output = run_tot(&env, &base, &["verify", "--init"]).await;
+    assert_eq!(output.status.code(), Some(0));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("deprecated") && stderr.contains("tot verify accept"),
+        "{stderr}"
+    );
 
     // Later runs load them without --trust; the notice is gone.
     let output = run_tot(&env, &base, &["verify"]).await;
@@ -1307,4 +1316,51 @@ async fn verify_init_saves_the_detected_steps_for_later_runs() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!stderr.contains("verify: not configured"), "{stderr}");
     assert!(!stderr.contains("verify: using steps detected"), "{stderr}");
+}
+
+#[tokio::test]
+async fn init_is_a_dry_run_unless_applied_and_writes_only_chosen_files() {
+    let (base, _fake) = spawn().await;
+    let env = env();
+    std::fs::write(
+        env.cwd.join("Makefile"),
+        "lint:\n\tcheck-style\n\ntest:\n\t./run-tests\n\ndeploy:\n\tship\n",
+    )
+    .unwrap();
+
+    let output = run_tot(&env, &base, &["init"]).await;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(0), "{stdout}");
+    // The fake model answers prose, so the proposal is the detected part.
+    assert!(
+        stdout.contains("# evidence: Makefile:4 target `test`"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("deploy\"]"), "{stdout}");
+    assert!(stdout.contains("the model draft failed"), "{stdout}");
+    assert!(
+        stdout.contains("inert until you run with --trust"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("dry run: nothing was written"), "{stdout}");
+    assert!(!env.cwd.join(".harness/verify.toml").exists());
+    assert!(!env.cwd.join("AGENTS.md").exists());
+
+    let output = run_tot(
+        &env,
+        &base,
+        &["init", "--apply", "--only", ".harness/verify.toml"],
+    )
+    .await;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(0), "{stdout}");
+    let written = std::fs::read_to_string(env.cwd.join(".harness/verify.toml")).unwrap();
+    assert!(
+        written.contains("command = [\"make\", \"test\"]"),
+        "{written}"
+    );
+    assert!(
+        !env.cwd.join("AGENTS.md").exists(),
+        "only the chosen file is written"
+    );
 }

@@ -166,14 +166,34 @@ pub struct Cli {
     pub plan: bool,
 }
 
+#[derive(Debug, Clone, Copy, clap::Subcommand)]
+pub enum VerifyCommand {
+    /// Detect steps from the project's manifest files and save them for this
+    /// project (in the user data directory). Nothing is run.
+    Accept,
+}
+
 #[derive(Debug, clap::Subcommand)]
 pub enum Command {
     /// Show or set up the verify steps for this project.
     Verify {
-        /// Detect steps from the project's manifest files and save them for
-        /// this project (in the user data directory). Nothing is run.
-        #[arg(long)]
+        #[command(subcommand)]
+        action: Option<VerifyCommand>,
+        /// Deprecated: use `tot verify accept`.
+        #[arg(long, hide = true)]
         init: bool,
+    },
+    /// Draft AGENTS.md and .harness/verify.toml for this workspace with the
+    /// model, from a bounded set of repository files. Shows the proposal and
+    /// writes nothing unless --apply is given; nothing is run either way.
+    Init {
+        /// Write the proposed files (all of them, or those named by --only).
+        #[arg(long)]
+        apply: bool,
+        /// With --apply, write only this file (`AGENTS.md` or
+        /// `.harness/verify.toml`); repeatable.
+        #[arg(long, value_name = "FILE", requires = "apply")]
+        only: Vec<String>,
     },
     /// Print the engine capability manifest and profile mismatches.
     Doctor {
@@ -386,7 +406,7 @@ pub async fn run(cli: Cli) -> Result<i32> {
             config.verify = crate::config::VerifyConfig::load(&verify_path)?;
         }
     }
-    // Steps the user accepted for this project (`tot verify --init`,
+    // Steps the user accepted for this project (`tot verify accept`,
     // `/verify accept`), else the detected ones for this session.
     crate::verify_setup::fill_unconfigured(&mut config, &paths);
 
@@ -535,8 +555,26 @@ pub async fn run(cli: Cli) -> Result<i32> {
     if let Some(Command::Context { json, .. }) = &cli.command {
         return run_context(&config, &paths, *json);
     }
-    if let Some(Command::Verify { init }) = &cli.command {
-        return run_verify(&config, &paths, *init);
+    if let Some(Command::Verify { action, init }) = &cli.command {
+        if *init {
+            eprintln!(
+                "warning: `tot verify --init` is deprecated and will be removed in the next release; use `tot verify accept`"
+            );
+        }
+        let accept = *init || matches!(action, Some(VerifyCommand::Accept));
+        return run_verify(&config, &paths, accept);
+    }
+    if let Some(Command::Init { apply, only }) = &cli.command {
+        let options = RuntimeOptions {
+            path_jail: cli.path_jail,
+            engagement: None,
+            no_session: true,
+            no_redact: false,
+            resume: None,
+            continue_last: false,
+            approver: None,
+        };
+        return run_init(config, paths, options, *apply, only).await;
     }
     if let Some(Command::Doctor { json, fix }) = &cli.command {
         return run_doctor(&config, &paths, *json, *fix).await;
@@ -626,7 +664,7 @@ pub async fn run(cli: Cli) -> Result<i32> {
                 "[notice] {}",
                 crate::verify_setup::detected_notice(
                     &config.verify,
-                    "Save them with `tot verify --init`."
+                    "Save them with `tot verify accept`."
                 )
             );
         } else if crate::verify_setup::take_offer(&paths)
@@ -644,7 +682,7 @@ pub async fn run(cli: Cli) -> Result<i32> {
                 "[notice] {}",
                 crate::verify_setup::unconfigured_notice(
                     &detected,
-                    "Save them with `tot verify --init`."
+                    "Save them with `tot verify accept`."
                 )
             );
         } else if !detected.steps.is_empty()
@@ -679,14 +717,14 @@ pub async fn run(cli: Cli) -> Result<i32> {
     outcome
 }
 
-/// `tot verify [--init]`: show the verify steps, or detect and save them.
+/// `tot verify [accept]`: show the verify steps, or detect and save them.
 fn run_verify(config: &Config, paths: &Paths, init: bool) -> Result<i32> {
     if config.verify.is_detected() && !init {
         println!(
             "{}",
             crate::verify_setup::detected_notice(
                 &config.verify,
-                "Save them with `tot verify --init`."
+                "Save them with `tot verify accept`."
             )
         );
         return Ok(0);
@@ -704,7 +742,7 @@ fn run_verify(config: &Config, paths: &Paths, init: bool) -> Result<i32> {
             "{}",
             crate::verify_setup::unconfigured_notice(
                 &detected,
-                "Save them with `tot verify --init`."
+                "Save them with `tot verify accept`."
             )
         );
         return Ok(0);
@@ -728,6 +766,63 @@ fn run_verify(config: &Config, paths: &Paths, init: bool) -> Result<i32> {
         println!("  {}: {}", step.name, step.command);
     }
     Ok(0)
+}
+
+/// `tot init [--apply] [--only FILE]`: draft, show, and optionally write the
+/// onboarding files. Dry run by default.
+async fn run_init(
+    config: Config,
+    paths: Paths,
+    options: RuntimeOptions,
+    apply: bool,
+    only: &[String],
+) -> Result<i32> {
+    for name in only {
+        if name != crate::init::AGENTS_FILE && name != crate::init::VERIFY_FILE {
+            bail!(
+                "--only takes {} or {}, not {name:?}",
+                crate::init::AGENTS_FILE,
+                crate::init::VERIFY_FILE
+            );
+        }
+    }
+    let cwd = paths.cwd.clone();
+    let runtime = crate::app::create_runtime(config, paths, options).await?;
+    eprintln!(
+        "init: reading {} and asking {} for a draft (no tools; nothing runs)…",
+        cwd.display(),
+        runtime.core.provider.model()
+    );
+    let proposal = crate::init::draft(&runtime.core, CancellationToken::new()).await;
+    print!("{}", crate::init::report(&proposal));
+    if proposal.files.is_empty() {
+        return Ok(0);
+    }
+    if !apply {
+        println!(
+            "dry run: nothing was written. Re-run with --apply to write these files, or --apply --only <file> for one."
+        );
+        return Ok(0);
+    }
+    let chosen: Vec<&crate::init::ProposedFile> = proposal
+        .files
+        .iter()
+        .filter(|file| only.is_empty() || only.contains(&file.path))
+        .collect();
+    if chosen.is_empty() {
+        println!("nothing to write: --only named no proposed file");
+        return Ok(1);
+    }
+    match crate::init::apply(&cwd, &chosen) {
+        Ok(written) => {
+            println!("wrote {}", written.join(", "));
+            Ok(0)
+        }
+        Err(error) => {
+            eprintln!("error: {error}");
+            Ok(1)
+        }
+    }
 }
 
 /// `tot completions <shell>`: write a completion script for packaging.
@@ -859,6 +954,18 @@ async fn run_doctor(config: &Config, paths: &Paths, json: bool, fix: bool) -> Re
                 .collect()
         } else {
             Vec::new()
+        },
+        stale: {
+            // The steps in use, or, in an untrusted project, the ones a
+            // committed .harness/verify.toml would bring.
+            let steps = if config.verify.is_detected() || config.verify.steps.is_empty() {
+                crate::config::VerifyConfig::load(&paths.cwd.join(crate::init::VERIFY_FILE))
+                    .map(|loaded| loaded.steps)
+                    .unwrap_or_default()
+            } else {
+                config.verify.steps.clone()
+            };
+            crate::init::stale_steps(&paths.cwd, &steps)
         },
     });
     if let Ok(selection) = crate::tools::ToolRegistry::builtin().select_for(

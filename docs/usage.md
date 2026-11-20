@@ -66,6 +66,35 @@ PASS  cargo  42 passed (3.1 s)
 - **Stop the loop, not the work.** Loop and stall guards end a repeating run with a status, not a silent bill. A guard or budget stop gives the model one tool-less step to summarize what it changed and what is left. Budget checkpoints renew on the same progress the stall tracker counts: a file change or a passing verification. The first no-progress stop in a turn (a checkpoint or the stall guard) asks the model to change approach and gives it one more allowance; only the second ends the turn. Without a thinking control, the summary request gets 6144 output tokens instead of 1536 so a thinking model has room to reason and still answer.
 - **Name the next action.** Every error tells the model what to do instead of leaving it to guess.
 
+### Set up a workspace with `/init`
+
+`/init` (TUI) or `tot init` (CLI) drafts `AGENTS.md` and `.harness/verify.toml`
+for the workspace and writes only what you approve:
+
+1. The harness reads a bounded set of files (manifests, `Makefile`/`justfile`/
+   `Taskfile`, up to four CI workflows, README, an existing `AGENTS.md`; 6 KiB
+   each, 40 KiB total, symlinks not followed) and detects verify steps itself:
+   manifest detection plus `make`/`just`/`task` targets such as `test` or
+   `lint`, each with the line it is defined on.
+2. One model request with no tools turns that into `AGENTS.md` prose and any
+   extra steps. Nothing runs during init.
+3. A model step is kept only when its evidence holds: a file the model was
+   shown, and a cited line that mentions the command. Deploy, publish, install
+   and clean commands are dropped, and every dropped step is listed.
+4. You review each file, shown in full when new or as a diff when it exists.
+   An existing `AGENTS.md` only gains an `## Added by /init` section, and an
+   existing `verify.toml` keeps its text with the new steps appended. Text that
+   looks like an injected instruction is flagged, and that file starts rejected.
+
+In the TUI, Space, `a` and `r` toggle files and Enter writes the accepted ones.
+`tot init` is a dry run; `tot init --apply` writes everything it proposed, and
+`--apply --only AGENTS.md` writes just that file. A file that changed after the
+proposal was made is refused. Steps in `.harness/verify.toml` load only for a
+trusted project and still go through the permission policy on every run.
+Commit both files to share them. A model that is down still gives you the
+deterministic proposal. `tot doctor` flags a step whose `make` target or
+package script no longer exists.
+
 ## Tools that know the codebase
 
 Twenty-six built-ins in three packs. `coding` (core + coding) is the default; `full` adds the security pack. `security` and `minimal` narrow it further; `strict` and `shell` are weak-model presets (see [configuration](configuration.md#weak-model-profiles)). `patch` is the hash-anchored editor and is selected only when the model profile sets `edit_mode = "hash"`; text mode exposes `edit` alone.
@@ -155,7 +184,7 @@ Tab completes the token at the cursor: commands, arguments (themes, profiles, sk
 
 Write `@path` in a prompt to attach a file: `fix the panic in @src/parser.rs`. Typing `@` opens a live picker over the project's files (gitignored files excluded): it matches names fuzzily, shows each file's folder, and ranks paths under a typed directory first; Tab or Enter inserts the path. The file is read through the same path as the `read` tool and appended to your message, so the model can edit it without another read. Up to eight files per prompt, within a quarter of the usable context. You can also just name a file: `the panic at src/parser.rs:88` or a pasted stack trace attaches up to three existing text files in the project the same way, with `:line` suffixes and trace formats understood; a word that only looks like a path is ignored. `[prompt] attach_named_files = false` turns that off. `@shot.png` attaches a screenshot: a model with vision input sees the image, and a text-only model can get a description from a local vision model; the `read` tool opens images too. Images are checked by content, stripped of EXIF, and sent only to local endpoints unless you opt in. See [images.md](images.md).
 
-Slash commands: `/help /quit /login /model /profile /theme /tree /rewind /fork /new /resume /sessions /compact /tools /mcp /skill /workflow /sec /trust /commit /pr /plan /permissions /export /clear /debug`.
+Slash commands: `/help /quit /login /model /profile /theme /tree /rewind /fork /init /new /resume /sessions /compact /tools /mcp /skill /workflow /sec /trust /commit /pr /plan /permissions /export /clear /debug`.
 
 Every tool call passes a permission policy first. The default level `normal` runs read-only calls and asks before edits and commands, showing the exact command or path and a diff; `y` approves exactly that call for the session. `/permissions` opens a picker with one line per level — `normal`, `accept-edits` (edits run, commands ask), `deny-all` (anything that would ask is denied), and `yolo` (no approvals; deny rules still apply) — and `/permissions <level>` sets one directly. The footer spells out a non-default level (`deny-all: anything that would ask is denied`), `yolo` needs a one-key confirmation and is never written to the config, and `/plan` keeps its own command: mutating tools are removed and refused at dispatch until `/plan approve`. Modes, rules, and `--yolo` are in [configuration.md](configuration.md#permissions).
 
