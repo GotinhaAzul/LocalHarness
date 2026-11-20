@@ -105,6 +105,23 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("debug", "toggle the debug panel"),
 ];
 
+/// Whether a slash command line may run while a turn is in flight. These
+/// read state or touch only the session's approval latch: `/approve` covers
+/// the model's next sensitive action, so it is useful exactly while the model
+/// works. `/trust confirm` rebuilds the runtime and waits for the turn.
+pub(crate) fn runs_during_turn(line: &str) -> bool {
+    let body = line.trim().trim_start_matches('/');
+    let (name, rest) = match body.find(char::is_whitespace) {
+        Some(position) => (&body[..position], body[position..].trim()),
+        None => (body, ""),
+    };
+    match name {
+        "help" | "quit" | "debug" | "approve" => true,
+        "trust" => rest != "confirm",
+        _ => false,
+    }
+}
+
 /// Argument syntax per command, for `/help <command>`.
 fn command_usage(name: &str) -> &'static str {
     match name {

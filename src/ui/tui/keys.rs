@@ -222,9 +222,13 @@ impl App {
                 }
                 // While a switch loads, prose stays in the prompt (commands
                 // still run) so nothing typed ahead is lost.
-                let command = self.input.text().trim_start().starts_with('/');
+                let text = self.input.text();
+                let command = text.trim_start().starts_with('/');
                 let waiting = self.switching.is_some() && !command;
-                let idle = !self.turn_active && !waiting;
+                // `/approve`, `/help`, and the like run mid-turn; anything
+                // else waits so a prompt is never sent into a running turn.
+                let busy_ok = command && !text.contains('\n') && runs_during_turn(&text);
+                let idle = (!self.turn_active && !waiting) || busy_ok;
                 match self.input.submit(idle) {
                     Some(text) => {
                         let trimmed = text.trim().to_string();
@@ -247,7 +251,7 @@ impl App {
                     }
                     None if !idle => {
                         self.set_notice(
-                            "a turn is running; press Esc to cancel before sending",
+                            "a turn is running; press Esc to cancel before sending (/approve and /help work now)",
                             Role::Warning,
                         );
                     }

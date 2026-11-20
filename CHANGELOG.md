@@ -9,6 +9,10 @@ release may change defaults when the change is called out below.
 
 ### Added
 
+- `/approve` works while the model is working, so a sensitive action the
+  provenance gate held back can be approved and retried in the same turn.
+  `/help`, `/debug`, `/quit`, and `/trust` (but not `/trust confirm`) also run
+  mid-turn; before, the prompt refused every command until the turn ended.
 - `/rewind` with no argument opens a picker of your messages on the branch,
   newest first, with when each was sent and which files the rewind restores;
   type to filter, Enter rewinds. `/rewind [turns] [force]` is unchanged.

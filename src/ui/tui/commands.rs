@@ -10,8 +10,7 @@ impl App {
             Some(position) => (&body[..position], body[position..].trim()),
             None => (body, ""),
         };
-        let always = matches!(name, "help" | "quit" | "debug" | "trust" | "approve");
-        if self.turn_active && !always {
+        if self.turn_active && !runs_during_turn(text) {
             self.set_notice(
                 "cancel the running turn first (Esc) before using this command",
                 Role::Warning,
