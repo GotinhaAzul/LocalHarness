@@ -4,7 +4,7 @@
 # and sha256sums for each release; the release workflow attaches a rendered
 # copy with both filled in.
 pkgname=totality
-pkgver=0.2.0
+pkgver=0.2.1
 pkgrel=1
 pkgdesc='Local-first agent harness for coding and security work'
 arch=('x86_64' 'aarch64')

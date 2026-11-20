@@ -622,7 +622,7 @@ context joins the leading system message, written once; `user_prompt` and
 One JSONL file per session tree. Append-only. Every line is one entry.
 
 ```json
-{"v":1,"seq":0,"id":"s0","parent":null,"ts":"2026-11-07T20:00:00Z","type":"session","data":{"cwd":"/home/user/src/app","endpoint":"http://127.0.0.1:8080","model":"local-model","profile":"full","app":"0.2.0"}}
+{"v":1,"seq":0,"id":"s0","parent":null,"ts":"2026-11-07T20:00:00Z","type":"session","data":{"cwd":"/home/user/src/app","endpoint":"http://127.0.0.1:8080","model":"local-model","profile":"full","app":"0.2.1"}}
 {"v":1,"seq":1,"id":"e1","parent":null,"ts":"...","type":"user","data":{"content":"Fix the parser bug"}}
 {"v":1,"seq":2,"id":"e2","parent":"e1","ts":"...","type":"assistant","data":{"content":"I will inspect it.","tool_calls":[{"id":"call_1","name":"read","arguments":{"path":"src/parser.rs"}}],"usage":{"prompt_tokens":512,"completion_tokens":18}}}
 {"v":1,"seq":3,"id":"e3","parent":"e2","ts":"...","type":"tool_result","data":{"call_id":"call_1","content":"...","is_error":false}}

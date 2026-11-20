@@ -7,8 +7,27 @@ release may change defaults when the change is called out below.
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-11-19
+
+Quality-of-life updates: `/init` for workspace onboarding, `/tree` and
+`/rewind` pickers for moving around a session, `/approve` while the model
+works, and a run of TUI, permission, and tool-surface refinements merged since
+0.2.0.
+
 ### Added
 
+- `/init` (TUI) and `tot init` (CLI) draft `AGENTS.md` and
+  `.harness/verify.toml` for a workspace
+  ([#175](https://github.com/GotinhaAzul/Totality/issues/175)). The harness
+  reads a bounded set of files and detects steps itself, including
+  `make`/`just`/`task` targets with the line each is defined on, so a
+  Makefile-only project gets steps. One tool-less model request writes the
+  prose and may add steps, which are kept only when their cited evidence
+  checks out. Each file is reviewed (full content or diff) and approved before
+  it is written; an existing `AGENTS.md` only gains a section. `tot init` is a
+  dry run without `--apply`.
+- `tot doctor` names verify steps whose `make`/`just`/`task` target or
+  package script no longer exists.
 - `/approve` works while the model is working, so a sensitive action the
   provenance gate held back can be approved and retried in the same turn.
   `/help`, `/debug`, `/quit`, and `/trust` (but not `/trust confirm`) also run
@@ -112,6 +131,150 @@ release may change defaults when the change is called out below.
   shows a warning. This also fixes `/theme save` replacing a private (`0600`)
   config that may hold an API key with a group- or world-readable file.
   `/permissions` remains session-only and is never written.
+
+### Changed
+
+- The bottom of the TUI says plainly when something needs you. A permission
+  question, a hunk review, the `yolo` confirmation, a missing model, an
+  injection warning, a commit or pull request behind its preview gate, or a
+  finished plan replaces the spinner above the input with a reversed
+  `Needs you: <what>` bar showing the exact command or path and the keys that
+  answer it. The footer shows those keys with a `WAITING FOR YOU` or
+  `ACTION NEEDED` badge, the placeholder says keys answer the question, the
+  terminal title ends with `needs you: <what>`, and the bell rings once per
+  new item (`[ui] bell`, default `true`). Otherwise the footer shows
+  `working` during a turn and `✓ your turn` after it.
+- The header shows the prompt-cache hit as a percentage (`cache 94%`, warning
+  color under 70%) instead of token counts, keeps it at narrower widths, and
+  hides `tok/s` until a call has been measured.
+- The wall-clock checkpoint scales with the measured model speed: the
+  allowance is `[budgets] max_wall_minutes` or six model calls at the slowest
+  of the last five measured calls, whichever is longer, and the "recent
+  progress" window covers at least three such calls. A 10 tok/s thinking
+  model whose calls take several minutes is no longer stopped as
+  no-progress during one long call. Fast engines see no change.
+- The system prompt's operating rules no longer restate what the gates
+  enforce (read before edit, the plan from the third file, no interactive
+  programs, `recall` for truncated output) or ask the model to judge its own
+  context size for `thread split`; each gate says what to do when it applies,
+  and compaction runs on the measured budget. "Run verify, then review" is
+  included only with `[gates] auto_settle = false`, and the `bg` and
+  `repo_map` hints only when the profile has those tools. About 450 fewer
+  characters on every request with the default profile.
+- With no configured or accepted verify steps, a session uses the steps
+  detected from the project manifest (`[gates] verify_detected`, default
+  `true`), so the verify gate and harness-run settle checks are on in an
+  ordinary repository. This replaces "propose, never run" from #128: the
+  steps run through the permission policy like any command (the default mode
+  asks first), are never saved without `tot verify --init` or
+  `/verify accept`, and `verify_detected = false` restores the old behavior.
+  The startup notice, `/verify`, `tot verify` and `tot doctor` say the steps
+  are detected.
+- Agent-run commands (`bash`, `bg`, `verify`, `test`) can no longer wait on a
+  human. Each starts a new session with no controlling terminal, so git, ssh,
+  and sudo prompts fail at once instead of hanging the run or reading the
+  TUI's keystrokes, and each gets `GIT_TERMINAL_PROMPT=0`,
+  `GIT_EDITOR`/`EDITOR`/`VISUAL=true`, `PAGER`/`GIT_PAGER=cat`, and
+  `DEBIAN_FRONTEND=noninteractive` (inside `--sandbox` too).
+- `bash` and `bg` run `bash -c` instead of a login shell (`bash -lc`). The
+  user's profile is no longer sourced on every call, so banners and slow
+  profile scripts stay out of tool output and a command behaves the same on
+  every machine. Commands inherit the environment `tot` was started with; set
+  `BASH_ENV` to a file to source one anyway.
+- The repository map injected into the system prompt is smaller (at most
+  1200 chars, down from 1800) and says it is an index, not a full listing.
+  The map ranks files (README, manifests, entry points, source, tests, then
+  other docs), summarises code that does not fit by directory, and reserves up
+  to 40% of its budget for data and config files so a large source tree cannot
+  push them out. Data directories with up to 12 files are listed by name;
+  larger ones show name patterns such as `INV-* ×20` (#159).
+- The first no-progress stop in a turn (a budget checkpoint or the stall
+  guard) no longer ends it. The model is told to drop the repeating approach
+  and try a different method (a script, another tool), the stall counters
+  reset, and it gets one more allowance; at a tool checkpoint the pending
+  batch is skipped. The second no-progress stop ends the turn with the
+  tool-less summary as before. The session records a `budget-pivot` entry.
+  Found on A04, where the model looped on `git history` and tool hunting.
+- The tool-less summary at the end of a stopped turn gets 6144 output tokens
+  (was 1536) when the profile cannot turn thinking off. A thinking model
+  could spend the whole 1536 on reasoning and leave no summary; an empty one
+  now raises a notice.
+
+- Permission levels are named for what they do: `dont-ask` is now `deny-all`
+  and `ask` is now `normal`, in the TUI, the docs, and `--mode`. `dont-ask`
+  and `ask` are still accepted as deprecated aliases in config files and on
+  `--mode`, so existing setups keep working, and `--mode` also takes the new
+  names. `yolo` stays reachable only via `--yolo` or `/permissions yolo`.
+- **Renamed to Totality.** The binary is `tot` (installers also add a
+  `totality` link), the crate is `totality`, and environment variables use
+  the `TOT_` prefix. The `LH_` names still work. Config and data move to
+  `~/.config/totality` and `~/.local/share/totality`; the old `localharness`
+  directories are used until the new ones exist, so sessions and settings
+  carry over. Older sessions' harness messages are still recognized. The
+  installer still installs pre-0.3 releases (`lh`) when pinned.
+- **Default theme:** `default` is now the warm dusk palette (`totality`); the
+  previous default is available as `classic`.
+- Tool rows label calls by their main argument (`Read src/cli.rs · first 130
+  lines`), fold read and recall output until ctrl+o, and sit on consecutive
+  lines with the thoughts between them. Markdown headings drop their `#`
+  markers and lists use round bullets. The spinner is an eclipse.
+- `/resume`, `/sessions`, `--continue`, and `/resume last` skip the prompt
+  history file and sessions without a user message; times read as `5 min ago`.
+- A model call that fails for a transient reason is retried inside the turn:
+  a connection failure, a dropped or stalled stream, a 5xx except 501/505,
+  408/504, or 429 (now its own `rate_limited` class). `[model] retries`
+  (default 3) bounds the attempts, with jittered 1x/4x/15x backoff of
+  `retry_backoff_ms` (default 1000), honoring `Retry-After` within
+  `retry_deadline_secs` (default 120). The partial reply is logged as a
+  `model-retry` entry, never replayed; retries are notices and do not count as
+  model calls. `retries = 0` restores the old behavior
+  ([#119](https://github.com/GotinhaAzul/LocalHarness/issues/119)).
+- With `[gates] auto_settle` (default true), the harness runs verify and then
+  review itself when the model settles after changing files, through the same
+  permission rules and hooks, and records `verify-result` plus
+  `review-result`. Clean results settle on the answer already written with a
+  `[harness] verify passed, review clean` notice; a failed verify or flagged
+  review continues with one user-role message carrying the results.
+  `auto_settle = false` restores the model-relayed gate messages
+  ([#123](https://github.com/GotinhaAzul/LocalHarness/issues/123)).
+- A turn stopped by the loop guard now ends with the `stalled` status instead
+  of `done`: `lh -p` exits 2 instead of 0, a workflow step is no longer marked
+  succeeded, and ACP reports `max_turn_requests`.
+- `edit` takes `occurrence` (1-based) to replace one named match; it cannot be
+  combined with `replace_all`, and the ambiguous-match error names both. This
+  is the single text-mode editor: `patch` is now the hash-anchored editor and
+  is selected only with `edit_mode = "hash"`
+  ([#170](https://github.com/GotinhaAzul/Totality/issues/170)).
+- `verify` takes `path` and `test`. With one, it runs the detected runner for
+  that file or test and returns the first failure, the way the old `test` tool
+  did; without one it runs the configured steps exactly as before. A targeted
+  result is recorded with `targeted: true` and never clears the verify gate,
+  satisfies the final todo task, or counts for `pr draft`
+  ([#170](https://github.com/GotinhaAzul/Totality/issues/170)).
+- `git` keeps only its gated actions: `stage`, `unstage`, `commit_message`,
+  `commit`, `branch`, `worktree`, and `undo`. `status`, `diff`, `log`, and
+  `blame` are read through `bash`, where they are still classified read-only;
+  calling them through `git` returns the equivalent command in the error
+  ([#170](https://github.com/GotinhaAzul/Totality/issues/170)).
+- A profile that still lists `test`, or `patch` in text mode, loads with a
+  deprecation warning naming the replacement for one release instead of
+  failing. The built-in `strict` and `shell` profiles are unchanged
+  ([#170](https://github.com/GotinhaAzul/Totality/issues/170)).
+
+### Deprecated
+
+- `tot verify accept` replaces `tot verify --init`, matching `/verify accept`.
+  `--init` still works for this release and prints a deprecation warning.
+
+### Removed
+
+- The `test` tool. Use `verify` with `path` or `test`; a call to `test` from an
+  older session or a model trained on another harness is routed there by the
+  repair layer, with its target intact
+  ([#170](https://github.com/GotinhaAzul/Totality/issues/170)).
+- The `git` read actions (`status`, `diff`, `log`, `blame`). Use `bash` and the
+  equivalent git command, which the error spells out
+  ([#170](https://github.com/GotinhaAzul/Totality/issues/170)).
 
 ### Fixed
 
@@ -261,148 +424,6 @@ release may change defaults when the change is called out below.
   ([#120](https://github.com/GotinhaAzul/LocalHarness/issues/120)).
 - `grep` prints `--` separators only between context groups. With no context
   lines it printed one after every non-adjacent match.
-
-### Changed
-
-- The bottom of the TUI says plainly when something needs you. A permission
-  question, a hunk review, the `yolo` confirmation, a missing model, an
-  injection warning, a commit or pull request behind its preview gate, or a
-  finished plan replaces the spinner above the input with a reversed
-  `Needs you: <what>` bar showing the exact command or path and the keys that
-  answer it. The footer shows those keys with a `WAITING FOR YOU` or
-  `ACTION NEEDED` badge, the placeholder says keys answer the question, the
-  terminal title ends with `needs you: <what>`, and the bell rings once per
-  new item (`[ui] bell`, default `true`). Otherwise the footer shows
-  `working` during a turn and `✓ your turn` after it.
-- The header shows the prompt-cache hit as a percentage (`cache 94%`, warning
-  color under 70%) instead of token counts, keeps it at narrower widths, and
-  hides `tok/s` until a call has been measured.
-- The wall-clock checkpoint scales with the measured model speed: the
-  allowance is `[budgets] max_wall_minutes` or six model calls at the slowest
-  of the last five measured calls, whichever is longer, and the "recent
-  progress" window covers at least three such calls. A 10 tok/s thinking
-  model whose calls take several minutes is no longer stopped as
-  no-progress during one long call. Fast engines see no change.
-- The system prompt's operating rules no longer restate what the gates
-  enforce (read before edit, the plan from the third file, no interactive
-  programs, `recall` for truncated output) or ask the model to judge its own
-  context size for `thread split`; each gate says what to do when it applies,
-  and compaction runs on the measured budget. "Run verify, then review" is
-  included only with `[gates] auto_settle = false`, and the `bg` and
-  `repo_map` hints only when the profile has those tools. About 450 fewer
-  characters on every request with the default profile.
-- With no configured or accepted verify steps, a session uses the steps
-  detected from the project manifest (`[gates] verify_detected`, default
-  `true`), so the verify gate and harness-run settle checks are on in an
-  ordinary repository. This replaces "propose, never run" from #128: the
-  steps run through the permission policy like any command (the default mode
-  asks first), are never saved without `tot verify --init` or
-  `/verify accept`, and `verify_detected = false` restores the old behavior.
-  The startup notice, `/verify`, `tot verify` and `tot doctor` say the steps
-  are detected.
-- Agent-run commands (`bash`, `bg`, `verify`, `test`) can no longer wait on a
-  human. Each starts a new session with no controlling terminal, so git, ssh,
-  and sudo prompts fail at once instead of hanging the run or reading the
-  TUI's keystrokes, and each gets `GIT_TERMINAL_PROMPT=0`,
-  `GIT_EDITOR`/`EDITOR`/`VISUAL=true`, `PAGER`/`GIT_PAGER=cat`, and
-  `DEBIAN_FRONTEND=noninteractive` (inside `--sandbox` too).
-- `bash` and `bg` run `bash -c` instead of a login shell (`bash -lc`). The
-  user's profile is no longer sourced on every call, so banners and slow
-  profile scripts stay out of tool output and a command behaves the same on
-  every machine. Commands inherit the environment `tot` was started with; set
-  `BASH_ENV` to a file to source one anyway.
-- The repository map injected into the system prompt is smaller (at most
-  1200 chars, down from 1800) and says it is an index, not a full listing.
-  The map ranks files (README, manifests, entry points, source, tests, then
-  other docs), summarises code that does not fit by directory, and reserves up
-  to 40% of its budget for data and config files so a large source tree cannot
-  push them out. Data directories with up to 12 files are listed by name;
-  larger ones show name patterns such as `INV-* ×20` (#159).
-- The first no-progress stop in a turn (a budget checkpoint or the stall
-  guard) no longer ends it. The model is told to drop the repeating approach
-  and try a different method (a script, another tool), the stall counters
-  reset, and it gets one more allowance; at a tool checkpoint the pending
-  batch is skipped. The second no-progress stop ends the turn with the
-  tool-less summary as before. The session records a `budget-pivot` entry.
-  Found on A04, where the model looped on `git history` and tool hunting.
-- The tool-less summary at the end of a stopped turn gets 6144 output tokens
-  (was 1536) when the profile cannot turn thinking off. A thinking model
-  could spend the whole 1536 on reasoning and leave no summary; an empty one
-  now raises a notice.
-
-- Permission levels are named for what they do: `dont-ask` is now `deny-all`
-  and `ask` is now `normal`, in the TUI, the docs, and `--mode`. `dont-ask`
-  and `ask` are still accepted as deprecated aliases in config files and on
-  `--mode`, so existing setups keep working, and `--mode` also takes the new
-  names. `yolo` stays reachable only via `--yolo` or `/permissions yolo`.
-- **Renamed to Totality.** The binary is `tot` (installers also add a
-  `totality` link), the crate is `totality`, and environment variables use
-  the `TOT_` prefix. The `LH_` names still work. Config and data move to
-  `~/.config/totality` and `~/.local/share/totality`; the old `localharness`
-  directories are used until the new ones exist, so sessions and settings
-  carry over. Older sessions' harness messages are still recognized. The
-  installer still installs pre-0.3 releases (`lh`) when pinned.
-- **Default theme:** `default` is now the warm dusk palette (`totality`); the
-  previous default is available as `classic`.
-- Tool rows label calls by their main argument (`Read src/cli.rs · first 130
-  lines`), fold read and recall output until ctrl+o, and sit on consecutive
-  lines with the thoughts between them. Markdown headings drop their `#`
-  markers and lists use round bullets. The spinner is an eclipse.
-- `/resume`, `/sessions`, `--continue`, and `/resume last` skip the prompt
-  history file and sessions without a user message; times read as `5 min ago`.
-- A model call that fails for a transient reason is retried inside the turn:
-  a connection failure, a dropped or stalled stream, a 5xx except 501/505,
-  408/504, or 429 (now its own `rate_limited` class). `[model] retries`
-  (default 3) bounds the attempts, with jittered 1x/4x/15x backoff of
-  `retry_backoff_ms` (default 1000), honoring `Retry-After` within
-  `retry_deadline_secs` (default 120). The partial reply is logged as a
-  `model-retry` entry, never replayed; retries are notices and do not count as
-  model calls. `retries = 0` restores the old behavior
-  ([#119](https://github.com/GotinhaAzul/LocalHarness/issues/119)).
-- With `[gates] auto_settle` (default true), the harness runs verify and then
-  review itself when the model settles after changing files, through the same
-  permission rules and hooks, and records `verify-result` plus
-  `review-result`. Clean results settle on the answer already written with a
-  `[harness] verify passed, review clean` notice; a failed verify or flagged
-  review continues with one user-role message carrying the results.
-  `auto_settle = false` restores the model-relayed gate messages
-  ([#123](https://github.com/GotinhaAzul/LocalHarness/issues/123)).
-- A turn stopped by the loop guard now ends with the `stalled` status instead
-  of `done`: `lh -p` exits 2 instead of 0, a workflow step is no longer marked
-  succeeded, and ACP reports `max_turn_requests`.
-
-### Changed
-
-- `edit` takes `occurrence` (1-based) to replace one named match; it cannot be
-  combined with `replace_all`, and the ambiguous-match error names both. This
-  is the single text-mode editor: `patch` is now the hash-anchored editor and
-  is selected only with `edit_mode = "hash"`
-  ([#170](https://github.com/GotinhaAzul/Totality/issues/170)).
-- `verify` takes `path` and `test`. With one, it runs the detected runner for
-  that file or test and returns the first failure, the way the old `test` tool
-  did; without one it runs the configured steps exactly as before. A targeted
-  result is recorded with `targeted: true` and never clears the verify gate,
-  satisfies the final todo task, or counts for `pr draft`
-  ([#170](https://github.com/GotinhaAzul/Totality/issues/170)).
-- `git` keeps only its gated actions: `stage`, `unstage`, `commit_message`,
-  `commit`, `branch`, `worktree`, and `undo`. `status`, `diff`, `log`, and
-  `blame` are read through `bash`, where they are still classified read-only;
-  calling them through `git` returns the equivalent command in the error
-  ([#170](https://github.com/GotinhaAzul/Totality/issues/170)).
-- A profile that still lists `test`, or `patch` in text mode, loads with a
-  deprecation warning naming the replacement for one release instead of
-  failing. The built-in `strict` and `shell` profiles are unchanged
-  ([#170](https://github.com/GotinhaAzul/Totality/issues/170)).
-
-### Removed
-
-- The `test` tool. Use `verify` with `path` or `test`; a call to `test` from an
-  older session or a model trained on another harness is routed there by the
-  repair layer, with its target intact
-  ([#170](https://github.com/GotinhaAzul/Totality/issues/170)).
-- The `git` read actions (`status`, `diff`, `log`, `blame`). Use `bash` and the
-  equivalent git command, which the error spells out
-  ([#170](https://github.com/GotinhaAzul/Totality/issues/170)).
 
 ## [0.2.0] - 2026-11-15
 
@@ -577,4 +598,6 @@ packaging, and a local HTTP API. It includes all work merged in PRs
   event-log lock, and refuses a cross-root session-id collision instead of
   replacing the live entry ([PR #113](https://github.com/GotinhaAzul/LocalHarness/pull/113)).
 
+[Unreleased]: https://github.com/GotinhaAzul/Totality/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/GotinhaAzul/Totality/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/GotinhaAzul/LocalHarness/compare/v0.1.0...v0.2.0
