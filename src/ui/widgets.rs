@@ -671,7 +671,10 @@ impl HunkReviewModal {
 impl ModalData {
     pub fn title(&self) -> String {
         match self {
-            ModalData::Tree(_) => " Session tree ".into(),
+            ModalData::Tree(_) => {
+                " Session tree · ↑↓ move · [ ] messages · Enter go here · r rewind files too · Esc close "
+                    .into()
+            }
             ModalData::Sessions(_) => " Sessions · Enter resume · Esc close ".into(),
             ModalData::Tools(_) => " Tools ".into(),
             ModalData::Picker(view) => {
@@ -845,33 +848,48 @@ pub fn tree_lines(view: &TreeView, width: usize, theme: &Theme) -> Vec<Line<'sta
     for (index, row) in view.rows.iter().enumerate() {
         let when = row
             .ts
-            .map(|ts| ts.format("%H:%M").to_string())
+            .map(|ts| ts.with_timezone(&chrono::Local).format("%H:%M").to_string())
             .unwrap_or_default();
-        let tokens = if row.tokens > 0 {
-            format!("~{}t", row.tokens)
+        let mut tail = String::new();
+        if row.tools > 0 {
+            tail.push_str(&format!(
+                "  {} tool{}",
+                row.tools,
+                if row.tools == 1 { "" } else { "s" }
+            ));
+        }
+        if !when.is_empty() {
+            tail.push_str(&format!("  {when}"));
+        }
+        if row.tokens > 0 {
+            tail.push_str(&format!("  ~{}t", row.tokens));
+        }
+        tail.push_str(&format!("  {}", row.id));
+        let here = if row.active { "  ← here" } else { "" };
+        // `●` marks the active branch so the way back is easy to follow.
+        let marker = if row.on_path { "● " } else { "  " };
+        let fixed = UnicodeWidthStr::width(row.prefix.as_str())
+            + 2
+            + 3
+            + UnicodeWidthStr::width(tail.as_str())
+            + UnicodeWidthStr::width(here);
+        let preview_style = if row.on_path {
+            theme.style(Role::Fg)
         } else {
-            String::new()
+            theme.style(Role::Muted)
         };
         let mut spans = vec![
             Span::styled(row.prefix.clone(), theme.style(Role::Border)),
-            Span::styled(format!("{}  ", row.id), theme.style(Role::Muted)),
+            Span::styled(marker, theme.style(Role::Accent)),
             Span::styled(format!("{}  ", row.role), role_style(row.role, theme)),
             Span::styled(
-                clip_end(&row.preview, width.saturating_sub(28).max(10)),
-                theme.style(Role::Fg),
+                clip_end(&row.preview, width.saturating_sub(fixed).max(10)),
+                preview_style,
             ),
+            Span::styled(tail, theme.style(Role::Muted)),
         ];
-        if !when.is_empty() {
-            spans.push(Span::raw("  "));
-            spans.push(Span::styled(when, theme.style(Role::Muted)));
-        }
-        if !tokens.is_empty() {
-            spans.push(Span::raw("  "));
-            spans.push(Span::styled(tokens, theme.style(Role::Muted)));
-        }
         if row.active {
-            spans.push(Span::raw("  "));
-            spans.push(Span::styled("*", theme.bold(Role::Accent)));
+            spans.push(Span::styled(here, theme.bold(Role::Accent)));
         }
         let mut line = Line::from(spans);
         if index == view.selected {

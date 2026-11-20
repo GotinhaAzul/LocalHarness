@@ -630,7 +630,7 @@ mod tests {
     const COMMANDS: &[(&str, &str)] = &[
         ("help", "list commands"),
         ("theme", "change the theme"),
-        ("tree", "browse the session tree"),
+        ("tree", "browse the session tree and jump to any step"),
         ("trust", "show trust state"),
         ("sec", "security"),
         ("export", "export"),

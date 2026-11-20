@@ -1,4 +1,11 @@
 //! `/tree` modal: a flattened, depth-first view of the session tree.
+//!
+//! Tool results fold into the assistant step that called them, and entries
+//! the user never sees (the session header, checkout markers, `custom`
+//! bookkeeping such as `tool-probe` or `fs-change`) are looked through: their
+//! visible descendants keep the place in the tree they would have had.
+
+use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 
@@ -14,10 +21,25 @@ pub struct TreeRow {
     pub role: char,
     pub preview: String,
     pub ts: Option<DateTime<Utc>>,
-    /// Rough token estimate for the entry.
+    /// Rough token estimate for the entry and its folded tool results.
     pub tokens: u64,
-    /// True when this entry is the active leaf.
+    /// Tool calls this assistant step made; their results are folded in.
+    pub tools: usize,
+    /// True when this row is where the conversation currently stands.
     pub active: bool,
+    /// True when the row is on the active branch.
+    pub on_path: bool,
+}
+
+/// Where choosing a row moves the conversation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Destination {
+    /// Entry the leaf moves to. It can be the session header, which means
+    /// "before the first message".
+    pub target: String,
+    /// The user message the destination sits just before, to put back in the
+    /// prompt for editing and resending.
+    pub prefill: Option<String>,
 }
 
 /// Selection and scroll state for the tree modal.
@@ -34,19 +56,43 @@ impl TreeView {
     }
 
     pub fn from_tree(tree: &SessionTree, active: Option<&str>) -> Self {
-        let mut rows = Vec::new();
-        let roots: Vec<&Entry> = tree
-            .roots()
-            .into_iter()
-            .filter(|entry| is_displayed(entry))
-            .collect();
-        let last = roots.len().saturating_sub(1);
-        for (index, root) in roots.into_iter().enumerate() {
-            walk(tree, root, 0, "", "", index == last, active, &mut rows);
+        let path: Vec<&Entry> = active.map(|id| tree.path_to(id)).unwrap_or_default();
+        let on_path: HashSet<&str> = path.iter().map(|entry| entry.id.as_str()).collect();
+        // The leaf is often hidden (a tool result, an `fs-change` record, a
+        // rewind marker); the row that stands for it is its nearest visible
+        // ancestor.
+        let active_row = path
+            .iter()
+            .rev()
+            .find(|entry| is_displayed(entry))
+            .map(|entry| entry.id.clone());
+        // One pass over the entries; `SessionTree::children` scans them all.
+        let mut children: HashMap<&str, Vec<&Entry>> = HashMap::new();
+        for entry in tree.entries() {
+            if let (Some(parent), false) = (entry.parent.as_deref(), entry.is_checkout()) {
+                children.entry(parent).or_default().push(entry);
+            }
         }
+        let ctx = Walk {
+            tree,
+            children,
+            active: active_row.as_deref(),
+            on_path: &on_path,
+        };
+        let mut rows = Vec::new();
+        let mut roots = Vec::new();
+        for root in tree.roots() {
+            if is_displayed(root) {
+                roots.push(root);
+            } else {
+                roots.extend(ctx.visible_children(&root.id));
+            }
+        }
+        ctx.walk_children(&roots, 0, "", &mut rows);
+        let selected = rows.iter().position(|row| row.active).unwrap_or(0);
         TreeView {
             rows,
-            selected: 0,
+            selected,
             scroll: 0,
         }
     }
@@ -86,6 +132,25 @@ impl TreeView {
         }
     }
 
+    /// Select the row standing for the active leaf.
+    pub fn select_active(&mut self) {
+        if let Some(index) = self.rows.iter().position(|row| row.active) {
+            self.selected = index;
+        }
+    }
+
+    /// Jump to the previous (`-1`) or next (`1`) user message.
+    pub fn jump_user(&mut self, direction: isize) {
+        let mut index = self.selected as isize + direction;
+        while index >= 0 && (index as usize) < self.rows.len() {
+            if self.rows[index as usize].role == 'U' {
+                self.selected = index as usize;
+                return;
+            }
+            index += direction;
+        }
+    }
+
     /// Keep the selected row inside a viewport of `height` rows.
     pub fn ensure_visible(&mut self, height: usize) {
         let height = height.max(1);
@@ -105,72 +170,162 @@ impl TreeView {
             .ok_or_else(|| CheckoutError::NotFound("(empty tree)".into()))?;
         tree.resolve_checkout(&row.id)
     }
+
+    /// Where choosing the selected row goes. A user message means "go back to
+    /// just before it" with its text ready to edit; any other row continues
+    /// the conversation from that step.
+    pub fn destination(&self, tree: &SessionTree) -> Result<Destination, CheckoutError> {
+        let row = self
+            .selected_row()
+            .ok_or_else(|| CheckoutError::NotFound("(empty tree)".into()))?;
+        destination_for(tree, &row.id)
+    }
+}
+
+/// See [`TreeView::destination`].
+pub fn destination_for(tree: &SessionTree, id: &str) -> Result<Destination, CheckoutError> {
+    let entry = tree
+        .get(id)
+        .ok_or_else(|| CheckoutError::NotFound(id.to_string()))?;
+    if let EntryKind::User(user) = &entry.kind {
+        let target = match &entry.parent {
+            Some(parent) => tree.resolve_checkout(parent)?,
+            None => tree
+                .header()
+                .map(|header| header.id.clone())
+                .ok_or(CheckoutError::SessionHeader)?,
+        };
+        return Ok(Destination {
+            target,
+            prefill: Some(user.content.clone()),
+        });
+    }
+    Ok(Destination {
+        target: tree.resolve_checkout(id)?,
+        prefill: None,
+    })
 }
 
 fn is_displayed(entry: &Entry) -> bool {
     !matches!(
         entry.kind,
-        EntryKind::Session(_) | EntryKind::Checkout(_) | EntryKind::Custom(_)
+        EntryKind::Session(_)
+            | EntryKind::Checkout(_)
+            | EntryKind::Custom(_)
+            | EntryKind::ToolResult(_)
     )
 }
 
-#[allow(clippy::too_many_arguments)]
-fn walk(
-    tree: &SessionTree,
-    entry: &Entry,
-    depth: usize,
-    prefix: &str,
-    child_prefix: &str,
-    _last: bool,
-    active: Option<&str>,
-    rows: &mut Vec<TreeRow>,
-) {
-    rows.push(TreeRow {
-        id: entry.id.clone(),
-        depth,
-        prefix: prefix.to_string(),
-        role: entry.role_char(),
-        preview: entry.preview(72),
-        ts: Some(entry.ts),
-        tokens: estimate_tokens(entry),
-        active: active == Some(entry.id.as_str()),
-    });
-    if depth > 256 {
-        return;
-    }
-    let children: Vec<&Entry> = visible_children(tree, &entry.id);
-    let last = children.len().saturating_sub(1);
-    for (index, child) in children.into_iter().enumerate() {
-        let child_last = index == last;
-        let connector = if child_last { "`- " } else { "|- " };
-        let row_prefix = format!("{child_prefix}{connector}");
-        let next_prefix = format!("{child_prefix}{}", if child_last { "   " } else { "|  " });
-        walk(
-            tree,
-            child,
-            depth + 1,
-            &row_prefix,
-            &next_prefix,
-            child_last,
-            active,
-            rows,
-        );
-    }
+struct Walk<'a> {
+    tree: &'a SessionTree,
+    children: HashMap<&'a str, Vec<&'a Entry>>,
+    active: Option<&'a str>,
+    on_path: &'a HashSet<&'a str>,
 }
 
-/// Displayed children of `id`, looking through entries the tree does not show
-/// (`fs-change`, rewind markers, session headers). A hidden entry is
-/// structural, not a branch: its visible descendants stay on the same level.
-fn visible_children<'a>(tree: &'a SessionTree, id: &str) -> Vec<&'a Entry> {
-    let mut out = Vec::new();
-    for child in tree.children(id) {
-        if is_displayed(child) {
-            out.push(child);
-        } else {
-            out.extend(visible_children(tree, &child.id));
+impl<'a> Walk<'a> {
+    /// Emit `entry` and everything below it. A single child continues the
+    /// line at the same depth (in a loop, so a long session cannot overflow
+    /// the stack); only a real branch point indents and recurses, so a long
+    /// linear session stays flush left.
+    fn walk(
+        &self,
+        entry: &'a Entry,
+        depth: usize,
+        prefix: &str,
+        child_prefix: &str,
+        rows: &mut Vec<TreeRow>,
+    ) {
+        rows.push(self.row(entry, depth, prefix));
+        let mut cursor = entry;
+        loop {
+            let children = self.visible_children(&cursor.id);
+            match children.as_slice() {
+                [] => return,
+                [only] => {
+                    rows.push(self.row(only, depth, child_prefix));
+                    cursor = only;
+                }
+                _ => {
+                    self.walk_children(&children, depth, child_prefix, rows);
+                    return;
+                }
+            }
         }
     }
-    out
+
+    fn walk_children(
+        &self,
+        children: &[&'a Entry],
+        depth: usize,
+        prefix: &str,
+        rows: &mut Vec<TreeRow>,
+    ) {
+        if let [only] = children {
+            self.walk(only, depth, prefix, prefix, rows);
+            return;
+        }
+        if depth > 256 {
+            return;
+        }
+        let last = children.len().saturating_sub(1);
+        for (index, child) in children.iter().enumerate() {
+            let child_last = index == last;
+            let connector = if child_last { "└─ " } else { "├─ " };
+            let row_prefix = format!("{prefix}{connector}");
+            let next_prefix = format!("{prefix}{}", if child_last { "   " } else { "│  " });
+            self.walk(child, depth + 1, &row_prefix, &next_prefix, rows);
+        }
+    }
+
+    fn row(&self, entry: &Entry, depth: usize, prefix: &str) -> TreeRow {
+        let tools = match &entry.kind {
+            EntryKind::Assistant(data) => data.tool_calls.as_ref().map_or(0, Vec::len),
+            _ => 0,
+        };
+        let folded: u64 = if tools > 0 {
+            self.tree
+                .batch_results(&entry.id)
+                .into_iter()
+                .map(estimate_tokens)
+                .sum()
+        } else {
+            0
+        };
+        TreeRow {
+            id: entry.id.clone(),
+            depth,
+            prefix: prefix.to_string(),
+            role: entry.role_char(),
+            preview: entry.preview(72),
+            ts: Some(entry.ts),
+            tokens: estimate_tokens(entry) + folded,
+            tools,
+            active: self.active == Some(entry.id.as_str()),
+            on_path: self.on_path.contains(entry.id.as_str()),
+        }
+    }
+
+    /// Displayed children of `id`, looking through entries the tree does not
+    /// show (tool results, `fs-change`, rewind markers, session headers). A
+    /// hidden entry is structural, not a branch: its visible descendants stay
+    /// on the same level.
+    fn visible_children(&self, id: &str) -> Vec<&'a Entry> {
+        let mut out = Vec::new();
+        let mut stack: Vec<&'a Entry> = self
+            .children
+            .get(id)
+            .map(|kids| kids.iter().rev().copied().collect())
+            .unwrap_or_default();
+        while let Some(child) = stack.pop() {
+            if is_displayed(child) {
+                out.push(child);
+            } else if let Some(kids) = self.children.get(child.id.as_str()) {
+                stack.extend(kids.iter().rev().copied());
+            }
+        }
+        out
+    }
 }
 
 /// Coarse token estimate: characters divided by four.
@@ -294,14 +449,20 @@ mod tests {
     fn renders_two_branches_with_connectors_and_active_marker() {
         let tree = fixture();
         let view = TreeView::from_tree(&tree, Some("e6"));
-        assert_eq!(view.rows.len(), 6);
+        let ids: Vec<&str> = view.rows.iter().map(|row| row.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["e1", "e2", "e4", "e5", "e6"],
+            "tool results fold away"
+        );
         assert_eq!(view.rows[0].role, 'U');
         assert_eq!(view.rows[1].role, 'A');
-        assert_eq!(view.rows[2].role, 'R');
-        // e4 is the first of two children, e5 the last.
-        assert_eq!(view.rows[3].prefix, "      |- ");
-        assert_eq!(view.rows[4].prefix, "      `- ");
-        assert_eq!(view.rows[5].prefix, "         `- ");
+        assert_eq!(view.rows[1].tools, 1);
+        // A linear run stays flush left; only the branch point indents.
+        assert_eq!(view.rows[1].prefix, "");
+        assert_eq!(view.rows[2].prefix, "├─ ");
+        assert_eq!(view.rows[3].prefix, "└─ ");
+        assert_eq!(view.rows[4].prefix, "   ");
         let active: Vec<&str> = view
             .rows
             .iter()
@@ -309,8 +470,16 @@ mod tests {
             .map(|row| row.id.as_str())
             .collect();
         assert_eq!(active, vec!["e6"]);
+        assert_eq!(view.selected, 4, "the view opens on the active row");
+        let on_path: Vec<&str> = view
+            .rows
+            .iter()
+            .filter(|row| row.on_path)
+            .map(|row| row.id.as_str())
+            .collect();
+        assert_eq!(on_path, ["e1", "e2", "e5", "e6"]);
         assert_eq!(view.rows[0].preview, "Fix the parser bug");
-        assert!(view.rows[2].tokens > 0);
+        assert!(view.rows[1].tokens > estimate_tokens(tree.get("e2").unwrap()));
     }
 
     #[test]
@@ -319,10 +488,109 @@ mod tests {
         let mut view = TreeView::from_tree(&tree, Some("e6"));
         view.selected = 1; // assistant with one call
         assert_eq!(view.resolve(&tree).unwrap(), "e3");
-        view.selected = 3; // assistant without calls
+        view.selected = 2; // assistant without calls
         assert_eq!(view.resolve(&tree).unwrap(), "e4");
-        view.selected = 2; // result resolves to its batch end
-        assert_eq!(view.resolve(&tree).unwrap(), "e3");
+    }
+
+    #[test]
+    fn a_user_row_goes_back_to_just_before_the_message() {
+        let mut tree = fixture();
+        tree.push(entry(
+            0,
+            "s0",
+            None,
+            EntryKind::Session(
+                serde_json::from_value(json!({
+                    "cwd": "", "endpoint": "", "model": "", "profile": "", "app": ""
+                }))
+                .unwrap(),
+            ),
+        ));
+        let mut view = TreeView::from_tree(&tree, Some("e6"));
+        view.selected = 3; // e5, a user message after the tool batch
+        assert_eq!(
+            view.destination(&tree).unwrap(),
+            Destination {
+                target: "e3".into(),
+                prefill: Some("Try another approach".into()),
+            }
+        );
+        view.selected = 0; // the first message has no parent: before it is the header
+        assert_eq!(view.destination(&tree).unwrap().target, "s0");
+        view.selected = 2;
+        assert_eq!(
+            view.destination(&tree).unwrap(),
+            Destination {
+                target: "e4".into(),
+                prefill: None,
+            }
+        );
+    }
+
+    #[test]
+    fn a_hidden_root_does_not_hide_the_conversation() {
+        // Real sessions start with a `tool-probe` record before the first
+        // message, so every later entry descends from a hidden root.
+        let mut tree = SessionTree::new();
+        tree.push(entry(
+            1,
+            "e1",
+            None,
+            EntryKind::Custom(crate::session::CustomData::new("tool-probe")),
+        ));
+        tree.push(user(2, "e2", Some("e1"), "hello"));
+        tree.push(assistant(3, "e3", "e2", 0, "hi"));
+        tree.push(entry(
+            4,
+            "e4",
+            Some("e3"),
+            EntryKind::Custom(crate::session::CustomData::new("fs-change")),
+        ));
+        let view = TreeView::from_tree(&tree, Some("e4"));
+        let ids: Vec<&str> = view.rows.iter().map(|row| row.id.as_str()).collect();
+        assert_eq!(ids, ["e2", "e3"]);
+        assert!(
+            view.rows[1].active,
+            "a hidden leaf marks its visible ancestor"
+        );
+        assert_eq!(view.selected, 1);
+        assert_eq!(view.destination(&tree).unwrap().target, "e3");
+        let mut view = view;
+        view.selected = 0;
+        assert_eq!(view.destination(&tree).unwrap().target, "e1");
+    }
+
+    #[test]
+    fn a_long_linear_session_does_not_indent_or_recurse() {
+        let mut tree = SessionTree::new();
+        tree.push(user(1, "e1", None, "go"));
+        let mut parent = "e1".to_string();
+        for seq in 2..5_000u64 {
+            let id = format!("e{seq}");
+            tree.push(assistant(seq, &id, &parent, 0, "step"));
+            parent = id;
+        }
+        let view = TreeView::from_tree(&tree, Some(&parent));
+        assert_eq!(view.rows.len(), 4_999);
+        assert!(
+            view.rows
+                .iter()
+                .all(|row| row.depth == 0 && row.prefix.is_empty())
+        );
+    }
+
+    #[test]
+    fn jump_user_moves_between_messages() {
+        let tree = fixture();
+        let mut view = TreeView::from_tree(&tree, Some("e6"));
+        view.jump_user(-1);
+        assert_eq!(view.selected_row().unwrap().id, "e5");
+        view.jump_user(-1);
+        assert_eq!(view.selected_row().unwrap().id, "e1");
+        view.jump_user(-1);
+        assert_eq!(view.selected_row().unwrap().id, "e1");
+        view.jump_user(1);
+        assert_eq!(view.selected_row().unwrap().id, "e5");
     }
 
     #[test]
@@ -335,7 +603,8 @@ mod tests {
         let error = tree.resolve_checkout("e2").unwrap_err();
         assert_eq!(error, CheckoutError::IncompleteBatch { have: 1, want: 2 });
         assert!(error.to_string().contains("incomplete"));
-        assert_eq!(view.rows.len(), 3);
+        assert_eq!(view.rows.len(), 2);
+        assert!(view.rows[1].active);
     }
 
     #[test]
@@ -373,7 +642,7 @@ mod tests {
             ["e1", "e3"],
             "the assistant below a hidden fs-change entry stays visible"
         );
-        assert_eq!(view.rows[1].depth, 1);
+        assert_eq!(view.rows[1].depth, 0);
     }
 
     #[test]

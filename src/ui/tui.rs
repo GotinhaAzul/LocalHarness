@@ -69,10 +69,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("login", "configure the endpoint, model, and API key"),
     ("profile", "pick the tool profile"),
     ("theme", "pick a theme (live preview) or save it"),
-    ("tree", "browse and checkout the session tree"),
+    ("tree", "browse the session tree and jump to any step"),
     (
         "rewind",
-        "restore files and the conversation to an earlier turn",
+        "pick a message to rewind files and the conversation to",
     ),
     ("fork", "checkout the latest assistant step"),
     ("new", "start a fresh session"),
@@ -114,7 +114,10 @@ fn command_usage(name: &str) -> &'static str {
         "profile" => "/profile [name]   (no name: pick from a list)",
         "theme" => "/theme [name|save]   (no name: pick with live preview)",
         "resume" => "/resume [id|last]   (no id: pick from a list)",
-        "rewind" => "/rewind [turns] [force]   (default: before the last user message)",
+        "rewind" => "/rewind [turns] [force]   (no argument: pick the message to go back before)",
+        "tree" => {
+            "/tree   (Enter go here · r rewind files too · R force · [ ] messages · . current)"
+        }
         "skill" => "/skill [name]   (no name: pick from a list)",
         "workflow" => "/workflow [name]   (no name: pick from a list)",
         "sec" => {

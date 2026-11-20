@@ -1581,3 +1581,148 @@ async fn applying_theme_profile_and_reasoning_persists_them() {
         "the profile write keeps unrelated keys"
     );
 }
+
+/// A session shaped like a real one: a `tool-probe` record before the first
+/// message, two turns, and an `fs-change` from the second turn.
+fn seed_navigation_session(app: &App) -> (String, String, String) {
+    let cwd = app.cwd_path();
+    std::fs::write(cwd.join("a.txt"), "changed\n").unwrap();
+    let session = app.runtime.as_ref().unwrap().session.clone();
+    let mut session = session.lock().unwrap();
+    session
+        .append(EntryKind::Custom(crate::session::CustomData::new(
+            "tool-probe",
+        )))
+        .unwrap();
+    let first = session
+        .append(EntryKind::User(UserData {
+            attachments: Vec::new(),
+            content: "first turn".into(),
+        }))
+        .unwrap();
+    let reply = session
+        .append(EntryKind::Assistant(crate::session::AssistantData {
+            content: Some("ok".into()),
+            ..Default::default()
+        }))
+        .unwrap();
+    let second = session
+        .append(EntryKind::User(UserData {
+            attachments: Vec::new(),
+            content: "second turn".into(),
+        }))
+        .unwrap();
+    let snapshot = session.artifacts.write("original\n").unwrap();
+    session
+        .append(EntryKind::Custom(
+            crate::session::CustomData::new("fs-change")
+                .with("path", "a.txt")
+                .with("snapshot", snapshot.id)
+                .with(
+                    "after_sha256",
+                    crate::tools::undo::content_hash(b"changed\n"),
+                ),
+        ))
+        .unwrap();
+    (first.id, reply.id, second.id)
+}
+
+fn leaf(app: &App) -> String {
+    app.runtime
+        .as_ref()
+        .unwrap()
+        .session
+        .lock()
+        .unwrap()
+        .active_leaf_id()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn tree_opens_on_a_session_that_starts_with_a_hidden_record() {
+    let (_dir, mut app) = test_app().await;
+    seed_navigation_session(&app);
+    app.run_command("/tree").await;
+    let Some(ModalData::Tree(view)) = &app.modal else {
+        panic!("the tree modal did not open: {:?}", app.notice);
+    };
+    let previews: Vec<&str> = view.rows.iter().map(|row| row.preview.as_str()).collect();
+    assert_eq!(previews, ["first turn", "ok", "second turn"]);
+    assert_eq!(view.selected, 2, "the tree opens on the active step");
+}
+
+#[tokio::test]
+async fn tree_enter_on_a_message_goes_back_before_it_and_prefills_it() {
+    let (_dir, mut app) = test_app().await;
+    let (_, reply, _) = seed_navigation_session(&app);
+    app.run_command("/tree").await;
+    app.handle_modal_key(key(KeyCode::Enter)).await;
+    assert!(app.modal.is_none());
+    assert_eq!(leaf(&app), reply);
+    assert_eq!(app.input.text(), "second turn");
+    assert_eq!(
+        std::fs::read_to_string(app.cwd_path().join("a.txt")).unwrap(),
+        "changed\n",
+        "Enter moves the conversation only"
+    );
+}
+
+#[tokio::test]
+async fn tree_r_rewinds_files_too() {
+    let (_dir, mut app) = test_app().await;
+    seed_navigation_session(&app);
+    app.run_command("/tree").await;
+    app.handle_modal_key(key(KeyCode::Char('['))).await;
+    app.handle_modal_key(key(KeyCode::Char('['))).await;
+    app.handle_modal_key(key(KeyCode::Char('r'))).await;
+    assert!(app.modal.is_none(), "{:?}", app.notice);
+    assert_eq!(
+        std::fs::read_to_string(app.cwd_path().join("a.txt")).unwrap(),
+        "original\n"
+    );
+    assert_eq!(app.input.text(), "first turn");
+    let session = app.runtime.as_ref().unwrap().session.lock().unwrap();
+    assert!(session.latest_custom_on_path("rewind").is_some());
+    assert!(
+        !session
+            .branch_entries()
+            .iter()
+            .any(|entry| matches!(entry.kind, EntryKind::User(_))),
+        "back before the first message"
+    );
+}
+
+#[tokio::test]
+async fn bare_rewind_opens_a_picker_of_messages() {
+    let (_dir, mut app) = test_app().await;
+    let (_, reply, _) = seed_navigation_session(&app);
+    app.run_command("/rewind").await;
+    let Some(ModalData::Picker(view)) = &app.modal else {
+        panic!("the rewind picker did not open: {:?}", app.notice);
+    };
+    let labels: Vec<&str> = view.items.iter().map(|item| item.label.as_str()).collect();
+    assert_eq!(labels, ["#2 second turn", "#1 first turn"]);
+    assert!(view.items[0].description.contains("restores a.txt"));
+    assert!(view.items[1].description.contains("restores a.txt"));
+    app.handle_modal_key(key(KeyCode::Enter)).await;
+    assert!(app.modal.is_none());
+    assert_eq!(
+        app.runtime
+            .as_ref()
+            .unwrap()
+            .session
+            .lock()
+            .unwrap()
+            .branch_entries()
+            .iter()
+            .rev()
+            .find(|entry| !matches!(entry.kind, EntryKind::Custom(_)))
+            .map(|entry| entry.id.clone()),
+        Some(reply)
+    );
+    assert_eq!(
+        std::fs::read_to_string(app.cwd_path().join("a.txt")).unwrap(),
+        "original\n"
+    );
+    assert_eq!(app.input.text(), "second turn");
+}

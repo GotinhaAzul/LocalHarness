@@ -97,8 +97,8 @@ One append-only JSONL file per session tree under the data directory,
 checkouts, and forks are non-destructive.
 
 ```text
-/tree       show branches and switch
-/rewind     restore files and the conversation to an earlier turn
+/tree       browse branches and jump to any step
+/rewind     pick a message; restore files and the conversation to before it
 /fork       branch from the current leaf
 /new        start a fresh session
 /resume     pick a previous session by prefix or suffix
@@ -106,6 +106,15 @@ checkouts, and forks are non-destructive.
 /export     write a Markdown transcript
 ```
 
+`/tree` opens on where you are, with the active branch marked `●` and tool
+results folded into the step that called them. `↑`/`↓` move, `[`/`]` jump
+between your messages, `.` returns to the current step. Enter goes there: on
+one of your messages it goes back to just before it and puts the text in the
+prompt to edit and resend; on any other step the next message continues from
+it. `r` does the same and also restores the files (a rewind), `R` forces it.
+
+`/rewind` with no argument opens a picker of your messages on the branch,
+newest first, with how many files each would restore; type to filter.
 `/rewind [turns]` restores every file the harness wrote after the target to its
 snapshot there, then moves the leaf; the old branch stays in `/tree`. An edit
 made outside the harness refuses the rewind and is named; `/rewind 1 force`

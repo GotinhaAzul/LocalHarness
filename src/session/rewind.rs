@@ -432,13 +432,10 @@ pub fn apply(session: &mut Session, plan: &RewindPlan, force: bool) -> Result<Re
     Ok(report)
 }
 
-/// The entry before the `turns`-th most recent user message on the active
-/// branch. `turns = 1` is "before the last user message".
-pub fn target_before_turn(session: &Session, turns: usize) -> Result<String, String> {
-    if turns == 0 {
-        return Err("pass a positive number of turns, for example /rewind 1".into());
-    }
-    let users: Vec<&Entry> = session
+/// User messages on the active branch, oldest first. Continuation prompts
+/// the harness sent on its own are not turns the user can rewind to.
+pub fn branch_user_messages(session: &Session) -> Vec<&Entry> {
+    session
         .branch_entries()
         .into_iter()
         .filter(|entry| {
@@ -446,14 +443,28 @@ pub fn target_before_turn(session: &Session, turns: usize) -> Result<String, Str
                 && matches!(entry.kind, EntryKind::User(_))
                 && entry.provenance.as_deref() != Some(crate::provenance::CONTINUATION)
         })
-        .collect();
+        .collect()
+}
+
+/// The `turns`-th most recent user message on the active branch.
+pub fn user_before_turn(session: &Session, turns: usize) -> Result<&Entry, String> {
+    if turns == 0 {
+        return Err("pass a positive number of turns, for example /rewind 1".into());
+    }
+    let users = branch_user_messages(session);
     if turns > users.len() {
         return Err(format!(
             "this branch has {} user message(s); cannot rewind {turns}. Use /rewind with a smaller number.",
             users.len()
         ));
     }
-    let user = users[users.len() - turns];
+    Ok(users[users.len() - turns])
+}
+
+/// The entry before the `turns`-th most recent user message on the active
+/// branch. `turns = 1` is "before the last user message".
+pub fn target_before_turn(session: &Session, turns: usize) -> Result<String, String> {
+    let user = user_before_turn(session, turns)?;
     Ok(user
         .parent
         .clone()

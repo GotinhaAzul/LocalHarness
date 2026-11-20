@@ -777,10 +777,12 @@ impl App {
         let Some(runtime) = &self.runtime else {
             return;
         };
-        let view = match runtime.session.lock() {
+        let mut view = match runtime.session.lock() {
             Ok(session) => TreeView::new(&session),
             Err(poison) => TreeView::new(&poison.into_inner()),
         };
+        // Open scrolled to the current step; keys use the same 15-row window.
+        view.ensure_visible(15);
         if view.is_empty() {
             self.set_notice("the session tree is empty", Role::Muted);
             return;
@@ -788,12 +790,27 @@ impl App {
         self.modal = Some(ModalData::Tree(view));
     }
 
+    /// `/rewind` with no argument opens a picker of the user messages on the
+    /// active branch; `/rewind [turns] [force]` rewinds directly.
     pub(super) fn command_rewind(&mut self, argument: &str) {
         let Some(runtime) = &self.runtime else {
             return;
         };
-        let core = runtime.core.clone();
-        let session_handle = runtime.session.clone();
+        if argument.trim().is_empty() {
+            let items = match runtime.session.lock() {
+                Ok(session) => rewind_items(&session),
+                Err(poison) => rewind_items(&poison.into_inner()),
+            };
+            if items.is_empty() {
+                self.set_notice("no user message on this branch to rewind to", Role::Warning);
+                return;
+            }
+            let picker = PickerModal::new("rewind", "Rewind to before…", items, "").with_subtitle(
+                "restores files and the conversation; the old branch stays in /tree",
+            );
+            self.modal = Some(ModalData::Picker(picker));
+            return;
+        }
         let mut turns = 1usize;
         let mut force = false;
         for word in argument.split_whitespace() {
@@ -809,27 +826,92 @@ impl App {
                 return;
             }
         }
+        let found = {
+            let session = match runtime.session.lock() {
+                Ok(session) => session,
+                Err(poison) => poison.into_inner(),
+            };
+            crate::session::rewind::user_before_turn(&session, turns).and_then(|user| {
+                crate::ui::tree::destination_for(&session.tree, &user.id)
+                    .map_err(|error| error.to_string())
+            })
+        };
+        match found {
+            Ok(destination) => {
+                self.rewind_to(&destination.target, force, destination.prefill);
+            }
+            Err(message) => {
+                self.set_notice(message.clone(), Role::Warning);
+                self.transcript.push_note("rewind", message, true);
+            }
+        }
+    }
+
+    /// Choose a `/tree` row: move the conversation there, and with
+    /// `Some(force)` restore the harness-written files too. A user message
+    /// row goes to just before it and puts its text back in an empty prompt.
+    /// Returns true when the conversation moved.
+    pub(super) fn tree_go(&mut self, row: &str, rewind: Option<bool>) -> bool {
+        let Some(runtime) = &self.runtime else {
+            return false;
+        };
+        let destination = match runtime.session.lock() {
+            Ok(session) => crate::ui::tree::destination_for(&session.tree, row),
+            Err(poison) => crate::ui::tree::destination_for(&poison.into_inner().tree, row),
+        };
+        let destination = match destination {
+            Ok(destination) => destination,
+            Err(error) => {
+                self.set_notice(error.to_string(), Role::Error);
+                return false;
+            }
+        };
+        if let Some(force) = rewind {
+            return self.rewind_to(&destination.target, force, destination.prefill);
+        }
+        if let Err(error) = self.checkout_target(&destination.target, "tree") {
+            self.set_notice(error, Role::Error);
+            return false;
+        }
+        let message = match destination.prefill {
+            Some(text) if self.prefill_prompt(&text) => {
+                "back before that message; edit it and press Enter to resend"
+            }
+            Some(_) => "back before that message (your draft was kept)",
+            None => "checked out; the next message continues from here",
+        };
+        self.set_notice(message, Role::Success);
+        true
+    }
+
+    /// Put `text` in the prompt when it is empty, so a draft is never lost.
+    fn prefill_prompt(&mut self, text: &str) -> bool {
+        if !self.input.is_empty() {
+            return false;
+        }
+        self.input.set_text(text);
+        true
+    }
+
+    /// Rewind files and the conversation to `target`. Returns true on success.
+    pub(super) fn rewind_to(&mut self, target: &str, force: bool, prefill: Option<String>) -> bool {
+        let Some(runtime) = &self.runtime else {
+            return false;
+        };
+        let core = runtime.core.clone();
+        let session_handle = runtime.session.clone();
         let mut session = match session_handle.lock() {
             Ok(session) => session,
             Err(poison) => poison.into_inner(),
         };
-        let target = match crate::session::rewind::target_before_turn(&session, turns) {
-            Ok(target) => target,
-            Err(message) => {
-                drop(session);
-                self.set_notice(message.clone(), Role::Warning);
-                self.transcript.push_note("rewind", message, true);
-                return;
-            }
-        };
-        let plan = match crate::session::rewind::plan(&session, &target) {
+        let plan = match crate::session::rewind::plan(&session, target) {
             Ok(plan) => plan,
             Err(error) => {
                 drop(session);
                 let message = format!("{error:#}");
                 self.set_notice(message.clone(), Role::Error);
                 self.transcript.push_note("rewind", message, true);
-                return;
+                return false;
             }
         };
         let paths: Vec<_> = plan
@@ -848,7 +930,7 @@ impl App {
                     Role::Error,
                 );
                 self.transcript.push_note("rewind", message, true);
-                return;
+                return false;
             }
         };
         let _ = session.fsync();
@@ -860,9 +942,15 @@ impl App {
             crate::tools::write::record_own_write(&ctx, path);
         }
         self.refresh_session_blocks();
-        let message = format!("rewound to {}: {}", report.target, report.summary());
+        let mut message = format!("rewound to {}: {}", report.target, report.summary());
         self.transcript.push_note("rewind", message.clone(), false);
+        if let Some(text) = prefill
+            && self.prefill_prompt(&text)
+        {
+            message.push_str(" · message back in the prompt");
+        }
         self.set_notice(message, Role::Success);
+        true
     }
 
     pub(super) fn command_fork(&mut self) {
@@ -1738,13 +1826,25 @@ impl App {
                 Ok(session) => session,
                 Err(poison) => poison.into_inner(),
             };
-            let resolved = session
+            // The header means "before the first message": move there
+            // directly, since it is not a step `resolve_checkout` accepts.
+            if session
                 .tree
-                .resolve_checkout(target)
-                .map_err(|error| error.to_string())?;
-            session
-                .checkout(&resolved, reason)
-                .map_err(|error| error.to_string())?;
+                .header()
+                .is_some_and(|header| header.id == target)
+            {
+                session
+                    .move_leaf(target, reason)
+                    .map_err(|error| error.to_string())?;
+            } else {
+                let resolved = session
+                    .tree
+                    .resolve_checkout(target)
+                    .map_err(|error| error.to_string())?;
+                session
+                    .checkout(&resolved, reason)
+                    .map_err(|error| error.to_string())?;
+            }
             let _ = session.fsync();
             Ok(())
         };
@@ -1897,4 +1997,50 @@ pub(super) fn permission_log_text(log: &[crate::policy::LoggedDecision]) -> Stri
     }
     out.push_str("Layers: `rule <id>` and `<mode> mode default` come from [permissions]; `session approval` and `you` are your answers; `hook`, `provenance`, and `frontend` are checks that run after the policy.");
     out
+}
+
+/// Rows for the `/rewind` picker: the user messages on the active branch,
+/// newest first, each running `/rewind <turns>`.
+fn rewind_items(session: &crate::session::Session) -> Vec<PickItem> {
+    use crate::session::EntryKind;
+    let branch = session.branch_entries();
+    let users = crate::session::rewind::branch_user_messages(session);
+    let total = users.len();
+    users
+        .iter()
+        .rev()
+        .enumerate()
+        .map(|(index, user)| {
+            let turns = index + 1;
+            // Files the harness wrote from this message on; the rewind puts
+            // each one back.
+            let mut files: Vec<&str> = branch
+                .iter()
+                .filter(|entry| entry.seq > user.seq)
+                .filter_map(|entry| match &entry.kind {
+                    EntryKind::Custom(custom) if custom.kind == "fs-change" => {
+                        custom.payload.get("path").and_then(|path| path.as_str())
+                    }
+                    _ => None,
+                })
+                .collect();
+            files.sort_unstable();
+            files.dedup();
+            let ago = match turns {
+                1 => "last message".to_string(),
+                n => format!("{n} messages back"),
+            };
+            let changes = match files.len() {
+                0 => "no file changes".to_string(),
+                1 => format!("restores {}", files[0]),
+                n => format!("restores {n} files"),
+            };
+            let when = user.ts.with_timezone(&chrono::Local).format("%H:%M");
+            PickItem {
+                label: format!("#{} {}", total - index, user.preview(60)),
+                description: format!("{when} · {ago} · {changes}"),
+                action: PickAction::Run(format!("/rewind {turns}")),
+            }
+        })
+        .collect()
 }

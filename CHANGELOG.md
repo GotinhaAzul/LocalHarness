@@ -9,6 +9,16 @@ release may change defaults when the change is called out below.
 
 ### Added
 
+- `/rewind` with no argument opens a picker of your messages on the branch,
+  newest first, with when each was sent and which files the rewind restores;
+  type to filter, Enter rewinds. `/rewind [turns] [force]` is unchanged.
+- `/tree` is a navigator: it opens on the current step, marks the active
+  branch with `●`, folds tool results into the step that called them, and
+  indents only at real branch points. `[`/`]` jump between your messages and
+  `.` returns to the current step. Enter on one of your messages goes back to
+  just before it and puts the text in the prompt to edit and resend; `r` does
+  the same and restores files too (a rewind), `R` forces it.
+
 - Files named in a prompt without `@` are attached like `@` mentions:
   `the panic at src/parser.rs:88:5`, a pasted stack trace, or
   `File "pkg/mod.py", line 3` attaches up to three existing text files under
@@ -101,6 +111,9 @@ release may change defaults when the change is called out below.
 
 ### Fixed
 
+- `/tree` showed "the session tree is empty" for every session: the
+  `tool-probe` record written before the first message is a hidden root, and
+  the tree dropped it together with the whole conversation below it.
 - Agent-run commands start a new session through the `setsid` utility
   (util-linux or busybox) instead of a `pre_exec` hook. The hook made every
   spawn `fork` instead of `posix_spawn`, so a child could briefly hold another
