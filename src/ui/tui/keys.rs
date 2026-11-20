@@ -150,6 +150,9 @@ impl App {
             KeyCode::Esc => {
                 if self.turn_active {
                     self.cancel_turn();
+                } else if let Some(job) = self.init_job.take() {
+                    job.cancel();
+                    self.set_notice("init draft cancelled; nothing was written", Role::Muted);
                 } else if self.input.text().trim_start().starts_with('/')
                     && !self.input.text().contains('\n')
                 {
@@ -222,9 +225,13 @@ impl App {
                 }
                 // While a switch loads, prose stays in the prompt (commands
                 // still run) so nothing typed ahead is lost.
-                let command = self.input.text().trim_start().starts_with('/');
+                let text = self.input.text();
+                let command = text.trim_start().starts_with('/');
                 let waiting = self.switching.is_some() && !command;
-                let idle = !self.turn_active && !waiting;
+                // `/approve`, `/help`, and the like run mid-turn; anything
+                // else waits so a prompt is never sent into a running turn.
+                let busy_ok = command && !text.contains('\n') && runs_during_turn(&text);
+                let idle = (!self.turn_active && !waiting) || busy_ok;
                 match self.input.submit(idle) {
                     Some(text) => {
                         let trimmed = text.trim().to_string();
@@ -247,7 +254,7 @@ impl App {
                     }
                     None if !idle => {
                         self.set_notice(
-                            "a turn is running; press Esc to cancel before sending",
+                            "a turn is running; press Esc to cancel before sending (/approve and /help work now)",
                             Role::Warning,
                         );
                     }
@@ -303,8 +310,9 @@ impl App {
             return;
         };
         let mut close = false;
-        let mut target: Option<String> = None;
-        let mut focus_input = false;
+        // Row id, and `Some(force)` to rewind files as well as the conversation.
+        let mut tree_go: Option<(String, Option<bool>)> = None;
+        let mut init_apply: Option<InitReview> = None;
         let mut switch: Option<PathBuf> = None;
         let mut picked: Option<PickAction> = None;
         let mut preview_theme: Option<String> = None;
@@ -313,26 +321,33 @@ impl App {
 
         match &mut modal {
             ModalData::Tree(view) => match key.code {
-                KeyCode::Esc => close = true,
-                KeyCode::Up => view.move_by(-1),
-                KeyCode::Down => view.move_by(1),
+                KeyCode::Esc | KeyCode::Char('q') => close = true,
+                KeyCode::Up | KeyCode::Char('k') => view.move_by(-1),
+                KeyCode::Down | KeyCode::Char('j') => view.move_by(1),
                 KeyCode::PageUp => view.page(-1, 15),
                 KeyCode::PageDown => view.page(1, 15),
-                KeyCode::Home => view.home(),
-                KeyCode::End => view.end(),
-                KeyCode::Char('k') => view.move_by(-1),
-                KeyCode::Char('j') => view.move_by(1),
-                KeyCode::Char('f') | KeyCode::Char('n') => {
-                    if let Some(row) = view.selected_row() {
-                        target = Some(row.id.clone());
-                        focus_input = true;
-                    }
+                KeyCode::Home | KeyCode::Char('g') => view.home(),
+                KeyCode::End | KeyCode::Char('G') => view.end(),
+                KeyCode::Char('[') => view.jump_user(-1),
+                KeyCode::Char(']') => view.jump_user(1),
+                KeyCode::Char('.') => view.select_active(),
+                KeyCode::Enter => tree_go = view.selected_row().map(|row| (row.id.clone(), None)),
+                KeyCode::Char('r') => {
+                    tree_go = view.selected_row().map(|row| (row.id.clone(), Some(false)));
                 }
-                KeyCode::Enter => {
-                    if let Some(row) = view.selected_row() {
-                        target = Some(row.id.clone());
-                    }
+                KeyCode::Char('R') => {
+                    tree_go = view.selected_row().map(|row| (row.id.clone(), Some(true)));
                 }
+                _ => {}
+            },
+            ModalData::Init(view) => match key.code {
+                KeyCode::Esc => close = true,
+                KeyCode::Up | KeyCode::Char('k') => view.move_by(-1),
+                KeyCode::Down | KeyCode::Char('j') => view.move_by(1),
+                KeyCode::Char(' ') => view.set(None),
+                KeyCode::Char('a') | KeyCode::Char('y') => view.set(Some(true)),
+                KeyCode::Char('r') | KeyCode::Char('n') => view.set(Some(false)),
+                KeyCode::Enter => init_apply = Some(view.clone()),
                 _ => {}
             },
             ModalData::Sessions(view) => match key.code {
@@ -460,21 +475,16 @@ impl App {
             return;
         }
 
-        if let Some(target) = target {
-            match self.checkout_target(&target, "tree") {
-                Ok(()) => {
-                    close = true;
-                    self.set_notice(
-                        if focus_input {
-                            "branch point selected; type a message"
-                        } else {
-                            "checked out"
-                        },
-                        Role::Success,
-                    );
-                }
-                Err(error) => self.set_notice(error, Role::Error),
-            }
+        if let Some(review) = init_apply {
+            self.modal = None;
+            self.apply_init(&review);
+            return;
+        }
+
+        if let Some((row, rewind)) = tree_go
+            && self.tree_go(&row, rewind)
+        {
+            close = true;
         }
 
         if let Some(path) = switch {
@@ -506,6 +516,9 @@ impl App {
         }
 
         if close {
+            if matches!(modal, ModalData::Init(_)) {
+                self.set_notice("init cancelled; nothing was written", Role::Muted);
+            }
             self.modal = None;
             self.restore_previewed_theme();
         } else {

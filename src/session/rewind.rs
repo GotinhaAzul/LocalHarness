@@ -109,23 +109,82 @@ fn conflict_message(conflicts: &[String]) -> String {
     )
 }
 
+/// One `fs-change` entry on the active branch.
+struct Change {
+    seq: u64,
+    payload: Map<String, Value>,
+}
+
+/// Harness writes on the active branch, grouped by display path, with undo
+/// records folded in: an undo removes the change it names and is not itself a
+/// change.
+struct Changes {
+    stacks: BTreeMap<String, Vec<Change>>,
+    /// `(undo seq, reverted seq, path)` for every undo that named a change.
+    undo_seqs: Vec<(u64, u64, String)>,
+}
+
+impl Changes {
+    fn collect(entries: &[&Entry]) -> Self {
+        let mut stacks: BTreeMap<String, Vec<Change>> = BTreeMap::new();
+        let mut undo_seqs = Vec::new();
+        for entry in entries {
+            let EntryKind::Custom(custom) = &entry.kind else {
+                continue;
+            };
+            if custom.kind != "fs-change" {
+                continue;
+            }
+            let Some(display) = custom.payload.get("path").and_then(Value::as_str) else {
+                continue;
+            };
+            if custom.payload.get("undo").and_then(Value::as_bool) == Some(true) {
+                if let Some(reverted) = custom.payload.get("reverts").and_then(Value::as_u64) {
+                    for stack in stacks.values_mut() {
+                        stack.retain(|change| change.seq != reverted);
+                    }
+                    undo_seqs.push((entry.seq, reverted, display.to_string()));
+                }
+                continue;
+            }
+            stacks.entry(display.to_string()).or_default().push(Change {
+                seq: entry.seq,
+                payload: custom.payload.clone(),
+            });
+        }
+        Changes { stacks, undo_seqs }
+    }
+
+    /// Display paths with a change after `after_seq`, sorted.
+    fn paths_after(&self, after_seq: u64) -> Vec<String> {
+        self.stacks
+            .iter()
+            .filter(|(_, stack)| stack.iter().any(|change| change.seq > after_seq))
+            .map(|(display, _)| display.clone())
+            .collect()
+    }
+}
+
+/// The seq a rewind to `resolved` moves the conversation to. The first user
+/// entry has no parent, so the header is not on the branch path; rewinding to
+/// it means "before the first turn" and uses seq 0.
+fn boundary_seq(session: &Session, entries: &[&Entry], resolved: &str) -> Result<u64> {
+    if session.tree.header().map(|entry| entry.id.as_str()) == Some(resolved) {
+        return Ok(0);
+    }
+    entries
+        .iter()
+        .find(|entry| entry.id == resolved)
+        .map(|entry| entry.seq)
+        .ok_or_else(|| anyhow::anyhow!("entry {resolved} is not on the active branch"))
+}
+
 /// Build the rewind plan for `target` on the active branch.
 pub fn plan(session: &Session, target: &str) -> Result<RewindPlan> {
     let entries = session.branch_entries();
     let resolved = resolve_target(session, &entries, target)?;
     let header = session.tree.header();
-    let header_id = header.map(|entry| entry.id.clone());
-    // The first user entry has no parent, so the header is not on the branch
-    // path; rewinding to it means "before the first turn" and uses seq 0.
-    let target_seq = if header_id.as_deref() == Some(resolved.as_str()) {
-        0
-    } else {
-        entries
-            .iter()
-            .find(|entry| entry.id == resolved)
-            .map(|entry| entry.seq)
-            .ok_or_else(|| anyhow::anyhow!("entry {target} is not on the active branch"))?
-    };
+    let target_seq = boundary_seq(session, &entries, &resolved)?;
     let cwd = header
         .and_then(|entry| match &entry.kind {
             EntryKind::Session(data) if !data.cwd.trim().is_empty() => {
@@ -135,43 +194,12 @@ pub fn plan(session: &Session, target: &str) -> Result<RewindPlan> {
         })
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
-    struct Change {
-        seq: u64,
-        payload: Map<String, Value>,
-    }
-
-    // Active harness changes per path, after undos are folded in. An undo
-    // entry removes the change it names and is not itself a file change.
-    let mut stacks: BTreeMap<String, Vec<Change>> = BTreeMap::new();
-    let mut cross_undoes: Vec<(u64, u64, String)> = Vec::new();
-    for entry in &entries {
-        let EntryKind::Custom(custom) = &entry.kind else {
-            continue;
-        };
-        if custom.kind != "fs-change" {
-            continue;
-        }
-        let Some(display) = custom.payload.get("path").and_then(Value::as_str) else {
-            continue;
-        };
-        if custom.payload.get("undo").and_then(Value::as_bool) == Some(true) {
-            if let Some(reverted) = custom.payload.get("reverts").and_then(Value::as_u64) {
-                for stack in stacks.values_mut() {
-                    stack.retain(|change| change.seq != reverted);
-                }
-                cross_undoes.push((entry.seq, reverted, display.to_string()));
-            }
-            continue;
-        }
-        stacks.entry(display.to_string()).or_default().push(Change {
-            seq: entry.seq,
-            payload: custom.payload.clone(),
-        });
-    }
+    let changes = Changes::collect(&entries);
+    let stacks = &changes.stacks;
 
     let mut files = Vec::new();
     let mut unrestorable = Vec::new();
-    for (display, stack) in &stacks {
+    for (display, stack) in stacks {
         let post: Vec<&Change> = stack
             .iter()
             .filter(|change| change.seq > target_seq)
@@ -237,10 +265,10 @@ pub fn plan(session: &Session, target: &str) -> Result<RewindPlan> {
     // An undo after the target that reverted a change made at or before the
     // target would need the after-content of a change the harness never
     // snapshotted. Name it instead of silently restoring the wrong bytes.
-    for (undo_seq, reverted_seq, display) in cross_undoes {
-        if undo_seq > target_seq && reverted_seq <= target_seq {
+    for (undo_seq, reverted_seq, display) in &changes.undo_seqs {
+        if *undo_seq > target_seq && *reverted_seq <= target_seq {
             unrestorable.push(Unrestorable {
-                display,
+                display: display.clone(),
                 reason: format!(
                     "an undo after the target reverted the change at seq {reverted_seq}, which \
                      happened at or before the target; the harness did not snapshot the content \
@@ -257,6 +285,34 @@ pub fn plan(session: &Session, target: &str) -> Result<RewindPlan> {
         files,
         unrestorable,
     })
+}
+
+/// What rewinds on the active branch would restore, for previews such as the
+/// `/rewind` picker. Undo folding is shared with [`plan`]; snapshots are not
+/// read, so a broken artifact is only reported when the rewind runs.
+pub struct Preview<'a> {
+    session: &'a Session,
+    entries: Vec<&'a Entry>,
+    changes: Changes,
+}
+
+impl<'a> Preview<'a> {
+    pub fn new(session: &'a Session) -> Self {
+        let entries = session.branch_entries();
+        let changes = Changes::collect(&entries);
+        Preview {
+            session,
+            entries,
+            changes,
+        }
+    }
+
+    /// Display paths a rewind to `target` restores, sorted.
+    pub fn files(&self, target: &str) -> Result<Vec<String>> {
+        let resolved = resolve_target(self.session, &self.entries, target)?;
+        let target_seq = boundary_seq(self.session, &self.entries, &resolved)?;
+        Ok(self.changes.paths_after(target_seq))
+    }
 }
 
 /// Apply a plan. With `force`, a file that changed outside the harness is
@@ -432,13 +488,10 @@ pub fn apply(session: &mut Session, plan: &RewindPlan, force: bool) -> Result<Re
     Ok(report)
 }
 
-/// The entry before the `turns`-th most recent user message on the active
-/// branch. `turns = 1` is "before the last user message".
-pub fn target_before_turn(session: &Session, turns: usize) -> Result<String, String> {
-    if turns == 0 {
-        return Err("pass a positive number of turns, for example /rewind 1".into());
-    }
-    let users: Vec<&Entry> = session
+/// User messages on the active branch, oldest first. Continuation prompts
+/// the harness sent on its own are not turns the user can rewind to.
+pub fn branch_user_messages(session: &Session) -> Vec<&Entry> {
+    session
         .branch_entries()
         .into_iter()
         .filter(|entry| {
@@ -446,14 +499,28 @@ pub fn target_before_turn(session: &Session, turns: usize) -> Result<String, Str
                 && matches!(entry.kind, EntryKind::User(_))
                 && entry.provenance.as_deref() != Some(crate::provenance::CONTINUATION)
         })
-        .collect();
+        .collect()
+}
+
+/// The `turns`-th most recent user message on the active branch.
+pub fn user_before_turn(session: &Session, turns: usize) -> Result<&Entry, String> {
+    if turns == 0 {
+        return Err("pass a positive number of turns, for example /rewind 1".into());
+    }
+    let users = branch_user_messages(session);
     if turns > users.len() {
         return Err(format!(
             "this branch has {} user message(s); cannot rewind {turns}. Use /rewind with a smaller number.",
             users.len()
         ));
     }
-    let user = users[users.len() - turns];
+    Ok(users[users.len() - turns])
+}
+
+/// The entry before the `turns`-th most recent user message on the active
+/// branch. `turns = 1` is "before the last user message".
+pub fn target_before_turn(session: &Session, turns: usize) -> Result<String, String> {
+    let user = user_before_turn(session, turns)?;
     Ok(user
         .parent
         .clone()

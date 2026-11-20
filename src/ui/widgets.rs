@@ -609,6 +609,58 @@ pub enum ModalData {
     Tools(ToolsModal),
     Picker(PickerModal),
     HunkReview(HunkReviewModal),
+    Init(InitReview),
+}
+
+/// The `/init` proposal, one row per file to accept or reject. The content
+/// or diff of each file is in the transcript above.
+#[derive(Debug, Clone)]
+pub struct InitReview {
+    pub proposal: crate::init::Proposal,
+    pub accepted: Vec<bool>,
+    pub selected: usize,
+    pub scroll: usize,
+}
+
+impl InitReview {
+    /// Every file starts accepted except one carrying a warning.
+    pub fn new(proposal: crate::init::Proposal) -> Self {
+        let accepted = proposal
+            .files
+            .iter()
+            .map(|file| file.warnings.is_empty())
+            .collect();
+        Self {
+            proposal,
+            accepted,
+            selected: 0,
+            scroll: 0,
+        }
+    }
+
+    pub fn move_by(&mut self, delta: isize) {
+        let count = self.proposal.files.len();
+        if count == 0 {
+            return;
+        }
+        self.selected = (self.selected as isize + delta).clamp(0, count as isize - 1) as usize;
+    }
+
+    pub fn set(&mut self, accept: Option<bool>) {
+        if let Some(slot) = self.accepted.get_mut(self.selected) {
+            *slot = accept.unwrap_or(!*slot);
+        }
+    }
+
+    pub fn chosen(&self) -> Vec<&crate::init::ProposedFile> {
+        self.proposal
+            .files
+            .iter()
+            .zip(&self.accepted)
+            .filter(|(_, accepted)| **accepted)
+            .map(|(file, _)| file)
+            .collect()
+    }
 }
 
 /// The hunk list shown before the second file mutation of a turn lands.
@@ -671,7 +723,10 @@ impl HunkReviewModal {
 impl ModalData {
     pub fn title(&self) -> String {
         match self {
-            ModalData::Tree(_) => " Session tree ".into(),
+            ModalData::Tree(_) => {
+                " Session tree · ↑↓ move · [ ] messages · Enter go here · r rewind files too · Esc close "
+                    .into()
+            }
             ModalData::Sessions(_) => " Sessions · Enter resume · Esc close ".into(),
             ModalData::Tools(_) => " Tools ".into(),
             ModalData::Picker(view) => {
@@ -692,6 +747,11 @@ impl ModalData {
                     view.items.len()
                 )
             }
+            ModalData::Init(view) => format!(
+                " Init · {}/{} files · Space toggle · a accept · r reject · Enter write · Esc cancel ",
+                view.chosen().len(),
+                view.proposal.files.len()
+            ),
             ModalData::HunkReview(view) => {
                 let accepted = view
                     .choices
@@ -715,6 +775,7 @@ impl ModalData {
             ModalData::Tools(view) => view.items.len(),
             ModalData::Picker(view) => view.filtered().len().max(1),
             ModalData::HunkReview(view) => view.hunks.len().max(1),
+            ModalData::Init(view) => init_rows(view).len().max(1),
         }
     }
 
@@ -725,6 +786,7 @@ impl ModalData {
             ModalData::Tools(view) => view.scroll,
             ModalData::Picker(view) => view.scroll,
             ModalData::HunkReview(view) => view.scroll,
+            ModalData::Init(view) => view.scroll,
         }
     }
 
@@ -766,6 +828,8 @@ impl ModalData {
                 }
                 view.scroll = view.scroll.min(view.hunks.len().saturating_sub(height));
             }
+            // A handful of files with their detail lines: always fits.
+            ModalData::Init(view) => view.scroll = 0,
         }
     }
 
@@ -777,8 +841,63 @@ impl ModalData {
             ModalData::Tools(view) => tools_lines(view, width, theme),
             ModalData::Picker(view) => picker_lines(view, width, theme),
             ModalData::HunkReview(view) => hunk_review_lines(view, width, theme),
+            ModalData::Init(view) => init_lines(view, width, theme),
         }
     }
+}
+
+/// `(file index, text, role)` rows: a file line, then its evidence and
+/// warnings indented under it.
+fn init_rows(view: &InitReview) -> Vec<(Option<usize>, String, Role)> {
+    let mut rows = Vec::new();
+    for (index, file) in view.proposal.files.iter().enumerate() {
+        let mark = if view.accepted.get(index).copied().unwrap_or(false) {
+            "[x]"
+        } else {
+            "[ ]"
+        };
+        rows.push((
+            Some(index),
+            format!("{mark} {}  {}", file.path, file.summary()),
+            Role::Fg,
+        ));
+        for line in &file.evidence {
+            rows.push((None, format!("      + {line}"), Role::Muted));
+        }
+        for warning in &file.warnings {
+            rows.push((None, format!("      ! {warning}"), Role::Warning));
+        }
+    }
+    if view
+        .proposal
+        .files
+        .iter()
+        .any(|file| file.path.starts_with(".harness/"))
+    {
+        rows.push((None, String::new(), Role::Muted));
+        rows.push((
+            None,
+            crate::init::trust_note(view.proposal.trusted),
+            Role::Muted,
+        ));
+    }
+    rows
+}
+
+fn init_lines(view: &InitReview, width: usize, theme: &Theme) -> Vec<Line<'static>> {
+    let rows = init_rows(view);
+    if view.proposal.files.is_empty() {
+        return vec![Line::styled("nothing to change", theme.style(Role::Muted))];
+    }
+    rows.into_iter()
+        .map(|(index, text, role)| {
+            let mut line = Line::styled(clip_end(&text, width.max(10)), theme.style(role));
+            if index == Some(view.selected) {
+                line = line.style(selected_style(theme));
+            }
+            line
+        })
+        .collect()
 }
 
 fn hunk_review_lines(view: &HunkReviewModal, width: usize, theme: &Theme) -> Vec<Line<'static>> {
@@ -845,33 +964,48 @@ pub fn tree_lines(view: &TreeView, width: usize, theme: &Theme) -> Vec<Line<'sta
     for (index, row) in view.rows.iter().enumerate() {
         let when = row
             .ts
-            .map(|ts| ts.format("%H:%M").to_string())
+            .map(|ts| ts.with_timezone(&chrono::Local).format("%H:%M").to_string())
             .unwrap_or_default();
-        let tokens = if row.tokens > 0 {
-            format!("~{}t", row.tokens)
+        let mut tail = String::new();
+        if row.tools > 0 {
+            tail.push_str(&format!(
+                "  {} tool{}",
+                row.tools,
+                if row.tools == 1 { "" } else { "s" }
+            ));
+        }
+        if !when.is_empty() {
+            tail.push_str(&format!("  {when}"));
+        }
+        if row.tokens > 0 {
+            tail.push_str(&format!("  ~{}t", row.tokens));
+        }
+        tail.push_str(&format!("  {}", row.id));
+        let here = if row.active { "  ← here" } else { "" };
+        // `●` marks the active branch so the way back is easy to follow.
+        let marker = if row.on_path { "● " } else { "  " };
+        let fixed = UnicodeWidthStr::width(row.prefix.as_str())
+            + 2
+            + 3
+            + UnicodeWidthStr::width(tail.as_str())
+            + UnicodeWidthStr::width(here);
+        let preview_style = if row.on_path {
+            theme.style(Role::Fg)
         } else {
-            String::new()
+            theme.style(Role::Muted)
         };
         let mut spans = vec![
             Span::styled(row.prefix.clone(), theme.style(Role::Border)),
-            Span::styled(format!("{}  ", row.id), theme.style(Role::Muted)),
+            Span::styled(marker, theme.style(Role::Accent)),
             Span::styled(format!("{}  ", row.role), role_style(row.role, theme)),
             Span::styled(
-                clip_end(&row.preview, width.saturating_sub(28).max(10)),
-                theme.style(Role::Fg),
+                clip_end(&row.preview, width.saturating_sub(fixed).max(10)),
+                preview_style,
             ),
+            Span::styled(tail, theme.style(Role::Muted)),
         ];
-        if !when.is_empty() {
-            spans.push(Span::raw("  "));
-            spans.push(Span::styled(when, theme.style(Role::Muted)));
-        }
-        if !tokens.is_empty() {
-            spans.push(Span::raw("  "));
-            spans.push(Span::styled(tokens, theme.style(Role::Muted)));
-        }
         if row.active {
-            spans.push(Span::raw("  "));
-            spans.push(Span::styled("*", theme.bold(Role::Accent)));
+            spans.push(Span::styled(here, theme.bold(Role::Accent)));
         }
         let mut line = Line::from(spans);
         if index == view.selected {

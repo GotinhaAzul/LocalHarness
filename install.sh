@@ -62,7 +62,7 @@ if [ "$VERSION" = "latest" ]; then
         "https://api.github.com/repos/${REPO}/releases/latest" \
         | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
         | head -n 1)" || true
-    [ -n "$tag" ] || fail "cannot resolve the latest release from GitHub; set TOT_VERSION to a release such as 0.2.0"
+    [ -n "$tag" ] || fail "cannot resolve the latest release from GitHub; set TOT_VERSION to a release such as 0.3.0"
     VERSION="$tag"
 fi
 VERSION="${VERSION#v}"

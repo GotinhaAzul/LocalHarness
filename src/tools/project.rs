@@ -33,7 +33,7 @@ const NPM_PLACEHOLDER_TEST: &str = "echo \"Error: no test specified\" && exit 1"
 
 /// Verify step timeout written into config by [`DetectedStep::to_config`].
 /// Matches `default_step_timeout` in `config.rs`.
-const DETECTED_STEP_TIMEOUT_SECS: u64 = 600;
+pub const DETECTED_STEP_TIMEOUT_SECS: u64 = 600;
 
 // ---------------------------------------------------------------------------
 // Test runner detection

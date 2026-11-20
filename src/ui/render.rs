@@ -2282,7 +2282,12 @@ fn render_modal(frame: &mut Frame, modal: &ModalData, area: Rect, theme: &Theme)
     frame.render_widget(Clear, rect);
     let inner_width = width.saturating_sub(2) as usize;
     let lines = modal.lines(inner_width, theme);
-    let scroll = modal.scroll().min(lines.len().saturating_sub(1)) as u16;
+    // Never scroll past a full window: rows the 15-row key window leaves
+    // below the selection would otherwise show as empty space.
+    let inner_height = height.saturating_sub(2) as usize;
+    let scroll = modal
+        .scroll()
+        .min(lines.len().saturating_sub(inner_height.max(1))) as u16;
     let block = WidgetBlock::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)

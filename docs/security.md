@@ -149,7 +149,8 @@ dispatch:
   `provenance-warning` entry, and requires approval for the next sensitive
   action: network access, a path outside the workspace, or a scope change.
 - Review the warning, then run `/approve` in the TUI to allow exactly the next
-  sensitive action. Without approval the call returns `provenance_approval` and
+  sensitive action. It works while the model is still working, so its retry
+  in the same turn goes through. Without approval the call returns `provenance_approval` and
   does not run. A frontend permission callback (ACP) can also be the approver.
 - Untrusted content can never enable a denied tool, add a tool, change the
   endpoint, widen `/sec` scope, or change the permission mode. Hooks and

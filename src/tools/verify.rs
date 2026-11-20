@@ -56,7 +56,7 @@ fn no_verify_error(ctx: &ToolContext) -> ToolResult {
         .or_else(|| detected.steps.last());
     let suggestion = match step {
         Some(step) => format!(
-            "Detected from {}: {}. Run it through bash now, for example {{\"command\":\"{}\"}}, or save the detected steps with `tot verify --init` and call verify again.",
+            "Detected from {}: {}. Run it through bash now, for example {{\"command\":\"{}\"}}, or save the detected steps with `tot verify accept` and call verify again.",
             detected.markers.join(", "),
             step.command,
             step.command
