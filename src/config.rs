@@ -1289,6 +1289,16 @@ pub enum GitApproval {
     Allow,
 }
 
+impl GitApproval {
+    /// User-facing label for this approval mode.
+    pub fn label(self) -> &'static str {
+        match self {
+            GitApproval::Ask => "ask",
+            GitApproval::Allow => "allow",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LspConfig {

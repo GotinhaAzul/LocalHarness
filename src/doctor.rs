@@ -67,6 +67,9 @@ pub struct DoctorManifest {
     /// gets `min(window / 4, 32768)` instead of the 4096 default.
     pub output_tokens: Option<u32>,
     pub output_source: Option<String>,
+    /// Git tool permissions: commit, pr, rewrite_history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_permissions: Option<GitPermissions>,
 }
 
 /// Verify configuration as `tot doctor` reports it.
@@ -90,6 +93,17 @@ pub struct SchemaSizes {
     pub short_chars: usize,
     /// `full`, `short`, or `auto`.
     pub setting: String,
+}
+
+/// Git tool permission status for `tot doctor`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitPermissions {
+    /// `git commit` permission: "allow" or "ask".
+    pub commit: String,
+    /// `git pr` permission: "allow" or "ask".
+    pub pr: String,
+    /// `git rewrite_history` permission: "allow" or "ask".
+    pub rewrite_history: String,
 }
 
 impl DoctorManifest {
@@ -430,6 +444,7 @@ impl DoctorManifest {
             verify: None,
             output_tokens: None,
             output_source: None,
+            git_permissions: None,
         }
     }
 
@@ -855,6 +870,7 @@ mod tests {
             verify: None,
             output_tokens: None,
             output_source: None,
+            git_permissions: None,
         }
     }
 

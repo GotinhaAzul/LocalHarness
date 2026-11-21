@@ -985,6 +985,12 @@ async fn run_doctor(config: &Config, paths: &Paths, json: bool, fix: bool) -> Re
             .into(),
         });
     }
+    // Git tool permissions
+    manifest.git_permissions = Some(crate::doctor::GitPermissions {
+        commit: config.git.commit.label().to_string(),
+        pr: config.git.pr.label().to_string(),
+        rewrite_history: config.git.rewrite_history.label().to_string(),
+    });
     let usage_key = crate::provider::probe::tool_probe_key(&provider, None);
     if let Some(message) = crate::doctor::load_usage_mismatch(
         &paths.data_dir.join(crate::doctor::USAGE_MISMATCH_CACHE),
