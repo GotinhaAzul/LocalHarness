@@ -60,7 +60,7 @@ impl Tool for GitTool {
     }
 
     fn description(&self) -> &'static str {
-        "Gated git: stage, unstage, commit_message (style + draft), commit (user approves), branch, worktree, undo. Read status/diff/log/blame with bash."
+        "Gated git: stage, unstage, commit_message (style + draft), commit (user approves), branch, worktree, undo, rewrite_history. Read status/diff/log/blame with bash."
     }
 
     fn schema(&self) -> Value {
@@ -68,9 +68,9 @@ impl Tool for GitTool {
             json!({
                 "action": {
                     "type": "string",
-                    "enum": ["stage", "unstage", "commit_message", "commit", "branch", "worktree", "undo"],
+                    "enum": ["stage", "unstage", "commit_message", "commit", "branch", "worktree", "undo", "rewrite_history"],
                 },
-                "paths": {"type": "array", "items": {"type": "string"}, "description": "stage/unstage: workspace files."},
+                "paths": {"type": "array", "items": {"type": "string"}, "description": "stage/unstage: workspace files; rewrite_history: paths to remove or keep."},
                 "path": {"type": "string", "description": "worktree add: directory."},
                 "message": {"type": "string", "description": "commit: subject, blank line, body saying why."},
                 "op": {"type": "string", "enum": ["create", "switch", "list", "add", "remove"], "description": "branch: create|switch|list; worktree: add|remove|list."},
@@ -78,6 +78,8 @@ impl Tool for GitTool {
                 "branch": {"type": "string", "description": "worktree add: branch (created if missing)."},
                 "base": {"type": "string", "description": "start point (default HEAD)."},
                 "stash": {"type": "boolean", "description": "switch: stash changes first."},
+                "invert": {"type": "boolean", "description": "rewrite_history: if true, remove paths; if false, keep only paths."},
+                "refspec": {"type": "string", "description": "rewrite_history: refs to rewrite (default: --all)."},
             }),
             &["action"],
         )
@@ -146,10 +148,11 @@ fn dispatch(ctx: &ToolContext, config: &GitConfig, args: &Value) -> ToolResult {
         "branch" => branch(ctx, args),
         "worktree" => worktree(ctx, args),
         "undo" => undo(ctx),
+        "rewrite_history" => rewrite_history(ctx, config, args),
         other => ToolResult::err(
             "invalid_args",
             format!(
-                "unknown git action {other:?}; use stage, unstage, commit_message, commit, branch, worktree or undo. For status, diff, log, or blame use bash with the git command."
+                "unknown git action {other:?}; use stage, unstage, commit_message, commit, branch, worktree, undo, or rewrite_history. For status, diff, log, or blame use bash with the git command."
             ),
         ),
     }
@@ -1392,6 +1395,296 @@ fn undo(ctx: &ToolContext) -> ToolResult {
 }
 
 // ---------------------------------------------------------------------------
+// History rewrite
+
+/// Guardrails for history rewrite operations.
+/// Returns the path to the backup bundle if created successfully.
+fn create_backup_bundle(cwd: &Path, session_id: &str) -> Option<PathBuf> {
+    let data_dir = cwd.parent()?;
+    let rewrite_dir = data_dir.join("rewrites");
+    let timestamp = chrono::Utc::now().format("%Y%m%d-%H%M%S").to_string();
+    let bundle_path = rewrite_dir.join(format!("{session_id}-{timestamp}.bundle"));
+    
+    if let Err(e) = std::fs::create_dir_all(&rewrite_dir) {
+        eprintln!("Failed to create rewrite dir: {e}");
+        return None;
+    }
+    
+    let result = git(cwd, &["bundle", "create", bundle_path.to_string_lossy().as_ref(), "--all"]);
+    if result.ok {
+        Some(bundle_path)
+    } else {
+        eprintln!("Failed to create bundle: {}", result.error());
+        None
+    }
+}
+
+/// Record all refs and their OIDs for later verification.
+fn record_refs(cwd: &Path) -> BTreeMap<String, String> {
+    let result = git(cwd, &["for-each-ref", "--format=%(objectname) %(refname)"]);
+    let mut refs = BTreeMap::new();
+    
+    if result.ok {
+        for line in result.stdout.lines() {
+            let parts: Vec<&str> = line.splitn(2, ' ').collect();
+            if parts.len() == 2 {
+                refs.insert(parts[1].to_string(), parts[0].to_string());
+            }
+        }
+    }
+    refs
+}
+
+/// Verify repository is in a clean state (no uncommitted changes).
+fn check_clean_tree(cwd: &Path) -> Result<(), String> {
+    let result = git(cwd, &["status", "--porcelain"]);
+    if result.stdout.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "repository has uncommitted changes:\n{}",
+            result.stdout
+        ))
+    }
+}
+
+/// Verify .git is at the repository root.
+fn check_repo_root(cwd: &Path) -> Result<(), String> {
+    let git_dir = cwd.join(".git");
+    if git_dir.is_dir() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} is not at the repository root (no .git directory found)",
+            cwd.display()
+        ))
+    }
+}
+
+/// Execute git-filter-repo if available, otherwise fall back to git filter-branch.
+fn execute_rewrite(cwd: &Path, paths: &[String], invert: bool, refspec: Option<&str>) -> Run {
+    // Try git-filter-repo first
+    let filter_repo_available = std::process::Command::new("git-filter-repo")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok();
+    
+    let mut args: Vec<&str> = Vec::new();
+    
+    if filter_repo_available {
+        args.push("filter-repo");
+        args.push("--force");
+        
+        for path in paths {
+            args.push("--path");
+            args.push(path.as_str());
+        }
+        
+        if invert {
+            args.push("--invert-paths");
+        }
+        
+        if let Some(rs) = refspec {
+            args.push("--refspec");
+            args.push(rs);
+        } else {
+            args.push("--all");
+        }
+        
+        let result = git(cwd, &args);
+        if result.ok {
+            return result;
+        }
+    }
+    
+    // Fall back to git filter-branch
+    args.clear();
+    args.push("filter-branch");
+    args.push("--prune-empty");
+    args.push("--index-filter");
+    
+    let mut filter_cmd = String::new();
+    for path in paths {
+        filter_cmd.push_str(&format!("git rm --cached --ignore-unmatch {}; ", path));
+    }
+    filter_cmd.push_str("true");
+    args.push(&filter_cmd);
+    
+    if let Some(rs) = refspec {
+        args.push("--");
+        args.push(rs);
+    } else {
+        args.push("--all");
+    }
+    
+    git(cwd, &args)
+}
+
+/// Verify refs and commit metadata after rewrite.
+fn verify_rewrite(cwd: &Path, old_refs: &BTreeMap<String, String>) -> Result<String, String> {
+    // Run fsck
+    let fsck_result = git(cwd, &["fsck", "--no-dangling"]);
+    if !fsck_result.ok {
+        return Err(format!("git fsck failed: {}", fsck_result.error()));
+    }
+    
+    // Get new refs
+    let new_refs = record_refs(cwd);
+    
+    // Compare
+    let mut report = String::new();
+    let mut all_ok = true;
+    
+    for (ref_name, old_oid) in old_refs {
+        if let Some(new_oid) = new_refs.get(ref_name) {
+            if old_oid != new_oid {
+                report.push_str(&format!("{}: {} -> {}\n", ref_name, old_oid, new_oid));
+            }
+        } else {
+            report.push_str(&format!("{}: MISSING (was {})\n", ref_name, old_oid));
+            all_ok = false;
+        }
+    }
+    
+    // Check for unexpected refs
+    for (ref_name, _) in &new_refs {
+        if !old_refs.contains_key(ref_name) {
+            report.push_str(&format!("{}: NEW\n", ref_name));
+        }
+    }
+    
+    if all_ok {
+        Ok(report)
+    } else {
+        Err(report)
+    }
+}
+
+/// Get session ID from context, handling poisoned locks.
+fn get_session_id(ctx: &ToolContext) -> String {
+    match ctx.session.lock() {
+        Ok(session) => session.id.clone(),
+        Err(poisoned) => poisoned.into_inner().id.clone(),
+    }
+}
+
+fn rewrite_history(ctx: &ToolContext, config: &GitConfig, args: &Value) -> ToolResult {
+    // Check permission
+    match config.rewrite_history {
+        GitApproval::Allow => {},
+        GitApproval::Ask => {
+            // In headless mode without opt-in, deny
+            return ToolResult::err(
+                "GIT_REWRITE_DENIED",
+                "history rewrite requires approval; use `git` action `rewrite_history` or configure permissions. This session has no approval channel.",
+            );
+        }
+    }
+    
+    // Check repository root
+    if let Err(e) = check_repo_root(&ctx.cwd) {
+        return ToolResult::err("GIT_NOT_ROOT", e);
+    }
+    
+    // Check clean tree
+    if let Err(e) = check_clean_tree(&ctx.cwd) {
+        return ToolResult::err("GIT_DIRTY", e);
+    }
+    
+    // Get parameters
+    let paths: Vec<String> = optional_str(args, "paths")
+        .map(|s| vec![s])
+        .unwrap_or_else(|| {
+            args.get("paths")
+                .and_then(Value::as_array)
+                .map(|arr| arr.iter().filter_map(Value::as_str).map(String::from).collect())
+                .unwrap_or_default()
+        });
+    
+    if paths.is_empty() {
+        return ToolResult::err(
+            "invalid_args",
+            "rewrite_history requires at least one path",
+        );
+    }
+    
+    let invert = optional_bool(args, "invert").unwrap_or(true);
+    let refspec = optional_str(args, "refspec");
+    
+    // Create backup bundle
+    let session_id = get_session_id(ctx);
+    let bundle_path = match create_backup_bundle(&ctx.cwd, &session_id) {
+        Some(p) => p,
+        None => {
+            return ToolResult::err(
+                "GIT_BACKUP_FAILED",
+                "failed to create backup bundle",
+            );
+        }
+    };
+    
+    // Record refs before rewrite
+    let old_refs = record_refs(&ctx.cwd);
+    
+    // Execute rewrite
+    let rewrite_result = execute_rewrite(&ctx.cwd, &paths, invert, refspec.as_deref());
+    
+    if !rewrite_result.ok {
+        // On failure, attempt to restore from bundle
+        let bundle_str = bundle_path.to_string_lossy();
+        let restore_result = git(&ctx.cwd, &["fetch", &bundle_str]);
+        if restore_result.ok {
+            return ToolResult::err(
+                "GIT_REWRITE_FAILED",
+                format!(
+                    "rewrite failed: {}. Backup bundle available at: {}",
+                    rewrite_result.error(),
+                    bundle_path.display()
+                ),
+            );
+        }
+        return ToolResult::err("GIT_REWRITE_FAILED", rewrite_result.error());
+    }
+    
+    // Verify rewrite
+    match verify_rewrite(&ctx.cwd, &old_refs) {
+        Ok(report) => {
+            let result_msg = format!(
+                "History rewrite completed successfully.\n\n{}\n\nOID mapping:\n{}",
+                rewrite_result.transcript(),
+                report
+            );
+            ToolResult::ok(result_msg)
+        }
+        Err(e) => {
+            // Verification failed - try to restore
+            let restore_result = git(&ctx.cwd, &["fetch", bundle_path.to_string_lossy().as_ref()]);
+            if restore_result.ok {
+                ToolResult::err(
+                    "GIT_VERIFY_FAILED",
+                    format!(
+                        "verification failed after rewrite: {}. Restored from backup. Backup bundle at: {}",
+                        e,
+                        bundle_path.display()
+                    ),
+                )
+            } else {
+                ToolResult::err(
+                    "GIT_VERIFY_FAILED",
+                    format!(
+                        "verification failed after rewrite: {}. Backup bundle at: {}",
+                        e,
+                        bundle_path.display()
+                    ),
+                )
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Branches and worktrees
 
 fn valid_branch(cwd: &Path, name: &str) -> Result<(), ToolResult> {
@@ -1664,13 +1957,53 @@ fn worktree_remove(ctx: &ToolContext, args: &Value) -> ToolResult {
 /// Why a shell command that rewrites or discards git history is refused, or
 /// `None` when it is allowed. Best effort, like the scope gate: it reads each
 /// `git` invocation in the command line, including after `&&`, `;` and `|`.
+/// Also matches standalone history-rewriting binaries like git-filter-repo and bfg.
 pub fn destructive_git(command: &str) -> Option<String> {
+    let command_lower = command.to_lowercase();
+    
+    // Check for standalone history-rewriting binaries first
+    // These appear as the first token (or after shell operators)
+    let standalone_binaries = [
+        "git-filter-repo",
+        "git-filter-branch", 
+        "bfg",
+        "bfg-repo-cleaner",
+    ];
+    
+    for binary in &standalone_binaries {
+        if command_lower.contains(binary) {
+            return Some(format!(
+                "`{binary}` is refused: it rewrites the whole history. History surgery is not available through bash; call `git` action `rewrite_history`."
+            ));
+        }
+    }
+    
+    // Check for python -m filter_repo
+    if command_lower.contains("python") || command_lower.contains("python3") {
+        if command_lower.contains("filter_repo") || command_lower.contains("filter-repo") {
+            return Some(format!(
+                "`python -m filter_repo` is refused: it rewrites the whole history. History surgery is not available through bash; call `git` action `rewrite_history`."
+            ));
+        }
+    }
+    
     let segments = command.split(['\n', ';', '|', '&', '(', ')', '`']);
     for segment in segments {
         let tokens: Vec<String> = segment
             .split_whitespace()
             .map(|token| token.trim_matches(['"', '\'']).to_string())
             .collect();
+        
+        // Check each token for standalone binary
+        for token in &tokens {
+            let token_lower = token.to_lowercase();
+            if standalone_binaries.iter().any(|&b| token_lower == b) {
+                return Some(format!(
+                    "`{token}` is refused: it rewrites the whole history. History surgery is not available through bash; call `git` action `rewrite_history`."
+                ));
+            }
+        }
+        
         let Some(start) = tokens
             .iter()
             .position(|token| token.rsplit('/').next() == Some("git"))
@@ -1738,7 +2071,7 @@ pub fn destructive_git(command: &str) -> Option<String> {
         };
         if let Some((shape, why)) = reason {
             return Some(format!(
-                "`{shape}` is refused: {why}. Use the git tool (stage, commit, branch, undo) for ordinary changes; if this operation is really needed, ask the user to run it themselves."
+                "`{shape}` is refused: {why}. Use the git tool (stage, commit, branch, undo, rewrite_history) for ordinary changes and history surgery; if this operation is really needed through bash, it is not available in this session."
             ));
         }
     }
@@ -1908,6 +2241,28 @@ mod tests {
                 continue;
             }
             assert!(refused.is_none(), "{command} must be allowed: {refused:?}");
+        }
+    }
+
+    #[test]
+    fn destructive_standalone_binaries_are_refused() {
+        for command in [
+            "git-filter-repo --path assets/demo.mp4 --invert-paths --force",
+            "bfg --delete-files assets/demo.mp4",
+            "python -m filter_repo --path assets/demo.mp4",
+            "python3 -m filter_repo --path assets/demo.mp4",
+            "git-filter-branch --index-filter 'git rm --cached assets/demo.mp4'",
+        ] {
+            let result = destructive_git(command);
+            assert!(
+                result.is_some(),
+                "{command} must be refused"
+            );
+            let msg = result.unwrap();
+            assert!(
+                msg.contains("rewrite_history"),
+                "refusal message for {command} must mention rewrite_history: {msg}"
+            );
         }
     }
 

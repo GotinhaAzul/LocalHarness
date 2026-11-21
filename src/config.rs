@@ -1260,6 +1260,9 @@ pub struct GitConfig {
     pub commit: GitApproval,
     /// Draft PRs and PR comments: `ask` waits for `/pr confirm`.
     pub pr: GitApproval,
+    /// History rewrite operations (filter-branch, filter-repo): `ask` waits for
+    /// approval; `allow` runs immediately (use with caution).
+    pub rewrite_history: GitApproval,
     /// Longest accepted commit subject, in characters.
     pub subject_max: usize,
 }
@@ -1269,6 +1272,7 @@ impl Default for GitConfig {
         Self {
             commit: GitApproval::Ask,
             pr: GitApproval::Ask,
+            rewrite_history: GitApproval::Ask,
             subject_max: 72,
         }
     }
