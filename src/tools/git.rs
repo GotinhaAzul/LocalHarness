@@ -2608,4 +2608,61 @@ mod tests {
         let commit_message = call(&ctx, &config, json!({"action":"commit_message"}));
         assert!(!commit_message.is_error, "{}", commit_message.content);
     }
+
+    #[test]
+    fn rewrite_history_requires_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        repo(dir.path());
+        let ctx = test_context(dir.path());
+        let config = GitConfig::default();
+        
+        let result = call(&ctx, &config, json!({"action": "rewrite_history"}));
+        assert!(result.is_error);
+        
+        let result = call(&ctx, &config, json!({"action": "rewrite_history", "paths": []}));
+        assert!(result.is_error);
+    }
+
+    #[test]
+    fn rewrite_history_denies_in_ask_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        repo(dir.path());
+        let ctx = test_context(dir.path());
+        let config = GitConfig {
+            rewrite_history: GitApproval::Ask,
+            ..Default::default()
+        };
+        
+        let result = call(&ctx, &config, json!({
+            "action": "rewrite_history",
+            "paths": ["some/file.txt"]
+        }));
+        
+        assert!(result.is_error);
+        assert!(result.content.contains("rewrite_history"));
+        assert!(result.content.contains("approval"));
+    }
+
+    #[test]
+    fn rewrite_history_requires_clean_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        repo(dir.path());
+        std::fs::write(dir.path().join("tracked.txt"), "one\n").unwrap();
+        commit_all(dir.path(), "one");
+        std::fs::write(dir.path().join("tracked.txt"), "two\n").unwrap();
+        
+        let ctx = test_context(dir.path());
+        let config = GitConfig {
+            rewrite_history: GitApproval::Allow,
+            ..Default::default()
+        };
+        
+        let result = call(&ctx, &config, json!({
+            "action": "rewrite_history",
+            "paths": ["tracked.txt"]
+        }));
+        
+        assert!(result.is_error);
+        assert!(result.content.contains("DIRTY") || result.content.contains("uncommitted"));
+    }
 }
